@@ -11,7 +11,16 @@ import {
   useAudioRecording,
   useDocumentUpload,
   useQuickActions,
+  useVoiceStream,
+  type FinalTranscript,
 } from '../hooks';
+
+// Phase B streaming voice pipeline. When `VITE_FEATURE_VOICE_STREAM=true`,
+// recording + TTS go through `useVoiceStream` (single bidirectional WS to
+// voice-server) instead of the request-response REST pair. Off by default
+// during the soak period so flag-off is the safety path.
+const VOICE_STREAM_ENABLED = import.meta.env.VITE_FEATURE_VOICE_STREAM === 'true';
+const ACCESS_TOKEN_KEY = 'renfield_access_token';
 import type {
   ActionWsMessage,
   AgentFederationProgressMessage,
@@ -275,8 +284,11 @@ export function ChatProvider({ children }: ChatProviderProps) {
     }
   }, [getAudioContext]);
 
-  // Speak text using TTS
-  const speakText = useCallback(async (text: string): Promise<void> => {
+  // Speak text using TTS — legacy REST path. Replaced by useVoiceStream
+  // when VOICE_STREAM_ENABLED. The legacy implementation stays around as
+  // the safety case (axios timeout + the long-message warning + the
+  // ttsErrorShown latch) until the streaming path has soaked.
+  const speakTextLegacy = useCallback(async (text: string): Promise<void> => {
     try {
       if (audioRef.current) {
         try {
@@ -353,9 +365,16 @@ export function ChatProvider({ children }: ChatProviderProps) {
 
   // Ref for sendMessageInternal (used by handleTranscription before
   // sendMessageInternal is declared below).
-  const sendMessageInternalRef = useRef<(text: string, fromVoice?: boolean) => Promise<void>>(
+  const sendMessageInternalRef = useRef<
+    (text: string, fromVoice?: boolean, voiceMeta?: { speakerEmbedding?: number[] | null }) => Promise<void>
+  >(
     async () => undefined,
   );
+
+  // Ref for the streaming-aware speakText so callbacks declared before
+  // useVoiceStream (e.g. handleStreamComplete) can use it. Initialized
+  // to a no-op; assigned after speakText is declared below.
+  const speakTextRef = useRef<(text: string) => Promise<void>>(async () => undefined);
 
   // AbortController used to cancel any in-flight WebSocket-handshake wait
   // (see sendMessageInternal). Aborted on unmount so we don't continue to
@@ -504,7 +523,10 @@ export function ChatProvider({ children }: ChatProviderProps) {
             lastAutoTTSTextRef.current = completedMessage.content;
 
             setTimeout(() => {
-              speakText(completedMessage.content).finally(() => {
+              // Indirection via ref so this callback can be declared before
+              // the streaming-aware speakText (which depends on the
+              // useVoiceStream hook below).
+              speakTextRef.current(completedMessage.content).finally(() => {
                 autoTTSPendingRef.current = false;
 
                 if (wakeWordEnabledRef.current && wakeWordActivatedRef.current) {
@@ -532,7 +554,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
       return prev;
     });
     setLoading(false);
-  }, [speakText, resumeWakeWord]);
+  }, [resumeWakeWord]);
 
   // Handle stream chunk
   const handleStreamChunk = useCallback((content: string) => {
@@ -756,19 +778,93 @@ export function ChatProvider({ children }: ChatProviderProps) {
     }
   }, [wakeWordEnabled, resumeWakeWord]);
 
-  // Audio recording hook
-  const {
-    recording,
-    audioLevel,
-    silenceTimeRemaining,
-    startRecording,
-    toggleRecording,
-  } = useAudioRecording({
+  // Audio recording — legacy request-response path (always wired so the
+  // flag-off safety case keeps working without rerendering tree shape).
+  const audioRec = useAudioRecording({
     onTranscription: handleTranscription,
     onError: handleRecordingError,
     onRecordingStart: handleRecordingStart,
     onRecordingStop: handleRecordingStop,
   });
+
+  // Phase B streaming voice path. Only the values below get exposed to
+  // consumers when VOICE_STREAM_ENABLED; the hook is always called so
+  // the conditional-hook rule isn't violated.
+  const handleStreamFinal = useCallback((result: FinalTranscript) => {
+    debug.log('voice-stream final transcript:', result.text);
+    // B.4.a: forward speaker_embedding through the chat-WS envelope so
+    // the backend resolves the speaker without re-running Whisper. The
+    // backend handler treats the field as nullable; text-only flows
+    // skip it.
+    void sendMessageInternalRef.current(result.text, true, {
+      speakerEmbedding: result.speakerEmbedding,
+    });
+  }, []);
+
+  const handleStreamError = useCallback((code: string, message: string) => {
+    debug.log(`voice-stream error: ${code}: ${message}`);
+    handleRecordingError(`${code}: ${message}`);
+  }, [handleRecordingError]);
+
+  // Token: read once, refresh via storage event so a token rotation
+  // mid-session updates the ref without re-rendering this provider for
+  // every state change.
+  const [streamToken, setStreamToken] = useState<string | null>(() =>
+    localStorage.getItem(ACCESS_TOKEN_KEY),
+  );
+  useEffect(() => {
+    const handler = (e: StorageEvent) => {
+      if (e.key === ACCESS_TOKEN_KEY) setStreamToken(e.newValue);
+    };
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
+  }, []);
+
+  const voiceStream = useVoiceStream({
+    token: streamToken,
+    onFinal: handleStreamFinal,
+    onError: handleStreamError,
+    // R7 fix from B.3 review: lastInputChannelRef + autoTTSPendingRef +
+    // wake-word-pause are all set in handleRecordingStart; without these
+    // hooks the streaming path silently bypasses auto-TTS for voice
+    // messages. Wire them so the streaming and legacy paths behave
+    // identically from the orchestration layer's view.
+    onRecordingStart: handleRecordingStart,
+    onRecordingStop: handleRecordingStop,
+  });
+
+  const recording = VOICE_STREAM_ENABLED ? voiceStream.recording : audioRec.recording;
+  const audioLevel = VOICE_STREAM_ENABLED ? 0 : audioRec.audioLevel;
+  const silenceTimeRemaining = VOICE_STREAM_ENABLED ? 0 : audioRec.silenceTimeRemaining;
+  // Stable callback identities — without these the conditional ternaries
+  // would create a new function every render, breaking memoization
+  // downstream (the main exported context object).
+  const startStreamRecording = useCallback(() => { void voiceStream.startRecording(); }, [voiceStream]);
+  const toggleStreamRecording = useCallback(() => {
+    if (voiceStream.recording) voiceStream.stopRecording();
+    else void voiceStream.startRecording();
+  }, [voiceStream]);
+  const startRecording = VOICE_STREAM_ENABLED ? startStreamRecording : audioRec.startRecording;
+  const toggleRecording = VOICE_STREAM_ENABLED ? toggleStreamRecording : audioRec.toggleRecording;
+
+  // Streaming-aware speakText. Resolves when the TTS request is dispatched
+  // (streaming) or playback completes (legacy). Existing callers see the
+  // same Promise<void> shape.
+  const speakText = useCallback(async (text: string): Promise<void> => {
+    if (!VOICE_STREAM_ENABLED) {
+      return speakTextLegacy(text);
+    }
+    if (!text || text.trim().length === 0) return;
+    try {
+      await voiceStream.speakText(text);
+    } catch (e) {
+      debug.log('voice-stream speakText error', e);
+    }
+  }, [speakTextLegacy, voiceStream]);
+
+  useEffect(() => {
+    speakTextRef.current = speakText;
+  }, [speakText]);
 
   // Document upload hook
   const {
@@ -832,7 +928,11 @@ export function ChatProvider({ children }: ChatProviderProps) {
   startRecordingRef.current = startRecording;
 
   // Internal send message function
-  const sendMessageInternal = useCallback(async (text: string, fromVoice = false): Promise<void> => {
+  const sendMessageInternal = useCallback(async (
+    text: string,
+    fromVoice = false,
+    voiceMeta?: { speakerEmbedding?: number[] | null },
+  ): Promise<void> => {
     if (!text.trim()) return;
 
     if (!fromVoice) {
@@ -894,6 +994,11 @@ export function ChatProvider({ children }: ChatProviderProps) {
       use_rag: useRag,
       knowledge_base_id: selectedKnowledgeBase,
       ...(completedIds.length > 0 && { attachment_ids: completedIds }),
+      // B.4.a: ECAPA speaker embedding from voice-server flows here.
+      // Backend chat handler resolves the Speaker DB row when present.
+      ...(voiceMeta?.speakerEmbedding && {
+        speaker_embedding: voiceMeta.speakerEmbedding,
+      }),
     };
 
     // wsSendMessage re-checks readyState before .send() and returns false
