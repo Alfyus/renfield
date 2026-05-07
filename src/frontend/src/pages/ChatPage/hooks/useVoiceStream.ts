@@ -32,6 +32,32 @@ const HEADER_LEN = 24; // 4 magic + 16 uuid + 4 sequence
 const VOICE_CODEC = 'audio/webm;codecs=opus';
 const CHUNK_INTERVAL_MS = 100;
 
+// Timing diagnostics for voice pipeline. Toggle in browser console:
+//   localStorage.setItem('renfield_voice_timing', '1') → enable
+//   localStorage.removeItem('renfield_voice_timing') → disable
+// Outputs structured timestamps so the perceived-latency breakdown
+// is reconstructable from the console.
+function vlog(stage: string, extra?: Record<string, unknown>): void {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('renfield_voice_timing')) {
+      const ms = performance.now().toFixed(1);
+      // eslint-disable-next-line no-console
+      console.log(`🎤 [+${ms}ms] ${stage}`, extra ?? '');
+    }
+  } catch { /* ignore */ }
+}
+
+// Voice-activity detection — mirrors useAudioRecording's defaults so the
+// streaming path's end-of-utterance UX matches what users learned with
+// the legacy hook. Server-side VAD also runs as a safety net (C.2).
+const VAD = {
+  SILENCE_THRESHOLD: 10,      // RMS below this counts as silence
+  SILENCE_DURATION_MS: 1500,  // total silence before auto-stop
+  MIN_RECORDING_MS: 800,      // ignore silence in the first ~800 ms
+  FFT_SIZE: 512,
+  SMOOTHING: 0.3,
+};
+
 interface FinalTranscript {
   text: string;
   language: string;
@@ -98,6 +124,8 @@ export function useVoiceStream({
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const vadFrameRef = useRef<number | null>(null);
   const sessionReadyRef = useRef(false);
   const unmountedRef = useRef(false);
 
@@ -110,6 +138,10 @@ export function useVoiceStream({
   const [recording, setRecording] = useState(false);
   const [partialText, setPartialText] = useState<string>('');
   const [connected, setConnected] = useState(false);
+  // Surfaced to consumers so they can render the same listening
+  // indicator as the legacy hook (RMS bar + countdown).
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [silenceTimeRemaining, setSilenceTimeRemaining] = useState(0);
 
   // 'closed' is a valid AudioContextState at runtime but the TS DOM
   // lib version this project ships with omits it from the union.
@@ -179,11 +211,23 @@ export function useVoiceStream({
       case 'partial_transcript': {
         const text = (msg.text as string) ?? '';
         const confidence = (msg.confidence as number) ?? 0;
+        vlog('partial_transcript', { text: text.slice(0, 40), confidence: confidence.toFixed(2) });
         setPartialText(text);
         onPartial?.(text, confidence);
         break;
       }
       case 'final_transcript': {
+        vlog('final_transcript', { text: ((msg.text as string) || '').slice(0, 60), conf: (msg.speaker_confidence as number)?.toFixed(2) });
+        // Server-side VAD beat browser-side VAD (or the user clicked
+        // stop simultaneously) — stop the recorder so we don't keep
+        // streaming chunks against a now-flushed decoder. recorder.onstop
+        // sends stt_flush, which is a no-op on the server side after
+        // the auto-finalize already ran (server is idempotent on
+        // double-flush). C.4 from the design.
+        const rec = recorderRef.current;
+        if (rec && rec.state !== 'inactive') {
+          try { rec.stop(); } catch { /* ignore */ }
+        }
         const result: FinalTranscript = {
           text: (msg.text as string) ?? '',
           language: (msg.language as string) ?? 'de',
@@ -195,6 +239,7 @@ export function useVoiceStream({
         break;
       }
       case 'tts_done':
+        vlog('tts_done', { rid: msg.request_id });
         onTtsDone?.((msg.request_id as string) ?? '');
         break;
       case 'error':
@@ -256,6 +301,7 @@ export function useVoiceStream({
       if (ev.data instanceof ArrayBuffer) {
         const decoded = decodeRfwaHeader(ev.data);
         if (decoded) {
+          vlog('binary_frame', { size: decoded.wavBody.byteLength, seq: decoded.sequence });
           // decoded.wavBody is a standalone WAV with its own header.
           enqueuePlayback(decoded.wavBody);
         } else {
@@ -317,6 +363,18 @@ export function useVoiceStream({
       return;
     }
 
+    // Each utterance gets its own session_start so the server can
+    // spawn a fresh decoder. Without this, the first utterance works
+    // (decoder created on WS open), but every subsequent recording
+    // hits "decoder is None" on the server (finalize tore it down).
+    // Server's session_start handler is idempotent. WS message order
+    // is preserved end-to-end and the receive loop is sequential, so
+    // the session_start fully completes (decoder up) before the
+    // first MediaRecorder chunk arrives 100 ms later.
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'session_start', codec: VOICE_CODEC }));
+    }
+
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -329,6 +387,83 @@ export function useVoiceStream({
     const recorder = new MediaRecorder(stream, { mimeType: VOICE_CODEC });
     recorderRef.current = recorder;
 
+    // Voice-activity detector — auto-stop after 1.5 s of silence so
+    // users don't have to find the mic button. Mirrors the legacy
+    // useAudioRecording's RMS check. Server-side VAD (C.2) is the
+    // safety net for browsers without AnalyserNode access.
+    try {
+      const ctx = ensureAudioContext();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = VAD.FFT_SIZE;
+      analyser.smoothingTimeConstant = VAD.SMOOTHING;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const recordingStart = Date.now();
+      let lastSoundAt = Date.now();
+      let speechSeen = false;
+      // Throttle React state updates from the 60 Hz rAF loop to ~15 Hz
+      // (every ~66 ms). Updating state every frame caused so much
+      // context-consumer re-rendering that the partial-transcript
+      // bubble's setState calls were getting visually lost in the
+      // churn. RMS at 15 Hz is still smooth for the visualizer.
+      let lastStateAt = 0;
+
+      const checkSilence = () => {
+        const a = analyserRef.current;
+        const rec = recorderRef.current;
+        if (!a || !rec || rec.state === 'inactive') {
+          vadFrameRef.current = null;
+          return;
+        }
+        a.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i += 1) sum += dataArray[i] * dataArray[i];
+        const rms = Math.sqrt(sum / dataArray.length);
+        const now = Date.now();
+        const recordingTime = now - recordingStart;
+
+        // Compute the silence-auto-stop decision every frame (cheap,
+        // VAD timing precision matters), but throttle React state
+        // updates to ~15 Hz so we don't churn ChatContext consumers
+        // (which would also drown out partial_transcript updates).
+        const shouldUpdateState = now - lastStateAt > 66;
+
+        if (rms > VAD.SILENCE_THRESHOLD) {
+          lastSoundAt = now;
+          speechSeen = true;
+          if (shouldUpdateState) {
+            setAudioLevel(Math.round(rms));
+            setSilenceTimeRemaining(0);
+            lastStateAt = now;
+          }
+        } else if (
+          speechSeen
+          && recordingTime > VAD.MIN_RECORDING_MS
+          && now - lastSoundAt >= VAD.SILENCE_DURATION_MS
+        ) {
+          // Silence-auto-stop. recorder.onstop fires next, which
+          // sends stt_flush and the server takes it from there.
+          try { rec.stop(); } catch { /* ignore */ }
+          vadFrameRef.current = null;
+          return;
+        } else if (shouldUpdateState) {
+          setAudioLevel(Math.round(rms));
+          if (speechSeen && recordingTime > VAD.MIN_RECORDING_MS) {
+            const remaining = Math.max(0, VAD.SILENCE_DURATION_MS - (now - lastSoundAt));
+            setSilenceTimeRemaining(remaining);
+          }
+          lastStateAt = now;
+        }
+        vadFrameRef.current = requestAnimationFrame(checkSilence);
+      };
+      vadFrameRef.current = requestAnimationFrame(checkSilence);
+    } catch (e) {
+      debug.log('voice: VAD setup failed; recording without silence-auto-stop', e);
+    }
+
     recorder.ondataavailable = (e: BlobEvent) => {
       if (!e.data || e.data.size === 0) return;
       if (ws.readyState !== WebSocket.OPEN) return;
@@ -337,13 +472,21 @@ export function useVoiceStream({
       });
     };
     recorder.onstop = () => {
+      if (vadFrameRef.current !== null) {
+        cancelAnimationFrame(vadFrameRef.current);
+        vadFrameRef.current = null;
+      }
+      analyserRef.current = null;
       if (ws.readyState === WebSocket.OPEN) {
+        vlog('stt_flush_sent');
         ws.send(JSON.stringify({ type: 'stt_flush' }));
       }
       streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
       recorderRef.current = null;
       setRecording(false);
+      setAudioLevel(0);
+      setSilenceTimeRemaining(0);
       try { onRecordingStop?.(); } catch (e) { debug.log('voice: onRecordingStop threw', e); }
     };
 
@@ -356,7 +499,7 @@ export function useVoiceStream({
 
     recorder.start(CHUNK_INTERVAL_MS);
     setRecording(true);
-  }, [recording, ensureSocket, onError, onRecordingStart, onRecordingStop]);
+  }, [recording, ensureSocket, ensureAudioContext, onError, onRecordingStart, onRecordingStop]);
 
   const stopRecording = useCallback((): void => {
     const rec = recorderRef.current;
@@ -368,9 +511,11 @@ export function useVoiceStream({
   }, []);
 
   const speakText = useCallback(async (text: string, language?: string): Promise<string> => {
+    vlog('speakText:start', { len: text.length, preview: text.slice(0, 40) });
     const ws = await ensureSocket();
     const requestId = generateRequestId();
     ws.send(JSON.stringify({ type: 'tts_request', request_id: requestId, text, language }));
+    vlog('tts_request_sent', { rid: requestId, len: text.length });
     return requestId;
   }, [ensureSocket]);
 
@@ -385,6 +530,11 @@ export function useVoiceStream({
   useEffect(() => {
     return () => {
       unmountedRef.current = true;
+      if (vadFrameRef.current !== null) {
+        cancelAnimationFrame(vadFrameRef.current);
+        vadFrameRef.current = null;
+      }
+      analyserRef.current = null;
       const rec = recorderRef.current;
       if (rec && rec.state !== 'inactive') {
         try { rec.stop(); } catch { /* ignore */ }
@@ -411,6 +561,8 @@ export function useVoiceStream({
     recording,
     partialText,
     connected,
+    audioLevel,
+    silenceTimeRemaining,
   };
 }
 

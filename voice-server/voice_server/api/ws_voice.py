@@ -54,6 +54,15 @@ MAX_UTTERANCE_S = 60
 # is off (the partials path). Empirically calibrated; the final pass
 # uses VAD so isn't subject to this floor.
 PARTIAL_CONFIDENCE_FLOOR = 0.5
+# Server-side end-of-utterance: after this many seconds of trailing
+# silence (no high-confidence Whisper segment) we auto-finalize.
+# Browser-side VAD (C.1) usually beats this; this is the safety net
+# for clients without analyser access. 2.0s vs the browser's 1.5s
+# so the browser stays primary.
+SERVER_VAD_SILENCE_S = 2.0
+# Minimum recording duration before server-side VAD-stop can fire.
+# Prevents a hot-mic from cutting off the user's first syllable.
+SERVER_VAD_MIN_DURATION_S = 1.0
 
 
 @dataclass
@@ -66,6 +75,21 @@ class SessionState:
     last_partial_text: str = ""
     started_at: float = 0.0
     tts_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    # During _finalize the decoder is closed and a fresh one is
+    # spawned. Browser recorder buffers ~100 ms of chunks ahead, so
+    # several arrive after the close. They previously hit
+    # AudioDecoder.push and raised "decoder closed" /
+    # "WriteUnixTransport closed" — the chunk handler surfaced these
+    # as `invalid_audio` events which the frontend rendered as chat
+    # messages. Now we set draining=True for the swap window and
+    # silently drop chunks during it.
+    draining: bool = False
+    # C.2 server-side VAD: track when speech was last detected so we
+    # can auto-finalize after SERVER_VAD_SILENCE_S of trailing quiet.
+    # Browser-side VAD (C.1) is the primary trigger; this is the
+    # safety net for clients without analyser access.
+    last_speech_at: float = 0.0
+    speech_seen: bool = False
 
 
 def _accumulated_seconds(state: SessionState) -> float:
@@ -110,6 +134,13 @@ async def _maybe_emit_partial(ws: WebSocket, state: SessionState, stt: STTServic
         async for seg in stt.transcribe_stream(audio, partial=True):
             seg_texts.append(seg.text)
             last_conf = seg.confidence
+
+        # C.2: a confident partial = the user is actively speaking.
+        # Bookmark this time so the auto-finalize trigger only fires
+        # after SERVER_VAD_SILENCE_S of NO confident output.
+        if last_conf >= PARTIAL_CONFIDENCE_FLOOR:
+            state.last_speech_at = now
+            state.speech_seen = True
 
         # Confidence floor: with vad_filter off, faster-whisper sometimes
         # hallucinates plausible text on near-silence. Suppress partials
@@ -181,8 +212,30 @@ async def _finalize(
         payload["speaker_embedding"] = embedding
 
     await _send_json(ws, payload)
+    # C.3: reset session state so the next utterance over the same WS
+    # works without a "decoder closed" error storm. The user clicks the
+    # mic again → MediaRecorder emits chunks → we have a fresh decoder
+    # ready. Same codec as session_start (no need to renegotiate).
     state.audio_pcm.clear()
     state.last_partial_text = ""
+    state.last_partial_at = 0.0
+    state.last_speech_at = 0.0
+    state.speech_seen = False
+    # Inter-utterance protocol: close the decoder and DON'T auto-
+    # restart. The next utterance starts when the client sends a
+    # fresh session_start, which spawns a clean decoder. Chunks
+    # arriving between _finalize and that session_start are silently
+    # dropped (debug log) — they're MediaRecorder's pre-stop buffer
+    # crossing the finalize boundary, and there's no way to splice
+    # them mid-stream into either the old or new decoder cleanly
+    # (webm cluster headers).
+    if state.decoder is not None:
+        try:
+            await state.decoder.close()
+        except Exception:
+            pass
+        state.decoder = None
+        state.draining = True  # signal to chunk handler: between utterances
 
 
 async def _run_tts(
@@ -291,8 +344,29 @@ async def ws_voice(websocket: WebSocket, token: str | None = Query(default=None)
 
             if "bytes" in msg and msg["bytes"] is not None:
                 if state.decoder is None:
-                    await _send_error(websocket, "bad_message",
-                                       "binary frame before session_start")
+                    # Two legitimate cases:
+                    #  1. Binary frame before any session_start — protocol
+                    #     violation, but rare (frontend sends session_start
+                    #     before chunks).
+                    #  2. After _finalize: MediaRecorder's pre-stop buffer
+                    #     crosses the finalize boundary. Browser doesn't
+                    #     know we already finalized. Drop silently — these
+                    #     chunks belong neither to the prior utterance
+                    #     (already transcribed) nor cleanly to the next
+                    #     (need a fresh decoder which only the next
+                    #     session_start spawns). Logging at debug, not
+                    #     surfacing as an error event so the chat doesn't
+                    #     fill with internal-protocol noise.
+                    if state.draining:
+                        logger.debug(
+                            "voice session %s drop chunk between utterances (draining)",
+                            user_id,
+                        )
+                    else:
+                        logger.debug(
+                            "voice session %s drop chunk before session_start",
+                            user_id,
+                        )
                     continue
                 try:
                     await state.decoder.push(msg["bytes"])
@@ -300,9 +374,38 @@ async def ws_voice(websocket: WebSocket, token: str | None = Query(default=None)
                     if pcm.size:
                         state.audio_pcm.append(pcm)
                     await _maybe_emit_partial(websocket, state, stt)
+                    # C.2: server-side VAD auto-finalize. After
+                    # MIN_DURATION of recording, if speech was seen and
+                    # no confident segment has fired in SILENCE_S,
+                    # finalize. Browser-side VAD (C.1) usually beats
+                    # this; this is the safety net.
+                    now = time.monotonic()
+                    elapsed = now - state.started_at
+                    if (
+                        state.speech_seen
+                        and elapsed >= SERVER_VAD_MIN_DURATION_S
+                        and (now - state.last_speech_at) >= SERVER_VAD_SILENCE_S
+                    ):
+                        logger.info(
+                            "voice session %s auto-finalizing (server VAD)",
+                            user_id,
+                        )
+                        await _finalize(websocket, state, stt, speaker)
+                        state.speech_seen = False
+                        state.last_speech_at = 0.0
                     if _accumulated_seconds(state) >= MAX_UTTERANCE_S:
                         logger.warning("voice session %s hit MAX_UTTERANCE_S, force-finalizing", user_id)
                         await _finalize(websocket, state, stt, speaker)
+                        # C.5: tell the browser to stop streaming. After
+                        # the cap fires we don't accept more chunks for
+                        # this session — close cleanly with a reason
+                        # instead of silently letting the error storm
+                        # continue.
+                        await websocket.close(
+                            code=status.WS_1011_INTERNAL_ERROR,
+                            reason=f"max_utterance_seconds ({MAX_UTTERANCE_S}s)",
+                        )
+                        return
                 except Exception as e:
                     logger.exception("audio chunk error")
                     await _send_error(websocket, "invalid_audio", str(e))
@@ -322,12 +425,22 @@ async def ws_voice(websocket: WebSocket, token: str | None = Query(default=None)
             if mtype == "session_start":
                 codec = data.get("codec")
                 # Replacing an existing decoder leaks the old ffmpeg subprocess
-                # if we don't close first.
+                # if we don't close first. Sent at WS open AND at the
+                # start of each subsequent utterance — the second-and-
+                # later calls signal "starting a new utterance after a
+                # finalize."
                 await _close_decoder(state)
                 try:
                     state.decoder = AudioDecoder(codec)
                     await state.decoder.start()
                     state.codec = codec
+                    state.draining = False  # back to "live recording" state
+                    state.audio_pcm.clear()
+                    state.last_partial_text = ""
+                    state.last_partial_at = 0.0
+                    state.last_speech_at = 0.0
+                    state.speech_seen = False
+                    state.started_at = time.monotonic()
                     await _send_json(websocket, {"type": "session_ready"})
                 except ValueError as e:
                     await _send_error(websocket, "invalid_audio", str(e))
