@@ -131,11 +131,52 @@ class ActionExecutor:
         # MCP tool intents (mcp.* prefix — handles HA, n8n, weather, search, etc.)
         if self.mcp_manager and intent.startswith("mcp."):
             logger.info(f"🔌 Executing MCP tool: {intent}")
+            from utils.hooks import run_hooks
+            from utils.voice_context import voice_originated
+
+            # Plugin gate: ``verify_tool_call`` runs BEFORE ``pre_mcp_call``.
+            # Plugins (e.g. Reva's voice-2FA destructive-tool gate) may
+            # short-circuit the MCP call by returning an abort sentinel.
+            # Param repair via ``pre_mcp_call`` is wasted work if the call
+            # is going to be aborted, and the audit row should log what
+            # the LLM intended (pre-rewrite), not the corrected version.
+            voice_flag = voice_originated.get()
+            verify_results = await run_hooks(
+                "verify_tool_call",
+                intent=intent,
+                parameters=parameters,
+                user_id=user_id,
+                voice_originated=voice_flag,
+            )
+            for verdict in verify_results:
+                if isinstance(verdict, dict) and verdict.get("abort") is True:
+                    logger.info(
+                        f"🛑 verify_tool_call aborted {intent} "
+                        f"(voice_originated={voice_flag})"
+                    )
+                    user_response = verdict.get("user_response", "")
+                    # Adaptive Card dict OR plain string. Both flow back
+                    # into the agent loop as the tool result; downstream
+                    # rendering is the chat handler's job.
+                    #
+                    # success=False is intentional: the agent loop must
+                    # NOT chain another tool call thinking the original
+                    # succeeded. The user response IS the operation's
+                    # outcome — a confirmation prompt — not a delivered
+                    # action. action_taken=False reinforces this for the
+                    # legacy execution-state signal.
+                    return {
+                        "success": False,
+                        "message": user_response if isinstance(user_response, str) else "",
+                        "data": user_response if isinstance(user_response, dict) else None,
+                        "action_taken": False,
+                        "verify_aborted": True,
+                    }
+
             # Plugin pre-call rewrite. Plugins may repair malformed LLM
             # tool calls here (e.g. substitute a release id when the LLM
             # passed a title). First well-shaped non-None dict replaces
             # parameters; everything else is ignored.
-            from utils.hooks import run_hooks
             pre_call_results = await run_hooks(
                 "pre_mcp_call",
                 intent=intent,

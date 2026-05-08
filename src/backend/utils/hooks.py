@@ -250,6 +250,50 @@ HOOK_EVENTS: frozenset[str] = frozenset({
     # title to its API id when the LLM passed the wrong parameter
     # shape). Platform default (no handler) is a no-op.
     "pre_mcp_call",
+    # Pre-MCP tool call gate — fired by ActionExecutor BEFORE
+    # ``pre_mcp_call`` for any ``mcp.*`` intent. Handlers receive
+    # ``intent: str, parameters: dict, user_id: int | None,
+    # voice_originated: bool`` and return:
+    #
+    #   * ``None`` — defer to other handlers / platform (proceed normally)
+    #   * ``{"abort": True, "user_response": <str | dict>}`` — skip the
+    #     tool call. ``user_response`` is returned to the agent loop in
+    #     the synthesized result (string in ``message`` for plain text,
+    #     Adaptive Card dict in ``data`` for rich UI). The synthesized
+    #     result has ``success=False, action_taken=False`` so the agent
+    #     loop does NOT chain a follow-up tool call.
+    #   * ``{"abort": False}`` — explicit allow (currently equivalent to
+    #     None; reserved for future "force-allow over a later abort"
+    #     semantics).
+    #
+    # Multi-handler resolution: ``run_hooks`` filters None and returns
+    # all non-None contributions in registration order. ActionExecutor
+    # iterates and short-circuits on the FIRST ``{"abort": True}`` —
+    # later handlers' aborts are discarded silently. If you need to
+    # observe later handlers' opinions even after an abort, do that
+    # plumbing in your handler, not on the platform side.
+    #
+    # Ordering vs ``pre_mcp_call``: ``verify_tool_call`` runs FIRST.
+    # The gate decides whether to execute at all; param repair is
+    # wasted work if the call is going to be aborted, and an audit log
+    # should record what the LLM intended (pre-rewrite), not the
+    # platform-corrected version. If your ``pre_mcp_call`` handler
+    # normalizes a field a ``verify_tool_call`` policy reads (e.g.
+    # case-folding ``transition_issue.status``), the gate sees the
+    # pre-normalized value. Plugin authors: either move the rewrite to
+    # a different hook or write the policy against the LLM-shaped value.
+    #
+    # Failure semantics: handler exceptions are caught and logged via
+    # ``run_hooks`` — a crashed handler returns no opinion and the call
+    # proceeds. This is fail-OPEN at the platform layer. Plugins that
+    # need fail-CLOSED semantics (e.g. BaFin/regulated tenants where a
+    # crashed gate must not silently allow voice-destructive calls)
+    # MUST add their own outer try/except inside the handler that
+    # converts any exception to an abort sentinel.
+    #
+    # Platform default (no handler) is a no-op — proceeds to
+    # ``pre_mcp_call`` and the MCP call as before.
+    "verify_tool_call",
 })
 
 HookFn = Callable[..., Coroutine[Any, Any, Any]]
