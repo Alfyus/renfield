@@ -142,10 +142,13 @@ const SPACING: Record<string, string> = {
 /**
  * Server-side validator mirror — keep in sync with Reva's
  * _ALLOWED_ENTITY_RE in src/reva/wissensbasis/citation_chip.py.
- * Only accepts alphanumeric + dash + underscore; anything else (script
- * tags, javascript:, smuggled HTML) renders as a missing chip.
+ * Accepts alphanumeric + dash + underscore + slash (the slash supports
+ * Digital.ai Release path-style IDs like Applications/Folder.../Release...).
+ * Anything else (script tags, javascript:, smuggled HTML) and any ".."
+ * substring (path traversal) renders as a missing chip.
  */
-const CITE_ENTITY_RE = /^[A-Za-z0-9_\-]{1,128}$/;
+const CITE_ENTITY_RE = /^[A-Za-z0-9_\-/]{1,256}$/;
+const isValidEntity = (v: string) => !!v && !v.includes('..') && CITE_ENTITY_RE.test(v);
 
 /**
  * Parse markdown bold/italic and inline citation tags into React elements.
@@ -188,7 +191,7 @@ function renderFormattedText(text?: string): ReactNode {
       parts.push(<em key={key++}>{nextMatch[1]}</em>);
     } else {
       const [, entity, type, label] = nextMatch;
-      const validEntity = CITE_ENTITY_RE.test(entity);
+      const validEntity = isValidEntity(entity);
       parts.push(
         <CitationChip
           key={key++}
@@ -349,7 +352,7 @@ function renderElement(element: AcElement | undefined, index: number | string = 
       // it missing keeps the chip visible (so the agent's intent is
       // preserved) while blocking the click.
       const cc = element as AcCitationChip;
-      const validEntity = !cc.missing && CITE_ENTITY_RE.test(cc.entity ?? '');
+      const validEntity = !cc.missing && isValidEntity(cc.entity ?? '');
       return (
         <CitationChip
           key={key}
