@@ -20,7 +20,7 @@
  * `collapsed`, which left the panel permanently inaccessible on phones.
  */
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChevronRight, Layers, X } from 'lucide-react';
 
@@ -172,6 +172,11 @@ interface MobileBottomSheetProps {
   closeLabel: string;
 }
 
+// Selector for everything Tab can normally land on. Used by the focus
+// trap to find the first/last focusable element inside the sheet.
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 function MobileBottomSheet({
   children,
   onClose,
@@ -179,6 +184,9 @@ function MobileBottomSheet({
   heading,
   closeLabel,
 }: MobileBottomSheetProps) {
+  const sheetRef = useRef<HTMLDivElement | null>(null);
+  const closeBtnRef = useRef<HTMLButtonElement | null>(null);
+
   // Body scroll lock while the sheet is open — without this, scrolling
   // inside the sheet cascades up to the chat list once the sheet content
   // is at its top, which feels broken on touch devices.
@@ -190,11 +198,45 @@ function MobileBottomSheet({
     };
   }, []);
 
-  // Esc closes the sheet — keyboard-accessible without forcing the user
-  // to find the X button on a small viewport.
+  // WCAG SC 2.4.3 — initial focus moves into the dialog on open.
+  // Lands on the close button: predictable, doesn't focus a content
+  // chip the user has to dismiss before getting back to the close
+  // affordance.
+  useEffect(() => {
+    closeBtnRef.current?.focus();
+  }, []);
+
+  // WCAG SC 2.1.2 — focus trap. Esc closes; Tab/Shift+Tab cycle within
+  // the sheet's focusable elements rather than escaping to the chat
+  // input behind the backdrop.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') {
+        onClose();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const sheet = sheetRef.current;
+      if (!sheet) return;
+      const focusables = Array.from(
+        sheet.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+      ).filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      } else if (active && !sheet.contains(active)) {
+        // Focus drifted outside the sheet (e.g. a hidden tabbable link
+        // in the underlying chat). Pull it back in.
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -208,6 +250,7 @@ function MobileBottomSheet({
         aria-hidden="true"
       />
       <div
+        ref={sheetRef}
         role="dialog"
         aria-modal="true"
         aria-label={ariaLabel}
@@ -223,6 +266,7 @@ function MobileBottomSheet({
         <header className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700">
           <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{heading}</h2>
           <button
+            ref={closeBtnRef}
             type="button"
             onClick={onClose}
             className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
