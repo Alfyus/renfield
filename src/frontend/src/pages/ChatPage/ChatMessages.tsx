@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react';
+import { useRef, useEffect, useMemo, type ReactNode } from 'react';
 import type { ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Volume2, Loader, FileText, AlertCircle, CheckCircle, Search, CheckCircle2, XCircle, ChevronRight, Radio } from 'lucide-react';
@@ -7,6 +7,8 @@ import IntentCorrectionButton from '../../components/IntentCorrectionButton';
 import AttachmentQuickActions from './AttachmentQuickActions';
 import EmailForwardDialog from './EmailForwardDialog';
 import { useChatContext } from './context/ChatContext';
+import { CitationChip } from '../../components/wissensbasis/CitationChip';
+import { useTraceQuery, type TraceEntity } from '../../api/resources/wissensbasis';
 
 const IMAGE_URL_RE = /https?:\/\/[^\s)]+?\/Items\/[^\s)]+?\/Images\/[^\s)]+|https?:\/\/[^\s)]+\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s)]*)?/i;
 
@@ -19,7 +21,55 @@ type ContentPart =
   | { type: 'link'; label: string; url: string }
   | { type: 'image'; url: string };
 
-function renderMessageContent(text: string, imageAlt: string): ReactElement {
+function renderTextWithChips(text: string, entities: TraceEntity[], keyPrefix: string): ReactNode[] {
+  if (!text || entities.length === 0) {
+    return [text];
+  }
+  const candidates = entities
+    .filter((e) => {
+      const d = (e.display_name || '').trim();
+      const id = (e.entity_id || '').trim();
+      if (!d || !id || d.length < 3) return false;
+      if (d === id && /^\d+$/.test(d)) return false;
+      return true;
+    })
+    .sort((a, b) => b.display_name.length - a.display_name.length);
+  if (candidates.length === 0) return [text];
+
+  const escaped = candidates.map((c) => c.display_name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const pattern = new RegExp('(?<![A-Za-z0-9_])(' + escaped.join('|') + ')(?![A-Za-z0-9_])', 'g');
+  const byDisplay = new Map(candidates.map((c) => [c.display_name, c]));
+
+  const out: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      out.push(text.slice(lastIndex, match.index));
+    }
+    const ent = byDisplay.get(match[1]);
+    if (ent) {
+      out.push(
+        <CitationChip
+          key={`${keyPrefix}-chip-${key++}`}
+          entity={ent.entity_id}
+          label={ent.display_name}
+          entityType={ent.entity_type}
+        />,
+      );
+    } else {
+      out.push(match[0]);
+    }
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < text.length) {
+    out.push(text.slice(lastIndex));
+  }
+  return out;
+}
+
+function renderMessageContent(text: string, imageAlt: string, entities: TraceEntity[] = [], msgKey = 'm'): ReactElement {
   // Combined pattern: markdown links [text](url), image URLs, or plain URLs
   const pattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s)]+?\/Items\/[^\s)]+?\/Images\/[^\s)]+|https?:\/\/[^\s)]+\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s)]*)?|https?:\/\/[^\s)]+/gi;
 
@@ -48,7 +98,11 @@ function renderMessageContent(text: string, imageAlt: string): ReactElement {
   }
 
   if (parts.length === 1 && parts[0].type === 'text') {
-    return <p className="whitespace-pre-wrap">{text}</p>;
+    return (
+      <p className="whitespace-pre-wrap">
+        {renderTextWithChips(text, entities, msgKey)}
+      </p>
+    );
   }
 
   return (
@@ -72,7 +126,7 @@ function renderMessageContent(text: string, imageAlt: string): ReactElement {
             className="text-primary-600 dark:text-primary-400 underline hover:text-primary-800 dark:hover:text-primary-300"
           >{part.label}</a>
         ) : (
-          <span key={i}>{part.content}</span>
+          <span key={i}>{renderTextWithChips(part.content, entities, `${msgKey}-${i}`)}</span>
         )
       )}
     </div>
@@ -85,9 +139,20 @@ export default function ChatMessages() {
     messages, loading, historyLoading, speakText, handleFeedbackSubmit,
     actionLoading, actionResult, indexToKb, sendToPaperless, sendToBoth, handleSummarize,
     handleSendViaEmail, emailDialog, confirmSendViaEmail, cancelEmailDialog,
-    sendMessage,
+    sendMessage, sessionId,
   } = useChatContext();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Fetch the wissensbasis reasoning trace for this session so we can
+  // wrap entity mentions in the assistant prose with CitationChips.
+  // The trace is rebuilt server-side on every agent turn (drained from
+  // the wb_annotations accumulator) so the entity list stays current.
+  // useTraceQuery gates on sessionId — null/missing returns empty data.
+  const traceQ = useTraceQuery(sessionId);
+  const chipEntities = useMemo(
+    () => traceQ.data?.trace?.entities ?? [],
+    [traceQ.data?.trace?.entities],
+  );
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -238,7 +303,7 @@ export default function ChatMessages() {
               </ul>
             )}
 
-            {message.role === 'assistant' ? renderMessageContent(message.content, t('chat.albumArt')) : <p className="whitespace-pre-wrap">{message.content}</p>}
+            {message.role === 'assistant' ? renderMessageContent(message.content, t('chat.albumArt'), chipEntities, `msg-${index}`) : <p className="whitespace-pre-wrap">{message.content}</p>}
 
             {/* Adaptive Card (from WebSocket card message) */}
             {message.card && (
