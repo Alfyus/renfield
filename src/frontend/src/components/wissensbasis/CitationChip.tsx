@@ -60,14 +60,18 @@ export function CitationChip({ entity, label, entityType, missing }: CitationChi
   const isFocused = !missing && entity === focusEntityId;
   const interactive = !missing && !!entity;
 
+  // DESIGN.md only allows crimson + turquoise + neutral grays. Citation
+  // chips are an informational element → accent (turquoise) tier. Existing
+  // Badge.tsx uses the same accent-100/accent-700/accent-600/20/accent-400
+  // pairing — match it for visual consistency.
   const baseClasses =
     'inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-xs font-medium align-baseline transition-colors';
   const tone = missing
     ? 'bg-gray-100 dark:bg-gray-700/50 text-gray-400 dark:text-gray-500 line-through cursor-not-allowed'
     : isFocused
-      ? 'bg-blue-200 dark:bg-blue-700/60 text-blue-900 dark:text-blue-100 ring-1 ring-blue-400 dark:ring-blue-500'
-      : 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-200 hover:bg-blue-100 dark:hover:bg-blue-800/40';
-  const focusRing = interactive ? 'focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500' : '';
+      ? 'bg-accent-200 dark:bg-accent-600/40 text-accent-900 dark:text-accent-100 ring-1 ring-accent-500 dark:ring-accent-400'
+      : 'bg-accent-100 dark:bg-accent-600/20 text-accent-700 dark:text-accent-400 hover:bg-accent-200 dark:hover:bg-accent-600/30';
+  const focusRing = interactive ? 'focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-500' : '';
 
   if (!interactive) {
     return (

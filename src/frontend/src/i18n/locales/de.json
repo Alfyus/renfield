@@ -1233,7 +1233,8 @@
       "expandShort": "Wissensbasis",
       "collapse": "Panel einklappen",
       "reasoningHeading": "Argumentation",
-      "focusHeading": "Fokus"
+      "focusHeading": "Fokus",
+      "defaultMix": "Standard-Aufteilung"
     },
     "subgraph": {
       "loading": "Lädt…",

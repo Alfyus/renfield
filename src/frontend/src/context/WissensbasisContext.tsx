@@ -1,21 +1,26 @@
 /**
  * Wissensbasis focus context — shared focus entity_id state.
  *
- * Lives at the chat-page level (and the standalone /wissensbasis page).
+ * Mounted at the chat-page level (with syncWithUrl=false to keep the
+ * chat URL clean) and at the standalone /wissensbasis page (with
+ * syncWithUrl=true so refresh + back/forward + shareable URLs work).
  * The CitationChip render arm in AdaptiveCardRenderer reads `setFocus`
  * from this context so a chip click in the answer prose refocuses the
  * side panel on the clicked entity.
  *
- * URL-encoded state: when used inside a Routes-aware tree, the provider
- * keeps `?focus=UUID` in sync with state via the `syncWithUrl` prop.
- * Refreshing the page restores the focus entity. Browser back/forward
- * cycles through prior focus picks.
- *
  * No backend write — focus is per-tab, per-browser. Cross-tab
- * coordination is explicitly out of scope for v1 (P3 of /office-hours).
+ * coordination is explicitly out of scope for v1.
  */
 
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from 'react';
 import { useSearchParams } from 'react-router';
 
 interface WissensbasisContextValue {
@@ -46,9 +51,11 @@ export function WissensbasisProvider({
   defaultCollapsed = false,
 }: ProviderProps) {
   const [searchParams, setSearchParams] = useSearchParams();
+  // Only sample the URL when this provider is configured to sync with it.
+  // The chat-page mount uses syncWithUrl=false because chat URLs already
+  // encode the conversation; clicking chips shouldn't pollute that bar.
   const urlFocus = syncWithUrl ? searchParams.get('focus') : null;
 
-  // Initialize from URL when syncWithUrl is true; otherwise null.
   const [focusEntityId, setFocusState] = useState<string | null>(urlFocus);
 
   const [collapsed, setCollapsed] = useState<boolean>(() => {
@@ -58,26 +65,40 @@ export function WissensbasisProvider({
   });
 
   // Keep state in sync with URL changes (back/forward navigation).
+  // useState bails out on same-value updates, so this won't loop with
+  // the state→URL write below.
   useEffect(() => {
     if (!syncWithUrl) return;
     setFocusState(urlFocus);
   }, [urlFocus, syncWithUrl]);
 
-  const setFocus = (entityId: string | null) => {
-    setFocusState(entityId);
-    if (!syncWithUrl) return;
-    const next = new URLSearchParams(searchParams);
-    if (entityId) {
-      next.set('focus', entityId);
-    } else {
-      next.delete('focus');
-    }
-    // `replace: true` keeps each focus pick from polluting the back stack
-    // with one entry per chip click — only explicit navigations push.
-    setSearchParams(next, { replace: true });
-  };
+  const setFocus = useCallback(
+    (entityId: string | null) => {
+      setFocusState(entityId);
+      if (!syncWithUrl) return;
+      // Functional setSearchParams: read the LATEST params at call time
+      // instead of closing over a snapshot. Closing over `searchParams`
+      // would silently drop sibling params (e.g. ?session=) when the
+      // closure was created before the user navigated to add them.
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (entityId) {
+            next.set('focus', entityId);
+          } else {
+            next.delete('focus');
+          }
+          return next;
+        },
+        // replace: true keeps each chip click out of the back stack —
+        // only explicit navigations push, so back/forward feels natural.
+        { replace: true },
+      );
+    },
+    [syncWithUrl, setSearchParams],
+  );
 
-  const toggleCollapsed = () => {
+  const toggleCollapsed = useCallback(() => {
     setCollapsed((prev) => {
       const next = !prev;
       if (typeof window !== 'undefined') {
@@ -85,33 +106,43 @@ export function WissensbasisProvider({
       }
       return next;
     });
-  };
+  }, []);
 
   const value = useMemo(
     () => ({ focusEntityId, setFocus, collapsed, toggleCollapsed }),
-    // setFocus + toggleCollapsed close over searchParams; depending on
-    // [searchParams] would re-create them every URL change. Stable
-    // identities are good enough since they always read the latest state.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [focusEntityId, collapsed],
+    [focusEntityId, setFocus, collapsed, toggleCollapsed],
   );
 
   return <WissensbasisContext.Provider value={value}>{children}</WissensbasisContext.Provider>;
 }
 
 /**
- * Read the current focus state. Returns a no-op shim when called outside
- * a provider so the AdaptiveCardRenderer's CitationChip arm can render
- * citation chips in non-Wissensbasis surfaces (e.g. the standalone Brain
- * page) — chips just become non-interactive in that case.
+ * Read the current focus state.
+ *
+ * Throws in development when called outside a provider — matches the
+ * useAuth / useTheme pattern in this codebase. Catching the misuse at
+ * dev-time prevents the silent "chip click does nothing" failure mode
+ * the previous shim allowed. In production, returns a no-op shim so
+ * citation chips on non-Wissensbasis surfaces (e.g. legacy /brain) at
+ * worst render as visually correct but inert pills rather than crashing
+ * the page.
  */
 export function useWissensbasis(): WissensbasisContextValue {
   const ctx = useContext(WissensbasisContext);
   if (ctx) return ctx;
+
+  if (import.meta.env.DEV) {
+    throw new Error(
+      'useWissensbasis must be used within a WissensbasisProvider. ' +
+        'Mount <WissensbasisProvider> above the component tree, or use a non-context ' +
+        'CitationChip variant on surfaces that intentionally render chips without focus interactivity.',
+    );
+  }
+
   return {
     focusEntityId: null,
     setFocus: () => {
-      /* no-op outside a provider */
+      /* no-op outside a provider in production */
     },
     collapsed: false,
     toggleCollapsed: () => {

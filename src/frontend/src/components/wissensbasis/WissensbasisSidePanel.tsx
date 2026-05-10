@@ -64,9 +64,9 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
         type="button"
         onClick={toggleCollapsed}
         className="fixed bottom-4 right-4 z-30 inline-flex items-center gap-1.5
-          rounded-full bg-blue-600 text-white shadow-lg px-4 py-2 text-sm font-medium
-          hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2
-          focus-visible:ring-blue-300"
+          rounded-full bg-primary-600 text-white shadow-lg px-4 py-2 text-sm font-medium
+          hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2
+          focus-visible:ring-primary-300"
         aria-label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')}
       >
         <Layers className="h-4 w-4" aria-hidden="true" />
@@ -131,13 +131,16 @@ function SectionHeading({
   label: string;
   source?: 'role' | 'user_override' | 'default';
 }) {
+  const { t } = useTranslation();
   return (
     <div className="px-3 pt-2 pb-1 flex items-baseline justify-between">
       <h3 className="text-[11px] uppercase tracking-wider text-gray-500 dark:text-gray-400 font-semibold">
         {label}
       </h3>
       {source === 'default' && (
-        <span className="text-[10px] text-gray-400 dark:text-gray-500">default mix</span>
+        <span className="text-[10px] text-gray-400 dark:text-gray-500">
+          {t('wissensbasis.panel.defaultMix', 'default mix')}
+        </span>
       )}
     </div>
   );

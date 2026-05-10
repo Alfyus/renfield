@@ -1,6 +1,8 @@
 import { useTranslation } from 'react-i18next';
 import { Menu } from 'lucide-react';
 import ChatSidebar from '../../components/ChatSidebar';
+import { WissensbasisSidePanel } from '../../components/wissensbasis/WissensbasisSidePanel';
+import { WissensbasisProvider } from '../../context/WissensbasisContext';
 
 import ChatHeader from './ChatHeader';
 import ChatMessages from './ChatMessages';
@@ -44,14 +46,29 @@ function ChatPageLayout() {
         <ChatMessages />
         <ChatInput />
       </div>
+
+      {/* Wissensbasis side panel — A-LANDING composed view (A2 reasoning + A4 focus).
+          Self-gates: backend routes return 404 when REVA_WISSENSBASIS_ENABLED=false,
+          which makes every query enabled=false and the panel renders empty placeholders.
+          Citation chips inside ChatMessages reach the same WissensbasisProvider via
+          context, so chip click → setFocus → side panel refocus works end-to-end. */}
+      <WissensbasisSidePanel sessionId={sessionId} role={null} />
     </div>
   );
 }
 
 export default function ChatPage() {
   return (
+    // Provider wraps BOTH the chat area (whose AdaptiveCardRenderer emits
+    // CitationChip components consuming useWissensbasis) and the side panel
+    // (which reads the same focus state). syncWithUrl=false on this surface
+    // because chat-page URLs already encode the conversation; we don't want
+    // every chip click pushing a `?focus=` param into the chat URL bar.
+    // The standalone /wissensbasis page sets syncWithUrl=true.
     <ChatProvider>
-      <ChatPageLayout />
+      <WissensbasisProvider syncWithUrl={false} defaultCollapsed>
+        <ChatPageLayout />
+      </WissensbasisProvider>
     </ChatProvider>
   );
 }

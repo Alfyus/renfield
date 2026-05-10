@@ -99,11 +99,11 @@ function FocusCard({ focus }: { focus: FocusEntity }) {
   const { t } = useTranslation();
   const importancePct = Math.round(focus.importance * 100);
   return (
-    <div className="rounded-md border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-3 py-2">
-      <p className="font-semibold text-sm text-blue-900 dark:text-blue-100 break-words">
+    <div className="rounded-md border border-accent-300 dark:border-accent-700 bg-accent-50 dark:bg-accent-900/20 px-3 py-2">
+      <p className="font-semibold text-sm text-accent-900 dark:text-accent-100 break-words">
         {focus.display_name}
       </p>
-      <p className="text-xs text-blue-700 dark:text-blue-300 mt-0.5">
+      <p className="text-xs text-accent-700 dark:text-accent-400 mt-0.5">
         {focus.entity_type}
         {importancePct > 0 && (
           <>

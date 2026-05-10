@@ -40,13 +40,29 @@ export interface ReasoningSubgraphProps {
   isLoading?: boolean;
 }
 
+/**
+ * Subscribe to the prefers-reduced-motion media query. Reactive to OS
+ * toggles mid-session, which a one-shot `matchMedia(...).matches` read
+ * misses. DESIGN.md requires this surface to honor the setting.
+ */
+function useReducedMotion(): boolean {
+  const [reduced, setReduced] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  });
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, []);
+  return reduced;
+}
+
 export function ReasoningSubgraph({ trace, isLoading }: ReasoningSubgraphProps) {
   const { t } = useTranslation();
-
-  const reducedMotion =
-    typeof window !== 'undefined'
-      ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
-      : false;
+  const reducedMotion = useReducedMotion();
 
   if (isLoading) {
     return <SubgraphSkeleton label={t('wissensbasis.subgraph.loading', 'Loading…')} />;

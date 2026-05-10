@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
@@ -40,11 +40,14 @@ describe('CitationChip', () => {
     expect(screen.getByText('Deleted Thing')).toBeInTheDocument();
   });
 
-  it('falls back to non-interactive when no provider is mounted', () => {
-    renderWithRouter(<CitationChip entity="abc-123" label="X" />);
-    // Outside the provider the chip is still rendered but the click handler
-    // is a no-op shim — it remains a button (interactive markup) but state
-    // does not change. The test asserts it does not crash.
-    expect(screen.getByRole('button', { name: /Fokus auf X/i })).toBeInTheDocument();
+  it('throws in dev when used outside a WissensbasisProvider (matches useAuth/useTheme)', () => {
+    // Spy + suppress the React error boundary log so test output stays
+    // clean. The error is the contract — we WANT to surface it in dev to
+    // catch accidental misuse, while production gets the silent shim.
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => renderWithRouter(<CitationChip entity="abc-123" label="X" />)).toThrow(
+      /useWissensbasis must be used within a WissensbasisProvider/,
+    );
+    consoleSpy.mockRestore();
   });
 });

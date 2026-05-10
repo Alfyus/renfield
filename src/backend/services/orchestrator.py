@@ -50,7 +50,11 @@ if TYPE_CHECKING:
 # accumulator and provenance trail expect to merge across plugins.
 # Other keys still follow last-writer-wins with a collision warning.
 _LIST_SHAPED_PLUGIN_DATA_FIELDS: frozenset[str] = frozenset(
-    {"contacts", "provenance", "warnings"}
+    # `wb_annotations` is Reva's wissensbasis KG-annotation accumulator —
+    # each sub-agent emits the annotations its tool calls produced; the
+    # parent merges them into a single trace via post_orchestration. Same
+    # accumulator semantics as `contacts` / `provenance`.
+    {"contacts", "provenance", "warnings", "wb_annotations"}
 )
 
 

@@ -1233,7 +1233,8 @@
       "expandShort": "Wissensbasis",
       "collapse": "Collapse panel",
       "reasoningHeading": "Reasoning",
-      "focusHeading": "Focus"
+      "focusHeading": "Focus",
+      "defaultMix": "default mix"
     },
     "subgraph": {
       "loading": "Loading…",

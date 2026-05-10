@@ -145,7 +145,6 @@ const SPACING: Record<string, string> = {
  * tags, javascript:, smuggled HTML) renders as a missing chip.
  */
 const CITE_ENTITY_RE = /^[A-Za-z0-9_\-]{1,128}$/;
-const CITE_TAG_RE = /<cite\s+entity="([^"]+)"(?:\s+type="([^"]+)")?\s*>([^<]*)<\/cite>/gi;
 
 /**
  * Parse markdown bold/italic and inline citation tags into React elements.
@@ -154,6 +153,11 @@ const CITE_TAG_RE = /<cite\s+entity="([^"]+)"(?:\s+type="([^"]+)")?\s*>([^<]*)<\
  */
 function renderFormattedText(text?: string): ReactNode {
   if (!text) return null;
+  // Local non-global regex per-call. The pattern is re-used inside the
+  // loop with `.match()` (not `.exec()`), so `g` is unnecessary and the
+  // module-level `lastIndex` footgun is sidestepped entirely.
+  const citeTagRe = /<cite\s+entity="([^"]+)"(?:\s+type="([^"]+)")?\s*>([^<]*)<\/cite>/i;
+
   const parts: ReactNode[] = [];
   let remaining = String(text);
   let key = 0;
@@ -161,8 +165,7 @@ function renderFormattedText(text?: string): ReactNode {
   while (remaining.length > 0) {
     const boldMatch = remaining.match(/\*\*(.+?)\*\*/);
     const italicMatch = remaining.match(/_(.+?)_/);
-    CITE_TAG_RE.lastIndex = 0;
-    const citeMatch = CITE_TAG_RE.exec(remaining);
+    const citeMatch = remaining.match(citeTagRe);
 
     const candidates = [boldMatch, italicMatch, citeMatch].filter(
       (m): m is RegExpMatchArray => m !== null && m.index !== undefined,
@@ -336,16 +339,23 @@ function renderElement(element: AcElement | undefined, index: number | string = 
     case 'CitationChip': {
       // Standalone CitationChip element — used when card builders construct
       // chips programmatically (e.g. from a structured trace) rather than
-      // emitting <cite> tags inline in TextBlock prose. Both paths render
-      // the same component with the same context wiring.
+      // emitting <cite> tags inline in TextBlock prose.
+      //
+      // Defense-in-depth: validate the entity attribute against the same
+      // regex the inline parse path uses. The backend already validates
+      // before emitting, but a malformed/smuggled value here would still
+      // reach setSearchParams and a backend `?entity_id=` query. Marking
+      // it missing keeps the chip visible (so the agent's intent is
+      // preserved) while blocking the click.
       const cc = element as AcCitationChip;
+      const validEntity = !cc.missing && CITE_ENTITY_RE.test(cc.entity ?? '');
       return (
         <CitationChip
           key={key}
-          entity={cc.entity}
+          entity={validEntity ? cc.entity : ''}
           label={cc.label}
           entityType={cc.entity_type}
-          missing={cc.missing}
+          missing={!validEntity}
         />
       );
     }
