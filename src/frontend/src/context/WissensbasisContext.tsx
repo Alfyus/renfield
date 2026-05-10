@@ -134,8 +134,9 @@ export function useWissensbasis(): WissensbasisContextValue {
   if (import.meta.env.DEV) {
     throw new Error(
       'useWissensbasis must be used within a WissensbasisProvider. ' +
-        'Mount <WissensbasisProvider> above the component tree, or use a non-context ' +
-        'CitationChip variant on surfaces that intentionally render chips without focus interactivity.',
+        'Mount <WissensbasisProvider> above the component tree (e.g. inside ChatPage ' +
+        'or WissensbasisPage). On surfaces that intentionally render chips without ' +
+        'focus interactivity, this hook still falls back to a no-op shim in production.',
     );
   }
 

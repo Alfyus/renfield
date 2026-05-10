@@ -6,15 +6,23 @@
  * - Reads trace from /api/wissensbasis/trace?session_id=…
  * - Reads focus from /api/wissensbasis/focus?entity_id=… (driven by
  *   WissensbasisContext, which a CitationChip click updates).
- * - Collapsible (per-browser localStorage); collapsed state shows a
- *   floating expand button bottom-right.
- * - On mobile (<768px), auto-collapses and exposes a bottom-sheet open
- *   button instead of inline panel.
+ * - Desktop (≥768px): collapsible aside docked right.
+ * - Mobile (<768px): floating FAB; tapping opens a full-width bottom
+ *   sheet overlay with backdrop + close affordance.
+ *
+ * The four (collapsed × isMobile) states map cleanly:
+ *   - desktop + expanded → inline aside
+ *   - desktop + collapsed → floating FAB to expand
+ *   - mobile + collapsed → floating FAB to open the sheet
+ *   - mobile + expanded → bottom-sheet overlay
+ *
+ * The earlier implementation routed mobile to the FAB regardless of
+ * `collapsed`, which left the panel permanently inaccessible on phones.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronRight, ChevronLeft, Layers } from 'lucide-react';
+import { ChevronRight, Layers, X } from 'lucide-react';
 
 import {
   useFocusQuery,
@@ -57,44 +65,8 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
 
   const mix = mixQ.data ?? { a2: 60, a4: 40, source: 'default' as const, role: null };
 
-  // Collapsed (or mobile collapsed) — render only the floating expand button.
-  if (collapsed || isMobile) {
-    return (
-      <button
-        type="button"
-        onClick={toggleCollapsed}
-        className="fixed bottom-4 right-4 z-30 inline-flex items-center gap-1.5
-          rounded-full bg-primary-600 text-white shadow-lg px-4 py-2 text-sm font-medium
-          hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2
-          focus-visible:ring-primary-300"
-        aria-label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')}
-      >
-        <Layers className="h-4 w-4" aria-hidden="true" />
-        {t('wissensbasis.panel.expandShort', 'Wissensbasis')}
-      </button>
-    );
-  }
-
-  return (
-    <aside
-      className="hidden md:flex flex-col h-full w-96 shrink-0 border-l border-gray-200
-        dark:border-gray-700 bg-white dark:bg-gray-900 overflow-hidden"
-      aria-label={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
-    >
-      <header className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700">
-        <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">
-          {t('wissensbasis.panel.heading', 'Wissensbasis')}
-        </h2>
-        <button
-          type="button"
-          onClick={toggleCollapsed}
-          className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-          aria-label={t('wissensbasis.panel.collapse', 'Collapse panel')}
-        >
-          <ChevronRight className="h-4 w-4 text-gray-600 dark:text-gray-300" />
-        </button>
-      </header>
-
+  const panelBody = (
+    <>
       <div
         className="overflow-y-auto"
         style={{ flexBasis: `${mix.a2}%`, flexGrow: 0, flexShrink: 0 }}
@@ -120,7 +92,148 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
           errorMessage={focusQ.errorMessage}
         />
       </div>
+    </>
+  );
+
+  // Collapsed → render only the floating expand button. On mobile this
+  // is the only entry point; on desktop the user can also use the
+  // header chevron (rendered when expanded).
+  if (collapsed) {
+    return <ExpandFab onClick={toggleCollapsed} label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')} shortLabel={t('wissensbasis.panel.expandShort', 'Wissensbasis')} />;
+  }
+
+  // Mobile + expanded → bottom-sheet overlay with backdrop.
+  if (isMobile) {
+    return (
+      <MobileBottomSheet
+        onClose={toggleCollapsed}
+        ariaLabel={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
+        heading={t('wissensbasis.panel.heading', 'Wissensbasis')}
+        closeLabel={t('wissensbasis.panel.collapse', 'Collapse panel')}
+      >
+        {panelBody}
+      </MobileBottomSheet>
+    );
+  }
+
+  // Desktop + expanded → inline aside.
+  return (
+    <aside
+      className="hidden md:flex flex-col h-full w-96 shrink-0 border-l border-gray-200
+        dark:border-gray-700 bg-white dark:bg-gray-900 overflow-hidden"
+      aria-label={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
+    >
+      <header className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700">
+        <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">
+          {t('wissensbasis.panel.heading', 'Wissensbasis')}
+        </h2>
+        <button
+          type="button"
+          onClick={toggleCollapsed}
+          className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
+          aria-label={t('wissensbasis.panel.collapse', 'Collapse panel')}
+        >
+          <ChevronRight className="h-4 w-4 text-gray-600 dark:text-gray-300" />
+        </button>
+      </header>
+      {panelBody}
     </aside>
+  );
+}
+
+interface ExpandFabProps {
+  onClick: () => void;
+  label: string;
+  shortLabel: string;
+}
+
+function ExpandFab({ onClick, label, shortLabel }: ExpandFabProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="fixed bottom-4 right-4 z-30 inline-flex items-center gap-1.5
+        rounded-full bg-primary-600 text-white shadow-lg px-4 py-2 text-sm font-medium
+        hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2
+        focus-visible:ring-primary-300"
+      aria-label={label}
+    >
+      <Layers className="h-4 w-4" aria-hidden="true" />
+      {shortLabel}
+    </button>
+  );
+}
+
+interface MobileBottomSheetProps {
+  children: ReactNode;
+  onClose: () => void;
+  ariaLabel: string;
+  heading: string;
+  closeLabel: string;
+}
+
+function MobileBottomSheet({
+  children,
+  onClose,
+  ariaLabel,
+  heading,
+  closeLabel,
+}: MobileBottomSheetProps) {
+  // Body scroll lock while the sheet is open — without this, scrolling
+  // inside the sheet cascades up to the chat list once the sheet content
+  // is at its top, which feels broken on touch devices.
+  useEffect(() => {
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, []);
+
+  // Esc closes the sheet — keyboard-accessible without forcing the user
+  // to find the X button on a small viewport.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-40 bg-black/40 md:hidden motion-safe:transition-opacity"
+        onClick={onClose}
+        aria-hidden="true"
+      />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={ariaLabel}
+        className="fixed inset-x-0 bottom-0 z-50 max-h-[85vh] flex flex-col
+          bg-white dark:bg-gray-900 rounded-t-xl shadow-2xl border-t border-gray-200
+          dark:border-gray-700 md:hidden motion-safe:transition-transform"
+      >
+        {/* Drag handle pill — purely visual cue that this is a sheet,
+            not a fixed dialog. Drag-to-dismiss is deferred to v2. */}
+        <div className="pt-2 pb-1 flex justify-center" aria-hidden="true">
+          <span className="block w-10 h-1 rounded-full bg-gray-300 dark:bg-gray-600" />
+        </div>
+        <header className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700">
+          <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{heading}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
+            aria-label={closeLabel}
+          >
+            <X className="h-4 w-4 text-gray-600 dark:text-gray-300" />
+          </button>
+        </header>
+        <div className="flex-1 flex flex-col overflow-hidden">{children}</div>
+      </div>
+    </>
   );
 }
 
@@ -164,7 +277,7 @@ export function WissensbasisExpandButton() {
         text-gray-700 dark:text-gray-200"
       aria-label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')}
     >
-      <ChevronLeft className="h-3 w-3" aria-hidden="true" />
+      <Layers className="h-3 w-3" aria-hidden="true" />
       {t('wissensbasis.panel.expandShort', 'Wissensbasis')}
     </button>
   );

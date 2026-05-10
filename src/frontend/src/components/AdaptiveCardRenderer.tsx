@@ -109,7 +109,8 @@ const STYLE_COLORS: Record<string, string> = {
   good: 'text-green-600 dark:text-green-400',
   warning: 'text-yellow-600 dark:text-yellow-400',
   attention: 'text-red-600 dark:text-red-400',
-  accent: 'text-blue-600 dark:text-blue-400',
+  // DESIGN.md: accent is the turquoise axis. No blue in the palette.
+  accent: 'text-accent-600 dark:text-accent-400',
   default: 'text-gray-800 dark:text-gray-200',
 };
 
@@ -118,7 +119,7 @@ const CONTAINER_STYLES: Record<string, string> = {
   good: 'bg-green-50 dark:bg-green-900/20',
   warning: 'bg-yellow-50 dark:bg-yellow-900/20',
   attention: 'bg-red-50 dark:bg-red-900/20',
-  accent: 'bg-blue-50 dark:bg-blue-900/20',
+  accent: 'bg-accent-50 dark:bg-accent-900/20',
 };
 
 const SIZE_CLASSES: Record<string, string> = {

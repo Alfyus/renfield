@@ -44,10 +44,16 @@ describe('CitationChip', () => {
     // Spy + suppress the React error boundary log so test output stays
     // clean. The error is the contract — we WANT to surface it in dev to
     // catch accidental misuse, while production gets the silent shim.
+    //
+    // try/finally so a future assertion regression doesn't leak the spy
+    // into adjacent tests (Vitest has isolate:false in this suite).
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    expect(() => renderWithRouter(<CitationChip entity="abc-123" label="X" />)).toThrow(
-      /useWissensbasis must be used within a WissensbasisProvider/,
-    );
-    consoleSpy.mockRestore();
+    try {
+      expect(() => renderWithRouter(<CitationChip entity="abc-123" label="X" />)).toThrow(
+        /useWissensbasis must be used within a WissensbasisProvider/,
+      );
+    } finally {
+      consoleSpy.mockRestore();
+    }
   });
 });
