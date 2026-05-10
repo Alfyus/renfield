@@ -1,10 +1,13 @@
 import { Fragment, ReactNode } from 'react';
 import { ExternalLink } from 'lucide-react';
 
+import { CitationChip } from './wissensbasis/CitationChip';
+
 /**
  * Renders a subset of Microsoft Adaptive Card JSON used by Reva.
- * Supports: TextBlock, ColumnSet/Column, Container, FactSet/Fact,
- * Image, ActionSet, Action.OpenUrl, separator, spacing.
+ * Supports: TextBlock (with bold/italic/<cite> parsing), ColumnSet/Column,
+ * Container, FactSet/Fact, Image, ActionSet, Action.OpenUrl, separator,
+ * spacing, CitationChip.
  */
 
 type AcSize = 'Small' | 'Default' | 'Medium' | 'Large' | 'ExtraLarge' | 'Auto';
@@ -77,6 +80,16 @@ interface AcActionSet extends AcBaseElement {
   actions?: AcAction[];
 }
 
+interface AcCitationChip extends AcBaseElement {
+  type: 'CitationChip';
+  /** Canonical KGEntity.atom_id (UUID-shaped string) — backend-validated. */
+  entity: string;
+  label: string;
+  entity_type?: string;
+  /** True when backend could not resolve the entity. Renders disabled. */
+  missing?: boolean;
+}
+
 type AcElement =
   | AcTextBlock
   | AcColumnSet
@@ -84,7 +97,8 @@ type AcElement =
   | AcContainer
   | AcFactSet
   | AcImage
-  | AcActionSet;
+  | AcActionSet
+  | AcCitationChip;
 
 export interface AdaptiveCardSchema {
   body?: AcElement[];
@@ -95,7 +109,8 @@ const STYLE_COLORS: Record<string, string> = {
   good: 'text-green-600 dark:text-green-400',
   warning: 'text-yellow-600 dark:text-yellow-400',
   attention: 'text-red-600 dark:text-red-400',
-  accent: 'text-blue-600 dark:text-blue-400',
+  // DESIGN.md: accent is the turquoise axis. No blue in the palette.
+  accent: 'text-accent-600 dark:text-accent-400',
   default: 'text-gray-800 dark:text-gray-200',
 };
 
@@ -104,7 +119,7 @@ const CONTAINER_STYLES: Record<string, string> = {
   good: 'bg-green-50 dark:bg-green-900/20',
   warning: 'bg-yellow-50 dark:bg-yellow-900/20',
   attention: 'bg-red-50 dark:bg-red-900/20',
-  accent: 'bg-blue-50 dark:bg-blue-900/20',
+  accent: 'bg-accent-50 dark:bg-accent-900/20',
 };
 
 const SIZE_CLASSES: Record<string, string> = {
@@ -124,9 +139,26 @@ const SPACING: Record<string, string> = {
   ExtraLarge: 'mt-6',
 };
 
-/** Parse **bold** and _italic_ into React elements (no raw HTML injection). */
+/**
+ * Server-side validator mirror — keep in sync with Reva's
+ * _ALLOWED_ENTITY_RE in src/reva/wissensbasis/citation_chip.py.
+ * Only accepts alphanumeric + dash + underscore; anything else (script
+ * tags, javascript:, smuggled HTML) renders as a missing chip.
+ */
+const CITE_ENTITY_RE = /^[A-Za-z0-9_\-]{1,128}$/;
+
+/**
+ * Parse markdown bold/italic and inline citation tags into React elements.
+ * No raw HTML injection — every dynamic value flows through React's
+ * escape boundary.
+ */
 function renderFormattedText(text?: string): ReactNode {
   if (!text) return null;
+  // Local non-global regex per-call. The pattern is re-used inside the
+  // loop with `.match()` (not `.exec()`), so `g` is unnecessary and the
+  // module-level `lastIndex` footgun is sidestepped entirely.
+  const citeTagRe = /<cite\s+entity="([^"]+)"(?:\s+type="([^"]+)")?\s*>([^<]*)<\/cite>/i;
+
   const parts: ReactNode[] = [];
   let remaining = String(text);
   let key = 0;
@@ -134,8 +166,9 @@ function renderFormattedText(text?: string): ReactNode {
   while (remaining.length > 0) {
     const boldMatch = remaining.match(/\*\*(.+?)\*\*/);
     const italicMatch = remaining.match(/_(.+?)_/);
+    const citeMatch = remaining.match(citeTagRe);
 
-    const candidates = [boldMatch, italicMatch].filter(
+    const candidates = [boldMatch, italicMatch, citeMatch].filter(
       (m): m is RegExpMatchArray => m !== null && m.index !== undefined,
     );
     const nextMatch = candidates.sort((a, b) => (a.index ?? 0) - (b.index ?? 0))[0];
@@ -151,8 +184,20 @@ function renderFormattedText(text?: string): ReactNode {
 
     if (nextMatch === boldMatch) {
       parts.push(<strong key={key++}>{nextMatch[1]}</strong>);
-    } else {
+    } else if (nextMatch === italicMatch) {
       parts.push(<em key={key++}>{nextMatch[1]}</em>);
+    } else {
+      const [, entity, type, label] = nextMatch;
+      const validEntity = CITE_ENTITY_RE.test(entity);
+      parts.push(
+        <CitationChip
+          key={key++}
+          entity={validEntity ? entity : ''}
+          label={label}
+          entityType={type}
+          missing={!validEntity}
+        />,
+      );
     }
 
     remaining = remaining.substring(nextMatch.index + nextMatch[0].length);
@@ -289,6 +334,30 @@ function renderElement(element: AcElement | undefined, index: number | string = 
             return null;
           })}
         </div>
+      );
+    }
+
+    case 'CitationChip': {
+      // Standalone CitationChip element — used when card builders construct
+      // chips programmatically (e.g. from a structured trace) rather than
+      // emitting <cite> tags inline in TextBlock prose.
+      //
+      // Defense-in-depth: validate the entity attribute against the same
+      // regex the inline parse path uses. The backend already validates
+      // before emitting, but a malformed/smuggled value here would still
+      // reach setSearchParams and a backend `?entity_id=` query. Marking
+      // it missing keeps the chip visible (so the agent's intent is
+      // preserved) while blocking the click.
+      const cc = element as AcCitationChip;
+      const validEntity = !cc.missing && CITE_ENTITY_RE.test(cc.entity ?? '');
+      return (
+        <CitationChip
+          key={key}
+          entity={validEntity ? cc.entity : ''}
+          label={cc.label}
+          entityType={cc.entity_type}
+          missing={!validEntity}
+        />
       );
     }
 

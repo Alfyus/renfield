@@ -58,7 +58,8 @@
     "skipToContent": "Skip to content",
     "openMenu": "Open menu",
     "closeMenu": "Close menu",
-    "mainNavigation": "Main navigation"
+    "mainNavigation": "Main navigation",
+    "wissensbasis": "Wissensbasis"
   },
   "auth": {
     "login": "Login",
@@ -773,7 +774,7 @@
   },
   "presence": {
     "title": "Presence",
-    "subtitle": "Who is where \u2014 room presence via BLE, voice, and web",
+    "subtitle": "Who is where — room presence via BLE, voice, and web",
     "roomOccupancy": "Room Occupancy",
     "noData": "No presence data available",
     "presenceDisabled": "Presence detection is disabled (PRESENCE_ENABLED=false)",
@@ -932,12 +933,12 @@
       "title": "Embeddings",
       "description": "Re-calculate all vectors after changing the embedding model",
       "reembedAll": "Re-embed All",
-      "reembedWarning": "This operation takes 10\u201330 minutes. Only run after changing the embedding model.",
+      "reembedWarning": "This operation takes 10–30 minutes. Only run after changing the embedding model.",
       "reembedSuccess": "Vectors re-calculated successfully",
       "reembedModel": "Model",
       "reembedTable": "Table",
       "reembedErrors": "Errors",
-      "confirmReembed": "Re-embed all vectors? This can take 10\u201330 minutes."
+      "confirmReembed": "Re-embed all vectors? This can take 10–30 minutes."
     },
     "debug": {
       "title": "Debug",
@@ -962,15 +963,14 @@
     "relations": "Relations",
     "stats": "Statistics",
     "graph": "Graph",
-    "noEntities": "No entities yet. Start a conversation to build the knowledge graph.",
+    "noEntities": "No entities extracted yet",
     "graphError": "Could not load graph.",
     "graphAriaLabel": "Knowledge Graph Visualization",
     "switchToTable": "Table view",
-    "mentions": "mentions",
+    "mentions": "Mentions",
     "entityName": "Name",
     "entityType": "Type",
     "entityTypes": "Types",
-    "mentions": "Mentions",
     "lastSeen": "Last Seen",
     "predicate": "Relationship",
     "subject": "Subject",
@@ -981,7 +981,6 @@
     "mergeSelectSecond": "Select the target for \"{{name}}\"",
     "deleteConfirm": "Delete \"{{name}}\" and all its relations?",
     "deleteRelationConfirm": "Really delete this relation?",
-    "noEntities": "No entities extracted yet",
     "noRelations": "No relations found",
     "searchPlaceholder": "Search entities...",
     "showRelations": "Show relations",
@@ -1216,6 +1215,61 @@
       "success": "Answered successfully",
       "failed": "Failed",
       "unknown": "Unknown status (cancelled)"
+    }
+  },
+  "wissensbasis": {
+    "page": {
+      "title": "Wissensbasis",
+      "description": "Composed view of recent reasoning and focused entity neighborhood.",
+      "reasoningSection": "Reasoning subgraph",
+      "reasoningHeading": "Recent reasoning",
+      "focusSection": "Focus neighborhood",
+      "focusHeading": "Entity neighborhood"
+    },
+    "panel": {
+      "ariaLabel": "Wissensbasis composed view",
+      "heading": "Wissensbasis",
+      "expand": "Open Wissensbasis panel",
+      "expandShort": "Wissensbasis",
+      "collapse": "Collapse panel",
+      "reasoningHeading": "Reasoning",
+      "focusHeading": "Focus",
+      "defaultMix": "default mix"
+    },
+    "subgraph": {
+      "loading": "Loading…",
+      "empty": "No reasoning steps captured for this answer.",
+      "inlineHeading": "Entities the agent used",
+      "relationsToggle": "Relations ({{count}})",
+      "altListToggle": "Show as list ({{count}} entities)",
+      "canvasLabel": "Reasoning graph visualization"
+    },
+    "focus": {
+      "empty": "Click a citation chip in the answer to focus an entity here.",
+      "directNeighbors": "Direct neighbors",
+      "indirectNeighbors": "Two hops away",
+      "overflow": "+{{count}} more",
+      "overflowTooltip": "Open the standalone view to browse all neighbors",
+      "importance": "importance {{pct}}%",
+      "importanceTooltip": "Connectivity score",
+      "couldNotLoad": "Could not load focus neighborhood"
+    },
+    "chip": {
+      "ariaLabel": "Focus on {{label}}",
+      "missingTooltip": "Could not resolve entity"
+    },
+    "nextAction": {
+      "ariaLabel": "Suggested next action",
+      "delegate": "Delegate: {{name}}",
+      "draftButton": "Draft message to {{name}}",
+      "unavailableButton": "{{name}} unavailable",
+      "draftDisabled": "Draft action ships in T19.2"
+    },
+    "trace": {
+      "couldNotLoad": "Could not load reasoning trace"
+    },
+    "mix": {
+      "couldNotLoad": "Could not load layout configuration"
     }
   }
 }

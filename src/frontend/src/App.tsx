@@ -35,6 +35,7 @@ const PaperlessAuditPage = lazy(() => import('./pages/PaperlessAuditPage'));
 const RoutingDashboardPage = lazy(() => import('./pages/RoutingDashboardPage'));
 const BrainPage = lazy(() => import('./pages/BrainPage'));
 const BrainReviewPage = lazy(() => import('./pages/BrainReviewPage'));
+const WissensbasisPage = lazy(() => import('./pages/WissensbasisPage'));
 const CirclesSettingsPage = lazy(() => import('./pages/CirclesSettingsPage'));
 const CirclesPeersPage = lazy(() => import('./pages/CirclesPeersPage'));
 const FederationAuditPage = lazy(() => import('./pages/FederationAuditPage'));
@@ -90,6 +91,11 @@ function AppRoutes() {
             } />
             <Route path="/memory" element={<MemoryPage />} />
             <Route path="/knowledge-graph" element={<KnowledgeGraphPage />} />
+            <Route path="/wissensbasis" element={
+              <ProtectedRoute>
+                <WissensbasisPage />
+              </ProtectedRoute>
+            } />
             {/* Circles v1 — second brain, review queue, circles management */}
             <Route path="/brain" element={
               <ProtectedRoute>
