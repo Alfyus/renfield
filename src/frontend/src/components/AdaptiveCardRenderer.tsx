@@ -1,10 +1,13 @@
 import { Fragment, ReactNode } from 'react';
 import { ExternalLink } from 'lucide-react';
 
+import { CitationChip } from './wissensbasis/CitationChip';
+
 /**
  * Renders a subset of Microsoft Adaptive Card JSON used by Reva.
- * Supports: TextBlock, ColumnSet/Column, Container, FactSet/Fact,
- * Image, ActionSet, Action.OpenUrl, separator, spacing.
+ * Supports: TextBlock (with bold/italic/<cite> parsing), ColumnSet/Column,
+ * Container, FactSet/Fact, Image, ActionSet, Action.OpenUrl, separator,
+ * spacing, CitationChip.
  */
 
 type AcSize = 'Small' | 'Default' | 'Medium' | 'Large' | 'ExtraLarge' | 'Auto';
@@ -77,6 +80,16 @@ interface AcActionSet extends AcBaseElement {
   actions?: AcAction[];
 }
 
+interface AcCitationChip extends AcBaseElement {
+  type: 'CitationChip';
+  /** Canonical KGEntity.atom_id (UUID-shaped string) — backend-validated. */
+  entity: string;
+  label: string;
+  entity_type?: string;
+  /** True when backend could not resolve the entity. Renders disabled. */
+  missing?: boolean;
+}
+
 type AcElement =
   | AcTextBlock
   | AcColumnSet
@@ -84,7 +97,8 @@ type AcElement =
   | AcContainer
   | AcFactSet
   | AcImage
-  | AcActionSet;
+  | AcActionSet
+  | AcCitationChip;
 
 export interface AdaptiveCardSchema {
   body?: AcElement[];
@@ -124,7 +138,20 @@ const SPACING: Record<string, string> = {
   ExtraLarge: 'mt-6',
 };
 
-/** Parse **bold** and _italic_ into React elements (no raw HTML injection). */
+/**
+ * Server-side validator mirror — keep in sync with Reva's
+ * _ALLOWED_ENTITY_RE in src/reva/wissensbasis/citation_chip.py.
+ * Only accepts alphanumeric + dash + underscore; anything else (script
+ * tags, javascript:, smuggled HTML) renders as a missing chip.
+ */
+const CITE_ENTITY_RE = /^[A-Za-z0-9_\-]{1,128}$/;
+const CITE_TAG_RE = /<cite\s+entity="([^"]+)"(?:\s+type="([^"]+)")?\s*>([^<]*)<\/cite>/gi;
+
+/**
+ * Parse markdown bold/italic and inline citation tags into React elements.
+ * No raw HTML injection — every dynamic value flows through React's
+ * escape boundary.
+ */
 function renderFormattedText(text?: string): ReactNode {
   if (!text) return null;
   const parts: ReactNode[] = [];
@@ -134,8 +161,10 @@ function renderFormattedText(text?: string): ReactNode {
   while (remaining.length > 0) {
     const boldMatch = remaining.match(/\*\*(.+?)\*\*/);
     const italicMatch = remaining.match(/_(.+?)_/);
+    CITE_TAG_RE.lastIndex = 0;
+    const citeMatch = CITE_TAG_RE.exec(remaining);
 
-    const candidates = [boldMatch, italicMatch].filter(
+    const candidates = [boldMatch, italicMatch, citeMatch].filter(
       (m): m is RegExpMatchArray => m !== null && m.index !== undefined,
     );
     const nextMatch = candidates.sort((a, b) => (a.index ?? 0) - (b.index ?? 0))[0];
@@ -151,8 +180,20 @@ function renderFormattedText(text?: string): ReactNode {
 
     if (nextMatch === boldMatch) {
       parts.push(<strong key={key++}>{nextMatch[1]}</strong>);
-    } else {
+    } else if (nextMatch === italicMatch) {
       parts.push(<em key={key++}>{nextMatch[1]}</em>);
+    } else {
+      const [, entity, type, label] = nextMatch;
+      const validEntity = CITE_ENTITY_RE.test(entity);
+      parts.push(
+        <CitationChip
+          key={key++}
+          entity={validEntity ? entity : ''}
+          label={label}
+          entityType={type}
+          missing={!validEntity}
+        />,
+      );
     }
 
     remaining = remaining.substring(nextMatch.index + nextMatch[0].length);
@@ -289,6 +330,23 @@ function renderElement(element: AcElement | undefined, index: number | string = 
             return null;
           })}
         </div>
+      );
+    }
+
+    case 'CitationChip': {
+      // Standalone CitationChip element — used when card builders construct
+      // chips programmatically (e.g. from a structured trace) rather than
+      // emitting <cite> tags inline in TextBlock prose. Both paths render
+      // the same component with the same context wiring.
+      const cc = element as AcCitationChip;
+      return (
+        <CitationChip
+          key={key}
+          entity={cc.entity}
+          label={cc.label}
+          entityType={cc.entity_type}
+          missing={cc.missing}
+        />
       );
     }
 

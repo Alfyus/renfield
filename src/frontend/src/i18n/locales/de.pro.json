@@ -6,10 +6,11 @@
     "signInWithSso": "Mit Microsoft anmelden"
   },
   "nav": {
-    "brain": "Wissensbasis",
+    "brain": "Wissensbasis (klassisch)",
     "memory": "Notizen",
     "brainReview": "Prüf-Eingang",
-    "circles": "Sichtbarkeit"
+    "circles": "Sichtbarkeit",
+    "wissensbasis": "Wissensbasis"
   },
   "memory": {
     "title": "Notizen",

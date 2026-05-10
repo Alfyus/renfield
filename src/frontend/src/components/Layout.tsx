@@ -32,6 +32,7 @@ import {
   Share2,
   History,
   GitBranch,
+  Layers,
 } from 'lucide-react';
 import DeviceStatus from './DeviceStatus';
 import ThemeToggle from './ThemeToggle';
@@ -59,6 +60,7 @@ const mainNavigationConfig: NavItemConfig[] = [
   { nameKey: 'nav.federationAudit', href: '/brain/audit', icon: History },
   { nameKey: 'nav.memory', href: '/memory', icon: Brain },
   { nameKey: 'nav.knowledgeGraph', href: '/knowledge-graph', icon: Share2, feature: 'knowledge_graph' },
+  { nameKey: 'nav.wissensbasis', href: '/wissensbasis', icon: Layers },
   { nameKey: 'nav.tasks', href: '/tasks', icon: CheckSquare, feature: 'tasks' },
   { nameKey: 'nav.cameras', href: '/camera', icon: Camera, permission: ['cam.view', 'cam.full'], feature: 'cameras' },
 ];
