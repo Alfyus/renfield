@@ -3,7 +3,7 @@ Datenbank Models
 """
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, SmallInteger, String, Text, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, SmallInteger, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -1281,6 +1281,138 @@ class AtomExplicitGrant(Base):
     atom = relationship("Atom", back_populates="explicit_grants")
     grantee = relationship("User", foreign_keys=[granted_to_user_id])
     granter = relationship("User", foreign_keys=[granted_by])
+
+
+# ---------------------------------------------------------------------------
+# Wissensbasis longitudinal substrate (platform-level provenance primitives)
+# ---------------------------------------------------------------------------
+
+
+class WBFieldProvenance(Base):
+    """
+    Snapshot-at-observation row pinning the exact value an external system
+    returned for one field at one fetch time.
+
+    Substrate for BaFin audit replay ("what did we know about REL-100 six
+    months ago"). FK uses ON DELETE CASCADE; the legal_hold discrimination
+    is enforced in Python by ``services/atom_purge_service.py``, which
+    copies legal_hold=TRUE rows to ``WBFieldProvenanceArchive`` before
+    issuing the atoms DELETE.
+
+      - legal_hold = TRUE  → archived before atom purge (BaFin audit)
+      - legal_hold = FALSE → deleted by CASCADE with the atom (GDPR Art. 17)
+
+    Direct ``DELETE FROM atoms`` calls bypass this discrimination and are
+    blocked by the lint at ``tests/backend/test_no_direct_atom_delete.py``.
+
+    Writers go through Reva's truth-engine accumulator; the agent's
+    ``on_pre_agent_context`` hook starts a ContextVar collector, every
+    tool result extracts ``FieldProvenance`` records via the
+    ``compact_mcp_result`` hook, and ``on_post_agent`` flushes them as
+    a single batched INSERT in a background task (fire-and-forget — see
+    ``wb_snapshot_writes_total`` Prometheus counter for completeness
+    measurement).
+    """
+    __tablename__ = "wb_field_provenance"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=True)
+    source_type = Column(String(32), nullable=False)
+    source_id = Column(String(512), nullable=False)
+    field_path = Column(String(256), nullable=False)
+    snapshot_value_json = Column(JSON, nullable=False)
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
+    req_id = Column(String(8), nullable=True)
+    legal_hold = Column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("idx_wb_fp_lookup", "source_type", "source_id", "field_path"),
+        Index("idx_wb_fp_atom_id", "atom_id"),
+    )
+
+
+class WBFieldProvenanceArchive(Base):
+    """
+    Append-only audit archive for snapshots that outlive their atom.
+
+    Populated by ``services/atom_purge_service.py`` before it issues a
+    ``DELETE FROM atoms``: legal_hold=TRUE rows in ``wb_field_provenance``
+    are copied here (atom_id stripped — the atom is about to be gone),
+    then the atom DELETE cascades through and wipes the live table.
+
+    The archive survives until a future legal-hold-release path
+    (out of scope; ships when BaFin retention windows expire).
+    """
+    __tablename__ = "wb_field_provenance_archive"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    original_atom_id = Column(String(36), nullable=True)
+    source_type = Column(String(32), nullable=False)
+    source_id = Column(String(512), nullable=False)
+    field_path = Column(String(256), nullable=False)
+    snapshot_value_json = Column(JSON, nullable=False)
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
+    req_id = Column(String(8), nullable=True)
+    archived_at = Column(DateTime(timezone=True), nullable=False)
+    archive_reason = Column(String(64), nullable=False)
+
+    __table_args__ = (
+        Index("idx_wb_fpa_lookup", "source_type", "source_id", "field_path"),
+    )
+
+
+class WBEventLog(Base):
+    """
+    Ordered event stream extracted from tool results that carry
+    activity logs / phase histories.
+
+    Substrate for vN+1 process-conformance evaluation: comparing actual
+    release execution against an idealized markdown model. Ships empty
+    in this sprint — ingestion writers land alongside the conformance
+    evaluator in vN+1.
+    """
+    __tablename__ = "wb_event_log"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    source_type = Column(String(32), nullable=False)
+    source_id = Column(String(512), nullable=False)
+    event_type = Column(String(64), nullable=False)
+    event_at = Column(DateTime(timezone=True), nullable=False)
+    payload_json = Column(JSON, nullable=False)
+    ingested_at = Column(DateTime(timezone=True), nullable=False)
+    req_id = Column(String(8), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type", "source_id", "event_type", "event_at",
+            name="uq_wb_el_dedup",
+        ),
+        Index("idx_wb_el_source_order", "source_type", "source_id", "event_at"),
+    )
+
+
+class WBRetrospectiveAnnotation(Base):
+    """
+    Per-atom retrospective annotation ("what went well", "improvement",
+    "blocker", "followup").
+
+    Substrate for vN+1 retrospective aggregation. Ships empty — capture
+    surface (UI + agent skill) lands alongside the aggregator. Cascades
+    with atom purge: retrospective notes are non-audit, can be discarded
+    on GDPR Art. 17 deletion.
+    """
+    __tablename__ = "wb_retrospective_annotation"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=False)
+    annotation_key = Column(String(64), nullable=False)
+    annotation_value = Column(Text, nullable=False)
+    author_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_wb_ra_atom", "atom_id"),
+    )
 
 
 class PeerUser(Base):
