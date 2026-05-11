@@ -38,6 +38,7 @@ import DeviceStatus from './DeviceStatus';
 import ThemeToggle from './ThemeToggle';
 import LanguageSwitcher from './LanguageSwitcher';
 import NotificationToast from './NotificationToast';
+import { useWissensbasisAvailable } from '../api/resources/wissensbasis';
 import { useAuth } from '../context/AuthContext';
 
 interface NavItemConfig {
@@ -110,6 +111,14 @@ export default function Layout({ children }: LayoutProps) {
 
   const { user, isAuthenticated, authEnabled, logout, hasAnyPermission, isFeatureEnabled } = useAuth();
 
+  // Backend-gated Reva features that aren't in Renfield's feature dict.
+  // wissensbasisAvailable: true when /api/wissensbasis/me/mix is reachable
+  // (route mounted), undefined while the probe is in flight (don't flash
+  // the entry), false on 404 (REVA_WISSENSBASIS_ENABLED=false). Hides the
+  // nav entry in flag-off environments so users don't click into a
+  // permanently empty page.
+  const wissensbasisAvailable = useWissensbasisAvailable();
+
   const mainNavigation: NavItem[] = mainNavigationConfig.map((item) => ({
     ...item,
     name: t(item.nameKey),
@@ -123,6 +132,10 @@ export default function Layout({ children }: LayoutProps) {
   const filterNavItems = (items: NavItem[]): NavItem[] => {
     return items.filter((item) => {
       if (item.feature && !isFeatureEnabled(item.feature)) return false;
+      // Reva-side: hide the wissensbasis entry when its backend gate is
+      // off. Treat `undefined` (probe in flight) as hidden too — better
+      // to be late-revealed than to flash and disappear.
+      if (item.href === '/wissensbasis' && wissensbasisAvailable !== true) return false;
       if (!authEnabled) return true;
       if (!item.permission) return true;
       return hasAnyPermission(item.permission);

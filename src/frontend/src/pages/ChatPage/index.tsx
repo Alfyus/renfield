@@ -3,6 +3,7 @@ import { Menu } from 'lucide-react';
 import ChatSidebar from '../../components/ChatSidebar';
 import { WissensbasisSidePanel } from '../../components/wissensbasis/WissensbasisSidePanel';
 import { WissensbasisProvider } from '../../context/WissensbasisContext';
+import { useWissensbasisAvailable } from '../../api/resources/wissensbasis';
 
 import ChatHeader from './ChatHeader';
 import ChatMessages from './ChatMessages';
@@ -16,6 +17,13 @@ function ChatPageLayout() {
     conversations, conversationsLoading,
     sessionId, switchConversation, startNewChat, handleDeleteConversation,
   } = useChatContext();
+  // Hide the side panel + FAB when the Reva backend has
+  // REVA_WISSENSBASIS_ENABLED=false. Otherwise users see permanently
+  // empty placeholders. ChatMessages still imports the trace query,
+  // but useTraceQuery's `enabled` flag gates it on sessionId being
+  // present and the route returning a real result; when the route
+  // 404s, useTraceQuery falls through to empty data harmlessly.
+  const wissensbasisAvailable = useWissensbasisAvailable();
 
   return (
     <div className="h-[calc(100vh-8rem)] flex">
@@ -48,11 +56,13 @@ function ChatPageLayout() {
       </div>
 
       {/* Wissensbasis side panel — A-LANDING composed view (A2 reasoning + A4 focus).
-          Self-gates: backend routes return 404 when REVA_WISSENSBASIS_ENABLED=false,
-          which makes every query enabled=false and the panel renders empty placeholders.
-          Citation chips inside ChatMessages reach the same WissensbasisProvider via
-          context, so chip click → setFocus → side panel refocus works end-to-end. */}
-      <WissensbasisSidePanel sessionId={sessionId} role={null} />
+          Mounted only when the backend route is reachable (probed once via
+          useWissensbasisAvailable). When REVA_WISSENSBASIS_ENABLED=false in
+          prod, the routes 404 and the panel is omitted entirely — no empty
+          placeholders, no FAB clutter. */}
+      {wissensbasisAvailable === true && (
+        <WissensbasisSidePanel sessionId={sessionId} role={null} />
+      )}
     </div>
   );
 }
