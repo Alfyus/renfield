@@ -1223,8 +1223,21 @@
       "description": "Zusammengesetzte Ansicht aktueller Argumentation und der Nachbarschaft fokussierter Entitäten.",
       "reasoningSection": "Argumentations-Subgraph",
       "reasoningHeading": "Aktuelle Argumentation",
+      "recentSessionsHeading": "Letzte Unterhaltungen",
       "focusSection": "Fokus-Nachbarschaft",
-      "focusHeading": "Entitäts-Nachbarschaft"
+      "focusHeading": "Entitäts-Nachbarschaft",
+      "recentEntitiesHeading": "Entitäten durchstöbern"
+    },
+    "sessions": {
+      "empty": "Noch keine Unterhaltungen. Starte eine, um die Wissensbasis zu füllen.",
+      "noPreview": "(keine Vorschau)",
+      "meta": "{{count}} Nachr · {{when}}",
+      "couldNotLoad": "Letzte Unterhaltungen konnten nicht geladen werden"
+    },
+    "entities": {
+      "empty": "Noch keine Entitäten. Sprich mit Reva, dann erscheinen sie hier.",
+      "mentionCount": "{{count}} Erwähnungen",
+      "couldNotLoad": "Entitäten konnten nicht geladen werden"
     },
     "panel": {
       "ariaLabel": "Wissensbasis-Komposition",
