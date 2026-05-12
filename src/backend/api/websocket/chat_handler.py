@@ -11,6 +11,7 @@ This module handles:
 
 import asyncio
 import re
+import uuid
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
@@ -22,6 +23,7 @@ from services.input_guard import detect_injection
 from services.websocket_auth import WSAuthError, authenticate_websocket
 from services.websocket_rate_limiter import get_rate_limiter
 from utils.config import settings
+from utils.request_context import request_id as request_id_var
 from utils.voice_context import voice_originated
 
 from .shared import (
@@ -593,6 +595,22 @@ async def websocket_endpoint(
             # Receive message
             data = await websocket.receive_json()
 
+            # Per-message request id, minted FIRST so every error path
+            # (rate-limit, validation) gets a fresh correlator instead of
+            # the "--------" sentinel or the previous turn's leftover.
+            # Mirrors the voice_originated.set(False) clear-before-validate
+            # pattern below. Client-supplied request_id (if any) overwrites
+            # this after validation.
+            #
+            # Without this set(), the ContextVar falls through to its
+            # default "--------" — every downstream log line, every Reva
+            # observability counter, and every wb_field_provenance row
+            # written in the async flush gets the sentinel, defeating
+            # correlation. Child tasks spawned via
+            # ``asyncio.create_task`` / ``asyncio.gather`` inherit the
+            # value automatically (Python 3.7+ context propagation).
+            request_id_var.set(uuid.uuid4().hex[:8])
+
             # Rate limiting check
             allowed, reason = rate_limiter.check(ip_address)
             if not allowed:
@@ -621,6 +639,13 @@ async def websocket_endpoint(
             except ValidationError as e:
                 await send_ws_error(websocket, WSErrorCode.INVALID_MESSAGE, str(e))
                 continue
+
+            # Prefer the client-supplied request_id if present — lets the
+            # frontend correlate its own outbound id to backend traces.
+            # The fresh uuid set at loop-top stays if the client didn't
+            # send one.
+            if msg_request_id:
+                request_id_var.set(msg_request_id[:8])
 
             # Truthy embedding = came from the voice path; null/empty = text.
             voice_originated.set(bool(msg_speaker_embedding))
