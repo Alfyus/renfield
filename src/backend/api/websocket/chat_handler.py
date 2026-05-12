@@ -595,6 +595,22 @@ async def websocket_endpoint(
             # Receive message
             data = await websocket.receive_json()
 
+            # Per-message request id, minted FIRST so every error path
+            # (rate-limit, validation) gets a fresh correlator instead of
+            # the "--------" sentinel or the previous turn's leftover.
+            # Mirrors the voice_originated.set(False) clear-before-validate
+            # pattern below. Client-supplied request_id (if any) overwrites
+            # this after validation.
+            #
+            # Without this set(), the ContextVar falls through to its
+            # default "--------" — every downstream log line, every Reva
+            # observability counter, and every wb_field_provenance row
+            # written in the async flush gets the sentinel, defeating
+            # correlation. Child tasks spawned via
+            # ``asyncio.create_task`` / ``asyncio.gather`` inherit the
+            # value automatically (Python 3.7+ context propagation).
+            request_id_var.set(uuid.uuid4().hex[:8])
+
             # Rate limiting check
             allowed, reason = rate_limiter.check(ip_address)
             if not allowed:
@@ -624,17 +640,12 @@ async def websocket_endpoint(
                 await send_ws_error(websocket, WSErrorCode.INVALID_MESSAGE, str(e))
                 continue
 
-            # Per-message request id, set into the ContextVar so every
-            # downstream log line + every Reva observability counter +
-            # every wb_field_provenance row written in the async flush
-            # can be correlated back to this turn. Client-supplied
-            # request_id wins (up to 8 chars to fit the request_id
-            # ContextVar default's width); otherwise we mint a fresh
-            # 8-char UUID prefix. Without this set(), the ContextVar
-            # falls through to its default "--------" — every audit
-            # row gets the sentinel, defeating correlation.
-            rid = (msg_request_id or uuid.uuid4().hex)[:8]
-            request_id_var.set(rid)
+            # Prefer the client-supplied request_id if present — lets the
+            # frontend correlate its own outbound id to backend traces.
+            # The fresh uuid set at loop-top stays if the client didn't
+            # send one.
+            if msg_request_id:
+                request_id_var.set(msg_request_id[:8])
 
             # Truthy embedding = came from the voice path; null/empty = text.
             voice_originated.set(bool(msg_speaker_embedding))
