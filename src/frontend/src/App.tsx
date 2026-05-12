@@ -35,7 +35,8 @@ const PaperlessAuditPage = lazy(() => import('./pages/PaperlessAuditPage'));
 const RoutingDashboardPage = lazy(() => import('./pages/RoutingDashboardPage'));
 const BrainPage = lazy(() => import('./pages/BrainPage'));
 const BrainReviewPage = lazy(() => import('./pages/BrainReviewPage'));
-const WissensbasisPage = lazy(() => import('./pages/WissensbasisPage'));
+// WissensbasisPage was the A-LANDING 2D composed page; superseded by
+// the unified 3D Wissensgraph (see /wissensbasis redirect below).
 const CirclesSettingsPage = lazy(() => import('./pages/CirclesSettingsPage'));
 const CirclesPeersPage = lazy(() => import('./pages/CirclesPeersPage'));
 const FederationAuditPage = lazy(() => import('./pages/FederationAuditPage'));
@@ -91,10 +92,15 @@ function AppRoutes() {
             } />
             <Route path="/memory" element={<MemoryPage />} />
             <Route path="/knowledge-graph" element={<KnowledgeGraphPage />} />
+            {/* /wissensbasis was the A-LANDING 2D composed page (A2+A4).
+                Replaced 2026-05-12 by the unified 3D Wissensgraph scene
+                with a built-in search overlay (driven from D23: "one
+                continuous 3D experience, not 3D→flat handoff"). All
+                ?focus= URLs continue to resolve via /knowledge-graph
+                which renders the same focus-mode scene the A4 panel
+                used to render in flat chips. */}
             <Route path="/wissensbasis" element={
-              <ProtectedRoute>
-                <WissensbasisPage />
-              </ProtectedRoute>
+              <Navigate to={`/knowledge-graph${window.location.search}`} replace />
             } />
             {/* Circles v1 — second brain, review queue, circles management */}
             <Route path="/brain" element={
