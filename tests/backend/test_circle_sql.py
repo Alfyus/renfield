@@ -43,10 +43,12 @@ class TestCirclesFilterClause:
 
     def test_membership_subquery_uses_owner_alias(self):
         clause = circles_filter_clause(table_alias="e")
-        assert "circle_memberships m" in clause
-        assert "m.circle_owner_id = e.user_id" in clause
-        assert "m.dimension = 'tier'" in clause
-        assert "(m.value::text)::int <= e.circle_tier" in clause
+        # circle_memberships uses inner alias 'cm' (not 'm') to avoid
+        # shadowing outer table aliases — see the rename commit message.
+        assert "circle_memberships cm" in clause
+        assert "cm.circle_owner_id = e.user_id" in clause
+        assert "cm.dimension = 'tier'" in clause
+        assert "(cm.value::text)::int <= e.circle_tier" in clause
 
     def test_owner_table_alias_overrides_only_owner_col(self):
         # When owner is on a JOINed table (kb), tier should still come from
@@ -60,8 +62,8 @@ class TestCirclesFilterClause:
         )
         assert "kb.owner_id = :asker_id" in clause
         assert "dc.circle_tier = :asker_id_pub" in clause
-        assert "m.circle_owner_id = kb.owner_id" in clause
-        assert "(m.value::text)::int <= dc.circle_tier" in clause
+        assert "cm.circle_owner_id = kb.owner_id" in clause
+        assert "(cm.value::text)::int <= dc.circle_tier" in clause
 
     def test_source_id_expr_overrides_default(self):
         clause = circles_filter_clause(
@@ -124,6 +126,27 @@ class TestConversationMemoriesWrapper:
         assert params == {
             "asker_id": 42, "asker_id_pub": TIER_PUBLIC, "asker_id_src": "conversation_memories",
         }
+
+    def test_circle_memberships_alias_does_not_shadow_outer(self):
+        """Regression: circle_memberships must NOT use alias 'm'.
+
+        The default alias for conversation_memories is also 'm'. When the
+        EXISTS subquery used 'circle_memberships m', the inner 'm'
+        shadowed the outer wherever the clause referenced
+        ``{owner_alias}.{owner_col}`` (which expands to 'm.user_id'). The
+        production query then failed with "column m.user_id does not exist"
+        because the resolution happened inside the subquery where 'm'
+        means circle_memberships (no user_id column).
+
+        Caught in prod 2026-05-12 in the chat_handler memory-retrieval
+        path. Fix: alias circle_memberships as 'cm'.
+        """
+        clause, _ = conversation_memories_circles_filter(asker_id=42)
+        assert "circle_memberships m " not in clause, (
+            "circle_memberships must NOT use alias 'm' — would shadow "
+            "the outer conversation_memories alias"
+        )
+        assert "circle_memberships cm " in clause
 
 
 class TestDocumentChunksWrapper:

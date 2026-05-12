@@ -124,13 +124,22 @@ def circles_filter_clause(
     # parses cleanly here. SQLite is permissive about the direct cast which
     # is why the string-shape tests (run on SQLite) didn't catch this — the
     # production bug surfaced as 500 on /knowledge-graph against asyncpg.
+    #
+    # Alias for circle_memberships is "cm", NOT "m". A previous version used
+    # "m", which silently shadowed the OUTER alias when callers pass
+    # table_alias="m" (the default for conversation_memories_circles_filter).
+    # In that case {owner_alias}.{owner_col} expands to "m.user_id" — and
+    # inside this EXISTS scope, "m" resolves to circle_memberships, which
+    # has no user_id column. The query fails with
+    # "column m.user_id does not exist". Caught in prod 2026-05-12 in
+    # the chat_handler memory-retrieval path.
     parts.append(
         f"EXISTS ("
-        f"  SELECT 1 FROM circle_memberships m "
-        f"  WHERE m.circle_owner_id = {owner_alias}.{owner_col} "
-        f"  AND m.member_user_id = :{asker_param} "
-        f"  AND m.dimension = 'tier' "
-        f"  AND (m.value::text)::int <= {table_alias}.{tier_col}"
+        f"  SELECT 1 FROM circle_memberships cm "
+        f"  WHERE cm.circle_owner_id = {owner_alias}.{owner_col} "
+        f"  AND cm.member_user_id = :{asker_param} "
+        f"  AND cm.dimension = 'tier' "
+        f"  AND (cm.value::text)::int <= {table_alias}.{tier_col}"
         f")"
     )
 
