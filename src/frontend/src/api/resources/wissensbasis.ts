@@ -98,6 +98,30 @@ export interface RoleMix {
   role: string | null;
 }
 
+export interface SessionListItem {
+  session_id: string;
+  preview: string;
+  updated_at: string;
+  message_count: number;
+}
+
+export interface SessionList {
+  items: SessionListItem[];
+  total: number;
+}
+
+export interface EntityListItem {
+  entity_id: string;
+  display_name: string;
+  entity_type: string;
+  mention_count: number;
+}
+
+export interface EntityList {
+  items: EntityListItem[];
+  total: number;
+}
+
 // Query key factories. Keep keys local to this resource — `keys.ts` is
 // shared and would couple the platform to a Reva-only feature flag.
 const wbKeys = {
@@ -106,6 +130,8 @@ const wbKeys = {
   focus: (entityId: string, hops: number, maxPerHop: number | null) =>
     ['wissensbasis', 'focus', entityId, { hops, maxPerHop }] as const,
   mix: (role: string | null) => ['wissensbasis', 'mix', role] as const,
+  sessions: (limit: number) => ['wissensbasis', 'sessions', limit] as const,
+  entities: (limit: number) => ['wissensbasis', 'entities', limit] as const,
 };
 
 async function fetchTrace(sessionId: string): Promise<TracePeek> {
@@ -166,6 +192,55 @@ export function useFocusQuery(
       enabled: enabled && !!entityId,
     },
     'wissensbasis.focus.couldNotLoad',
+  );
+}
+
+async function fetchSessions(limit: number): Promise<SessionList> {
+  const { data } = await apiClient.get<SessionList>('/api/wissensbasis/sessions', {
+    params: { limit },
+  });
+  return data;
+}
+
+async function fetchEntities(limit: number): Promise<EntityList> {
+  const { data } = await apiClient.get<EntityList>('/api/wissensbasis/entities', {
+    params: { limit },
+  });
+  return data;
+}
+
+/**
+ * Recent sessions for the wissensbasis A2 picker.
+ *
+ * Used when the user lands on /wissensbasis without ?session= in the URL —
+ * surfaces all the chats they've had so they can pick one to inspect
+ * instead of staring at an empty card.
+ */
+export function useRecentSessionsQuery(limit = 50, enabled = true) {
+  return useApiQuery(
+    {
+      queryKey: wbKeys.sessions(limit),
+      queryFn: () => fetchSessions(limit),
+      staleTime: STALE.LIVE, // session list churns whenever a chat happens
+      enabled,
+    },
+    'wissensbasis.sessions.couldNotLoad',
+  );
+}
+
+/**
+ * Top entities for the wissensbasis A4 picker. Mention-count ordered,
+ * mirrors what the user is most likely to want to focus on.
+ */
+export function useRecentEntitiesQuery(limit = 60, enabled = true) {
+  return useApiQuery(
+    {
+      queryKey: wbKeys.entities(limit),
+      queryFn: () => fetchEntities(limit),
+      staleTime: STALE.DEFAULT,
+      enabled,
+    },
+    'wissensbasis.entities.couldNotLoad',
   );
 }
 
