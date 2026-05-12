@@ -1223,21 +1223,8 @@
       "description": "Composed view of recent reasoning and focused entity neighborhood.",
       "reasoningSection": "Reasoning subgraph",
       "reasoningHeading": "Recent reasoning",
-      "recentSessionsHeading": "Recent conversations",
       "focusSection": "Focus neighborhood",
-      "focusHeading": "Entity neighborhood",
-      "recentEntitiesHeading": "Browse entities"
-    },
-    "sessions": {
-      "empty": "No conversations yet. Start one to populate the knowledge base.",
-      "noPreview": "(no preview)",
-      "meta": "{{count}} msg · {{when}}",
-      "couldNotLoad": "Could not load recent conversations"
-    },
-    "entities": {
-      "empty": "No entities yet. Talk to Reva and they will appear here.",
-      "mentionCount": "{{count}} mentions",
-      "couldNotLoad": "Could not load entities"
+      "focusHeading": "Entity neighborhood"
     },
     "panel": {
       "ariaLabel": "Wissensbasis composed view",
