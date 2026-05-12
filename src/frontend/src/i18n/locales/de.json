@@ -1252,7 +1252,14 @@
       "overflowTooltip": "Standalone-Ansicht öffnen, um alle Nachbarn zu durchsuchen",
       "importance": "Wichtigkeit {{pct}}%",
       "importanceTooltip": "Konnektivitäts-Score",
-      "couldNotLoad": "Fokus-Nachbarschaft konnte nicht geladen werden"
+      "couldNotLoad": "Fokus-Nachbarschaft konnte nicht geladen werden",
+      "observedFields": "Beobachtete Werte",
+      "observedFieldsTooltip": "Feldwerte, die zum Beobachtungszeitpunkt festgehalten wurden — Quelle für Audit-Replay",
+      "observedAt": "Stand: {{when}}",
+      "observedFieldsMore": "+{{count}} weitere Werte",
+      "sourcePriority1": "Aus zwischengespeicherten Snapshots",
+      "sourcePriority2": "Aus dem Wissensgraph",
+      "sourcePriority3": "Aus aktueller Session-Spur"
     },
     "chip": {
       "ariaLabel": "Fokus auf {{label}}",

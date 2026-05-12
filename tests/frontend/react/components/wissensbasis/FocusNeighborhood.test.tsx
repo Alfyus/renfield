@@ -1,9 +1,23 @@
 import { describe, it, expect } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, fireEvent } from '@testing-library/react';
 
 import { FocusNeighborhood } from '../../../../../src/frontend/src/components/wissensbasis/FocusNeighborhood';
 import { WissensbasisProvider } from '../../../../../src/frontend/src/context/WissensbasisContext';
 import { renderWithRouter } from '../../test-utils';
+
+const baseData = {
+  focus: {
+    entity_id: 'r1',
+    display_name: 'REL-100',
+    entity_type: 'release',
+    importance: 0.5,
+  },
+  hop1: [],
+  hop2: [],
+  edges: [],
+  overflow_hop1: 0,
+  overflow_hop2: 0,
+};
 
 describe('FocusNeighborhood', () => {
   it('renders empty placeholder when no data', () => {
@@ -54,5 +68,104 @@ describe('FocusNeighborhood', () => {
       </WissensbasisProvider>,
     );
     expect(screen.getByRole('alert')).toHaveTextContent('Backend down');
+  });
+
+  // Sprint 2 — observed_fields + source_priority rendering.
+
+  it('renders observed values when API includes them', () => {
+    renderWithRouter(
+      <WissensbasisProvider>
+        <FocusNeighborhood
+          data={{
+            ...baseData,
+            source_priority: 1,
+            observed_fields: [
+              {
+                field_path: 'status',
+                value: 'IN_PROGRESS',
+                fetched_at: new Date().toISOString(),
+                source_type: 'release',
+              },
+              {
+                field_path: 'owner',
+                value: 'alice',
+                fetched_at: new Date().toISOString(),
+                source_type: 'release',
+              },
+            ],
+          }}
+        />
+      </WissensbasisProvider>,
+    );
+    expect(screen.getByText('status')).toBeInTheDocument();
+    expect(screen.getByText('IN_PROGRESS')).toBeInTheDocument();
+    expect(screen.getByText('owner')).toBeInTheDocument();
+    expect(screen.getByText('alice')).toBeInTheDocument();
+  });
+
+  it('caps observed values at 5 and reveals more via the expand button', () => {
+    const now = new Date().toISOString();
+    const fields = Array.from({ length: 8 }, (_, i) => ({
+      field_path: `field_${i}`,
+      value: `value_${i}`,
+      fetched_at: now,
+      source_type: 'release',
+    }));
+    renderWithRouter(
+      <WissensbasisProvider>
+        <FocusNeighborhood data={{ ...baseData, observed_fields: fields }} />
+      </WissensbasisProvider>,
+    );
+    // 5 visible by default — fields 0..4 should be rendered.
+    expect(screen.getByText('field_0')).toBeInTheDocument();
+    expect(screen.getByText('field_4')).toBeInTheDocument();
+    // field_5+ are hidden until expand.
+    expect(screen.queryByText('field_5')).not.toBeInTheDocument();
+    // "+3 weitere Werte" button.
+    const more = screen.getByRole('button', { name: /\+3 weitere/ });
+    fireEvent.click(more);
+    expect(screen.getByText('field_5')).toBeInTheDocument();
+    expect(screen.getByText('field_7')).toBeInTheDocument();
+  });
+
+  it('renders source priority label when present', () => {
+    renderWithRouter(
+      <WissensbasisProvider>
+        <FocusNeighborhood data={{ ...baseData, source_priority: 1 }} />
+      </WissensbasisProvider>,
+    );
+    // German default — sourcePriority1 = "Aus zwischengespeicherten Snapshots".
+    expect(screen.getByText(/Aus zwischengespeicherten Snapshots/)).toBeInTheDocument();
+  });
+
+  it('omits observed-values section when array is empty', () => {
+    renderWithRouter(
+      <WissensbasisProvider>
+        <FocusNeighborhood data={{ ...baseData, observed_fields: [] }} />
+      </WissensbasisProvider>,
+    );
+    // The "Beobachtete Werte" heading should not appear when the array is empty.
+    expect(screen.queryByText(/Beobachtete Werte/)).not.toBeInTheDocument();
+  });
+
+  it('stringifies non-scalar observed values without crashing', () => {
+    renderWithRouter(
+      <WissensbasisProvider>
+        <FocusNeighborhood
+          data={{
+            ...baseData,
+            observed_fields: [
+              {
+                field_path: 'status',
+                value: { name: 'To Do', category: 'To Do' }, // nested object (jira shape)
+                fetched_at: new Date().toISOString(),
+                source_type: 'jira',
+              },
+            ],
+          }}
+        />
+      </WissensbasisProvider>,
+    );
+    expect(screen.getByText(/"name":"To Do"/)).toBeInTheDocument();
   });
 });

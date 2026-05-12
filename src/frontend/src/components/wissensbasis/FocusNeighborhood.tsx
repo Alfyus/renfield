@@ -13,12 +13,17 @@
  * a citation chip in the answer.
  */
 
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router';
-import { Eye, MoreHorizontal } from 'lucide-react';
+import { Clock, Eye, MoreHorizontal } from 'lucide-react';
 
 import { CitationChip } from './CitationChip';
-import type { FocusEntity, FocusNeighborhood as FocusNeighborhoodData } from '../../api/resources/wissensbasis';
+import type {
+  FocusEntity,
+  FocusNeighborhood as FocusNeighborhoodData,
+  ObservedField,
+} from '../../api/resources/wissensbasis';
 
 export interface FocusNeighborhoodProps {
   data: FocusNeighborhoodData | null;
@@ -58,7 +63,8 @@ export function FocusNeighborhood({ data, isLoading, errorMessage }: FocusNeighb
 
   return (
     <div className="space-y-3 px-3 py-2">
-      <FocusCard focus={data.focus} />
+      <FocusCard focus={data.focus} sourcePriority={data.source_priority ?? null} />
+      <ObservedFieldsSection observed={data.observed_fields ?? []} />
       <NeighborSection
         title={t('wissensbasis.focus.directNeighbors', 'Direct neighbors')}
         entities={data.hop1}
@@ -95,9 +101,23 @@ function NeighborhoodSkeleton() {
   );
 }
 
-function FocusCard({ focus }: { focus: FocusEntity }) {
+function FocusCard({
+  focus,
+  sourcePriority,
+}: {
+  focus: FocusEntity;
+  sourcePriority: 1 | 2 | 3 | null;
+}) {
   const { t } = useTranslation();
   const importancePct = Math.round(focus.importance * 100);
+  const sourceLabelKey =
+    sourcePriority === 1
+      ? 'wissensbasis.focus.sourcePriority1'
+      : sourcePriority === 2
+        ? 'wissensbasis.focus.sourcePriority2'
+        : sourcePriority === 3
+          ? 'wissensbasis.focus.sourcePriority3'
+          : null;
   return (
     <div className="rounded-md border border-accent-300 dark:border-accent-700 bg-accent-50 dark:bg-accent-900/20 px-3 py-2">
       <p className="font-semibold text-sm text-accent-900 dark:text-accent-100 break-words">
@@ -113,9 +133,123 @@ function FocusCard({ focus }: { focus: FocusEntity }) {
             </span>
           </>
         )}
+        {sourceLabelKey && (
+          <>
+            <span className="mx-1.5 opacity-50">·</span>
+            <span className="italic">{t(sourceLabelKey)}</span>
+          </>
+        )}
       </p>
     </div>
   );
+}
+
+/**
+ * Observed values section — renders the sprint-2 wb_field_provenance
+ * snapshots returned in `FocusNeighborhood.observed_fields[]`. Each
+ * entry is a (field_path, value, fetched_at) triple. Source priority
+ * 1 = cached provenance, 2 = KG only, 3 = trace fallback. Observed
+ * fields only appear when priority is 1 (P2/P3 don't contribute).
+ *
+ * Backend coarsening keeps values JSON-serializable; for display the
+ * component stringifies them — leaves dicts/lists readable rather
+ * than blank.
+ */
+function ObservedFieldsSection({ observed }: { observed: ObservedField[] }) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  if (observed.length === 0) return null;
+
+  // Show 5 most-recent by default; expand reveals the full list.
+  const sorted = [...observed].sort(
+    (a, b) => new Date(b.fetched_at).getTime() - new Date(a.fetched_at).getTime(),
+  );
+  const VISIBLE = 5;
+  const visible = expanded ? sorted : sorted.slice(0, VISIBLE);
+  const hidden = sorted.length - visible.length;
+
+  return (
+    <div>
+      <p
+        className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1.5 flex items-center gap-1"
+        title={t(
+          'wissensbasis.focus.observedFieldsTooltip',
+          'Field values pinned at observation time — source for audit replay',
+        )}
+      >
+        <Clock className="h-3 w-3" aria-hidden="true" />
+        {t('wissensbasis.focus.observedFields', 'Observed values')}
+      </p>
+      <ul className="space-y-1">
+        {visible.map((f, idx) => (
+          <ObservedFieldRow key={`${f.source_type}:${f.field_path}:${idx}`} field={f} />
+        ))}
+      </ul>
+      {hidden > 0 && !expanded && (
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          className="mt-1.5 text-xs text-accent-700 dark:text-accent-400 hover:underline"
+        >
+          {t('wissensbasis.focus.observedFieldsMore', '+{{count}} more values', { count: hidden })}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ObservedFieldRow({ field }: { field: ObservedField }) {
+  const { t, i18n } = useTranslation();
+  const when = formatTimestamp(field.fetched_at, i18n.language);
+  const valueText = stringifyValue(field.value);
+  return (
+    <li className="text-xs">
+      <span className="font-mono text-gray-500 dark:text-gray-400">{field.field_path}</span>
+      <span className="mx-1.5 opacity-50">=</span>
+      <span className="text-gray-900 dark:text-gray-100 break-all">{valueText}</span>
+      <span className="ml-1.5 text-gray-400 dark:text-gray-500 italic">
+        {t('wissensbasis.focus.observedAt', 'as of {{when}}', { when })}
+      </span>
+    </li>
+  );
+}
+
+function stringifyValue(value: unknown): string {
+  if (value === null || value === undefined) return '∅';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatTimestamp(iso: string, locale: string): string {
+  // Show as relative when recent (< 24h) — "5m ago", "3h ago" — and
+  // an absolute short-date otherwise. Avoids "2026-05-12T06:24:11.689175"
+  // dominating the row while staying precise enough for audit context.
+  try {
+    const t = new Date(iso).getTime();
+    if (!Number.isFinite(t)) return iso;
+    const deltaMin = (Date.now() - t) / 60000;
+    if (deltaMin < 1) return locale.startsWith('de') ? 'gerade eben' : 'just now';
+    if (deltaMin < 60) {
+      const mins = Math.floor(deltaMin);
+      return locale.startsWith('de') ? `vor ${mins} Min` : `${mins}m ago`;
+    }
+    if (deltaMin < 60 * 24) {
+      const hrs = Math.floor(deltaMin / 60);
+      return locale.startsWith('de') ? `vor ${hrs} Std` : `${hrs}h ago`;
+    }
+    return new Date(iso).toLocaleDateString(locale, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  } catch {
+    return iso;
+  }
 }
 
 interface NeighborSectionProps {
