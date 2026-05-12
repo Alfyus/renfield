@@ -1,32 +1,44 @@
 /**
- * GraphView — Wissensgraph 3D (variant A-3D).
+ * GraphView — Wissensgraph 3D, single unified scene.
  *
- * Three.js scene rendering the connected-component clusters returned
- * by /api/wissensbasis/graph as translucent spheres with hub entities
- * orbiting each. Cross-cluster bridges drawn as bezier arcs. Camera
- * orbits via OrbitControls (drag to rotate, scroll to zoom, right-drag
- * to pan).
+ * Two modes driven by the ?focus= URL param:
  *
- * Replaces the prior react-force-graph-2d view per the approved
- * A-LANDING+A-3D design (designs/wissensgraph-20260509/approved.json).
- * Cluster grouping is dynamic (connected components) so new
- * integrations surface naturally as new clusters without code changes.
+ *   - Corpus mode (no ?focus=): renders the connected-component
+ *     clusters returned by /api/wissensbasis/graph. Translucent
+ *     spheres with hub entities orbiting each.
  *
- * Hub click → navigate to /wissensbasis?focus=<atom_id>, ties into
- * the T24 UUID-based focus chain.
+ *   - Focus mode (?focus=<entity_id>): renders the entity's
+ *     neighborhood. Focus entity at center, hop1 entities orbiting
+ *     close, hop2 entities in an outer translucent shell. Data from
+ *     /api/wissensbasis/focus.
  *
- * Render budget: ~16 entities + ~10 relations in current prod (target
- * 60fps trivially). The scene uses StandardMaterial only on hubs +
- * cluster cores; everything else is BasicMaterial / wireframe to keep
- * the scene cheap on the GPU.
+ * Search overlay (top-left) drives the camera in either mode: type a
+ * name, pick a suggestion, the URL ?focus= updates and the scene
+ * re-renders focused on that entity. Click a hub in the scene → same
+ * URL-param change → same re-render. No page navigation, no flat-list
+ * handoff.
+ *
+ * Replaces the prior 2D force layout AND the separate Wissensbasis
+ * flat-chip A4 panel per the user's "one continuous 3D experience"
+ * framing (Option 3 in D23, 2026-05-12).
+ *
+ * Render budget: corpus mode = ~200 entities + ~50 relations in
+ * current prod; focus mode = single entity + hop1 (≤30) + hop2 (≤30).
+ * Either way trivially 60fps. Scene uses StandardMaterial only on
+ * hubs + cluster cores; everything else is BasicMaterial / wireframe.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router';
+import { useSearchParams } from 'react-router';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 import apiClient from '../../utils/axios';
+import type {
+  FocusEntity,
+  FocusNeighborhood,
+  SearchHit,
+} from '../../api/resources/wissensbasis';
 
 interface Hub {
   entity_id: string;
@@ -44,67 +56,64 @@ interface Cluster {
   color_seed: number;
 }
 
-interface Bridge {
-  from_cluster: string;
-  to_cluster: string;
-  weight: number;
-}
-
 interface GraphResponse {
   clusters: Cluster[];
-  bridges: Bridge[];
   total_entities: number;
   total_relations: number;
   truncated: boolean;
 }
 
-// Color palette — matches variant-A-3d.html. Each entry is the cluster
-// theme color; the renderer derives sphere atmosphere, shell, and core
-// from the same hex.
 const PALETTE: number[] = [
-  0xe63e54, // primary red (Reva brand)
-  0x06b6d4, // accent cyan
-  0xa78bfa, // violet
-  0xeab308, // amber
-  0xf97316, // orange
-  0x22c55e, // green
+  0xe63e54, 0x06b6d4, 0xa78bfa, 0xeab308, 0xf97316, 0x22c55e,
 ];
+const pickColor = (seed: number) => PALETTE[seed % PALETTE.length];
 
-function pickColor(seed: number): number {
-  return PALETTE[seed % PALETTE.length];
+// Stable debounce — keeps each keystroke from firing /search.
+function useDebounced<T>(value: T, ms: number): T {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setV(value), ms);
+    return () => clearTimeout(id);
+  }, [value, ms]);
+  return v;
 }
-
-// 5-color palette for hub status. The mock used these to color the
-// per-release hubs; for now we color hubs by their cluster's seed,
-// adding the status colors as a future hook when wb_field_provenance
-// status is wired in.
-const _STATUS_COLORS = [0x22c55e, 0xef4444, 0xeab308, 0x64748b];
-void _STATUS_COLORS;
 
 export default function GraphView() {
   const { t } = useTranslation();
-  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const focusId = searchParams.get('focus') || '';
+
   const rootRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
-  const [data, setData] = useState<GraphResponse | null>(null);
+
+  const [corpus, setCorpus] = useState<GraphResponse | null>(null);
+  const [focusData, setFocusData] = useState<FocusNeighborhood | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Fetch clusters from the Reva-side /api/wissensbasis/graph endpoint.
+  // Mode selector. Fetches the appropriate endpoint; clears the other.
   useEffect(() => {
     let cancelled = false;
-    apiClient.get<GraphResponse>('/api/wissensbasis/graph')
-      .then(res => { if (!cancelled) setData(res.data); })
-      .catch(err => {
-        if (!cancelled) setLoadError(err?.message || String(err));
-      });
+    setLoadError(null);
+    if (focusId) {
+      apiClient.get<FocusNeighborhood>('/api/wissensbasis/focus', {
+        params: { entity_id: focusId, hops: 2 },
+      })
+        .then(res => { if (!cancelled) { setFocusData(res.data); setCorpus(null); } })
+        .catch(err => { if (!cancelled) setLoadError(err?.message || String(err)); });
+    } else {
+      apiClient.get<GraphResponse>('/api/wissensbasis/graph')
+        .then(res => { if (!cancelled) { setCorpus(res.data); setFocusData(null); } })
+        .catch(err => { if (!cancelled) setLoadError(err?.message || String(err)); });
+    }
     return () => { cancelled = true; };
-  }, []);
+  }, [focusId]);
 
-  // Three.js scene lifecycle. Re-runs only when `data` changes.
+  // Three.js scene lifecycle.
   useEffect(() => {
     const root = rootRef.current;
     const labelsLayer: HTMLDivElement | null = labelsRef.current;
-    if (!root || !labelsLayer || !data) return;
+    if (!root || !labelsLayer) return;
+    if (!corpus && !focusData) return;
 
     const scene = new THREE.Scene();
     scene.fog = new THREE.FogExp2(0x0a0f1c, 0.018);
@@ -123,7 +132,7 @@ export default function GraphView() {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
-    controls.minDistance = 8;
+    controls.minDistance = 6;
     controls.maxDistance = 80;
 
     scene.add(new THREE.AmbientLight(0x6080a0, 0.55));
@@ -134,7 +143,6 @@ export default function GraphView() {
     rim.position.set(-12, -8, -16);
     scene.add(rim);
 
-    // Wireframe ground plane — depth reference, mostly subliminal.
     const plane = new THREE.Mesh(
       new THREE.PlaneGeometry(80, 80, 24, 24),
       new THREE.MeshBasicMaterial({ color: 0x1a2540, wireframe: true, transparent: true, opacity: 0.18 }),
@@ -143,89 +151,31 @@ export default function GraphView() {
     plane.position.y = -10;
     scene.add(plane);
 
-    // Lay out clusters on a circle in the XZ plane. Radius scales with
-    // cluster count so a 1-cluster scene doesn't hover way off-center.
-    const N = data.clusters.length;
-    const ringRadius = N <= 1 ? 0 : Math.min(14, 6 + N * 1.5);
-    const clusterMeshes: { group: THREE.Group; cluster: Cluster; pos: THREE.Vector3 }[] = [];
+    // Track all labelable things (cluster spheres OR focus entities)
+    // for the 2D label overlay + raycaster targets that drive
+    // click-to-refocus.
+    const labeled: Array<{
+      pos: THREE.Vector3;
+      name: string;
+      sub?: string;
+      yOffset: number;
+    }> = [];
+    const clickable: Array<{ mesh: THREE.Object3D; entityId: string }> = [];
 
-    data.clusters.forEach((c, i) => {
-      const angle = (i / Math.max(N, 1)) * Math.PI * 2;
-      const pos = new THREE.Vector3(
-        Math.cos(angle) * ringRadius,
-        // small vertical variation makes 3D feel more 3D
-        (i % 2 === 0 ? 1 : -1) * (i % 3) * 0.8,
-        Math.sin(angle) * ringRadius,
-      );
-      const color = pickColor(c.color_seed);
-      const radius = Math.max(2.0, Math.min(5.0, 1.4 + Math.sqrt(c.entity_count)));
+    if (corpus) {
+      buildCorpusScene(scene, corpus, labeled, clickable);
+    } else if (focusData) {
+      buildFocusScene(scene, focusData, labeled, clickable);
+    }
 
-      const group = new THREE.Group();
-      group.position.copy(pos);
-      group.userData = { cluster: c };
-
-      // 3 nested spheres for that "atmospheric" feel from the mock.
-      group.add(new THREE.Mesh(
-        new THREE.SphereGeometry(radius, 32, 32),
-        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.10, depthWrite: false }),
-      ));
-      group.add(new THREE.Mesh(
-        new THREE.SphereGeometry(radius * 1.02, 24, 16),
-        new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.32 }),
-      ));
-      group.add(new THREE.Mesh(
-        new THREE.SphereGeometry(0.5, 16, 16),
-        new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.45, roughness: 0.4 }),
-      ));
-
-      // Hubs orbit on the cluster's surface.
-      c.hubs.forEach((hub, hi) => {
-        const theta = (hi / Math.max(c.hubs.length, 1)) * Math.PI * 2;
-        const phi = Math.PI / 2 + ((hi % 2 === 0 ? 1 : -1) * 0.3);
-        const r = radius * 0.75;
-        const hubMesh = new THREE.Mesh(
-          new THREE.SphereGeometry(0.35 + (hi === 0 ? 0.18 : 0), 12, 12),
-          new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.5, roughness: 0.35 }),
-        );
-        hubMesh.position.set(
-          r * Math.sin(phi) * Math.cos(theta),
-          r * Math.cos(phi),
-          r * Math.sin(phi) * Math.sin(theta),
-        );
-        hubMesh.userData = { hub, cluster: c };
-        group.add(hubMesh);
-      });
-
-      scene.add(group);
-      clusterMeshes.push({ group, cluster: c, pos });
-    });
-
-    // Bridges between clusters (currently always empty from connected
-    // components, but the renderer is ready for the day we switch to
-    // Louvain / modularity-based clustering).
-    data.bridges.forEach(b => {
-      const from = clusterMeshes.find(m => m.cluster.id === b.from_cluster);
-      const to = clusterMeshes.find(m => m.cluster.id === b.to_cluster);
-      if (!from || !to) return;
-      const mid = from.pos.clone().add(to.pos).multiplyScalar(0.5);
-      mid.y += 4;
-      const curve = new THREE.QuadraticBezierCurve3(from.pos.clone(), mid, to.pos.clone());
-      const geom = new THREE.BufferGeometry().setFromPoints(curve.getPoints(40));
-      scene.add(new THREE.Line(
-        geom,
-        new THREE.LineBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0.35 }),
-      ));
-    });
-
-    // Project cluster positions into screen space for the DOM labels.
     function updateLabels() {
       if (!labelsLayer) return;
       while (labelsLayer.firstChild) labelsLayer.removeChild(labelsLayer.firstChild);
-      clusterMeshes.forEach(({ group, cluster }) => {
-        const v = group.position.clone();
-        v.y += 5; // float label above sphere
+      for (const item of labeled) {
+        const v = item.pos.clone();
+        v.y += item.yOffset;
         v.project(camera);
-        if (v.z > 1) return; // behind camera
+        if (v.z > 1) continue;
         const x = (v.x + 1) * 0.5 * W();
         const y = (1 - (v.y + 1) * 0.5) * H();
         const div = document.createElement('div');
@@ -237,21 +187,21 @@ export default function GraphView() {
         const name = document.createElement('div');
         name.className = 'text-sm';
         name.style.fontFamily = 'Cormorant, Georgia, serif';
-        name.textContent = cluster.label;
-        const sub = document.createElement('div');
-        sub.className = 'text-[10px] font-normal text-gray-400';
-        sub.textContent = cluster.sub_label;
+        name.textContent = item.name;
         div.appendChild(name);
-        div.appendChild(sub);
+        if (item.sub) {
+          const sub = document.createElement('div');
+          sub.className = 'text-[10px] font-normal text-gray-400';
+          sub.textContent = item.sub;
+          div.appendChild(sub);
+        }
         labelsLayer.appendChild(div);
-      });
+      }
     }
 
-    // Hover + click raycasting. Only fires on hub meshes (their userData
-    // has a `hub` key); cluster spheres are ignored for click intent.
+    // Hover + click raycasting.
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
-
     function onMove(e: MouseEvent) {
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -259,12 +209,23 @@ export default function GraphView() {
     }
     function onClick() {
       raycaster.setFromCamera(pointer, camera);
-      // Recurse so we hit hubs nested inside cluster groups.
-      const hits = raycaster.intersectObjects(scene.children, true);
+      const meshes = clickable.map(c => c.mesh);
+      const hits = raycaster.intersectObjects(meshes, true);
       for (const h of hits) {
-        const hub = (h.object.userData as { hub?: Hub }).hub;
-        if (hub?.entity_id) {
-          navigate(`/wissensbasis?focus=${encodeURIComponent(hub.entity_id)}`);
+        // Walk up to find an object with .userData.entityId (hubs nest inside groups).
+        let obj: THREE.Object3D | null = h.object;
+        while (obj && !(obj.userData as { entityId?: string }).entityId) {
+          obj = obj.parent;
+        }
+        const eid = (obj?.userData as { entityId?: string })?.entityId;
+        if (eid) {
+          // Stay in scene. Just bump the URL param; the mode effect
+          // refetches and the scene rebuilds on the next pass.
+          setSearchParams((prev) => {
+            const next = new URLSearchParams(prev);
+            next.set('focus', eid);
+            return next;
+          });
           return;
         }
       }
@@ -280,15 +241,14 @@ export default function GraphView() {
     window.addEventListener('resize', onResize);
 
     let rafId = 0;
+    let theta = 0;
     function loop() {
       controls.update();
-      // gentle orbit on hubs — picks up the "alive" feel from the mock
-      clusterMeshes.forEach(({ group }) => {
-        group.children.forEach(child => {
-          if ((child.userData as { hub?: Hub }).hub) {
-            child.rotation.y += 0.003;
-          }
-        });
+      theta += 0.003;
+      // Orbit any group whose userData asks for it (focus-mode hop1 rings).
+      scene.traverse(obj => {
+        const ud = obj.userData as { orbit?: boolean };
+        if (ud.orbit) obj.rotation.y = theta;
       });
       renderer.render(scene, camera);
       updateLabels();
@@ -305,7 +265,16 @@ export default function GraphView() {
       renderer.dispose();
       if (root.contains(renderer.domElement)) root.removeChild(renderer.domElement);
     };
-  }, [data, navigate]);
+  }, [corpus, focusData, setSearchParams]);
+
+  function setFocus(entityId: string | null) {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (entityId) next.set('focus', entityId);
+      else next.delete('focus');
+      return next;
+    });
+  }
 
   if (loadError) {
     return (
@@ -315,30 +284,308 @@ export default function GraphView() {
     );
   }
 
-  if (data && data.clusters.length === 0) {
-    return (
-      <div className="text-xs text-gray-500 dark:text-gray-400 italic px-3 py-12 text-center">
-        {t(
-          'knowledgeGraph.graph.empty',
-          'No entities in the knowledge graph yet. Start a conversation to populate it.',
-        )}
-      </div>
-    );
-  }
-
   return (
     <div className="relative w-full" style={{ height: '70vh', minHeight: 480 }}>
       <div ref={rootRef} className="absolute inset-0 rounded-lg overflow-hidden bg-[#0a0f1c]" />
       <div ref={labelsRef} className="pointer-events-none absolute inset-0" />
+
+      <SearchOverlay onPick={(eid) => setFocus(eid)} />
+
+      {focusId && (
+        <button
+          type="button"
+          onClick={() => setFocus(null)}
+          className="absolute top-3 right-3 text-[11px] px-2 py-1 rounded
+            bg-black/50 text-white/80 hover:bg-black/70 hover:text-white"
+          title={t('knowledgeGraph.graph.backToCorpus', 'Back to corpus view')}
+        >
+          {t('knowledgeGraph.graph.backToCorpus', '← Corpus')}
+        </button>
+      )}
+
       <div className="pointer-events-none absolute left-3 bottom-3 text-[10px] text-gray-500 bg-black/40 px-2 py-1 rounded">
         {t('knowledgeGraph.graph.hint', 'Drag to orbit · scroll to zoom · click a hub to focus')}
       </div>
-      {data && (
+
+      {corpus && !focusId && (
         <div className="pointer-events-none absolute right-3 bottom-3 text-[10px] text-gray-500 bg-black/40 px-2 py-1 rounded">
-          {data.total_entities} entities · {data.clusters.length} clusters
-          {data.truncated && ' · truncated'}
+          {corpus.total_entities} entities · {corpus.clusters.length} clusters
+          {corpus.truncated && ' · truncated'}
+        </div>
+      )}
+      {focusData && (
+        <div className="pointer-events-none absolute right-3 bottom-3 text-[10px] text-gray-500 bg-black/40 px-2 py-1 rounded">
+          {focusData.focus.display_name} · {focusData.hop1.length} hop1 · {focusData.hop2.length} hop2
         </div>
       )}
     </div>
   );
 }
+
+// =========================================================================
+// Scene builders
+// =========================================================================
+
+function buildCorpusScene(
+  scene: THREE.Scene,
+  data: GraphResponse,
+  labeled: Array<{ pos: THREE.Vector3; name: string; sub?: string; yOffset: number }>,
+  clickable: Array<{ mesh: THREE.Object3D; entityId: string }>,
+) {
+  const N = data.clusters.length;
+  const ringRadius = N <= 1 ? 0 : Math.min(14, 6 + N * 1.5);
+
+  data.clusters.forEach((c, i) => {
+    const angle = (i / Math.max(N, 1)) * Math.PI * 2;
+    const pos = new THREE.Vector3(
+      Math.cos(angle) * ringRadius,
+      (i % 2 === 0 ? 1 : -1) * (i % 3) * 0.8,
+      Math.sin(angle) * ringRadius,
+    );
+    const color = pickColor(c.color_seed);
+    const radius = Math.max(2.0, Math.min(5.0, 1.4 + Math.sqrt(c.entity_count)));
+
+    const group = new THREE.Group();
+    group.position.copy(pos);
+    group.userData = { cluster: c };
+
+    group.add(new THREE.Mesh(
+      new THREE.SphereGeometry(radius, 32, 32),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.10, depthWrite: false }),
+    ));
+    group.add(new THREE.Mesh(
+      new THREE.SphereGeometry(radius * 1.02, 24, 16),
+      new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.32 }),
+    ));
+    group.add(new THREE.Mesh(
+      new THREE.SphereGeometry(0.5, 16, 16),
+      new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.45, roughness: 0.4 }),
+    ));
+
+    c.hubs.forEach((hub, hi) => {
+      const theta = (hi / Math.max(c.hubs.length, 1)) * Math.PI * 2;
+      const phi = Math.PI / 2 + ((hi % 2 === 0 ? 1 : -1) * 0.3);
+      const r = radius * 0.75;
+      const hubMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.35 + (hi === 0 ? 0.18 : 0), 12, 12),
+        new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.5, roughness: 0.35 }),
+      );
+      hubMesh.position.set(
+        r * Math.sin(phi) * Math.cos(theta),
+        r * Math.cos(phi),
+        r * Math.sin(phi) * Math.sin(theta),
+      );
+      hubMesh.userData = { entityId: hub.entity_id, hub };
+      group.add(hubMesh);
+      clickable.push({ mesh: hubMesh, entityId: hub.entity_id });
+    });
+
+    scene.add(group);
+    labeled.push({ pos: pos.clone(), name: c.label, sub: c.sub_label, yOffset: radius * 1.1 });
+  });
+}
+
+function buildFocusScene(
+  scene: THREE.Scene,
+  data: FocusNeighborhood,
+  labeled: Array<{ pos: THREE.Vector3; name: string; sub?: string; yOffset: number }>,
+  clickable: Array<{ mesh: THREE.Object3D; entityId: string }>,
+) {
+  const focusColor = 0xe63e54;
+  const hop1Color = 0x06b6d4;
+  const hop2Color = 0xa78bfa;
+
+  // Focus entity — large central emissive sphere.
+  const focusMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(1.4, 32, 32),
+    new THREE.MeshStandardMaterial({
+      color: focusColor, emissive: focusColor, emissiveIntensity: 0.6, roughness: 0.3,
+    }),
+  );
+  focusMesh.userData = { entityId: data.focus.entity_id, focusEntity: data.focus };
+  scene.add(focusMesh);
+  // Atmospheric shell.
+  scene.add(new THREE.Mesh(
+    new THREE.SphereGeometry(2.5, 32, 32),
+    new THREE.MeshBasicMaterial({
+      color: focusColor, transparent: true, opacity: 0.08, depthWrite: false,
+    }),
+  ));
+  labeled.push({
+    pos: new THREE.Vector3(0, 0, 0),
+    name: data.focus.display_name,
+    sub: data.focus.entity_type,
+    yOffset: 3.2,
+  });
+
+  // hop1 ring — orbiting hubs at radius ~7. Group so we can lazy-orbit.
+  const hop1Group = new THREE.Group();
+  hop1Group.userData = { orbit: true };
+  scene.add(hop1Group);
+  data.hop1.forEach((e, i) => {
+    const theta = (i / Math.max(data.hop1.length, 1)) * Math.PI * 2;
+    const r = 7;
+    const mesh = makeHubMesh(hop1Color, 0.42);
+    mesh.position.set(Math.cos(theta) * r, Math.sin(theta * 2) * 0.6, Math.sin(theta) * r);
+    mesh.userData = { entityId: e.entity_id, entity: e };
+    hop1Group.add(mesh);
+    clickable.push({ mesh, entityId: e.entity_id });
+
+    // Edge from focus to hop1 (faint line).
+    const lineGeom = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0), mesh.position.clone(),
+    ]);
+    scene.add(new THREE.Line(
+      lineGeom,
+      new THREE.LineBasicMaterial({ color: hop1Color, transparent: true, opacity: 0.35 }),
+    ));
+  });
+
+  // hop2 outer shell — distributed on a larger sphere surface.
+  data.hop2.forEach((e, i) => {
+    const n = Math.max(data.hop2.length, 1);
+    // Fibonacci sphere distribution for even coverage.
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const y = 1 - (i / Math.max(n - 1, 1)) * 2;
+    const r = Math.sqrt(1 - y * y);
+    const theta = golden * i;
+    const R = 13;
+    const mesh = makeHubMesh(hop2Color, 0.3);
+    mesh.position.set(Math.cos(theta) * r * R, y * R, Math.sin(theta) * r * R);
+    mesh.userData = { entityId: e.entity_id, entity: e };
+    scene.add(mesh);
+    clickable.push({ mesh, entityId: e.entity_id });
+  });
+
+  // Wireframe outer-shell hint (the "2 HOPS" boundary from the A4 mock).
+  scene.add(new THREE.Mesh(
+    new THREE.SphereGeometry(13, 32, 16),
+    new THREE.MeshBasicMaterial({
+      color: 0x475569, wireframe: true, transparent: true, opacity: 0.10,
+    }),
+  ));
+}
+
+function makeHubMesh(color: number, radius: number): THREE.Mesh {
+  return new THREE.Mesh(
+    new THREE.SphereGeometry(radius, 12, 12),
+    new THREE.MeshStandardMaterial({
+      color, emissive: color, emissiveIntensity: 0.5, roughness: 0.35,
+    }),
+  );
+}
+
+// =========================================================================
+// Search overlay
+// =========================================================================
+
+function SearchOverlay({ onPick }: { onPick: (entityId: string) => void }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState('');
+  const [hits, setHits] = useState<SearchHit[]>([]);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const debouncedQ = useDebounced(q, 180);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (open) inputRef.current?.focus();
+  }, [open]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!debouncedQ.trim()) {
+      setHits([]);
+      return;
+    }
+    apiClient.get<{ items: SearchHit[] }>('/api/wissensbasis/search', {
+      params: { q: debouncedQ },
+    })
+      .then(res => { if (!cancelled) setHits(res.data.items || []); })
+      .catch(() => { if (!cancelled) setHits([]); });
+    return () => { cancelled = true; };
+  }, [debouncedQ]);
+
+  useEffect(() => { setActiveIndex(0); }, [hits.length]);
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'ArrowDown' && hits.length > 0) {
+      e.preventDefault();
+      setActiveIndex(i => Math.min(i + 1, hits.length - 1));
+    } else if (e.key === 'ArrowUp' && hits.length > 0) {
+      e.preventDefault();
+      setActiveIndex(i => Math.max(i - 1, 0));
+    } else if (e.key === 'Enter' && hits.length > 0) {
+      e.preventDefault();
+      onPick(hits[activeIndex].entity_id);
+      setOpen(false);
+      setQ('');
+    } else if (e.key === 'Escape') {
+      setOpen(false);
+      setQ('');
+    }
+  }
+
+  return (
+    <div className="absolute top-3 left-3 z-10">
+      {open ? (
+        <div className="w-72 bg-black/70 backdrop-blur-sm rounded-lg shadow-lg p-2">
+          <input
+            ref={inputRef}
+            type="text"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder={t('knowledgeGraph.graph.searchPlaceholder', 'Find entity…')}
+            className="w-full bg-transparent text-white text-sm outline-none px-2 py-1
+              border-b border-white/20 focus:border-white/50"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          {hits.length > 0 && (
+            <ul role="listbox" className="mt-1.5 max-h-72 overflow-y-auto">
+              {hits.map((hit, i) => (
+                <li key={hit.entity_id}>
+                  <button
+                    type="button"
+                    onClick={() => { onPick(hit.entity_id); setOpen(false); setQ(''); }}
+                    onMouseEnter={() => setActiveIndex(i)}
+                    className={`w-full text-left rounded px-2 py-1.5 text-xs transition-colors
+                      ${i === activeIndex ? 'bg-white/15' : 'hover:bg-white/10'}`}
+                  >
+                    <p className="text-white truncate">{hit.display_name}</p>
+                    <p className="text-[10px] text-gray-400 mt-0.5">
+                      {hit.entity_type}
+                      {hit.mention_count > 0 && ` · ${hit.mention_count} mentions`}
+                    </p>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {debouncedQ && hits.length === 0 && (
+            <p className="text-[11px] text-gray-400 italic px-2 py-1.5">
+              {t('knowledgeGraph.graph.searchNoResults', 'Nothing found')}
+            </p>
+          )}
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="bg-black/50 hover:bg-black/70 text-white/80 hover:text-white
+            px-3 py-1.5 rounded text-xs flex items-center gap-1.5"
+          title={t('knowledgeGraph.graph.searchTitle', 'Search an entity')}
+        >
+          <span>🔍</span>
+          <span>{t('knowledgeGraph.graph.searchButton', 'Find entity')}</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
+// FocusEntity import marker — keeps TS from complaining about the unused import
+// when builders are scoped helpers. The type is referenced via FocusNeighborhood.
+const _: FocusEntity | undefined = undefined;
+void _;

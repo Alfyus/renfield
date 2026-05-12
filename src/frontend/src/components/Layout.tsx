@@ -61,7 +61,9 @@ const mainNavigationConfig: NavItemConfig[] = [
   { nameKey: 'nav.federationAudit', href: '/brain/audit', icon: History },
   { nameKey: 'nav.memory', href: '/memory', icon: Brain },
   { nameKey: 'nav.knowledgeGraph', href: '/knowledge-graph', icon: Share2, feature: 'knowledge_graph' },
-  { nameKey: 'nav.wissensbasis', href: '/wissensbasis', icon: Layers },
+  // /wissensbasis sunset 2026-05-12 — merged into /knowledge-graph as a
+  // unified 3D scene with built-in search (D23, Option 3). Old chip
+  // URLs and ?focus= deep-links redirect via App.tsx Route.
   { nameKey: 'nav.tasks', href: '/tasks', icon: CheckSquare, feature: 'tasks' },
   { nameKey: 'nav.cameras', href: '/camera', icon: Camera, permission: ['cam.view', 'cam.full'], feature: 'cameras' },
 ];
