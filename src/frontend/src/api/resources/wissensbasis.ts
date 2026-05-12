@@ -60,6 +60,24 @@ export interface FocusEdge {
   relation: string;
 }
 
+/**
+ * A value observed for an entity at a specific time. Sourced from the
+ * sprint-2 wb_field_provenance substrate. Backend pins the JSON value
+ * the source returned at ``fetched_at`` so audit replay reconstructs
+ * "what did we know about X at time Y" even after the upstream value
+ * changes or the upstream record is deleted.
+ *
+ * source_type is the coarse DB CHECK enum (release / jira / confluence /
+ * itsm / memory / derived). The fine-grained source (release_phase,
+ * jira_issue, …) is recoverable from the row's field_path.
+ */
+export interface ObservedField {
+  field_path: string;
+  value: unknown;
+  fetched_at: string; // ISO 8601 UTC
+  source_type: string;
+}
+
 export interface FocusNeighborhood {
   focus: FocusEntity;
   hop1: FocusEntity[];
@@ -67,6 +85,10 @@ export interface FocusNeighborhood {
   edges: FocusEdge[];
   overflow_hop1: number;
   overflow_hop2: number;
+  // Sprint 2 additions — default to empty / null so older API responses
+  // (which omit them) still deserialize cleanly.
+  observed_fields?: ObservedField[];
+  source_priority?: 1 | 2 | 3 | null;
 }
 
 export interface RoleMix {

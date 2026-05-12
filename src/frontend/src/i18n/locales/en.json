@@ -1252,7 +1252,14 @@
       "overflowTooltip": "Open the standalone view to browse all neighbors",
       "importance": "importance {{pct}}%",
       "importanceTooltip": "Connectivity score",
-      "couldNotLoad": "Could not load focus neighborhood"
+      "couldNotLoad": "Could not load focus neighborhood",
+      "observedFields": "Observed values",
+      "observedFieldsTooltip": "Field values pinned at observation time — source for audit replay",
+      "observedAt": "as of {{when}}",
+      "observedFieldsMore": "+{{count}} more values",
+      "sourcePriority1": "From cached snapshots",
+      "sourcePriority2": "From knowledge graph",
+      "sourcePriority3": "From recent session trace"
     },
     "chip": {
       "ariaLabel": "Focus on {{label}}",
