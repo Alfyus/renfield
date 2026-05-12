@@ -11,6 +11,7 @@ This module handles:
 
 import asyncio
 import re
+import uuid
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
@@ -22,6 +23,7 @@ from services.input_guard import detect_injection
 from services.websocket_auth import WSAuthError, authenticate_websocket
 from services.websocket_rate_limiter import get_rate_limiter
 from utils.config import settings
+from utils.request_context import request_id as request_id_var
 from utils.voice_context import voice_originated
 
 from .shared import (
@@ -621,6 +623,18 @@ async def websocket_endpoint(
             except ValidationError as e:
                 await send_ws_error(websocket, WSErrorCode.INVALID_MESSAGE, str(e))
                 continue
+
+            # Per-message request id, set into the ContextVar so every
+            # downstream log line + every Reva observability counter +
+            # every wb_field_provenance row written in the async flush
+            # can be correlated back to this turn. Client-supplied
+            # request_id wins (up to 8 chars to fit the request_id
+            # ContextVar default's width); otherwise we mint a fresh
+            # 8-char UUID prefix. Without this set(), the ContextVar
+            # falls through to its default "--------" — every audit
+            # row gets the sentinel, defeating correlation.
+            rid = (msg_request_id or uuid.uuid4().hex)[:8]
+            request_id_var.set(rid)
 
             # Truthy embedding = came from the voice path; null/empty = text.
             voice_originated.set(bool(msg_speaker_embedding))
