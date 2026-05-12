@@ -125,6 +125,27 @@ class TestConversationMemoriesWrapper:
             "asker_id": 42, "asker_id_pub": TIER_PUBLIC, "asker_id_src": "conversation_memories",
         }
 
+    def test_circle_memberships_alias_does_not_shadow_outer(self):
+        """Regression: circle_memberships must NOT use alias 'm'.
+
+        The default alias for conversation_memories is also 'm'. When the
+        EXISTS subquery used 'circle_memberships m', the inner 'm'
+        shadowed the outer wherever the clause referenced
+        ``{owner_alias}.{owner_col}`` (which expands to 'm.user_id'). The
+        production query then failed with "column m.user_id does not exist"
+        because the resolution happened inside the subquery where 'm'
+        means circle_memberships (no user_id column).
+
+        Caught in prod 2026-05-12 in the chat_handler memory-retrieval
+        path. Fix: alias circle_memberships as 'cm'.
+        """
+        clause, _ = conversation_memories_circles_filter(asker_id=42)
+        assert "circle_memberships m " not in clause, (
+            "circle_memberships must NOT use alias 'm' — would shadow "
+            "the outer conversation_memories alias"
+        )
+        assert "circle_memberships cm " in clause
+
 
 class TestDocumentChunksWrapper:
     def test_owner_from_kb_tier_from_chunk(self):
