@@ -98,6 +98,18 @@ export interface RoleMix {
   role: string | null;
 }
 
+export interface SearchHit {
+  entity_id: string;
+  display_name: string;
+  entity_type: string;
+  mention_count: number;
+}
+
+export interface SearchResults {
+  items: SearchHit[];
+  total: number;
+}
+
 // Query key factories. Keep keys local to this resource — `keys.ts` is
 // shared and would couple the platform to a Reva-only feature flag.
 const wbKeys = {
@@ -106,6 +118,7 @@ const wbKeys = {
   focus: (entityId: string, hops: number, maxPerHop: number | null) =>
     ['wissensbasis', 'focus', entityId, { hops, maxPerHop }] as const,
   mix: (role: string | null) => ['wissensbasis', 'mix', role] as const,
+  search: (q: string) => ['wissensbasis', 'search', q] as const,
 };
 
 async function fetchTrace(sessionId: string): Promise<TracePeek> {
@@ -166,6 +179,36 @@ export function useFocusQuery(
       enabled: enabled && !!entityId,
     },
     'wissensbasis.focus.couldNotLoad',
+  );
+}
+
+async function fetchSearch(q: string): Promise<SearchResults> {
+  const { data } = await apiClient.get<SearchResults>('/api/wissensbasis/search', {
+    params: { q },
+  });
+  return data;
+}
+
+/**
+ * A4 direct-entry search. Live suggestions over KGEntity.name.
+ *
+ * Use case: user lands on /wissensbasis with a specific entity in
+ * mind. Empty query short-circuits to no results — the direct-entry
+ * premise is "I know what I'm looking for," not "show me everything."
+ *
+ * STALE.LIVE keeps the suggestion list fresh during typing without
+ * spamming the backend across debounce ticks.
+ */
+export function useSearchQuery(q: string, enabled = true) {
+  const trimmed = q.trim();
+  return useApiQuery(
+    {
+      queryKey: wbKeys.search(trimmed),
+      queryFn: () => fetchSearch(trimmed),
+      staleTime: STALE.LIVE,
+      enabled: enabled && trimmed.length > 0,
+    },
+    'wissensbasis.search.couldNotLoad',
   );
 }
 

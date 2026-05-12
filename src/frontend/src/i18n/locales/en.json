@@ -1244,6 +1244,14 @@
       "altListToggle": "Show as list ({{count}} entities)",
       "canvasLabel": "Reasoning graph visualization"
     },
+    "search": {
+      "label": "Search an entity by name — releases, tickets, people, documents",
+      "placeholder": "e.g. PRODUCT-A 1.3.5 or REVA-100",
+      "hint": "Direct entry. Start typing the name of the thing you want to focus on.",
+      "noResults": "Nothing found for \"{{q}}\". Try a different name or paste an ID.",
+      "mentions": "{{count}} mentions",
+      "couldNotLoad": "Search failed"
+    },
     "focus": {
       "empty": "Click a citation chip in the answer to focus an entity here.",
       "directNeighbors": "Direct neighbors",
