@@ -43,10 +43,12 @@ class TestCirclesFilterClause:
 
     def test_membership_subquery_uses_owner_alias(self):
         clause = circles_filter_clause(table_alias="e")
-        assert "circle_memberships m" in clause
-        assert "m.circle_owner_id = e.user_id" in clause
-        assert "m.dimension = 'tier'" in clause
-        assert "(m.value::text)::int <= e.circle_tier" in clause
+        # circle_memberships uses inner alias 'cm' (not 'm') to avoid
+        # shadowing outer table aliases — see the rename commit message.
+        assert "circle_memberships cm" in clause
+        assert "cm.circle_owner_id = e.user_id" in clause
+        assert "cm.dimension = 'tier'" in clause
+        assert "(cm.value::text)::int <= e.circle_tier" in clause
 
     def test_owner_table_alias_overrides_only_owner_col(self):
         # When owner is on a JOINed table (kb), tier should still come from
@@ -60,8 +62,8 @@ class TestCirclesFilterClause:
         )
         assert "kb.owner_id = :asker_id" in clause
         assert "dc.circle_tier = :asker_id_pub" in clause
-        assert "m.circle_owner_id = kb.owner_id" in clause
-        assert "(m.value::text)::int <= dc.circle_tier" in clause
+        assert "cm.circle_owner_id = kb.owner_id" in clause
+        assert "(cm.value::text)::int <= dc.circle_tier" in clause
 
     def test_source_id_expr_overrides_default(self):
         clause = circles_filter_clause(
