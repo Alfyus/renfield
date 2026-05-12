@@ -795,20 +795,7 @@ export default function KnowledgeGraphPage() {
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-500" />
           </div>
         }>
-          <GraphView
-            isDark={theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)}
-            onEntityClick={(entityId) => {
-              const entity = entities.find(e => e.id === entityId);
-              if (entity) {
-                setEditingEntity(entity);
-                setFormName(entity.name);
-                setFormType(entity.entity_type);
-                setFormDescription(entity.description || '');
-                setShowEditModal(true);
-              }
-            }}
-            onSwitchToEntities={() => setActiveTab('entities')}
-          />
+          <GraphView />
         </Suspense>
       )}
 

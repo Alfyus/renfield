@@ -1,467 +1,344 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+/**
+ * GraphView — Wissensgraph 3D (variant A-3D).
+ *
+ * Three.js scene rendering the connected-component clusters returned
+ * by /api/wissensbasis/graph as translucent spheres with hub entities
+ * orbiting each. Cross-cluster bridges drawn as bezier arcs. Camera
+ * orbits via OrbitControls (drag to rotate, scroll to zoom, right-drag
+ * to pan).
+ *
+ * Replaces the prior react-force-graph-2d view per the approved
+ * A-LANDING+A-3D design (designs/wissensgraph-20260509/approved.json).
+ * Cluster grouping is dynamic (connected components) so new
+ * integrations surface naturally as new clusters without code changes.
+ *
+ * Hub click → navigate to /wissensbasis?focus=<atom_id>, ties into
+ * the T24 UUID-based focus chain.
+ *
+ * Render budget: ~16 entities + ~10 relations in current prod (target
+ * 60fps trivially). The scene uses StandardMaterial only on hubs +
+ * cluster cores; everything else is BasicMaterial / wireframe to keep
+ * the scene cheap on the GPU.
+ */
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import ForceGraph2D, {
-  ForceGraphMethods,
-  LinkObject,
-  NodeObject,
-} from 'react-force-graph-2d';
+import { useNavigate } from 'react-router';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 import apiClient from '../../utils/axios';
 
-export type EntityType = 'person' | 'place' | 'organization' | 'thing' | 'event' | 'concept';
-
-interface ApiEntity {
-  id: string | number;
+interface Hub {
+  entity_id: string;
   name: string;
-  entity_type?: EntityType;
-  type?: EntityType;
-  mention_count?: number;
+  entity_type: string;
+  mention_count: number;
 }
 
-interface ApiRelation {
-  subject_id?: string | number;
-  object_id?: string | number;
-  subject?: { id: string | number };
-  object?: { id: string | number };
-  predicate?: string;
-  confidence?: number;
+interface Cluster {
+  id: string;
+  label: string;
+  sub_label: string;
+  entity_count: number;
+  hubs: Hub[];
+  color_seed: number;
 }
 
-interface EntitiesResponse {
-  entities?: ApiEntity[];
+interface Bridge {
+  from_cluster: string;
+  to_cluster: string;
+  weight: number;
 }
 
-interface RelationsResponse {
-  relations?: ApiRelation[];
+interface GraphResponse {
+  clusters: Cluster[];
+  bridges: Bridge[];
+  total_entities: number;
+  total_relations: number;
+  truncated: boolean;
 }
 
-interface GraphNode {
-  id: string | number;
-  name: string;
-  type?: EntityType;
-  mentionCount: number;
-  val: number;
-  x?: number;
-  y?: number;
-  _isNew?: boolean;
+// Color palette — matches variant-A-3d.html. Each entry is the cluster
+// theme color; the renderer derives sphere atmosphere, shell, and core
+// from the same hex.
+const PALETTE: number[] = [
+  0xe63e54, // primary red (Reva brand)
+  0x06b6d4, // accent cyan
+  0xa78bfa, // violet
+  0xeab308, // amber
+  0xf97316, // orange
+  0x22c55e, // green
+];
+
+function pickColor(seed: number): number {
+  return PALETTE[seed % PALETTE.length];
 }
 
-interface GraphLink {
-  source: string | number | GraphNode;
-  target: string | number | GraphNode;
-  label?: string;
-  confidence?: number;
-}
+// 5-color palette for hub status. The mock used these to color the
+// per-release hubs; for now we color hubs by their cluster's seed,
+// adding the status colors as a future hook when wb_field_provenance
+// status is wired in.
+const _STATUS_COLORS = [0x22c55e, 0xef4444, 0xeab308, 0x64748b];
+void _STATUS_COLORS;
 
-interface GraphData {
-  nodes: GraphNode[];
-  links: GraphLink[];
-}
-
-interface GraphViewProps {
-  onEntityClick?: (id: GraphNode['id']) => void;
-  onSwitchToEntities?: () => void;
-  isDark?: boolean;
-}
-
-// Library-wrapped node/link shapes (NodeObject adds runtime fields like x, y, vx).
-type FGNode = NodeObject<GraphNode>;
-type FGLink = LinkObject<GraphNode, GraphLink>;
-type FGRef = ForceGraphMethods<FGNode, FGLink>;
-
-const TYPE_COLORS: Record<EntityType, string> = {
-  person: '#3b82f6',
-  place: '#22c55e',
-  organization: '#a855f7',
-  thing: '#f59e0b',
-  event: '#ec4899',
-  concept: '#14b8a6',
-};
-
-const TYPE_COLORS_DARK: Record<EntityType, string> = {
-  person: '#60a5fa',
-  place: '#4ade80',
-  organization: '#c084fc',
-  thing: '#fbbf24',
-  event: '#f472b6',
-  concept: '#2dd4bf',
-};
-
-const TYPE_LABELS: Record<EntityType, string> = {
-  person: 'Person',
-  place: 'Ort',
-  organization: 'Organisation',
-  thing: 'Objekt',
-  event: 'Ereignis',
-  concept: 'Konzept',
-};
-
-const MAX_NODES = 200;
-const LABEL_ZOOM_THRESHOLD = 1.2;
-
-function entityToNode(e: ApiEntity, typeOverride?: EntityType): GraphNode {
-  return {
-    id: e.id,
-    name: e.name,
-    type: typeOverride ?? e.entity_type ?? e.type,
-    mentionCount: e.mention_count ?? 1,
-    val: Math.max(2, Math.min(10, e.mention_count ?? 1)),
-  };
-}
-
-export default function GraphView({ onEntityClick, onSwitchToEntities, isDark = false }: GraphViewProps) {
+export default function GraphView() {
   const { t } = useTranslation();
-  const graphRef = useRef<FGRef | undefined>(undefined);
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] });
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-  const [dimensions, setDimensions] = useState<{ width: number; height: number }>({ width: 800, height: 600 });
-  const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
-  const [wsConnected, setWsConnected] = useState<boolean>(false);
-  const wsRef = useRef<WebSocket | null>(null);
-  const entityMapRef = useRef<Map<GraphNode['id'], GraphNode>>(new Map());
+  const navigate = useNavigate();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const labelsRef = useRef<HTMLDivElement>(null);
+  const [data, setData] = useState<GraphResponse | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  const colors: Record<EntityType, string> = isDark ? TYPE_COLORS_DARK : TYPE_COLORS;
-
-  // Measure container size — also re-measure when loading finishes
+  // Fetch clusters from the Reva-side /api/wissensbasis/graph endpoint.
   useEffect(() => {
-    if (!containerRef.current) return;
+    let cancelled = false;
+    apiClient.get<GraphResponse>('/api/wissensbasis/graph')
+      .then(res => { if (!cancelled) setData(res.data); })
+      .catch(err => {
+        if (!cancelled) setLoadError(err?.message || String(err));
+      });
+    return () => { cancelled = true; };
+  }, []);
 
-    const measure = (): void => {
-      if (!containerRef.current) return;
-      const { width, height } = containerRef.current.getBoundingClientRect();
-      if (width > 0 && height > 0) {
-        setDimensions({ width: Math.floor(width), height: Math.floor(height) });
-      }
-    };
-
-    measure();
-
-    const observer = new ResizeObserver(() => measure());
-    observer.observe(containerRef.current);
-    return () => observer.disconnect();
-  }, [loading]);
-
-  // Fetch initial data
+  // Three.js scene lifecycle. Re-runs only when `data` changes.
   useEffect(() => {
-    const fetchData = async (): Promise<void> => {
-      try {
-        setError(null);
-        const [entitiesRes, relationsRes] = await Promise.all([
-          apiClient.get<EntitiesResponse>('/api/knowledge-graph/entities', { params: { size: MAX_NODES } }),
-          apiClient.get<RelationsResponse>('/api/knowledge-graph/relations', { params: { size: 200 } }),
-        ]);
+    const root = rootRef.current;
+    const labelsLayer: HTMLDivElement | null = labelsRef.current;
+    if (!root || !labelsLayer || !data) return;
 
-        const entities = entitiesRes.data.entities ?? [];
-        const relations = relationsRes.data.relations ?? [];
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x0a0f1c, 0.018);
 
-        const entityMap = new Map<GraphNode['id'], GraphNode>();
-        const nodes: GraphNode[] = entities.map((e) => {
-          const node = entityToNode(e);
-          entityMap.set(e.id, node);
-          return node;
-        });
+    const W = () => root.clientWidth;
+    const H = () => root.clientHeight;
+    const camera = new THREE.PerspectiveCamera(45, W() / H(), 0.1, 1000);
+    camera.position.set(0, 14, 36);
 
-        const links: GraphLink[] = relations
-          .filter((r) => {
-            const sId = r.subject_id ?? r.subject?.id;
-            const oId = r.object_id ?? r.object?.id;
-            return sId != null && oId != null && entityMap.has(sId) && entityMap.has(oId);
-          })
-          .map((r) => ({
-            source: (r.subject_id ?? r.subject?.id) as GraphNode['id'],
-            target: (r.object_id ?? r.object?.id) as GraphNode['id'],
-            label: r.predicate,
-            confidence: r.confidence,
-          }));
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(W(), H());
+    renderer.setClearColor(0x0a0f1c, 1);
+    root.appendChild(renderer.domElement);
 
-        entityMapRef.current = entityMap;
-        setGraphData({ nodes, links });
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 8;
+    controls.maxDistance = 80;
 
-        // Center graph after data loads
-        setTimeout(() => {
-          graphRef.current?.zoomToFit(400, 40);
-        }, 500);
-      } catch (err) {
-        console.error('Failed to load KG graph data:', err);
-        setError(t('knowledgeGraph.graphError', 'Graph konnte nicht geladen werden.'));
-      } finally {
-        setLoading(false);
-      }
-    };
+    scene.add(new THREE.AmbientLight(0x6080a0, 0.55));
+    const key = new THREE.DirectionalLight(0xffffff, 0.6);
+    key.position.set(8, 20, 14);
+    scene.add(key);
+    const rim = new THREE.DirectionalLight(0xe63e54, 0.18);
+    rim.position.set(-12, -8, -16);
+    scene.add(rim);
 
-    fetchData();
-  }, [t]);
+    // Wireframe ground plane — depth reference, mostly subliminal.
+    const plane = new THREE.Mesh(
+      new THREE.PlaneGeometry(80, 80, 24, 24),
+      new THREE.MeshBasicMaterial({ color: 0x1a2540, wireframe: true, transparent: true, opacity: 0.18 }),
+    );
+    plane.rotation.x = -Math.PI / 2;
+    plane.position.y = -10;
+    scene.add(plane);
 
-  // WebSocket for live updates
-  useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/knowledge-graph`;
-    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    // Lay out clusters on a circle in the XZ plane. Radius scales with
+    // cluster count so a 1-cluster scene doesn't hover way off-center.
+    const N = data.clusters.length;
+    const ringRadius = N <= 1 ? 0 : Math.min(14, 6 + N * 1.5);
+    const clusterMeshes: { group: THREE.Group; cluster: Cluster; pos: THREE.Vector3 }[] = [];
 
-    const connect = (): void => {
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+    data.clusters.forEach((c, i) => {
+      const angle = (i / Math.max(N, 1)) * Math.PI * 2;
+      const pos = new THREE.Vector3(
+        Math.cos(angle) * ringRadius,
+        // small vertical variation makes 3D feel more 3D
+        (i % 2 === 0 ? 1 : -1) * (i % 3) * 0.8,
+        Math.sin(angle) * ringRadius,
+      );
+      const color = pickColor(c.color_seed);
+      const radius = Math.max(2.0, Math.min(5.0, 1.4 + Math.sqrt(c.entity_count)));
 
-      ws.onopen = () => setWsConnected(true);
+      const group = new THREE.Group();
+      group.position.copy(pos);
+      group.userData = { cluster: c };
 
-      ws.onmessage = (event: MessageEvent<string>): void => {
-        try {
-          const payload = JSON.parse(event.data) as {
-            type?: string;
-            entities?: ApiEntity[];
-            relations?: ApiRelation[];
-          };
-          if (payload.type === 'kg_update') {
-            handleKgUpdate(payload.entities ?? [], payload.relations ?? []);
-          }
-        } catch (err) {
-          console.error('KG WS message parse error:', err);
+      // 3 nested spheres for that "atmospheric" feel from the mock.
+      group.add(new THREE.Mesh(
+        new THREE.SphereGeometry(radius, 32, 32),
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.10, depthWrite: false }),
+      ));
+      group.add(new THREE.Mesh(
+        new THREE.SphereGeometry(radius * 1.02, 24, 16),
+        new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.32 }),
+      ));
+      group.add(new THREE.Mesh(
+        new THREE.SphereGeometry(0.5, 16, 16),
+        new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.45, roughness: 0.4 }),
+      ));
+
+      // Hubs orbit on the cluster's surface.
+      c.hubs.forEach((hub, hi) => {
+        const theta = (hi / Math.max(c.hubs.length, 1)) * Math.PI * 2;
+        const phi = Math.PI / 2 + ((hi % 2 === 0 ? 1 : -1) * 0.3);
+        const r = radius * 0.75;
+        const hubMesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.35 + (hi === 0 ? 0.18 : 0), 12, 12),
+          new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.5, roughness: 0.35 }),
+        );
+        hubMesh.position.set(
+          r * Math.sin(phi) * Math.cos(theta),
+          r * Math.cos(phi),
+          r * Math.sin(phi) * Math.sin(theta),
+        );
+        hubMesh.userData = { hub, cluster: c };
+        group.add(hubMesh);
+      });
+
+      scene.add(group);
+      clusterMeshes.push({ group, cluster: c, pos });
+    });
+
+    // Bridges between clusters (currently always empty from connected
+    // components, but the renderer is ready for the day we switch to
+    // Louvain / modularity-based clustering).
+    data.bridges.forEach(b => {
+      const from = clusterMeshes.find(m => m.cluster.id === b.from_cluster);
+      const to = clusterMeshes.find(m => m.cluster.id === b.to_cluster);
+      if (!from || !to) return;
+      const mid = from.pos.clone().add(to.pos).multiplyScalar(0.5);
+      mid.y += 4;
+      const curve = new THREE.QuadraticBezierCurve3(from.pos.clone(), mid, to.pos.clone());
+      const geom = new THREE.BufferGeometry().setFromPoints(curve.getPoints(40));
+      scene.add(new THREE.Line(
+        geom,
+        new THREE.LineBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0.35 }),
+      ));
+    });
+
+    // Project cluster positions into screen space for the DOM labels.
+    function updateLabels() {
+      if (!labelsLayer) return;
+      while (labelsLayer.firstChild) labelsLayer.removeChild(labelsLayer.firstChild);
+      clusterMeshes.forEach(({ group, cluster }) => {
+        const v = group.position.clone();
+        v.y += 5; // float label above sphere
+        v.project(camera);
+        if (v.z > 1) return; // behind camera
+        const x = (v.x + 1) * 0.5 * W();
+        const y = (1 - (v.y + 1) * 0.5) * H();
+        const div = document.createElement('div');
+        div.className = 'pointer-events-none absolute font-semibold text-white text-xs whitespace-nowrap';
+        div.style.left = `${x}px`;
+        div.style.top = `${y}px`;
+        div.style.transform = 'translate(-50%, -100%)';
+        div.style.textShadow = '0 1px 2px rgba(0,0,0,0.8)';
+        const name = document.createElement('div');
+        name.className = 'text-sm';
+        name.style.fontFamily = 'Cormorant, Georgia, serif';
+        name.textContent = cluster.label;
+        const sub = document.createElement('div');
+        sub.className = 'text-[10px] font-normal text-gray-400';
+        sub.textContent = cluster.sub_label;
+        div.appendChild(name);
+        div.appendChild(sub);
+        labelsLayer.appendChild(div);
+      });
+    }
+
+    // Hover + click raycasting. Only fires on hub meshes (their userData
+    // has a `hub` key); cluster spheres are ignored for click intent.
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    function onMove(e: MouseEvent) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+    function onClick() {
+      raycaster.setFromCamera(pointer, camera);
+      // Recurse so we hit hubs nested inside cluster groups.
+      const hits = raycaster.intersectObjects(scene.children, true);
+      for (const h of hits) {
+        const hub = (h.object.userData as { hub?: Hub }).hub;
+        if (hub?.entity_id) {
+          navigate(`/wissensbasis?focus=${encodeURIComponent(hub.entity_id)}`);
+          return;
         }
-      };
+      }
+    }
+    renderer.domElement.addEventListener('mousemove', onMove);
+    renderer.domElement.addEventListener('click', onClick);
 
-      ws.onclose = () => {
-        wsRef.current = null;
-        setWsConnected(false);
-        reconnectTimer = setTimeout(connect, 5000);
-      };
+    function onResize() {
+      camera.aspect = W() / H();
+      camera.updateProjectionMatrix();
+      renderer.setSize(W(), H());
+    }
+    window.addEventListener('resize', onResize);
 
-      ws.onerror = () => {
-        ws.close();
-      };
-    };
-
-    connect();
+    let rafId = 0;
+    function loop() {
+      controls.update();
+      // gentle orbit on hubs — picks up the "alive" feel from the mock
+      clusterMeshes.forEach(({ group }) => {
+        group.children.forEach(child => {
+          if ((child.userData as { hub?: Hub }).hub) {
+            child.rotation.y += 0.003;
+          }
+        });
+      });
+      renderer.render(scene, camera);
+      updateLabels();
+      rafId = requestAnimationFrame(loop);
+    }
+    loop();
 
     return () => {
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', onResize);
+      renderer.domElement.removeEventListener('mousemove', onMove);
+      renderer.domElement.removeEventListener('click', onClick);
+      controls.dispose();
+      renderer.dispose();
+      if (root.contains(renderer.domElement)) root.removeChild(renderer.domElement);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [data, navigate]);
 
-  const handleKgUpdate = useCallback((newEntities: ApiEntity[], newRelations: ApiRelation[]): void => {
-    setGraphData((prev) => {
-      const entityMap = entityMapRef.current;
-      const nodes = [...prev.nodes];
-      const links = [...prev.links];
-
-      for (const e of newEntities) {
-        if (!entityMap.has(e.id)) {
-          const node: GraphNode = {
-            ...entityToNode(e),
-            _isNew: true,
-          };
-          entityMap.set(e.id, node);
-          nodes.push(node);
-        } else {
-          const existing = entityMap.get(e.id);
-          if (existing && e.mention_count) {
-            existing.mentionCount = e.mention_count;
-            existing.val = Math.max(2, Math.min(10, e.mention_count));
-          }
-        }
-      }
-
-      for (const r of newRelations) {
-        const sId = r.subject_id;
-        const oId = r.object_id;
-        if (sId != null && oId != null && entityMap.has(sId) && entityMap.has(oId)) {
-          links.push({
-            source: sId,
-            target: oId,
-            label: r.predicate,
-            confidence: r.confidence,
-          });
-        }
-      }
-
-      // FIFO eviction if over max
-      if (nodes.length > MAX_NODES) {
-        const toRemove = nodes.splice(0, nodes.length - MAX_NODES);
-        const removeIds = new Set<GraphNode['id']>(toRemove.map((n) => n.id));
-        for (const id of removeIds) {
-          entityMap.delete(id);
-        }
-        const filtered = links.filter((l) => {
-          const sourceId = typeof l.source === 'object' ? l.source.id : l.source;
-          const targetId = typeof l.target === 'object' ? l.target.id : l.target;
-          return !removeIds.has(sourceId) && !removeIds.has(targetId);
-        });
-        return { nodes, links: filtered };
-      }
-
-      return { nodes, links };
-    });
-  }, []);
-
-  const nodeCanvasObject = useCallback(
-    (node: GraphNode, ctx: CanvasRenderingContext2D, globalScale: number): void => {
-      const radius = Math.max(4, node.val * 1.5);
-      const color = (node.type && colors[node.type]) || colors.thing;
-      const isHovered = hoveredNode?.id === node.id;
-      if (node.x == null || node.y == null) return;
-
-      // Node circle
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, isHovered ? radius * 1.3 : radius, 0, 2 * Math.PI);
-      ctx.fillStyle = color;
-      ctx.fill();
-
-      // Glow for new or hovered nodes
-      if (node._isNew || isHovered) {
-        ctx.shadowColor = color;
-        ctx.shadowBlur = isHovered ? 20 : 15;
-        ctx.beginPath();
-        ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI);
-        ctx.fill();
-        ctx.shadowBlur = 0;
-        if (node._isNew) {
-          setTimeout(() => { node._isNew = false; }, 3000);
-        }
-      }
-
-      // Label: show only when zoomed in enough, or when hovered
-      if (globalScale > LABEL_ZOOM_THRESHOLD || isHovered) {
-        const fontSize = isHovered ? Math.max(12, 14 / globalScale) : Math.max(9, 11 / globalScale);
-        ctx.font = `${isHovered ? 'bold ' : ''}${fontSize}px sans-serif`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = isDark ? '#e5e7eb' : '#1f2937';
-        ctx.fillText(node.name, node.x, node.y + radius + fontSize);
-      }
-    },
-    [colors, isDark, hoveredNode],
-  );
-
-  const linkCanvasObject = useCallback(
-    (link: GraphLink, ctx: CanvasRenderingContext2D, globalScale: number): void => {
-      const start = typeof link.source === 'object' ? link.source : null;
-      const end = typeof link.target === 'object' ? link.target : null;
-      if (!start || !end || start.x == null || start.y == null || end.x == null || end.y == null) return;
-
-      ctx.beginPath();
-      ctx.moveTo(start.x, start.y);
-      ctx.lineTo(end.x, end.y);
-      ctx.strokeStyle = isDark ? 'rgba(148, 163, 184, 0.3)' : 'rgba(107, 114, 128, 0.3)';
-      ctx.lineWidth = 0.5;
-      ctx.stroke();
-
-      if (link.label && globalScale > 1.5) {
-        const midX = (start.x + end.x) / 2;
-        const midY = (start.y + end.y) / 2;
-        const fontSize = Math.max(8, 10 / globalScale);
-        ctx.font = `${fontSize}px sans-serif`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = isDark ? 'rgba(148, 163, 184, 0.5)' : 'rgba(107, 114, 128, 0.5)';
-        ctx.fillText(link.label, midX, midY);
-      }
-    },
-    [isDark],
-  );
-
-  const handleNodeClick = useCallback(
-    (node: GraphNode): void => {
-      onEntityClick?.(node.id);
-    },
-    [onEntityClick],
-  );
-
-  const handleRetry = (): void => {
-    setLoading(true);
-    setError(null);
-    setGraphData({ nodes: [], links: [] });
-    entityMapRef.current = new Map();
-  };
-
-  if (loading) {
+  if (loadError) {
     return (
-      <div className="flex items-center justify-center h-96">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-500" />
+      <div role="alert" className="text-xs text-red-700 dark:text-red-300 px-3 py-2 bg-red-50 dark:bg-red-900/20 rounded">
+        {t('knowledgeGraph.graph.loadError', 'Could not load graph: {{err}}', { err: loadError })}
       </div>
     );
   }
 
-  if (error) {
+  if (data && data.clusters.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center h-96 gap-4">
-        <p className="text-gray-500 dark:text-gray-400">{error}</p>
-        <button onClick={handleRetry} className="btn-primary px-4 py-2 text-sm">
-          {t('common.retry', 'Erneut versuchen')}
-        </button>
-      </div>
-    );
-  }
-
-  if (graphData.nodes.length === 0) {
-    return (
-      <div className="flex items-center justify-center h-96 text-gray-500 dark:text-gray-400">
-        {t('knowledgeGraph.noEntities', 'Keine Entitäten vorhanden. Starte eine Unterhaltung, um den Wissensgraph aufzubauen.')}
+      <div className="text-xs text-gray-500 dark:text-gray-400 italic px-3 py-12 text-center">
+        {t(
+          'knowledgeGraph.graph.empty',
+          'No entities in the knowledge graph yet. Start a conversation to populate it.',
+        )}
       </div>
     );
   }
 
   return (
-    <div
-      ref={containerRef}
-      className="relative w-full h-[calc(100vh-280px)] min-h-[400px] overflow-hidden"
-      aria-label={t('knowledgeGraph.graphAriaLabel', 'Wissensgraph Visualisierung')}
-    >
-      <ForceGraph2D
-        ref={graphRef}
-        graphData={graphData}
-        width={dimensions.width}
-        height={dimensions.height}
-        nodeCanvasObject={nodeCanvasObject}
-        linkCanvasObject={linkCanvasObject}
-        onNodeClick={handleNodeClick}
-        onNodeHover={setHoveredNode as (node: GraphNode | null) => void}
-        nodeId="id"
-        linkSource="source"
-        linkTarget="target"
-        cooldownTicks={100}
-        d3AlphaDecay={0.02}
-        d3VelocityDecay={0.3}
-        backgroundColor={isDark ? '#0f1117' : '#f8f7f5'}
-        enableNodeDrag={true}
-        enableZoomInteraction={true}
-      />
-
-      {hoveredNode && (
-        <div className="absolute top-3 left-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 shadow-lg text-sm pointer-events-none">
-          <p className="font-medium text-gray-900 dark:text-white">{hoveredNode.name}</p>
-          <p className="text-gray-500 dark:text-gray-400">
-            {(hoveredNode.type && TYPE_LABELS[hoveredNode.type]) || hoveredNode.type} · {hoveredNode.mentionCount}x {t('knowledgeGraph.mentions', 'erwähnt')}
-          </p>
+    <div className="relative w-full" style={{ height: '70vh', minHeight: 480 }}>
+      <div ref={rootRef} className="absolute inset-0 rounded-lg overflow-hidden bg-[#0a0f1c]" />
+      <div ref={labelsRef} className="pointer-events-none absolute inset-0" />
+      <div className="pointer-events-none absolute left-3 bottom-3 text-[10px] text-gray-500 bg-black/40 px-2 py-1 rounded">
+        {t('knowledgeGraph.graph.hint', 'Drag to orbit · scroll to zoom · click a hub to focus')}
+      </div>
+      {data && (
+        <div className="pointer-events-none absolute right-3 bottom-3 text-[10px] text-gray-500 bg-black/40 px-2 py-1 rounded">
+          {data.total_entities} entities · {data.clusters.length} clusters
+          {data.truncated && ' · truncated'}
         </div>
       )}
-
-      <div className="absolute bottom-10 left-3 flex flex-wrap gap-2 text-xs">
-        {(Object.entries(TYPE_LABELS) as Array<[EntityType, string]>).map(([type, label]) => (
-          <span key={type} className="flex items-center gap-1 text-gray-500 dark:text-gray-400">
-            <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: colors[type] }} />
-            {label}
-          </span>
-        ))}
-      </div>
-
-      <div className="absolute bottom-2 right-3 flex items-center gap-2 text-xs text-gray-400 dark:text-gray-600">
-        <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-green-400' : 'bg-gray-400'}`} />
-        {graphData.nodes.length} {t('knowledgeGraph.entities', 'Entitäten')} · {graphData.links.length} {t('knowledgeGraph.relations', 'Relationen')}
-      </div>
-
-      <div className="absolute bottom-2 left-3 text-xs text-gray-400 dark:text-gray-600 sm:hidden">
-        {onSwitchToEntities && (
-          <button onClick={onSwitchToEntities} className="underline hover:text-gray-600 dark:hover:text-gray-400">
-            {t('knowledgeGraph.switchToTable', 'Tabellenansicht')}
-          </button>
-        )}
-      </div>
     </div>
   );
 }
