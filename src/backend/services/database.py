@@ -4,7 +4,7 @@ Datenbank Service
 from pathlib import Path
 
 from loguru import logger
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from models.database import Base
@@ -20,6 +20,35 @@ engine = create_async_engine(
     pool_recycle=settings.db_pool_recycle,
     pool_pre_ping=True,
 )
+
+
+# Defensive cleanup: pg_advisory_lock is session-level (per-connection),
+# not transaction-level. ROLLBACK does NOT release it. If application code
+# fails to call pg_advisory_unlock before the connection returns to the
+# pool, the lock leaks and every subsequent caller for the same key
+# blocks forever on pg_advisory_lock waiting for nobody. This was
+# observed in prod on 2026-05-14 — three sessions queued on user_id=8
+# for 20+ minutes after a single v2-shadow-mode path failed mid-flight,
+# stalling all memory extraction for that user.
+#
+# Fix: release every advisory lock at connection checkin. Safe because
+# this codebase uses advisory locks for exactly one purpose
+# (ConversationMemoryService._user_lock_key — the v2 per-user extraction
+# serialisation). If a future feature wires another advisory lock, this
+# hook must be revisited.
+@event.listens_for(engine.sync_engine, "checkin")
+def _release_leaked_advisory_locks_on_checkin(dbapi_connection, connection_record):
+    """Release any held advisory locks when a connection returns to the pool."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SELECT pg_advisory_unlock_all();")
+    except Exception as e:
+        # Best-effort: never block checkin on cleanup failure. Worst case
+        # is the original leak symptom comes back, which we'll see in logs.
+        logger.warning(f"checkin: pg_advisory_unlock_all failed (swallowed): {type(e).__name__}: {e}")
+    finally:
+        cursor.close()
+
 
 # Session Factory
 AsyncSessionLocal = async_sessionmaker(

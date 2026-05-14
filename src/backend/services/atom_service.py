@@ -175,6 +175,7 @@ class AtomService:
         atom_type: str,
         owner_user_id: int,
         tier: int,
+        source_id: int | str | None = None,
     ) -> str:
         """Pre-create an atoms row before the source row exists.
 
@@ -185,6 +186,13 @@ class AtomService:
         method seeds the atoms row with a unique placeholder ``source_id``;
         the caller invokes :meth:`finalize_source_id` after flushing the
         source row to patch the real PK.
+
+        If the caller can supply the real ``source_id`` upfront (e.g. the
+        source row's ``atom_id`` FK is nullable, so the source row was
+        already flushed and its PK is known), pass it here to skip the
+        placeholder dance entirely — eliminates one UPDATE statement and
+        prevents the orphan-atom failure mode where a placeholder atom
+        commits but the source row's later flush is rolled back.
 
         Returns the minted atom_id. Intended call pattern:
 
@@ -204,13 +212,15 @@ class AtomService:
         """
         atom_id = str(uuid.uuid4())
         source_table = _table_for_atom_type(atom_type)
-        placeholder = f"__pending__{atom_id}"
+        seed_source_id: str = (
+            str(source_id) if source_id is not None else f"__pending__{atom_id}"
+        )
         now = datetime.now(UTC).replace(tzinfo=None)
         atom_row = AtomModel(
             atom_id=atom_id,
             atom_type=atom_type,
             source_table=source_table,
-            source_id=placeholder,
+            source_id=seed_source_id,
             owner_user_id=int(owner_user_id),
             policy={"tier": int(tier)},
             created_at=now,

@@ -425,26 +425,47 @@ class KnowledgeGraphService:
         # atom_id=None (the source-row ORM column is nullable). Production
         # always has the bootstrap admin, so the atom-backed path is the one
         # that actually runs.
-        atom_id: str | None = None
-        if owner_id is not None:
-            atom_id = await self._atom_service().create_with_source(
-                atom_type="kg_node",
-                owner_user_id=owner_id,
-                tier=default_tier,
-            )
+        # Order-of-operations fix (2026-05-14): previously this created the
+        # atom row FIRST with a "__pending__" source_id, then inserted the
+        # kg_entity, then UPDATEd the atom's source_id with the entity's
+        # real PK. If anything between those steps failed (validation,
+        # embedding flush, dedup query) AND the atom's flush had already
+        # been committed by another code path (e.g. atom_service.upsert_atom
+        # internal commit), production ended up with orphan atoms pointing
+        # at kg_entities IDs that never existed — every subsequent attempt
+        # to create a kg_entity then hit `uq_atoms_source` and failed,
+        # blocking the entire KG-extraction pipeline indefinitely.
+        #
+        # Insert the entity first (in a savepoint so a rollback doesn't
+        # poison the outer transaction), get its real PK, then create the
+        # atom with that PK — no placeholder, no later UPDATE step. The
+        # savepoint also guarantees that if the atom insert fails the
+        # entity insert is rolled back atomically.
         entity = KGEntity(
             user_id=owner_id,
             name=name,
             entity_type=entity_type if entity_type in KG_ENTITY_TYPES else "thing",
             description=description,
             embedding=embedding,
-            atom_id=atom_id,
+            atom_id=None,
             circle_tier=default_tier,
         )
-        self.db.add(entity)
-        await self.db.flush()
-        if atom_id is not None:
-            await self._atom_service().finalize_source_id(atom_id, entity.id)
+        atom_id: str | None = None
+        if owner_id is not None:
+            async with self.db.begin_nested():
+                self.db.add(entity)
+                await self.db.flush()  # assigns entity.id
+                atom_id = await self._atom_service().create_with_source(
+                    atom_type="kg_node",
+                    owner_user_id=owner_id,
+                    tier=default_tier,
+                    source_id=entity.id,
+                )
+                entity.atom_id = atom_id
+                await self.db.flush()
+        else:
+            self.db.add(entity)
+            await self.db.flush()
         logger.debug(f"KG: New entity '{name}' ({entity_type}) id={entity.id} atom_id={atom_id}")
         return entity
 
