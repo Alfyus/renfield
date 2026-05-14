@@ -465,10 +465,19 @@ class ConversationMemoryService:
                 v2_error=v2_error,
             ))
             await self.db.flush()
-            # Release the savepoint. Without this, asyncpg treats the nested
-            # transaction as unresolved on outer commit and the row write is
-            # not durable.
+            # Release the savepoint into the outer transaction.
             await log_sp.commit()
+            # Persist the outer transaction. Without this, callers that
+            # don't commit explicitly (e.g. chat_handler's
+            # `async with AsyncSessionLocal()` which closes WITHOUT
+            # committing the autobegun outer transaction) silently lose
+            # the shadow log row on session close — verified empirically
+            # in prod 2026-05-14 where 4 chat turns produced 0 shadow
+            # log rows despite extract_and_save_v2 running cleanly. The
+            # log row is the WHOLE POINT of shadow mode; persist it
+            # ourselves rather than depending on the caller's commit
+            # discipline.
+            await self.db.commit()
         except Exception as e:
             if log_sp is not None:
                 try:
@@ -476,7 +485,7 @@ class ConversationMemoryService:
                 except Exception:
                     pass
             logger.warning(
-                "v2 shadow: log-row write failed (swallowed): %s", type(e).__name__
+                f"v2 shadow: log-row write failed (swallowed): {type(e).__name__}: {e}"
             )
 
     async def _extract_and_save_v1_impl(
