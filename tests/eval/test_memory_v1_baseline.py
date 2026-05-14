@@ -15,6 +15,7 @@ These tests exist to:
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -192,9 +193,12 @@ class TestMatchesExpected:
         assert not _result("t", "generic_query", "NOOP", "UPDATE").matches_expected()
 
     @pytest.mark.unit
-    def test_update_expected_is_lenient(self):
-        # UPDATE expected — UPDATE, DELETE, and ADD (DELETE+ADD path) all OK
-        for actual in ("UPDATE", "DELETE", "ADD"):
+    def test_update_expected_accepts_update_or_delete(self):
+        # UPDATE expected — UPDATE or DELETE (DELETE+ADD pair surfaces as
+        # DELETE in the classifier because soft_deleted_ids check fires
+        # before new_ids). See TestMatchesExpectedDeleteFallback below for
+        # the post-review tightening that excludes ADD.
+        for actual in ("UPDATE", "DELETE"):
             assert _result("t", "cross_session_stale", "UPDATE", actual).matches_expected()
         assert not _result("t", "cross_session_stale", "UPDATE", "NOOP").matches_expected()
 
@@ -252,3 +256,203 @@ class TestRenderMarkdownReport:
         )
         # Three gap markers expected
         assert md.count("gap to close in v2") >= 3
+
+
+# ---------------------------------------------------------------------------
+# matches_expected — DELETE / FALLBACK paths (gaps surfaced by /review)
+# ---------------------------------------------------------------------------
+
+class TestMatchesExpectedDeleteFallback:
+
+    @pytest.mark.unit
+    def test_delete_expected_strict(self):
+        # DELETE-expected turns ONLY pass if actual is also DELETE
+        assert _result("t", "cross_session_stale", "DELETE", "DELETE").matches_expected()
+        assert not _result("t", "cross_session_stale", "DELETE", "NOOP").matches_expected()
+        assert not _result("t", "cross_session_stale", "DELETE", "ADD").matches_expected()
+        assert not _result("t", "cross_session_stale", "DELETE", "UPDATE").matches_expected()
+
+    @pytest.mark.unit
+    def test_fallback_expected_strict(self):
+        # FALLBACK-expected turns require the runner to have observed FALLBACK
+        assert _result("t", "pure_add", "FALLBACK", "FALLBACK").matches_expected()
+        assert not _result("t", "pure_add", "FALLBACK", "ADD").matches_expected()
+        assert not _result("t", "pure_add", "FALLBACK", "NOOP").matches_expected()
+
+    @pytest.mark.unit
+    def test_update_expected_rejects_add_after_review_fix(self):
+        # POST-REVIEW: STALE_DETECTION_OUTCOMES = {UPDATE, DELETE} — ADD is
+        # NO LONGER acceptable. A pure ADD on a stale turn means v1
+        # abandoned the old row (duplicate-accumulation, the bug v2 fixes).
+        # This locks the corrected definition.
+        assert _result("t", "cross_session_stale", "UPDATE", "UPDATE").matches_expected()
+        assert _result("t", "cross_session_stale", "UPDATE", "DELETE").matches_expected()
+        assert not _result("t", "cross_session_stale", "UPDATE", "ADD").matches_expected()
+        assert not _result("t", "cross_session_stale", "UPDATE", "NOOP").matches_expected()
+
+
+# ---------------------------------------------------------------------------
+# Helper functions exposed for safety (added in /review hardening)
+# ---------------------------------------------------------------------------
+
+class TestSafetyHelpers:
+
+    @pytest.mark.unit
+    def test_stable_test_user_id_is_deterministic(self):
+        # Same turn_id must produce the same user_id across calls — and
+        # across processes, by virtue of using hashlib (not hash()).
+        a1 = runner.stable_test_user_id("reva-dedup-01")
+        a2 = runner.stable_test_user_id("reva-dedup-01")
+        assert a1 == a2
+
+    @pytest.mark.unit
+    def test_stable_test_user_id_is_in_reserved_range(self):
+        # All allocated IDs must be >= TEST_USER_ID_BASE (2_000_000_000)
+        # so they never collide with real user IDs.
+        for turn_id in ["a", "reva-dedup-01", "renfield-add-02", "zzz" * 50]:
+            uid = runner.stable_test_user_id(turn_id)
+            assert uid >= runner.TEST_USER_ID_BASE
+            # blake2b 4-byte digest fits in 2^32 — never overflows int64.
+            assert uid < runner.TEST_USER_ID_BASE + (1 << 32)
+
+    @pytest.mark.unit
+    def test_stable_test_user_id_differs_per_turn(self):
+        # Different turn_ids should produce different user_ids (collision
+        # at 4-byte hash is ~1 in 4 billion).
+        ids = {runner.stable_test_user_id(f"turn-{i}") for i in range(100)}
+        assert len(ids) == 100
+
+    @pytest.mark.unit
+    def test_check_database_url_safety_rejects_prod_patterns(self):
+        cases = [
+            "postgresql://user:pass@renfield-private.cluster.local/db",
+            "postgresql://user@prod-db.k8s.local/renfield",
+            "postgresql://u@host/production_db",
+            "postgresql://u@host/renfield-db",
+        ]
+        for url in cases:
+            refusal = runner.check_database_url_safety(url, allow_prod=False)
+            assert refusal is not None, f"Should have refused: {url}"
+            assert "Refusing to run" in refusal
+
+    @pytest.mark.unit
+    def test_check_database_url_safety_accepts_dev_urls(self):
+        cases = [
+            "postgresql://user@localhost:5432/renfield_test",
+            "postgresql://user@127.0.0.1/renfield_dev",
+            "postgresql://user@db.test/renfield_baseline",
+        ]
+        for url in cases:
+            assert runner.check_database_url_safety(url, allow_prod=False) is None
+
+    @pytest.mark.unit
+    def test_check_database_url_safety_allow_prod_override(self):
+        # With allow_prod=True even a prod-looking URL is permitted (operator
+        # explicitly opted in via --i-know-this-is-prod).
+        url = "postgresql://user@prod.cluster.local/db"
+        assert runner.check_database_url_safety(url, allow_prod=True) is None
+
+
+# ---------------------------------------------------------------------------
+# Corpus lint — surface YAML drift before .159 fires the runner
+# ---------------------------------------------------------------------------
+
+class TestCorpusLint:
+    """Validates the in-repo corpus YAML against the runner's contract."""
+
+    CORPUS_PATH = Path(__file__).resolve().parents[2] / "tests" / "eval" / "memory_v1_baseline_corpus.yaml"
+
+    @pytest.fixture
+    def corpus(self):
+        # pyyaml is a runtime dep of the runner — these tests need it too.
+        # Skip cleanly if running on a dev shell without it (Renfield's
+        # canonical test runner is the .159 build box which has yaml).
+        yaml = pytest.importorskip("yaml")
+        with open(self.CORPUS_PATH) as f:
+            return yaml.safe_load(f)["corpus"]
+
+    @pytest.mark.unit
+    def test_corpus_is_nonempty(self, corpus):
+        assert len(corpus) > 0, "Corpus YAML must contain at least one turn"
+
+    @pytest.mark.unit
+    def test_every_turn_has_required_fields(self, corpus):
+        required = {"id", "category", "flavor", "lang", "user_message", "assistant_response", "expected_v1_outcome"}
+        for turn in corpus:
+            missing = required - set(turn.keys())
+            assert not missing, f"Turn {turn.get('id')} missing fields: {missing}"
+
+    @pytest.mark.unit
+    def test_every_category_is_valid(self, corpus):
+        for turn in corpus:
+            assert turn["category"] in runner.VALID_CATEGORIES, (
+                f"Turn {turn['id']}: category {turn['category']!r} not in VALID_CATEGORIES "
+                f"({runner.VALID_CATEGORIES})"
+            )
+
+    @pytest.mark.unit
+    def test_every_flavor_is_valid(self, corpus):
+        for turn in corpus:
+            assert turn["flavor"] in {"reva", "renfield"}, (
+                f"Turn {turn['id']}: flavor {turn['flavor']!r} not in {{reva, renfield}}"
+            )
+
+    @pytest.mark.unit
+    def test_every_expected_outcome_is_valid(self, corpus):
+        for turn in corpus:
+            assert turn["expected_v1_outcome"] in runner.VALID_OUTCOMES, (
+                f"Turn {turn['id']}: expected_v1_outcome {turn['expected_v1_outcome']!r} "
+                f"not in {runner.VALID_OUTCOMES}"
+            )
+
+    @pytest.mark.unit
+    def test_ids_are_unique(self, corpus):
+        ids = [turn["id"] for turn in corpus]
+        duplicates = {x for x in ids if ids.count(x) > 1}
+        assert not duplicates, f"Duplicate turn IDs: {duplicates}"
+
+    @pytest.mark.unit
+    def test_preexisting_memories_well_formed(self, corpus):
+        for turn in corpus:
+            for i, pre in enumerate(turn.get("preexisting_memories") or []):
+                assert "content" in pre, f"Turn {turn['id']} pre[{i}] missing content"
+                assert "category" in pre, f"Turn {turn['id']} pre[{i}] missing category"
+                if "age_days" in pre:
+                    assert isinstance(pre["age_days"], (int, float)) and pre["age_days"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# JSON round-trip for the --aggregate-only path
+# ---------------------------------------------------------------------------
+
+class TestJsonRoundTrip:
+
+    @pytest.mark.unit
+    def test_serialize_deserialize_round_trip(self):
+        original = [
+            _result("a1", "pure_add", "ADD", "ADD", latency=1.2, extracted=1),
+            _result("g1", "generic_query", "NOOP", "NOOP", latency=0.8),
+            _result("s1", "cross_session_stale", "UPDATE", "DELETE", latency=2.5, extracted=2),
+            _result("f1", "pure_add", "ADD", "FALLBACK", latency=0.0, parse_error=True),
+        ]
+        serialized = runner._serialize_results(original)
+        # Force through json so we catch any non-JSON-serializable fields
+        # (default=str was removed from the runner — we want this to raise
+        # cleanly if a field drifts to a non-primitive type).
+        round_tripped = runner._deserialize_results(json.loads(json.dumps(serialized)))
+        assert round_tripped == original
+
+    @pytest.mark.unit
+    def test_aggregation_invariant_under_round_trip(self):
+        original = [
+            _result(f"t{i}", "pure_add", "ADD", "ADD", latency=float(i))
+            for i in range(1, 11)
+        ]
+        report_before = runner.aggregate_baseline_metrics(original)
+        round_tripped = runner._deserialize_results(
+            json.loads(json.dumps(runner._serialize_results(original)))
+        )
+        report_after = runner.aggregate_baseline_metrics(round_tripped)
+        assert report_before == report_after
+
+

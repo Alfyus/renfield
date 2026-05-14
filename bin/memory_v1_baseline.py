@@ -48,15 +48,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import hashlib
 import json
 import logging
-import statistics
+import os
+import re
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 # yaml is imported lazily inside `run_corpus`; unit tests that only
 # exercise the pure aggregation paths must not require pyyaml.
@@ -67,16 +69,182 @@ from typing import Any, Iterable, Optional
 # ---------------------------------------------------------------------------
 
 VALID_OUTCOMES = {"NOOP", "ADD", "UPDATE", "DELETE", "FALLBACK"}
-VALID_CATEGORIES = {
-    "dedup",
+
+# Corpus categories that REQUIRE v1 to extract something (ADD or
+# UPDATE/DELETE on a pre-existing row). New "should-extract" categories
+# go here.
+EXTRACT_CATEGORIES = {"dedup", "pure_add", "cross_session_stale"}
+
+# Corpus categories where v1 should NOOP (generic queries, contradictions,
+# injection, decision-rationale, cross-tier probes). Derived from
+# VALID_CATEGORIES so adding a new category forces an explicit decision
+# in `aggregate_baseline_metrics`.
+NOOP_CATEGORIES = {
     "within_turn_contradiction",
     "generic_query",
     "role_injection",
-    "pure_add",
-    "cross_session_stale",
-    "circle_leakage",
     "wrong_substrate",
+    "circle_leakage",
 }
+
+VALID_CATEGORIES = EXTRACT_CATEGORIES | NOOP_CATEGORIES
+
+# Reserved namespace for test user_ids. Real user IDs in Renfield are
+# small positive integers (users.id is SERIAL starting at 1). The
+# baseline runner stays out of that range entirely to guarantee no
+# collision with real users — even if a misconfigured run somehow hits
+# a populated DB, the test_user_id values never overlap with anyone
+# real, and a single cleanup query
+# `DELETE FROM conversation_memories WHERE user_id >= 2_000_000_000`
+# reliably purges all baseline runs.
+TEST_USER_ID_BASE = 2_000_000_000
+
+
+# Patterns that indicate a settings.database_url likely points at
+# production infrastructure. Lower-cased substring match. The runner
+# refuses to proceed if any of these match BASELINE_DATABASE_URL.
+PROD_URL_PATTERNS = (
+    "prod",
+    "production",
+    ".cluster.local",
+    "k8s.local",
+    "kubernetes.default",
+    "renfield-private",
+    "renfield-db",
+)
+
+
+# Per-turn instrumentation counters. Reset at the start of each turn.
+# Wrappers installed by `_install_v1_instrumentation` increment these
+# when v1's silent error swallowing fires.
+_TURN_COUNTERS = {"parse_failures": 0, "embedding_failures": 0}
+
+
+# Acceptable outcomes for a cross-session stale-fact contradiction.
+# UPDATE or DELETE: v1 touched the stale row. A pure ADD outcome means
+# the old row was abandoned and a new one created — that IS the
+# duplicate-accumulation failure mode Mem0 v2 is designed to fix. The
+# diff classifier in `run_one_turn` emits DELETE before ADD when both
+# occur in one turn, so a DELETE+ADD pair surfaces as "DELETE" here.
+# Single source of truth used by both `aggregate_baseline_metrics` and
+# `matches_expected` (previously drift-prone — aggregator was strict,
+# matches_expected was over-permissive).
+STALE_DETECTION_OUTCOMES = {"UPDATE", "DELETE"}
+
+
+# ---------------------------------------------------------------------------
+# Safety helpers — pure (no DB / LLM imports)
+# ---------------------------------------------------------------------------
+
+def stable_test_user_id(turn_id: str) -> int:
+    """Deterministic test user_id allocator.
+
+    Returns an integer >= TEST_USER_ID_BASE (2_000_000_000). The value
+    is stable across processes (uses hashlib, not Python's randomized
+    `hash()` builtin) so post-hoc cleanup queries can rebuild the
+    test-id set from corpus turn_ids alone.
+
+    Why this matters: real user IDs in Renfield are small positive
+    integers. Using `hash(turn_id) % 1_000_000` (the original
+    implementation) would land allocate test IDs in 1..999_999 —
+    overlapping with real user accounts. A baseline run against a
+    populated DB would have attributed role-injection corpus content
+    to random real users.
+    """
+    h = hashlib.blake2b(turn_id.encode("utf-8"), digest_size=4).hexdigest()
+    return TEST_USER_ID_BASE + int(h, 16)
+
+
+def check_database_url_safety(db_url: str, allow_prod: bool = False) -> Optional[str]:
+    """Refuse to proceed against a production-pointing DB URL.
+
+    Returns:
+        None if the URL is safe to use, OR a refusal message naming
+        the matched pattern. The runner exits with the message
+        non-zero when this returns non-None and `allow_prod` is False.
+
+    Production-ness is fuzzy by design. We err on the side of refusing
+    rather than accidentally writing. Operators who really do want to
+    point at prod (e.g. for forensic re-runs against a snapshot) pass
+    `--i-know-this-is-prod`.
+    """
+    lower = db_url.lower()
+    for pattern in PROD_URL_PATTERNS:
+        if pattern in lower:
+            if allow_prod:
+                return None
+            return (
+                f"Refusing to run: BASELINE_DATABASE_URL contains {pattern!r}, "
+                f"which looks like production. Set a dedicated test-DB URL, or "
+                f"pass --i-know-this-is-prod if you genuinely want to write to "
+                f"this database (DESTRUCTIVE for real users)."
+            )
+    return None
+
+
+def _install_v1_instrumentation(service) -> Any:
+    """Monkey-patch the service so silent v1 error-swallowing becomes observable.
+
+    v1's `_parse_extraction_response` swallows json.JSONDecodeError and
+    returns []. v1's contradiction-resolution flow swallows embedding
+    failures and falls through. From the outside neither is visible —
+    `schema_validation_rate` and `embedding_error_rate` would be
+    permanently 0% if measured from extract_and_save's return value
+    alone.
+
+    This wrapper installs counter-incrementing patches on:
+      - `ConversationMemoryService._parse_extraction_response` (staticmethod)
+      - `ConversationMemoryService._get_embedding` (async instance method)
+
+    Counters are read post-call via `_TURN_COUNTERS` and reset per turn.
+    Returns a teardown callable.
+
+    The parse-failure detection is heuristic: if raw_text is non-empty,
+    non-whitespace, AND the v1 parser returned [], we re-attempt the
+    parse ourselves to disambiguate "legitimate empty array" from "JSON
+    decode failed and v1 swallowed it." Adds ~1ms per turn for the
+    re-parse; negligible in a 150-turn baseline.
+    """
+    cls = type(service)
+    orig_parse = cls._parse_extraction_response
+    orig_embed = cls._get_embedding
+
+    @staticmethod
+    def patched_parse(raw_text: str) -> list[dict]:
+        result = orig_parse(raw_text)
+        if result or not raw_text or not raw_text.strip():
+            return result
+        # v1 returned [] on a non-empty input → ambiguous. Re-parse to
+        # disambiguate. Mirrors v1's markdown-fence stripping.
+        text = raw_text.strip()
+        if "```" in text:
+            m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
+            if m:
+                text = m.group(1)
+        first_bracket = text.find("[")
+        if first_bracket >= 0:
+            text = text[first_bracket:]
+        try:
+            json.loads(text)
+        except json.JSONDecodeError:
+            _TURN_COUNTERS["parse_failures"] += 1
+        return result
+
+    async def patched_embed(self_ref, content):
+        try:
+            return await orig_embed(self_ref, content)
+        except Exception:
+            _TURN_COUNTERS["embedding_failures"] += 1
+            raise
+
+    cls._parse_extraction_response = patched_parse
+    cls._get_embedding = patched_embed
+
+    def teardown() -> None:
+        cls._parse_extraction_response = orig_parse
+        cls._get_embedding = orig_embed
+
+    return teardown
 
 
 @dataclasses.dataclass
@@ -97,12 +265,14 @@ class BaselineResult:
     def matches_expected(self) -> bool:
         # NOOP is the strictest; everything else is graded permissively
         # because UPDATE vs DELETE+ADD can both be acceptable outcomes
-        # for the same input (see corpus notes).
+        # for the same input (see corpus notes). The set
+        # `STALE_DETECTION_OUTCOMES` is the single source of truth for
+        # "UPDATE is satisfied by" and is also used in
+        # `aggregate_baseline_metrics`.
         if self.expected_outcome == "NOOP":
             return self.actual_outcome == "NOOP"
         if self.expected_outcome == "UPDATE":
-            # UPDATE or DELETE+ADD pair both acceptable
-            return self.actual_outcome in {"UPDATE", "DELETE", "ADD"}
+            return self.actual_outcome in STALE_DETECTION_OUTCOMES
         return self.actual_outcome == self.expected_outcome
 
 
@@ -178,15 +348,10 @@ def aggregate_baseline_metrics(results: list[BaselineResult]) -> BaselineReport:
     p95 = latencies[max(0, int(len(latencies) * 0.95) - 1)]
     p99 = latencies[max(0, int(len(latencies) * 0.99) - 1)]
 
-    # NOOP rate on "should not extract" categories
-    noop_cats = {
-        "generic_query",
-        "within_turn_contradiction",
-        "role_injection",
-        "wrong_substrate",
-        "circle_leakage",
-    }
-    noop_candidates = [r for r in results if r.category in noop_cats]
+    # NOOP rate on "should not extract" categories. Sourced from
+    # NOOP_CATEGORIES module constant so future corpus additions force
+    # explicit routing (the constant is checked in run_one_turn).
+    noop_candidates = [r for r in results if r.category in NOOP_CATEGORIES]
     noop_correct = sum(1 for r in noop_candidates if r.actual_outcome == "NOOP")
     noop_rate = noop_correct / len(noop_candidates) if noop_candidates else 0.0
 
@@ -195,11 +360,12 @@ def aggregate_baseline_metrics(results: list[BaselineResult]) -> BaselineReport:
     dup_count = sum(1 for r in dedup_results if r.actual_outcome == "ADD")
     dup_rate = dup_count / len(dedup_results) if dedup_results else 0.0
 
-    # Cross-session UPDATE detection
+    # Cross-session UPDATE detection. Uses STALE_DETECTION_OUTCOMES so
+    # the metric and matches_expected stay in lock-step.
     stale_results = [r for r in results if r.category == "cross_session_stale"]
     stale_detected = sum(
         1 for r in stale_results
-        if r.actual_outcome in {"UPDATE", "DELETE"}
+        if r.actual_outcome in STALE_DETECTION_OUTCOMES
     )
     stale_rate = stale_detected / len(stale_results) if stale_results else 0.0
 
@@ -287,12 +453,17 @@ async def run_one_turn(
     turn: dict[str, Any],
     db_session,
     service,
+    allow_cross_tier: bool = False,
 ) -> BaselineResult:
     """Execute one corpus turn against the v1 extract path.
 
+    Caller is responsible for transaction management: the runner
+    operates entirely inside `db_session.begin()`, so the caller wraps
+    each turn and commits-or-rolls-back per its --commit flag.
+
     Imports are inside the function so the module remains importable
-    without a backend env (the unit test only exercises the pure
-    aggregation paths above).
+    without a backend env (the pure aggregation paths covered by unit
+    tests do not exercise this function).
     """
     from models.database import ConversationMemory
 
@@ -301,35 +472,56 @@ async def run_one_turn(
         raise ValueError(
             f"Turn {turn['id']}: expected_v1_outcome={expected!r} not in {VALID_OUTCOMES}"
         )
+    if turn.get("category") not in VALID_CATEGORIES:
+        raise ValueError(
+            f"Turn {turn['id']}: category={turn.get('category')!r} not in {VALID_CATEGORIES}"
+        )
 
-    # 1. Allocate isolated user for this turn (small int to keep
-    #    advisory-lock hashing predictable in later v2 lanes).
-    test_user_id = hash(turn["id"]) % 1_000_000
+    # 1. Allocate test user_id in the reserved namespace (>= 2_000_000_000).
+    #    Stable across processes via hashlib — see stable_test_user_id docstring.
+    test_user_id = stable_test_user_id(turn["id"])
 
     # 2. Seed preexisting memories with backdated last_accessed_at.
-    seeded_ids: set[int] = set()
+    #    Restrict circle_tier to 0 unless --allow-cross-tier passed.
+    #    Otherwise a corpus YAML edit could seed at tier 4 (global) and
+    #    expose those seeded rows to every household member via Circles v1.
+    rows_to_seed = []
     for pre in turn.get("preexisting_memories") or []:
+        seed_tier = pre.get("circle_tier", 0)
+        if seed_tier != 0 and not allow_cross_tier:
+            raise ValueError(
+                f"Turn {turn['id']}: preexisting memory has circle_tier={seed_tier} "
+                f"but --allow-cross-tier was not passed. Cross-tier seeding is a "
+                f"security-sensitive operation."
+            )
         age_days = pre.get("age_days", 0)
         seeded_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=age_days)
-        row = ConversationMemory(
-            content=pre["content"],
-            category=pre["category"],
-            importance=pre.get("importance", 0.5),
-            user_id=pre.get("owner_user_id", test_user_id),
-            is_active=True,
-            access_count=0,
-            last_accessed_at=seeded_at,
-            created_at=seeded_at,
-            circle_tier=pre.get("circle_tier", 0),
+        # Re-namespace owner_user_id too — cross-tier-leakage corpus turns
+        # reference an "other user" via owner_user_id=99 in the YAML, which
+        # collides with real user 99. Offset into the test namespace.
+        raw_owner = pre.get("owner_user_id")
+        if raw_owner is None:
+            owner_id = test_user_id
+        else:
+            owner_id = TEST_USER_ID_BASE + int(raw_owner)
+        rows_to_seed.append(
+            ConversationMemory(
+                content=pre["content"],
+                category=pre["category"],
+                importance=pre.get("importance", 0.5),
+                user_id=owner_id,
+                is_active=True,
+                access_count=0,
+                last_accessed_at=seeded_at,
+                created_at=seeded_at,
+                circle_tier=seed_tier,
+            )
         )
-        db_session.add(row)
+    if rows_to_seed:
+        db_session.add_all(rows_to_seed)
         await db_session.flush()
-        # Track rows we expect to dedup/update against (those owned by
-        # the asker; cross-tier seeds are NOT tracked because v1 must
-        # not touch them).
-        if pre.get("owner_user_id", test_user_id) == test_user_id:
-            seeded_ids.add(row.id)
-    await db_session.commit()
+    # NOTE: no commit here. The outer `run_corpus` wraps the whole turn
+    # in `session.begin()` and decides whether to commit or rollback.
 
     # 3. Snapshot existing rows BEFORE the extract call.
     from sqlalchemy import select
@@ -342,13 +534,15 @@ async def run_one_turn(
     before_ids = {row.id for row in before}
     before_contents = {row.id: row.content for row in before}
 
-    # 4. Invoke v1 extract_and_save.
-    parse_error = False
-    embedding_error = False
+    # 4. Reset per-turn instrumentation counters (set by patched _parse_extraction_response + _get_embedding).
+    _TURN_COUNTERS["parse_failures"] = 0
+    _TURN_COUNTERS["embedding_failures"] = 0
+
+    # 5. Invoke v1 extract_and_save.
     fallback = False
     started = time.monotonic()
     try:
-        saved = await service.extract_and_save(
+        await service.extract_and_save(
             user_message=turn["user_message"],
             assistant_response=turn["assistant_response"],
             user_id=test_user_id,
@@ -357,11 +551,17 @@ async def run_one_turn(
         )
     except Exception as e:
         fallback = True
-        saved = []
-        logging.warning("Turn %s raised: %s", turn["id"], e)
+        # Log only the exception type, not str(e) — exception messages
+        # may embed user_message content (corpus role-injection strings,
+        # potential PII) and we don't want that in long-term log storage.
+        logging.warning("Turn %s raised: %s", turn["id"], type(e).__name__)
     elapsed = time.monotonic() - started
 
-    # 5. Snapshot AFTER and diff.
+    # 6. Snapshot the instrumentation counters (set by patched methods).
+    parse_error = _TURN_COUNTERS["parse_failures"] > 0
+    embedding_error = _TURN_COUNTERS["embedding_failures"] > 0
+
+    # 7. Snapshot AFTER and diff.
     after = (
         await db_session.execute(
             select(ConversationMemory.id, ConversationMemory.content, ConversationMemory.is_active)
@@ -371,16 +571,27 @@ async def run_one_turn(
     after_active = {row.id for row in after if row.is_active}
     after_inactive = {row.id for row in after if not row.is_active}
     new_ids = after_active - before_ids
-    deactivated_ids = before_ids - after_active
+    # Soft-delete only: rows missing from `after_active` AND present
+    # in `after_inactive`. A row that disappeared from `after` entirely
+    # (hard-deleted) is NOT a v1 outcome we expect — flag it via the
+    # extracted_count delta in the result so reviewers notice.
+    soft_deleted_ids = (before_ids - after_active) & after_inactive
+    hard_deleted_ids = (before_ids - after_active) - after_inactive
+    if hard_deleted_ids:
+        logging.warning(
+            "Turn %s: %d row(s) hard-deleted (expected soft-delete via is_active=false). "
+            "Indicates v1 misbehavior or a fixture inconsistency.",
+            turn["id"], len(hard_deleted_ids),
+        )
     changed_content = {
         row.id for row in after
         if row.id in before_ids and row.content != before_contents.get(row.id)
     }
 
-    # 6. Classify outcome.
+    # 8. Classify outcome.
     if fallback:
         actual = "FALLBACK"
-    elif deactivated_ids:
+    elif soft_deleted_ids:
         actual = "DELETE"
     elif changed_content:
         actual = "UPDATE"
@@ -395,7 +606,7 @@ async def run_one_turn(
         flavor=turn["flavor"],
         expected_outcome=expected,
         actual_outcome=actual,
-        extracted_count=len(new_ids) + len(deactivated_ids) + len(changed_content),
+        extracted_count=len(new_ids) + len(soft_deleted_ids) + len(changed_content),
         latency_seconds=elapsed,
         parse_error=parse_error,
         embedding_error=embedding_error,
@@ -407,8 +618,25 @@ async def run_corpus(
     corpus_path: Path,
     category_filter: Optional[str],
     flavor_filter: Optional[str],
+    commit: bool = False,
+    allow_cross_tier: bool = False,
+    allow_prod: bool = False,
 ) -> list[BaselineResult]:
-    """Run the full corpus end-to-end. Requires backend env (DB + LLM)."""
+    """Run the full corpus end-to-end. Requires backend env (DB + LLM).
+
+    Safety contract — gated on BASELINE_DATABASE_URL env var:
+      - Refuses to run if BASELINE_DATABASE_URL is unset (no fallback
+        to DATABASE_URL: too dangerous; the runner must be operated
+        with intent).
+      - Refuses to run if BASELINE_DATABASE_URL matches a prod URL
+        pattern, unless `allow_prod` is True.
+      - Default mode is ROLLBACK per turn: writes are NOT persisted.
+        Pass `commit=True` only for runs against a fully dedicated
+        test DB.
+      - Default refuses circle_tier>0 seeds in the corpus YAML to
+        prevent a malicious or careless YAML edit from leaking
+        cross-tier content. Pass `allow_cross_tier=True` to override.
+    """
     # Import backend modules lazily so this script can be unit-tested
     # without a full backend env.
     BACKEND_ROOT = Path(__file__).resolve().parent.parent / "src" / "backend"
@@ -420,14 +648,25 @@ async def run_corpus(
     except ImportError:
         sys.exit("pyyaml not installed (only needed for `run_corpus`). pip install pyyaml")
 
-    from utils.config import settings  # noqa: F401  (drives env wiring)
     from services.conversation_memory_service import ConversationMemoryService
 
-    # Caller is responsible for creating an async SQLAlchemy session
-    # pointed at a fresh test DB. We build one here from settings so
-    # this script can be run standalone.
+    # Read the dedicated baseline DB URL. We deliberately do NOT fall
+    # back to settings.database_url — the operator must opt in via
+    # BASELINE_DATABASE_URL so a stray invocation on a developer shell
+    # with prod credentials sourced cannot write to prod.
+    db_url = os.environ.get("BASELINE_DATABASE_URL")
+    if not db_url:
+        sys.exit(
+            "BASELINE_DATABASE_URL is not set. The baseline runner requires a "
+            "dedicated test-DB URL distinct from the production DATABASE_URL. "
+            "Set it to your test-postgres connection string before retrying."
+        )
+    refusal = check_database_url_safety(db_url, allow_prod=allow_prod)
+    if refusal:
+        sys.exit(refusal)
+
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-    engine = create_async_engine(settings.database_url, echo=False)
+    engine = create_async_engine(db_url, echo=False)
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     with open(corpus_path) as f:
@@ -440,24 +679,46 @@ async def run_corpus(
 
     results: list[BaselineResult] = []
     for turn in corpus:
+        # Each turn runs in its own session AND its own transaction.
+        # Default is rollback (commit=False): seeded rows + any v1
+        # writes are abandoned at end-of-turn. The LLM call still
+        # happens for real (it's outside the DB transaction), so
+        # latency/extract behavior is measured correctly — we just
+        # don't persist the side effects.
         async with Session() as session:
             service = ConversationMemoryService(session)
+            teardown = _install_v1_instrumentation(service)
             try:
-                result = await run_one_turn(turn, session, service)
-            except Exception as e:
-                logging.exception("Turn %s failed catastrophically: %s", turn["id"], e)
-                result = BaselineResult(
-                    turn_id=turn["id"],
-                    category=turn["category"],
-                    flavor=turn["flavor"],
-                    expected_outcome=turn.get("expected_v1_outcome", "NOOP"),
-                    actual_outcome="FALLBACK",
-                    extracted_count=0,
-                    latency_seconds=0.0,
-                    parse_error=False,
-                    embedding_error=False,
-                    notes=f"runner exception: {e}",
-                )
+                async with session.begin():
+                    try:
+                        result = await run_one_turn(
+                            turn, session, service,
+                            allow_cross_tier=allow_cross_tier,
+                        )
+                    except Exception as e:
+                        logging.exception(
+                            "Turn %s failed catastrophically: %s",
+                            turn["id"], type(e).__name__,
+                        )
+                        result = BaselineResult(
+                            turn_id=turn["id"],
+                            category=turn.get("category", "unknown"),
+                            flavor=turn.get("flavor", "unknown"),
+                            expected_outcome=turn.get("expected_v1_outcome", "NOOP"),
+                            actual_outcome="FALLBACK",
+                            extracted_count=0,
+                            latency_seconds=0.0,
+                            parse_error=False,
+                            embedding_error=False,
+                            notes=f"runner exception: {type(e).__name__}",
+                        )
+                    if not commit:
+                        # session.begin() commits at __aexit__ unless
+                        # we explicitly roll back first. Force rollback
+                        # before context exit so writes don't persist.
+                        await session.rollback()
+            finally:
+                teardown()
             results.append(result)
 
     await engine.dispose()
@@ -497,6 +758,35 @@ def main() -> int:
         type=Path,
         help="Skip the corpus run; read an existing JSON and regenerate the markdown report only.",
     )
+    parser.add_argument(
+        "--commit",
+        action="store_true",
+        help=(
+            "Persist seeded rows + any v1 writes. Default is ROLLBACK per turn — "
+            "the LLM call happens for real (so latency/extract behavior is measured) "
+            "but no rows are committed. Pass --commit ONLY against a fully dedicated "
+            "test DB where leaking rows is acceptable."
+        ),
+    )
+    parser.add_argument(
+        "--allow-cross-tier",
+        action="store_true",
+        help=(
+            "Permit preexisting_memories with circle_tier > 0 in the corpus. "
+            "Default refuses (a malicious / careless YAML edit could otherwise "
+            "seed at tier 4 / global and expose to all household members)."
+        ),
+    )
+    parser.add_argument(
+        "--i-know-this-is-prod",
+        action="store_true",
+        dest="allow_prod",
+        help=(
+            "Override the BASELINE_DATABASE_URL prod-pattern check. The runner "
+            "refuses to run against URLs containing 'prod', '.cluster.local', "
+            "etc. — use this flag only for deliberate forensic re-runs."
+        ),
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -507,7 +797,16 @@ def main() -> int:
         with open(args.aggregate_only) as f:
             results = _deserialize_results(json.load(f)["results"])
     else:
-        results = asyncio.run(run_corpus(args.corpus, args.category, args.flavor))
+        results = asyncio.run(
+            run_corpus(
+                args.corpus,
+                args.category,
+                args.flavor,
+                commit=args.commit,
+                allow_cross_tier=args.allow_cross_tier,
+                allow_prod=args.allow_prod,
+            )
+        )
 
     report = aggregate_baseline_metrics(results)
     md = render_markdown_report(report, args.corpus, run_started)
@@ -516,6 +815,9 @@ def main() -> int:
     md_path = args.output_dir / f"memory_v1_baseline_{timestamp}.md"
 
     with open(json_path, "w") as f:
+        # No `default=str` — let json.dump raise on unexpected types so
+        # schema mismatches (e.g. a future dataclass field becoming
+        # datetime / Path) surface loudly instead of silently coercing.
         json.dump(
             {
                 "run_started": run_started.isoformat(),
@@ -525,7 +827,6 @@ def main() -> int:
             },
             f,
             indent=2,
-            default=str,
         )
 
     with open(md_path, "w") as f:

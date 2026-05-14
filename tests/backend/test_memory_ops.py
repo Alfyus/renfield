@@ -362,3 +362,73 @@ class TestValidateAgainstCandidates:
         assert isinstance(result, str)
         assert " " not in result  # one-word label
         assert len(result) < 32
+
+    @pytest.mark.unit
+    def test_mixed_batch_with_one_invalid_target_returns_id_reject(self):
+        # First-encounter wins: validate_against_candidates short-circuits.
+        # Either ordering should produce 'id_reject' (the label is bounded).
+        ops_a = MemoryOpsList(root=[
+            MemoryOp(op=OpType.UPDATE, target_id=1, content="ok"),
+            MemoryOp(op=OpType.DELETE, target_id=999),  # invalid
+        ])
+        assert validate_against_candidates(ops_a, {1}) == "id_reject"
+
+        ops_b = MemoryOpsList(root=[
+            MemoryOp(op=OpType.UPDATE, target_id=999, content="ok"),  # invalid
+            MemoryOp(op=OpType.DELETE, target_id=2),
+        ])
+        assert validate_against_candidates(ops_b, {2}) == "id_reject"
+
+
+# ---------------------------------------------------------------------------
+# JSON round-trip — the schema's whole purpose is to validate LLM tool-call
+# JSON arriving over the wire. These tests lock the round-trip behavior so
+# a Pydantic v2 enum-serialization change can't slip through silently.
+# ---------------------------------------------------------------------------
+
+class TestJsonRoundTrip:
+
+    @pytest.mark.unit
+    def test_op_type_serializes_as_uppercase_string(self):
+        op = MemoryOp(op=OpType.ADD, content="x", category=MEMORY_CATEGORY_FACT)
+        dumped = op.model_dump_json()
+        # The enum must appear as a plain string in JSON, not as
+        # {"op": {"value": "ADD"}} or similar.
+        assert '"op":"ADD"' in dumped
+
+    @pytest.mark.unit
+    def test_memory_op_round_trip(self):
+        original = MemoryOp(
+            op=OpType.UPDATE,
+            target_id=42,
+            content="updated content",
+            importance=0.8,
+            reason="user clarified",
+        )
+        json_str = original.model_dump_json()
+        round_tripped = MemoryOp.model_validate_json(json_str)
+        assert round_tripped == original
+
+    @pytest.mark.unit
+    def test_memory_ops_list_round_trip(self):
+        original = MemoryOpsList(root=[
+            MemoryOp(op=OpType.ADD, content="prefers German", category=MEMORY_CATEGORY_PREFERENCE),
+            MemoryOp(op=OpType.UPDATE, target_id=10, content="new"),
+            MemoryOp(op=OpType.DELETE, target_id=20, reason="user retracted"),
+            MemoryOp(op=OpType.NOOP),
+        ])
+        json_str = original.model_dump_json()
+        round_tripped = MemoryOpsList.model_validate_json(json_str)
+        assert list(round_tripped) == list(original)
+
+    @pytest.mark.unit
+    def test_memory_ops_list_parses_llm_style_json(self):
+        # Simulates an LLM tool-call response shape.
+        llm_output = (
+            '[{"op": "ADD", "content": "prefers German", "category": "preference"}, '
+            '{"op": "NOOP", "reason": "nothing personal"}]'
+        )
+        parsed = MemoryOpsList.model_validate_json(llm_output)
+        assert len(parsed) == 2
+        assert list(parsed)[0].op == OpType.ADD
+        assert list(parsed)[1].op == OpType.NOOP

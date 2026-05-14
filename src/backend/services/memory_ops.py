@@ -29,9 +29,14 @@ See `docs/architecture/memory-architecture-plan.md` (Reva repo,
 - importance uses Renfield's existing float 0.1–1.0 range, not the
   Mem0 paper's 1–5 integer (DB column is Float, default 0.5).
 
-This module has NO DB / HTTP / LLM imports — it is pure Pydantic
-validation logic that can be exercised in unit tests without a
-backend env.
+This module has no DB session, HTTP client, or LLM client imports —
+the only `models.database` reference is the `MEMORY_CATEGORIES`
+constant list (imported at module top). Tests for this module live
+in `tests/backend/test_memory_ops.py` and consequently DO require
+the backend sys.path to be set up so SQLAlchemy can be imported
+transitively (the test rig uses the standard `tests/backend/conftest.py`).
+Inlining `MEMORY_CATEGORIES` here is rejected — two sources of truth
+for the valid-category set would silently drift.
 """
 
 from __future__ import annotations
@@ -210,6 +215,22 @@ def validate_against_candidates(
 ) -> Optional[str]:
     """Reject the batch if any op references a target_id outside the
     candidate set the LLM saw (optimistic concurrency check).
+
+    SECURITY CONTRACT — read before changing anything below:
+        `candidate_ids` MUST be the result of a retrieve_top_K query
+        already filtered by `user_id == asker_id` AND by Circles v1
+        reachability (`conversation_memories_circles_filter`). This
+        function ONLY checks set membership; it cannot tell whether
+        an id belongs to the asker or to another user. If the caller
+        passes a candidate set spanning two users (e.g. a buggy
+        circle-traversal that over-fetches, or a future test fixture
+        that forgets the filter), an LLM-supplied `target_id` could
+        UPDATE / DELETE another user's memory row through the v2
+        path with no schema-level barrier. Defense in depth: the
+        service-layer apply step should re-check ownership on every
+        target_id before commit. Lane B/2 will land that guard +
+        an integration test that fails when the candidate set spans
+        users.
 
     Returns:
         None if every op's target_id is either None (ADD / NOOP) or

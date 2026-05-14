@@ -43,16 +43,27 @@ python3 -m pytest tests/eval/test_memory_v1_baseline.py -v
 On the `.159` build box (full corpus run against real DB + LLM):
 
 ```bash
-# Requires:
-#   - DATABASE_URL pointing at a fresh test postgres (with pgvector +
-#     halfvec, matching prod's extensions)
-#   - LLM_OPENAI_BASE_URL pointing at cuda.local:8081 (Qwen3.6-A3B)
-#   - OLLAMA_EMBED_URL pointing at k8s-gpu-1 ollama (qwen3-embedding:4b)
-#   - All other settings from .env loaded normally
+# Required env vars (set EXPLICITLY — the runner refuses to fall back
+# to DATABASE_URL to prevent accidental prod writes):
+#   - BASELINE_DATABASE_URL — dedicated test postgres (with pgvector +
+#     halfvec, matching prod's extensions). MUST NOT contain "prod",
+#     ".cluster.local", "renfield-private", etc. unless --i-know-this-is-prod.
+#   - All other settings from .env loaded normally for the LLM call:
+#     LLM_OPENAI_BASE_URL pointing at cuda.local:8081 (Qwen3.6-A3B),
+#     OLLAMA_EMBED_URL pointing at k8s-gpu-1 ollama (qwen3-embedding:4b).
 
+export BASELINE_DATABASE_URL='postgresql+asyncpg://renfield:pass@127.0.0.1:5432/renfield_baseline'
+
+# Default mode: ROLLBACK per turn. The LLM call happens for real
+# (latency + extract behavior measured), but no seeded rows persist.
+# Use this for measurement-only runs.
 python3 bin/memory_v1_baseline.py \
     --corpus tests/eval/memory_v1_baseline_corpus.yaml \
     --output-dir ./baseline-runs/
+
+# Persist rows (required only if you want to inspect them post-hoc
+# via `/admin/recall?unranked=true` or a SQL query):
+python3 bin/memory_v1_baseline.py --commit
 
 # Filter to a subset:
 python3 bin/memory_v1_baseline.py --category dedup --flavor reva
@@ -60,7 +71,48 @@ python3 bin/memory_v1_baseline.py --category dedup --flavor reva
 # Aggregate-only from an existing run (e.g. to tweak the report format):
 python3 bin/memory_v1_baseline.py \
     --aggregate-only baseline-runs/memory_v1_baseline_20260514-094530.json
+
+# Cleanup (only needed after --commit runs):
+psql "$BASELINE_DATABASE_URL" \
+    -c 'DELETE FROM conversation_memories WHERE user_id >= 2000000000;'
 ```
+
+### Safety guarantees
+
+The runner is designed to be safe-by-default against accidental prod writes:
+
+1. **Dedicated env var.** `BASELINE_DATABASE_URL` is required and distinct from
+   `DATABASE_URL`. The runner does NOT fall back to `DATABASE_URL` — running
+   the script without `BASELINE_DATABASE_URL` exits with a clear error.
+2. **Prod URL pattern check.** Any URL containing `prod`, `production`,
+   `.cluster.local`, `kubernetes.default`, `renfield-private`, etc. is refused
+   unless `--i-know-this-is-prod` is passed.
+3. **Reserved user_id namespace.** All allocated test user_ids are
+   `>= 2_000_000_000` via deterministic `hashlib.blake2b` — they cannot collide
+   with real user IDs (small positive integers starting at 1). Even a worst-case
+   write to a populated DB attributes rows to test-namespace user_ids only.
+4. **Default rollback.** Each turn runs inside `async with session.begin()` and
+   the runner explicitly rolls back at end-of-turn unless `--commit` is passed.
+   Seeded rows + any v1 writes are abandoned.
+5. **Cross-tier seed gate.** Corpus YAML entries with `circle_tier > 0` are
+   refused unless `--allow-cross-tier` is passed. Prevents a YAML edit from
+   poisoning the global tier visible to every household member.
+6. **Exception logging tightened.** Exception messages from `extract_and_save`
+   are logged as `type(e).__name__` only — never the raw string, which could
+   embed corpus role-injection content or PII into long-term log storage.
+
+### Instrumentation
+
+v1's `extract_and_save` swallows `json.JSONDecodeError` (returns `[]`) and
+embedding HTTP failures (logged + falls back to ADD). From outside the
+service, both are indistinguishable from "nothing to extract."
+
+The runner monkey-patches `_parse_extraction_response` and `_get_embedding`
+during each turn to count these silent failures. Counter deltas surface as
+`parse_error` / `embedding_error` on each `BaselineResult` and drive the
+`schema_validation_rate` / `embedding_error_rate` metrics. The patches are
+torn down between turns (per-service, not per-process) so they never leak
+into anything else running in the same process.
 
 ## Outputs
 
