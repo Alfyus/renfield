@@ -158,12 +158,17 @@ de:
       - Operative Abfrage ("liste alle X", "zeig mir Y")
       - Identische Erinnerung schon vorhanden
       - Kein erinnerungswuerdiger Inhalt (Smalltalk, Systemantwort)
-      - Entscheidungsbegruendung ("wir haben uns fuer X entschieden, weil Y",
-        "die Wahl fiel auf X aus Risikogruenden") → NOOP. Solche Fakten
-        gehoeren in die bi-temporale Wissensbasis (atom-Substrat), nicht
-        in das persoenliche Erinnerungs-Subsystem. Die Erinnerung erfasst
-        Praeferenzen + Anweisungen + persoenliche Fakten des Benutzers,
-        nicht Projekt- oder Entscheidungs-Geschichte.
+      - Reine Entscheidungsbegruendung ("wir haben uns fuer X entschieden,
+        weil Y", "die Wahl fiel auf X aus Risikogruenden") → NOOP. Solche
+        Fakten gehoeren in die bi-temporale Wissensbasis (atom-Substrat),
+        nicht in das persoenliche Erinnerungs-Subsystem. Die Erinnerung
+        erfasst Praeferenzen + Anweisungen + persoenliche Fakten +
+        relevanten Benutzerkontext (laufende Plaene, Deadlines) — nicht
+        Projekt- oder Entscheidungs-Geschichte. Mischt eine Aeusserung
+        einen neuen Benutzerkontext mit einer Begruendung ("wir wechseln
+        zu Postgres, weil MySQL der Bottleneck ist"), ADD den Kontext-
+        Teil ("Plant Migration zu Postgres"); die Begruendung selbst
+        gehoert nicht in die Erinnerung.
 
     Im Zweifelsfall: ADD lieber als NOOP. NOOP nur wenn ein konkreter
     Grund aus der Liste oben zutrifft.
@@ -312,11 +317,16 @@ en:
       - Operational query ("list all X", "show me Y")
       - Identical memory already present
       - No memorable content (smalltalk, system response)
-      - Decision rationale ("we chose X because Y", "the choice fell on
-        X for risk reasons") → NOOP. Such facts belong in the bi-temporal
-        knowledge base (atom substrate), not in the personal memory
-        subsystem. Memory captures user preferences + instructions +
-        personal facts, not project or decision history.
+      - Pure decision rationale ("we chose X because Y", "the choice
+        fell on X for risk reasons") → NOOP. Such facts belong in the
+        bi-temporal knowledge base (atom substrate / wissensbasis), not
+        in the personal memory subsystem. Memory captures user
+        preferences + instructions + personal facts + relevant user
+        context (current plans, deadlines) — not project or decision
+        history. If an utterance mixes new user-context with a rationale
+        ("we're migrating to Postgres because MySQL is bottlenecking"),
+        ADD the context part ("Plans migration to Postgres"); the
+        rationale itself does not belong in memory.
 
     When in doubt: prefer ADD over NOOP. NOOP only when a concrete
     reason from the list above applies.

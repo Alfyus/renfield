@@ -1109,7 +1109,14 @@ class MemoryV2ShadowLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    # ON DELETE SET NULL must mirror the alembic migration. Without
+    # ondelete= here, create_all() (used by CI test fixtures) emits a
+    # RESTRICT FK that diverges from the production migration and
+    # fails user-deletion with IntegrityError.
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
     session_id = Column(String(255), nullable=True, index=True)
     lang = Column(String(10), nullable=True)
 

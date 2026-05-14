@@ -25,6 +25,7 @@ from models.database import (
     MEMORY_CATEGORIES,
     MEMORY_CHANGED_BY_RESOLUTION,
     MEMORY_CHANGED_BY_SYSTEM,
+    MEMORY_CHANGED_BY_USER,
     MEMORY_SCOPE_USER,
     MEMORY_SOURCE_LLM_INFERRED,
     ConversationMemory,
@@ -253,12 +254,21 @@ class ConversationMemoryService:
         3. SKIP: Transactional queries -> skip extraction
         4. DEFAULT: Proceed to LLM extraction (let the LLM decide)
         """
-        # Stage 1: Block injection attempts
+        # Stage 1: Block injection attempts.
+        # Scan BOTH user_msg and assistant_response — the v2 prompt
+        # interpolates both verbatim, so a poisoned MCP tool result
+        # reflected into assistant_response is an injection vector too.
         for pattern in _MEMORY_INJECTION_PATTERNS:
             if pattern.search(user_msg):
                 logger.info(
-                    f"Memory extraction blocked: injection pattern in "
+                    f"Memory extraction blocked: injection pattern in user_msg "
                     f"'{user_msg[:60]}...'"
+                )
+                return False
+            if pattern.search(assistant_response):
+                logger.info(
+                    f"Memory extraction blocked: injection pattern in "
+                    f"assistant_response '{assistant_response[:60]}...'"
                 )
                 return False
 
@@ -297,11 +307,12 @@ class ConversationMemoryService:
         Flag matrix:
           v2_authoritative=True  -> extract_and_save_v2 (v2 path; falls back
                                     to v1 on LLM/schema/drift failure)
-          v2_shadow=True (only)  -> v1 returns; v2 also runs as a background
-                                    fire-and-forget task that logs its
-                                    output (and lands in memory_v2_shadow_log
-                                    once that alembic table exists in Lane B/2
-                                    follow-up).
+          v2_shadow=True (only)  -> v1 returns; v2 then runs synchronously
+                                    on the SAME session after v1 commits,
+                                    logging its outcome to
+                                    memory_v2_shadow_log. Synchronous (not
+                                    fire-and-forget) because SQLAlchemy 2
+                                    AsyncSession is not concurrent-safe.
           both False (default)   -> v1 only (current behavior)
 
         Public API kept stable so chat_handler and other callers don't
@@ -391,6 +402,7 @@ class ConversationMemoryService:
         sp = None
 
         started = time.monotonic()
+        ops_capture: list[str] = []
         try:
             sp = await self.db.begin_nested()
             result = await self.extract_and_save_v2(
@@ -399,12 +411,16 @@ class ConversationMemoryService:
                 user_id=user_id,
                 session_id=session_id,
                 lang=lang,
+                _ops_capture=ops_capture,
             )
             v2_latency = time.monotonic() - started
             v2_count = len(result)
-            # Best-effort outcome classification — the dispatcher won't have
-            # access to the MemoryOpsList itself (consumed inside v2), so
-            # derive a coarse outcome from the result list.
+            # Capture the LLM's serialized MemoryOpsList for the diff report.
+            # ops_capture stays empty when v2 fell back to v1 on LLM/schema
+            # reject (no ops to log); a drift-reject still populates it because
+            # the LLM produced a valid (but stale) ops list.
+            if ops_capture:
+                v2_ops_json = ops_capture[0]
             if v2_count == 0:
                 v2_outcome = "noop"
             else:
@@ -432,29 +448,34 @@ class ConversationMemoryService:
         # Write the shadow log row in its OWN savepoint so a log-table
         # failure (e.g., schema drift, FK violation) does not cascade
         # into the v1 transaction.
+        log_sp = None
         try:
             log_sp = await self.db.begin_nested()
-            try:
-                self.db.add(MemoryV2ShadowLog(
-                    user_id=user_id,
-                    session_id=session_id,
-                    lang=lang,
-                    v1_outcome=v1_outcome,
-                    v1_extracted_count=v1_extracted_count,
-                    v1_latency_seconds=v1_latency_seconds,
-                    v2_outcome=v2_outcome,
-                    v2_ops_json=v2_ops_json,
-                    v2_extracted_count=v2_count,
-                    v2_fallback_reason=v2_fallback_reason,
-                    v2_latency_seconds=v2_latency,
-                    v2_error=v2_error,
-                ))
-                await self.db.flush()
-            finally:
-                # Commit the shadow log row (it's intentionally durable —
-                # the savepoint above gives us "all-or-nothing per row").
-                pass
+            self.db.add(MemoryV2ShadowLog(
+                user_id=user_id,
+                session_id=session_id,
+                lang=lang,
+                v1_outcome=v1_outcome,
+                v1_extracted_count=v1_extracted_count,
+                v1_latency_seconds=v1_latency_seconds,
+                v2_outcome=v2_outcome,
+                v2_ops_json=v2_ops_json,
+                v2_extracted_count=v2_count,
+                v2_fallback_reason=v2_fallback_reason,
+                v2_latency_seconds=v2_latency,
+                v2_error=v2_error,
+            ))
+            await self.db.flush()
+            # Release the savepoint. Without this, asyncpg treats the nested
+            # transaction as unresolved on outer commit and the row write is
+            # not durable.
+            await log_sp.commit()
         except Exception as e:
+            if log_sp is not None:
+                try:
+                    await log_sp.rollback()
+                except Exception:
+                    pass
             logger.warning(
                 "v2 shadow: log-row write failed (swallowed): %s", type(e).__name__
             )
@@ -825,9 +846,17 @@ class ConversationMemoryService:
         content: str,
         category: str | None,
         importance: float | None,
+        user_id: int | None,
     ) -> bool:
         """Apply UPDATE op to an existing row. Re-embeds the new content.
-        No internal commit."""
+        No internal commit.
+
+        Defense-in-depth: when user_id is provided, the WHERE clause
+        scopes the UPDATE to rows owned by that user. Even if the LLM
+        produces a target_id that escaped the candidate-set membership
+        check (poisoned retrieval, validator bug), this prevents
+        cross-user mutation at the SQL layer.
+        """
         new_embedding = None
         try:
             new_embedding = await self._get_embedding(content)
@@ -849,11 +878,10 @@ class ConversationMemoryService:
         if new_embedding is not None:
             values["embedding"] = new_embedding
 
-        result = await self.db.execute(
-            update(ConversationMemory)
-            .where(ConversationMemory.id == target_id)
-            .values(**values)
-        )
+        stmt = update(ConversationMemory).where(ConversationMemory.id == target_id)
+        if user_id is not None:
+            stmt = stmt.where(ConversationMemory.user_id == user_id)
+        result = await self.db.execute(stmt.values(**values))
         if result.rowcount > 0:
             await self._record_history(
                 memory_id=target_id,
@@ -866,21 +894,22 @@ class ConversationMemoryService:
             return True
         return False
 
-    async def _apply_delete_v2(self, *, target_id: int) -> bool:
+    async def _apply_delete_v2(self, *, target_id: int, user_id: int | None) -> bool:
         """Apply DELETE op — soft-delete via is_active=false. No internal commit.
 
         Per the retention-posture decision: DELETE fires ONLY on explicit
         user retraction. No automated process flips is_active. The row
         stays recoverable via `/admin/recall?include_inactive=true`.
+
+        Defense-in-depth on user_id: same rationale as _apply_update_v2.
         """
-        result = await self.db.execute(
-            update(ConversationMemory)
-            .where(ConversationMemory.id == target_id)
-            .values(
-                is_active=False,
-                last_accessed_at=datetime.now(UTC).replace(tzinfo=None),
-            )
-        )
+        stmt = update(ConversationMemory).where(ConversationMemory.id == target_id)
+        if user_id is not None:
+            stmt = stmt.where(ConversationMemory.user_id == user_id)
+        result = await self.db.execute(stmt.values(
+            is_active=False,
+            last_accessed_at=datetime.now(UTC).replace(tzinfo=None),
+        ))
         if result.rowcount > 0:
             await self._record_history(
                 memory_id=target_id,
@@ -897,6 +926,7 @@ class ConversationMemoryService:
         user_id: int | None = None,
         session_id: str | None = None,
         lang: str = "de",
+        _ops_capture: list[str] | None = None,
     ) -> list[ConversationMemory]:
         """Mem0-style batched extraction.
 
@@ -912,6 +942,12 @@ class ConversationMemoryService:
         Required setting: `memory_extraction_retrieve_k` (default 5).
         Honors the same `should_extract_memories` injection /
         transactional gate as v1.
+
+        `_ops_capture` is an opt-in side-channel for shadow mode: when a
+        list is passed, the JSON-serialized MemoryOpsList from the LLM
+        is appended to it before any apply or fallback. Used by
+        `_extract_v2_shadow_only` to populate `v2_ops_json` on the
+        shadow log row without changing this method's return type.
         """
         from services.memory_ops import OpType, validate_against_candidates
         from services.memory_retrieval import MemoryRetrieval
@@ -954,8 +990,21 @@ class ConversationMemoryService:
                 lang=lang,
             )
 
+        # Capture for shadow log: the LLM produced a valid ops list.
+        # Capture BEFORE drift check so the shadow log records the LLM's
+        # intent even when drift forces a v1 fallback.
+        if _ops_capture is not None:
+            try:
+                _ops_capture.append(ops_list.model_dump_json())
+            except Exception as e_dump:
+                logger.warning(
+                    "v2 extract: ops_capture serialization failed: %s",
+                    type(e_dump).__name__,
+                )
+
         # ---- Phase 3: re-lock + drift check + apply ops ----
         saved: list[ConversationMemory] = []
+        drift_reject = False
         await self._acquire_user_lock(user_id)
         try:
             # Re-retrieve to detect candidate drift since the LLM was called.
@@ -967,60 +1016,68 @@ class ConversationMemoryService:
             rejection = validate_against_candidates(ops_list, fresh_ids)
             if rejection is not None:
                 logger.info(f"v2 extract: drift rejected ({rejection}) → fallback to v1")
-                # Call v1 impl directly (see comment in the schema-reject branch above).
-                return await self._extract_and_save_v1_impl(
-                    user_message=user_message,
-                    assistant_response=assistant_response,
-                    user_id=user_id,
-                    session_id=session_id,
-                    lang=lang,
-                )
+                drift_reject = True
+                # Fall through to release the lock, then run v1 OUTSIDE it.
+                # Holding the advisory lock through v1's LLM latency would
+                # serialise concurrent turns for this user.
+            else:
+                touched: set[int] = set()
+                for op in ops_list.ops:
+                    if op.op == OpType.NOOP:
+                        continue
+                    elif op.op == OpType.ADD:
+                        memory = await self._apply_add_v2(
+                            content=op.content,
+                            category=op.category,
+                            importance=op.importance if op.importance is not None else 0.5,
+                            user_id=user_id,
+                            session_id=session_id,
+                        )
+                        if memory is not None:
+                            saved.append(memory)
+                    elif op.op == OpType.UPDATE:
+                        if op.target_id is not None and op.content and await self._apply_update_v2(
+                            target_id=op.target_id,
+                            content=op.content,
+                            category=op.category,
+                            importance=op.importance,
+                            user_id=user_id,
+                        ):
+                            touched.add(op.target_id)
+                    elif op.op == OpType.DELETE:
+                        if op.target_id is not None and await self._apply_delete_v2(
+                            target_id=op.target_id,
+                            user_id=user_id,
+                        ):
+                            touched.add(op.target_id)
 
-            touched: set[int] = set()
-            for op in ops_list.ops:
-                if op.op == OpType.NOOP:
-                    continue
-                elif op.op == OpType.ADD:
-                    memory = await self._apply_add_v2(
-                        content=op.content,
-                        category=op.category,
-                        importance=op.importance if op.importance is not None else 0.5,
-                        user_id=user_id,
-                        session_id=session_id,
+                # Bump last_accessed_at on retrieved-but-not-touched rows so the
+                # recency-decay ranking (Lane C) reflects this turn's relevance.
+                now = datetime.now(UTC).replace(tzinfo=None)
+                untouched = candidate_ids_initial - touched
+                for cid in untouched:
+                    await self.db.execute(
+                        update(ConversationMemory)
+                        .where(ConversationMemory.id == cid)
+                        .values(
+                            last_accessed_at=now,
+                            access_count=ConversationMemory.access_count + 1,
+                        )
                     )
-                    if memory is not None:
-                        saved.append(memory)
-                elif op.op == OpType.UPDATE:
-                    if op.target_id is not None and await self._apply_update_v2(
-                        target_id=op.target_id,
-                        content=op.content or "",
-                        category=op.category,
-                        importance=op.importance,
-                    ):
-                        touched.add(op.target_id)
-                elif op.op == OpType.DELETE:
-                    if op.target_id is not None and await self._apply_delete_v2(
-                        target_id=op.target_id,
-                    ):
-                        touched.add(op.target_id)
 
-            # Bump last_accessed_at on retrieved-but-not-touched rows so the
-            # recency-decay ranking (Lane C) reflects this turn's relevance.
-            now = datetime.now(UTC).replace(tzinfo=None)
-            untouched = candidate_ids_initial - touched
-            for cid in untouched:
-                await self.db.execute(
-                    update(ConversationMemory)
-                    .where(ConversationMemory.id == cid)
-                    .values(
-                        last_accessed_at=now,
-                        access_count=ConversationMemory.access_count + 1,
-                    )
-                )
-
-            await self.db.flush()  # surface FK / constraint errors before exit
+                await self.db.flush()  # surface FK / constraint errors before exit
         finally:
             await self._release_user_lock(user_id)
+
+        if drift_reject:
+            # Call v1 impl directly (see comment in the schema-reject branch above).
+            return await self._extract_and_save_v1_impl(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                user_id=user_id,
+                session_id=session_id,
+                lang=lang,
+            )
 
         return saved
 

@@ -18,6 +18,7 @@ via cascade.
 Indexes:
   - (created_at) for daily-diff windowing
   - (user_id, created_at) for per-user comparisons
+  - (session_id) mirrors the ORM `index=True` on the column
 """
 from __future__ import annotations
 
@@ -32,61 +33,57 @@ depends_on = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    existing_tables = set(inspector.get_table_names())
+    # `if_not_exists=True` is the idempotency guard. Avoids the
+    # stale-inspector-snapshot anti-pattern where checks reading from
+    # `sa.inspect(bind)` see a pre-DDL view of the schema even after
+    # the create_table fires within the same upgrade.
+    op.create_table(
+        "memory_v2_shadow_log",
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "user_id",
+            sa.Integer(),
+            sa.ForeignKey("users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column("session_id", sa.String(255), nullable=True),
+        sa.Column("lang", sa.String(10), nullable=True),
+        # v1 (authoritative)
+        sa.Column("v1_outcome", sa.String(20), nullable=True),
+        sa.Column("v1_extracted_count", sa.Integer(), nullable=True),
+        sa.Column("v1_latency_seconds", sa.Float(), nullable=True),
+        # v2 (rolled back, observed only)
+        sa.Column("v2_outcome", sa.String(20), nullable=True),
+        sa.Column("v2_ops_json", sa.Text(), nullable=True),
+        sa.Column("v2_extracted_count", sa.Integer(), nullable=True),
+        sa.Column("v2_fallback_reason", sa.String(40), nullable=True),
+        sa.Column("v2_latency_seconds", sa.Float(), nullable=True),
+        sa.Column("v2_error", sa.String(80), nullable=True),
+        if_not_exists=True,
+    )
 
-    if "memory_v2_shadow_log" not in existing_tables:
-        op.create_table(
-            "memory_v2_shadow_log",
-            sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-            sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
-            sa.Column(
-                "user_id",
-                sa.Integer(),
-                sa.ForeignKey("users.id", ondelete="SET NULL"),
-                nullable=True,
-            ),
-            sa.Column("session_id", sa.String(255), nullable=True),
-            sa.Column("lang", sa.String(10), nullable=True),
-            # v1 (authoritative)
-            sa.Column("v1_outcome", sa.String(20), nullable=True),
-            sa.Column("v1_extracted_count", sa.Integer(), nullable=True),
-            sa.Column("v1_latency_seconds", sa.Float(), nullable=True),
-            # v2 (rolled back, observed only)
-            sa.Column("v2_outcome", sa.String(20), nullable=True),
-            sa.Column("v2_ops_json", sa.Text(), nullable=True),
-            sa.Column("v2_extracted_count", sa.Integer(), nullable=True),
-            sa.Column("v2_fallback_reason", sa.String(40), nullable=True),
-            sa.Column("v2_latency_seconds", sa.Float(), nullable=True),
-            sa.Column("v2_error", sa.String(80), nullable=True),
-        )
-
-    # Index for daily-diff windowing (most recent records first).
-    existing_idx = {
-        i["name"] for i in inspector.get_indexes("memory_v2_shadow_log")
-    } if "memory_v2_shadow_log" in existing_tables else set()
-
-    if "idx_memv2sl_created_at" not in existing_idx:
-        op.create_index(
-            "idx_memv2sl_created_at",
-            "memory_v2_shadow_log",
-            ["created_at"],
-        )
-    if "idx_memv2sl_user_created" not in existing_idx:
-        op.create_index(
-            "idx_memv2sl_user_created",
-            "memory_v2_shadow_log",
-            ["user_id", "created_at"],
-        )
+    op.create_index(
+        "idx_memv2sl_created_at", "memory_v2_shadow_log", ["created_at"],
+        if_not_exists=True,
+    )
+    op.create_index(
+        "idx_memv2sl_user_created", "memory_v2_shadow_log", ["user_id", "created_at"],
+        if_not_exists=True,
+    )
+    # Mirrors the ORM `index=True` on session_id — without this the
+    # ORM/migration schemas drift (detectable by `alembic check`).
+    op.create_index(
+        "idx_memv2sl_session_id", "memory_v2_shadow_log", ["session_id"],
+        if_not_exists=True,
+    )
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if "memory_v2_shadow_log" in inspector.get_table_names():
-        existing_idx = {i["name"] for i in inspector.get_indexes("memory_v2_shadow_log")}
-        for idx_name in ("idx_memv2sl_user_created", "idx_memv2sl_created_at"):
-            if idx_name in existing_idx:
-                op.drop_index(idx_name, table_name="memory_v2_shadow_log")
-        op.drop_table("memory_v2_shadow_log")
+    for idx_name in (
+        "idx_memv2sl_session_id",
+        "idx_memv2sl_user_created",
+        "idx_memv2sl_created_at",
+    ):
+        op.drop_index(idx_name, table_name="memory_v2_shadow_log", if_exists=True)
+    op.drop_table("memory_v2_shadow_log", if_exists=True)
