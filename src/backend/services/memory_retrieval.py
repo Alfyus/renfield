@@ -171,7 +171,16 @@ class MemoryRetrieval:
                 })
                 memory_ids.append(row.id)
 
-        # Update access tracking
+        # Update access tracking. flush() not commit() — the caller's
+        # outer transaction decides when to persist. Previously this
+        # committed unconditionally, which broke the v2-shadow savepoint
+        # (the commit closed the savepoint's enclosing transaction,
+        # causing the rollback at the end of `_extract_v2_shadow_only`
+        # to fail with `ResourceClosedError: This transaction is
+        # closed`). Real callers (chat_handler, agent loop) commit at
+        # the end of their own scope anyway, so this preserves access
+        # tracking durability while letting shadow mode properly roll
+        # back.
         if memory_ids:
             await self.db.execute(
                 update(ConversationMemory)
@@ -181,7 +190,7 @@ class MemoryRetrieval:
                     last_accessed_at=datetime.now(UTC).replace(tzinfo=None),
                 )
             )
-            await self.db.commit()
+            await self.db.flush()
 
         return memories
 
