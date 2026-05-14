@@ -980,6 +980,7 @@ class ConversationMemoryService:
         try:
             candidates = await MemoryRetrieval(self.db).retrieve(
                 message=user_message, user_id=user_id, limit=retrieve_k,
+                ranker="recency_aware",
             )
         finally:
             await self._release_user_lock(user_id)
@@ -1027,6 +1028,7 @@ class ConversationMemoryService:
             # Re-retrieve to detect candidate drift since the LLM was called.
             fresh = await MemoryRetrieval(self.db).retrieve(
                 message=user_message, user_id=user_id, limit=retrieve_k,
+                ranker="recency_aware",
             )
             fresh_ids = {int(c["id"]) for c in fresh if c.get("id") is not None}
 

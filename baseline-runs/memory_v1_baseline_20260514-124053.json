@@ -1,0 +1,108 @@
+{
+  "run_started": "2026-05-14T12:40:53.326256+00:00",
+  "corpus_path": "/tests/eval/memory_v1_baseline_corpus.yaml",
+  "report": {
+    "total_turns": 7,
+    "turns_by_category": {
+      "circle_leakage": 7
+    },
+    "outcome_distribution": {
+      "NOOP": 7
+    },
+    "parse_error_rate": 0.0,
+    "embedding_error_rate": 0.0,
+    "latency_p50": 1.492985230870545,
+    "latency_p95": 1.544213451910764,
+    "latency_p99": 1.544213451910764,
+    "noop_rate_on_generic_queries": 1.0,
+    "duplicate_rate": 0.0,
+    "cross_session_update_detection": 0.0,
+    "schema_validation_rate": 1.0
+  },
+  "results": [
+    {
+      "turn_id": "reva-circ-01",
+      "category": "circle_leakage",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "NOOP",
+      "extracted_count": 0,
+      "latency_seconds": 1.5030704853124917,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Retrieve-top-K MUST honor circles filter; the tier-0 row of user 99 must not enter user 1's candidate set."
+    },
+    {
+      "turn_id": "reva-circ-02",
+      "category": "circle_leakage",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "NOOP",
+      "extracted_count": 0,
+      "latency_seconds": 1.544213451910764,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-circ-03",
+      "category": "circle_leakage",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "NOOP",
+      "extracted_count": 0,
+      "latency_seconds": 1.492985230870545,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-circ-04",
+      "category": "circle_leakage",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "NOOP",
+      "extracted_count": 0,
+      "latency_seconds": 1.4782746974378824,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Tier-2 (team scope) \u2014 asker not in the team, should not see."
+    },
+    {
+      "turn_id": "reva-circ-05",
+      "category": "circle_leakage",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "NOOP",
+      "extracted_count": 0,
+      "latency_seconds": 0.00014212308451533318,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "renfield-circ-01",
+      "category": "circle_leakage",
+      "flavor": "renfield",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "NOOP",
+      "extracted_count": 0,
+      "latency_seconds": 1.5920869875699282,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "renfield-circ-02",
+      "category": "circle_leakage",
+      "flavor": "renfield",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "NOOP",
+      "extracted_count": 0,
+      "latency_seconds": 1.4680799031630158,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Probe attempts to read tier-0 personal activity of another household member."
+    }
+  ]
+}

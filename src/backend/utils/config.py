@@ -299,9 +299,16 @@ class Settings(BaseSettings):
     memory_contradiction_threshold: float = Field(default=0.6, ge=0.3, le=0.89)  # Similarity range lower bound
     memory_contradiction_top_k: int = Field(default=5, ge=1, le=10)         # Max similar memories to compare
     # Mem0 v2 batched extraction (Lane B/2 of memory architecture plan)
-    memory_extraction_retrieve_k: int = Field(default=5, ge=1, le=20)       # Top-K candidates for v2 extract LLM prompt
+    memory_extraction_retrieve_k: int = Field(default=5, ge=1, le=50)       # Top-K candidates for v2 extract LLM prompt
     memory_extraction_v2_shadow: bool = False                                # Phase A: run v2 in shadow mode alongside v1
     memory_extraction_v2_authoritative: bool = False                         # Phase B: v2 is primary; v1 becomes legacy fallback
+    # Lane C two-stage retrieval with recency-aware rerank. Opt-in via
+    # `ranker="recency_aware"` on MemoryRetrieval.retrieve(). v2 callers
+    # use it by default; web chat / retrieve_for_prompt still on the
+    # legacy single-stage ranker until eval data justifies a flip.
+    memory_retrieval_recall_k: int = Field(default=50, ge=10, le=500)       # Stage-1 HNSW recall window
+    memory_retrieval_recency_weight: float = Field(default=0.2, ge=0.0, le=1.0)  # 0 = ignore recency, 1 = heavy weight
+    memory_retrieval_recency_half_life_days: int = Field(default=30, ge=1, le=365)  # Decay half-life for last_accessed_at
     memory_episodic_enabled: bool = False                                         # Opt-in for episodic memory
     memory_episodic_max_per_user: int = Field(default=100, ge=10, le=1000)       # Max episodes per user
     memory_episodic_decay_days: int = Field(default=90, ge=7, le=365)            # Days until episodes deactivate
