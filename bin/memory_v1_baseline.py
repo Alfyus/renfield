@@ -786,34 +786,48 @@ async def run_corpus(
             # InstrumentedConversationMemoryService is a per-turn instance.
             # No class-level monkey patches; nothing leaks across turns.
             service = InstrumentedService(session)
-            async with session.begin():
-                try:
-                    result = await run_one_turn(
-                        turn, session, service,
-                        allow_cross_tier=allow_cross_tier,
-                    )
-                except Exception as e:
-                    logging.exception(
-                        "Turn %s failed catastrophically: %s",
-                        turn["id"], type(e).__name__,
-                    )
-                    result = BaselineResult(
-                        turn_id=turn["id"],
-                        category=turn.get("category", "unknown"),
-                        flavor=turn.get("flavor", "unknown"),
-                        expected_outcome=turn.get("expected_v1_outcome", "NOOP"),
-                        actual_outcome="FALLBACK",
-                        extracted_count=0,
-                        latency_seconds=0.0,
-                        parse_error=False,
-                        embedding_error=False,
-                        notes=f"runner exception: {type(e).__name__}",
-                    )
-                if not commit:
-                    # session.begin() commits at __aexit__ unless we
-                    # explicitly roll back first. Force rollback before
-                    # context exit so writes don't persist.
+            # Transaction-management pattern: DO NOT use
+            # `async with session.begin():` here. SQLAlchemy 2 async's
+            # AsyncSessionTransaction.__aexit__ will commit/rollback on
+            # its own at context exit; calling `session.rollback()`
+            # explicitly inside that context closes the transaction and
+            # the __aexit__ then raises InvalidRequestError on the
+            # closed transaction. Adversarial review F4 caught this in
+            # theory; an actual cuda.local run surfaced it in practice.
+            # Pattern: manual commit/rollback at the right moments.
+            try:
+                result = await run_one_turn(
+                    turn, session, service,
+                    allow_cross_tier=allow_cross_tier,
+                )
+                if commit:
+                    await session.commit()
+                else:
                     await session.rollback()
+            except Exception as e:
+                # Any exception from run_one_turn (DB constraint, LLM
+                # failure, etc.) rolls back this turn. Other turns
+                # proceed normally with fresh sessions.
+                logging.exception(
+                    "Turn %s failed catastrophically: %s",
+                    turn["id"], type(e).__name__,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass  # session may already be in error state
+                result = BaselineResult(
+                    turn_id=turn["id"],
+                    category=turn.get("category", "unknown"),
+                    flavor=turn.get("flavor", "unknown"),
+                    expected_outcome=turn.get("expected_v1_outcome", "NOOP"),
+                    actual_outcome="FALLBACK",
+                    extracted_count=0,
+                    latency_seconds=0.0,
+                    parse_error=False,
+                    embedding_error=False,
+                    notes=f"runner exception: {type(e).__name__}",
+                )
             results.append(result)
 
     await engine.dispose()
