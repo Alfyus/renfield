@@ -536,8 +536,9 @@ async def run_one_turn(
     db_session,
     service,
     allow_cross_tier: bool = False,
+    use_v2: bool = False,
 ) -> BaselineResult:
-    """Execute one corpus turn against the v1 extract path.
+    """Execute one corpus turn against the v1 or v2 extract path.
 
     Caller is responsible for transaction management: the runner
     operates entirely inside `db_session.begin()`, so the caller wraps
@@ -649,11 +650,12 @@ async def run_one_turn(
     # parallelizes turns doesn't get cross-task counter writes.
     _current_instrumentation_counters.set({"parse_failures": 0, "embedding_failures": 0})
 
-    # 5. Invoke v1 extract_and_save.
+    # 5. Invoke extraction (v1 or v2 depending on use_v2).
     fallback = False
     started = time.monotonic()
+    extract_method = service.extract_and_save_v2 if use_v2 else service.extract_and_save
     try:
-        await service.extract_and_save(
+        await extract_method(
             user_message=turn["user_message"],
             assistant_response=turn["assistant_response"],
             user_id=test_user_id,
@@ -734,6 +736,7 @@ async def run_corpus(
     commit: bool = False,
     allow_cross_tier: bool = False,
     allow_prod: bool = False,
+    use_v2: bool = False,
 ) -> list[BaselineResult]:
     """Run the full corpus end-to-end. Requires backend env (DB + LLM).
 
@@ -825,6 +828,7 @@ async def run_corpus(
                 result = await run_one_turn(
                     turn, session, service,
                     allow_cross_tier=allow_cross_tier,
+                    use_v2=use_v2,
                 )
                 if commit:
                     await session.commit()
@@ -922,6 +926,16 @@ def main() -> int:
             "etc. — use this flag only for deliberate forensic re-runs."
         ),
     )
+    parser.add_argument(
+        "--use-v2",
+        action="store_true",
+        help=(
+            "Run the Mem0 v2 extractor (extract_and_save_v2) instead of v1. "
+            "Lets you produce a v2-vs-v1 side-by-side report against the same "
+            "corpus. v2 falls back to v1 on any LLM / schema / drift failure, "
+            "so partial-v2 results show through as v1 outcomes."
+        ),
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -940,6 +954,7 @@ def main() -> int:
                 commit=args.commit,
                 allow_cross_tier=args.allow_cross_tier,
                 allow_prod=args.allow_prod,
+                use_v2=args.use_v2,
             )
         )
 

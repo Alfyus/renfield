@@ -102,6 +102,18 @@ de:
 
     BEISPIELE:
 
+    User: "Ich bin Release Manager fuer Release 2.1."
+    Bestehend: (keine bestehenden Erinnerungen)
+    -> Klarer persoenlicher Fakt, kein Widerruf, nichts widerspricht.
+    -> [{{"op": "ADD", "content": "Is Release Manager for Release 2.1",
+          "category": "fact", "importance": 0.9}}]
+
+    User: "Sprich mich bitte mit Du an."
+    -> Stehende Anweisung. Auch wenn die Kandidatenliste leer ist:
+       ADD den Fakt. Leere Kandidaten heisst NICHT NOOP per default.
+    -> [{{"op": "ADD", "content": "Prefers informal address",
+          "category": "procedural", "importance": 0.8}}]
+
     User: "Ich liebe Mangos. Eigentlich mag ich keine Mangos."
     -> Widerrufs-Marker "Eigentlich" + Negation. NICHT "liebt Mangos" speichern.
     -> [{{"op": "NOOP", "reason": "user retracted within turn"}}]
@@ -224,6 +236,18 @@ en:
     - reason:     short string, optional, for human review
 
     EXAMPLES:
+
+    User: "I am the Release Manager for Release 2.1."
+    Existing: (no existing memories)
+    -> Clean personal fact. No retraction, nothing contradicting.
+    -> [{{"op": "ADD", "content": "Is Release Manager for Release 2.1",
+          "category": "fact", "importance": 0.9}}]
+
+    User: "Always respond in English."
+    -> Standing instruction. Empty candidates list is NOT a reason to NOOP —
+       ADD the fact. NOOP is only for retractions or non-memorable turns.
+    -> [{{"op": "ADD", "content": "Always respond in English",
+          "category": "procedural", "importance": 0.8}}]
 
     User: "I love mangoes. Actually I don't like mangoes."
     -> Retraction marker "Actually" + negation. Do NOT save "loves mangoes".
