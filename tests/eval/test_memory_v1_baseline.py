@@ -307,13 +307,33 @@ class TestSafetyHelpers:
 
     @pytest.mark.unit
     def test_stable_test_user_id_is_in_reserved_range(self):
-        # All allocated IDs must be >= TEST_USER_ID_BASE (2_000_000_000)
-        # so they never collide with real user IDs.
+        # All allocated IDs must be in [TEST_USER_ID_BASE, TEST_USER_ID_BASE + 2^24).
+        # The 2^24 ceiling is critical: TEST_USER_ID_BASE + 2^24 ≈ 2.017e9
+        # which fits Postgres INTEGER (int4, max 2_147_483_647) with
+        # ~130M of headroom. A 4-byte digest (the original implementation)
+        # would land up to 2e9 + 2^32 ≈ 6.3e9 → DataError on INSERT.
+        # See adversarial review F6.
         for turn_id in ["a", "reva-dedup-01", "renfield-add-02", "zzz" * 50]:
             uid = runner.stable_test_user_id(turn_id)
             assert uid >= runner.TEST_USER_ID_BASE
-            # blake2b 4-byte digest fits in 2^32 — never overflows int64.
-            assert uid < runner.TEST_USER_ID_BASE + (1 << 32)
+            assert uid < runner.TEST_USER_ID_BASE + (1 << 24)
+            # And — critically — fits int4:
+            assert uid <= 2_147_483_647, (
+                f"user_id {uid} overflows Postgres INTEGER (int4 max). "
+                f"TEST_USER_ID_HASH_BYTES must stay <= 3."
+            )
+
+    @pytest.mark.unit
+    def test_stable_owner_user_id_in_reserved_range_and_disjoint_from_test_ids(self):
+        # Owner IDs live in a separate band inside the test namespace so
+        # they cannot collide with stable_test_user_id outputs.
+        # See adversarial review F7.
+        for raw in [0, 1, 99, 1_000, 1_000_000]:
+            oid = runner.stable_owner_user_id(raw)
+            assert oid >= runner.TEST_USER_ID_BASE + runner.OWNER_ID_NAMESPACE_OFFSET
+            # Owners use small corpus values (single/double digit) so
+            # the band stays narrow and well under int4 max.
+            assert oid <= 2_147_483_647
 
     @pytest.mark.unit
     def test_stable_test_user_id_differs_per_turn(self):
@@ -329,6 +349,16 @@ class TestSafetyHelpers:
             "postgresql://user@prod-db.k8s.local/renfield",
             "postgresql://u@host/production_db",
             "postgresql://u@host/renfield-db",
+            # Project-specific patterns added in /review adversarial F5:
+            "postgresql://reva@db.aktivities.ai/renfield",
+            "postgresql://reva@chat.aktivities.ai/db",
+            "postgresql://reva@192.168.99.14/renfield",
+            "postgresql://reva@roberta/renfield",
+            "postgresql://reva@registry.treehouse.x-idra.de/db",
+            # Common managed-DB SaaS:
+            "postgresql://u@db.abc123.us-west-2.rds.amazonaws.com/renfield",
+            "postgresql://u@pg-xyz.aiven.io/defaultdb",
+            "postgresql://u@db.proj.supabase.co/postgres",
         ]
         for url in cases:
             refusal = runner.check_database_url_safety(url, allow_prod=False)

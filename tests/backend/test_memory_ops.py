@@ -260,7 +260,7 @@ class TestMemoryOpsList:
             ]
         )
         assert len(ops) == 3
-        assert [op.op for op in ops] == [OpType.ADD, OpType.UPDATE, OpType.DELETE]
+        assert [op.op for op in ops.ops] == [OpType.ADD, OpType.UPDATE, OpType.DELETE]
 
     @pytest.mark.unit
     def test_max_batch_size_at_limit(self):
@@ -303,7 +303,8 @@ class TestMemoryOpsList:
             MemoryOp(op=OpType.NOOP),
         ]
         ops = MemoryOpsList(root=items)
-        assert list(ops) == items
+        assert ops.ops == items
+        assert list(ops.ops) == items
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +420,23 @@ class TestJsonRoundTrip:
         ])
         json_str = original.model_dump_json()
         round_tripped = MemoryOpsList.model_validate_json(json_str)
-        assert list(round_tripped) == list(original)
+        assert round_tripped.ops == original.ops
+
+    @pytest.mark.unit
+    def test_pydantic_default_iter_preserved(self):
+        # F8 from adversarial review: previously MemoryOpsList overrode
+        # __iter__ to yield MemoryOp objects, which broke `dict(ops)`,
+        # `**ops`, and any Pydantic-native code expecting BaseModel's
+        # (field_name, value) tuples. The override is now removed.
+        ops = MemoryOpsList(root=[MemoryOp(op=OpType.NOOP)])
+        # The Pydantic-canonical access path:
+        assert ops.root == [MemoryOp(op=OpType.NOOP)]
+        # And the convenience property we added:
+        assert ops.ops == [MemoryOp(op=OpType.NOOP)]
+        # dict() must yield a 'root' key, NOT raise TypeError:
+        as_dict = dict(ops)
+        assert "root" in as_dict
+        assert as_dict["root"] == [MemoryOp(op=OpType.NOOP)]
 
     @pytest.mark.unit
     def test_memory_ops_list_parses_llm_style_json(self):
@@ -430,5 +447,5 @@ class TestJsonRoundTrip:
         )
         parsed = MemoryOpsList.model_validate_json(llm_output)
         assert len(parsed) == 2
-        assert list(parsed)[0].op == OpType.ADD
-        assert list(parsed)[1].op == OpType.NOOP
+        assert parsed.ops[0].op == OpType.ADD
+        assert parsed.ops[1].op == OpType.NOOP

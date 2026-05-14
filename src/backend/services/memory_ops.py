@@ -42,7 +42,7 @@ for the valid-category set would silently drift.
 from __future__ import annotations
 
 import enum
-from typing import Iterator, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field, RootModel, field_validator, model_validator
 
@@ -200,10 +200,16 @@ class MemoryOpsList(RootModel[list[MemoryOp]]):
 
         return self
 
-    # Convenience iterator + len so the service layer can write
-    # `for op in ops: ...` and `len(ops)` without poking at .root.
-    def __iter__(self) -> Iterator[MemoryOp]:  # type: ignore[override]
-        return iter(self.root)
+    # Convenience accessors. We deliberately do NOT override
+    # `__iter__` — Pydantic v2 BaseModel.__iter__ yields
+    # (field_name, value) tuples (so `dict(model)` works on field-shaped
+    # models), and overriding it on RootModel would silently break
+    # callers that do `dict(my_ops)` or `**my_ops` (TypeError).
+    # Callers iterate via `for op in ops.ops:` instead.
+    @property
+    def ops(self) -> list[MemoryOp]:
+        """The underlying list of MemoryOp instances."""
+        return self.root
 
     def __len__(self) -> int:
         return len(self.root)
@@ -217,20 +223,25 @@ def validate_against_candidates(
     candidate set the LLM saw (optimistic concurrency check).
 
     SECURITY CONTRACT — read before changing anything below:
-        `candidate_ids` MUST be the result of a retrieve_top_K query
-        already filtered by `user_id == asker_id` AND by Circles v1
-        reachability (`conversation_memories_circles_filter`). This
-        function ONLY checks set membership; it cannot tell whether
-        an id belongs to the asker or to another user. If the caller
-        passes a candidate set spanning two users (e.g. a buggy
-        circle-traversal that over-fetches, or a future test fixture
-        that forgets the filter), an LLM-supplied `target_id` could
-        UPDATE / DELETE another user's memory row through the v2
-        path with no schema-level barrier. Defense in depth: the
-        service-layer apply step should re-check ownership on every
-        target_id before commit. Lane B/2 will land that guard +
-        an integration test that fails when the candidate set spans
-        users.
+        This function ONLY checks set membership of target_id against
+        the candidate set. IT DOES NOT VALIDATE OWNERSHIP. Callers are
+        responsible for ensuring `candidate_ids` was constructed from
+        a retrieve_top_K query already filtered by `user_id == asker_id`
+        AND by Circles v1 reachability
+        (`conversation_memories_circles_filter`). Passing a candidate
+        set that spans multiple users (e.g. a buggy circle-traversal
+        that over-fetches, or a future test fixture that forgets the
+        filter) lets an LLM-supplied `target_id` UPDATE / DELETE
+        another user's memory row through the v2 path. The schema
+        offers no barrier against this.
+
+        Defense in depth is the caller's job at the service layer:
+        re-fetch each target_id immediately before commit and verify
+        `row.user_id == asker_id`. The integration test for v2 MUST
+        include a case where the candidate set deliberately spans two
+        users and assert that ownership-recheck rejects it; if that
+        test passes only because this function "would catch it," the
+        test is wrong — this function CANNOT catch it.
 
     Returns:
         None if every op's target_id is either None (ADD / NOOP) or
@@ -252,7 +263,7 @@ def validate_against_candidates(
             metrics.reva_memory_v2_fallback_total.labels(reason=rejection).inc()
             return await self._legacy_extract_and_save_fallback(...)
     """
-    for op in ops:
+    for op in ops.ops:
         if op.target_id is None:
             continue
         if op.target_id not in candidate_ids:

@@ -97,12 +97,34 @@ VALID_CATEGORIES = EXTRACT_CATEGORIES | NOOP_CATEGORIES
 # real, and a single cleanup query
 # `DELETE FROM conversation_memories WHERE user_id >= 2_000_000_000`
 # reliably purges all baseline runs.
+#
+# Sizing: TEST_USER_ID_BASE + 2^24 = 2_016_777_215, which fits Postgres
+# `INTEGER` (int4 max = 2_147_483_647) with ~130M of headroom.
+# `models/database.py:895` confirms conversation_memories.user_id is
+# Integer, NOT BigInteger — using a wider hash digest would overflow
+# int4 on ~96.5% of corpus turns and crash every baseline run with
+# DataError. See the adversarial review (F6) for the exact math.
 TEST_USER_ID_BASE = 2_000_000_000
+TEST_USER_ID_HASH_BYTES = 3  # 2^24 collision space = 16_777_216 buckets
+
+# Owner-ID offset for cross-tier corpus seeds (when a turn references
+# `owner_user_id: N` in the YAML to simulate another user's memory).
+# Offset by half the hash space so test_user_id and owner_user_id can
+# never collide — would silently invalidate circle_leakage turns by
+# attributing the "other user's" row to the asker.
+OWNER_ID_NAMESPACE_OFFSET = 1 << 23  # 8_388_608
 
 
-# Patterns that indicate a settings.database_url likely points at
-# production infrastructure. Lower-cased substring match. The runner
-# refuses to proceed if any of these match BASELINE_DATABASE_URL.
+# URL patterns that ALMOST CERTAINLY indicate prod infra. Substring
+# match (lower-cased). The runner refuses to proceed if any match
+# BASELINE_DATABASE_URL unless --i-know-this-is-prod is passed.
+#
+# This is project-specific: per the user's infrastructure memory, prod
+# lives at db.aktivities.ai, the 192.168.99.0/24 subnet, the roberta
+# build host, and the treehouse.x-idra.de registry domain. A generic
+# substring list ("prod", ".cluster.local", etc.) is necessary but not
+# sufficient — adversarial review F5 caught that the original list let
+# db.aktivities.ai through trivially.
 PROD_URL_PATTERNS = (
     "prod",
     "production",
@@ -111,13 +133,29 @@ PROD_URL_PATTERNS = (
     "kubernetes.default",
     "renfield-private",
     "renfield-db",
+    # Project-specific prod hostnames (Renfield + Reva infra)
+    "db.aktivities.ai",
+    ".aktivities.ai",
+    "192.168.99.",
+    "roberta",
+    ".x-idra.de",
+    "treehouse",
+    # Common managed-DB SaaS — would-be-prod URLs even if user named
+    # the env var "BASELINE_..." by mistake
+    ".rds.amazonaws.com",
+    ".aiven.io",
+    ".supabase.co",
+    ".neon.tech",
 )
 
 
-# Per-turn instrumentation counters. Reset at the start of each turn.
-# Wrappers installed by `_install_v1_instrumentation` increment these
-# when v1's silent error swallowing fires.
-_TURN_COUNTERS = {"parse_failures": 0, "embedding_failures": 0}
+# NOTE: per-turn instrumentation lives on the InstrumentedConversationMemoryService
+# subclass (defined later) — NOT as module-global state. The class-level
+# monkey-patch approach used in the first /review fix pass mutated the
+# real service class, leaking instrumented behavior into any other
+# extraction running in the same process. Subclassing keeps the
+# real service untouched and lets concurrent unrelated extractions
+# behave normally. See adversarial review F1+F2+F15.
 
 
 # Acceptable outcomes for a cross-session stale-fact contradiction.
@@ -139,10 +177,19 @@ STALE_DETECTION_OUTCOMES = {"UPDATE", "DELETE"}
 def stable_test_user_id(turn_id: str) -> int:
     """Deterministic test user_id allocator.
 
-    Returns an integer >= TEST_USER_ID_BASE (2_000_000_000). The value
-    is stable across processes (uses hashlib, not Python's randomized
-    `hash()` builtin) so post-hoc cleanup queries can rebuild the
-    test-id set from corpus turn_ids alone.
+    Returns an integer in [TEST_USER_ID_BASE, TEST_USER_ID_BASE + 2^24).
+    The value is stable across processes (uses hashlib, not Python's
+    randomized `hash()` builtin) so post-hoc cleanup queries can rebuild
+    the test-id set from corpus turn_ids alone.
+
+    Digest size is 3 bytes (24 bits) ON PURPOSE so the resulting user_id
+    fits Postgres `INTEGER` (int4 max = 2_147_483_647). A 4-byte digest
+    would land up to 2e9 + 2^32 ≈ 6.3e9 which overflows int4 and crashes
+    the INSERT — every baseline run would fail. See adversarial review
+    F6 + the TEST_USER_ID_HASH_BYTES module constant.
+
+    Collision space at 2^24 = 16.7M buckets is plenty for a 150-turn
+    corpus (birthday probability ~0.07%).
 
     Why this matters: real user IDs in Renfield are small positive
     integers. Using `hash(turn_id) % 1_000_000` (the original
@@ -151,8 +198,25 @@ def stable_test_user_id(turn_id: str) -> int:
     populated DB would have attributed role-injection corpus content
     to random real users.
     """
-    h = hashlib.blake2b(turn_id.encode("utf-8"), digest_size=4).hexdigest()
+    h = hashlib.blake2b(turn_id.encode("utf-8"), digest_size=TEST_USER_ID_HASH_BYTES).hexdigest()
     return TEST_USER_ID_BASE + int(h, 16)
+
+
+def stable_owner_user_id(raw_owner: int) -> int:
+    """Deterministic test owner_user_id allocator for cross-tier corpus seeds.
+
+    Maps a small positive int from the corpus YAML (e.g. `owner_user_id: 99`)
+    into the test namespace at a fixed offset that does NOT collide with
+    `stable_test_user_id` outputs.
+
+    Sizing: stable_test_user_id outputs land in
+    [TEST_USER_ID_BASE, TEST_USER_ID_BASE + 2^24). Owners live in
+    [TEST_USER_ID_BASE + 2^23, TEST_USER_ID_BASE + 2^23 + small),
+    so they're inside the test namespace (purged by the standard
+    cleanup query) but in a non-overlapping band when `raw_owner`
+    stays small (corpus YAML uses single/double-digit values).
+    """
+    return TEST_USER_ID_BASE + OWNER_ID_NAMESPACE_OFFSET + int(raw_owner)
 
 
 def check_database_url_safety(db_url: str, allow_prod: bool = False) -> Optional[str]:
@@ -182,69 +246,87 @@ def check_database_url_safety(db_url: str, allow_prod: bool = False) -> Optional
     return None
 
 
-def _install_v1_instrumentation(service) -> Any:
-    """Monkey-patch the service so silent v1 error-swallowing becomes observable.
+def _make_instrumented_service_class(base_cls):
+    """Build a subclass of ConversationMemoryService that counts the
+    silent error-swallowing v1 does.
 
-    v1's `_parse_extraction_response` swallows json.JSONDecodeError and
-    returns []. v1's contradiction-resolution flow swallows embedding
-    failures and falls through. From the outside neither is visible —
-    `schema_validation_rate` and `embedding_error_rate` would be
-    permanently 0% if measured from extract_and_save's return value
-    alone.
+    Why a subclass instead of monkey-patching the base class (the first
+    /review fix used module-global counters + class-level patches —
+    adversarial review F1+F2+F15 flagged it):
 
-    This wrapper installs counter-incrementing patches on:
-      - `ConversationMemoryService._parse_extraction_response` (staticmethod)
-      - `ConversationMemoryService._get_embedding` (async instance method)
+      - The base service class is shared across the whole process.
+        Patching it leaks instrumented behavior into ANY concurrent
+        ConversationMemoryService caller (background extraction
+        workers, hooks, other tests importing the runner module).
+      - A subclass leaves the real class untouched. Each turn
+        instantiates a fresh InstrumentedConversationMemoryService;
+        counters are per-instance, not module-global; nothing leaks.
+      - Cleanup is automatic when the instance is dropped — no
+        try/finally teardown to leak on exception.
 
-    Counters are read post-call via `_TURN_COUNTERS` and reset per turn.
-    Returns a teardown callable.
-
-    The parse-failure detection is heuristic: if raw_text is non-empty,
-    non-whitespace, AND the v1 parser returned [], we re-attempt the
-    parse ourselves to disambiguate "legitimate empty array" from "JSON
-    decode failed and v1 swallowed it." Adds ~1ms per turn for the
-    re-parse; negligible in a 150-turn baseline.
+    v1's `_parse_extraction_response` swallows json.JSONDecodeError
+    and returns []. v1's contradiction-resolution flow swallows
+    embedding failures and falls through. From the outside neither is
+    visible — `schema_validation_rate` and `embedding_error_rate`
+    would be permanently 0% if measured from extract_and_save's
+    return value alone. The subclass overrides catch both.
     """
-    cls = type(service)
-    orig_parse = cls._parse_extraction_response
-    orig_embed = cls._get_embedding
 
-    @staticmethod
-    def patched_parse(raw_text: str) -> list[dict]:
-        result = orig_parse(raw_text)
-        if result or not raw_text or not raw_text.strip():
+    class InstrumentedConversationMemoryService(base_cls):
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._parse_failures = 0
+            self._embedding_failures = 0
+
+        @staticmethod
+        def _parse_extraction_response(raw_text):  # type: ignore[override]
+            # We can't access self from a staticmethod, so we set a
+            # thread/task-local counter via the contextvar below. The
+            # subclass overrides the staticmethod to invoke the parent
+            # parser and capture parse-failure signal via re-parsing
+            # the same input ourselves (heuristic: non-empty input that
+            # produced empty output = JSONDecodeError swallowed by v1).
+            result = base_cls._parse_extraction_response(raw_text)
+            if result or not raw_text or not raw_text.strip():
+                return result
+            # Re-parse to disambiguate "legitimate empty array" vs
+            # "JSON decode failed and v1 returned []".
+            text = raw_text.strip()
+            if "```" in text:
+                m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
+                if m:
+                    text = m.group(1)
+            first_bracket = text.find("[")
+            if first_bracket >= 0:
+                text = text[first_bracket:]
+            try:
+                json.loads(text)
+            except json.JSONDecodeError:
+                _current_instrumentation_counters.get()["parse_failures"] += 1
             return result
-        # v1 returned [] on a non-empty input → ambiguous. Re-parse to
-        # disambiguate. Mirrors v1's markdown-fence stripping.
-        text = raw_text.strip()
-        if "```" in text:
-            m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
-            if m:
-                text = m.group(1)
-        first_bracket = text.find("[")
-        if first_bracket >= 0:
-            text = text[first_bracket:]
-        try:
-            json.loads(text)
-        except json.JSONDecodeError:
-            _TURN_COUNTERS["parse_failures"] += 1
-        return result
 
-    async def patched_embed(self_ref, content):
-        try:
-            return await orig_embed(self_ref, content)
-        except Exception:
-            _TURN_COUNTERS["embedding_failures"] += 1
-            raise
+        async def _get_embedding(self, content):  # type: ignore[override]
+            try:
+                return await super()._get_embedding(content)
+            except Exception:
+                self._embedding_failures += 1
+                _current_instrumentation_counters.get()["embedding_failures"] += 1
+                raise
 
-    cls._parse_extraction_response = patched_parse
-    cls._get_embedding = patched_embed
+    return InstrumentedConversationMemoryService
 
-    def teardown() -> None:
-        cls._parse_extraction_response = orig_parse
-        cls._get_embedding = orig_embed
 
-    return teardown
+# Per-turn counters. A ContextVar (not a module-global dict) so multiple
+# concurrent runs in the same interpreter would not stomp on each other.
+# In practice the runner is sequential, but this defense survives a
+# future refactor that parallelizes turns.
+import contextvars  # noqa: E402
+
+_current_instrumentation_counters: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "baseline_instrumentation_counters",
+    default={"parse_failures": 0, "embedding_failures": 0},
+)
 
 
 @dataclasses.dataclass
@@ -498,12 +580,14 @@ async def run_one_turn(
         seeded_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=age_days)
         # Re-namespace owner_user_id too — cross-tier-leakage corpus turns
         # reference an "other user" via owner_user_id=99 in the YAML, which
-        # collides with real user 99. Offset into the test namespace.
+        # collides with real user 99. Map through stable_owner_user_id so
+        # they (a) live in the test namespace and (b) never collide with
+        # test_user_id (different bands inside the namespace).
         raw_owner = pre.get("owner_user_id")
         if raw_owner is None:
             owner_id = test_user_id
         else:
-            owner_id = TEST_USER_ID_BASE + int(raw_owner)
+            owner_id = stable_owner_user_id(raw_owner)
         rows_to_seed.append(
             ConversationMemory(
                 content=pre["content"],
@@ -534,9 +618,10 @@ async def run_one_turn(
     before_ids = {row.id for row in before}
     before_contents = {row.id: row.content for row in before}
 
-    # 4. Reset per-turn instrumentation counters (set by patched _parse_extraction_response + _get_embedding).
-    _TURN_COUNTERS["parse_failures"] = 0
-    _TURN_COUNTERS["embedding_failures"] = 0
+    # 4. Reset per-turn instrumentation counters. Stored in a ContextVar
+    # rather than a module-global dict so a future refactor that
+    # parallelizes turns doesn't get cross-task counter writes.
+    _current_instrumentation_counters.set({"parse_failures": 0, "embedding_failures": 0})
 
     # 5. Invoke v1 extract_and_save.
     fallback = False
@@ -557,9 +642,11 @@ async def run_one_turn(
         logging.warning("Turn %s raised: %s", turn["id"], type(e).__name__)
     elapsed = time.monotonic() - started
 
-    # 6. Snapshot the instrumentation counters (set by patched methods).
-    parse_error = _TURN_COUNTERS["parse_failures"] > 0
-    embedding_error = _TURN_COUNTERS["embedding_failures"] > 0
+    # 6. Snapshot the instrumentation counters set by the
+    # InstrumentedConversationMemoryService subclass.
+    counters = _current_instrumentation_counters.get()
+    parse_error = counters["parse_failures"] > 0
+    embedding_error = counters["embedding_failures"] > 0
 
     # 7. Snapshot AFTER and diff.
     after = (
@@ -649,6 +736,7 @@ async def run_corpus(
         sys.exit("pyyaml not installed (only needed for `run_corpus`). pip install pyyaml")
 
     from services.conversation_memory_service import ConversationMemoryService
+    InstrumentedService = _make_instrumented_service_class(ConversationMemoryService)
 
     # Read the dedicated baseline DB URL. We deliberately do NOT fall
     # back to settings.database_url — the operator must opt in via
@@ -660,6 +748,15 @@ async def run_corpus(
             "BASELINE_DATABASE_URL is not set. The baseline runner requires a "
             "dedicated test-DB URL distinct from the production DATABASE_URL. "
             "Set it to your test-postgres connection string before retrying."
+        )
+    # Defense against the operator copy-pasting their prod URL into
+    # BASELINE_DATABASE_URL "for quick testing" — adversarial review F14.
+    prod_url = os.environ.get("DATABASE_URL")
+    if prod_url and db_url == prod_url and not allow_prod:
+        sys.exit(
+            "Refusing to run: BASELINE_DATABASE_URL is identical to DATABASE_URL. "
+            "The two env vars exist precisely to be different. Set BASELINE_DATABASE_URL "
+            "to your test-postgres URL (NOT your production one)."
         )
     refusal = check_database_url_safety(db_url, allow_prod=allow_prod)
     if refusal:
@@ -686,39 +783,37 @@ async def run_corpus(
         # latency/extract behavior is measured correctly — we just
         # don't persist the side effects.
         async with Session() as session:
-            service = ConversationMemoryService(session)
-            teardown = _install_v1_instrumentation(service)
-            try:
-                async with session.begin():
-                    try:
-                        result = await run_one_turn(
-                            turn, session, service,
-                            allow_cross_tier=allow_cross_tier,
-                        )
-                    except Exception as e:
-                        logging.exception(
-                            "Turn %s failed catastrophically: %s",
-                            turn["id"], type(e).__name__,
-                        )
-                        result = BaselineResult(
-                            turn_id=turn["id"],
-                            category=turn.get("category", "unknown"),
-                            flavor=turn.get("flavor", "unknown"),
-                            expected_outcome=turn.get("expected_v1_outcome", "NOOP"),
-                            actual_outcome="FALLBACK",
-                            extracted_count=0,
-                            latency_seconds=0.0,
-                            parse_error=False,
-                            embedding_error=False,
-                            notes=f"runner exception: {type(e).__name__}",
-                        )
-                    if not commit:
-                        # session.begin() commits at __aexit__ unless
-                        # we explicitly roll back first. Force rollback
-                        # before context exit so writes don't persist.
-                        await session.rollback()
-            finally:
-                teardown()
+            # InstrumentedConversationMemoryService is a per-turn instance.
+            # No class-level monkey patches; nothing leaks across turns.
+            service = InstrumentedService(session)
+            async with session.begin():
+                try:
+                    result = await run_one_turn(
+                        turn, session, service,
+                        allow_cross_tier=allow_cross_tier,
+                    )
+                except Exception as e:
+                    logging.exception(
+                        "Turn %s failed catastrophically: %s",
+                        turn["id"], type(e).__name__,
+                    )
+                    result = BaselineResult(
+                        turn_id=turn["id"],
+                        category=turn.get("category", "unknown"),
+                        flavor=turn.get("flavor", "unknown"),
+                        expected_outcome=turn.get("expected_v1_outcome", "NOOP"),
+                        actual_outcome="FALLBACK",
+                        extracted_count=0,
+                        latency_seconds=0.0,
+                        parse_error=False,
+                        embedding_error=False,
+                        notes=f"runner exception: {type(e).__name__}",
+                    )
+                if not commit:
+                    # session.begin() commits at __aexit__ unless we
+                    # explicitly roll back first. Force rollback before
+                    # context exit so writes don't persist.
+                    await session.rollback()
             results.append(result)
 
     await engine.dispose()
