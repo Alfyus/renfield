@@ -11,6 +11,7 @@ cosine similarity search via raw SQL (pgvector).
 import json
 import math
 import re
+import time
 from datetime import UTC, datetime, timedelta
 
 from loguru import logger
@@ -317,26 +318,44 @@ class ConversationMemoryService:
                 lang=lang,
             )
 
-        if settings.memory_extraction_v2_shadow:
-            # Fire v2 as a background task — does not block the v1 return
-            # path. v2's outcome is logged for later diff analysis once
-            # the memory_v2_shadow_log table lands (Lane B/2 follow-up).
-            import asyncio as _asyncio
-            _asyncio.create_task(self._extract_v2_shadow_only(
-                user_message=user_message,
-                assistant_response=assistant_response,
-                user_id=user_id,
-                session_id=session_id,
-                lang=lang,
-            ))
-
-        return await self._extract_and_save_v1_impl(
+        # v1 runs first (sequentially) so it has exclusive use of the
+        # session. The shadow path then runs on the same session AFTER
+        # v1 commits — concurrent task scheduling would race on the
+        # shared AsyncSession (SQLAlchemy 2 async sessions are not
+        # concurrent-safe).
+        v1_started = time.monotonic()
+        v1_result = await self._extract_and_save_v1_impl(
             user_message=user_message,
             assistant_response=assistant_response,
             user_id=user_id,
             session_id=session_id,
             lang=lang,
         )
+        v1_latency = time.monotonic() - v1_started
+
+        if settings.memory_extraction_v2_shadow:
+            # Run shadow synchronously on the same session. chat_handler
+            # already calls extract_and_save in a fire-and-forget post-
+            # response context, so the doubled latency does not affect
+            # user-facing response time.
+            try:
+                await self._extract_v2_shadow_only(
+                    user_message=user_message,
+                    assistant_response=assistant_response,
+                    user_id=user_id,
+                    session_id=session_id,
+                    lang=lang,
+                    v1_outcome=f"saved_{len(v1_result)}" if v1_result else "noop",
+                    v1_extracted_count=len(v1_result),
+                    v1_latency_seconds=v1_latency,
+                )
+            except Exception as e:
+                # Shadow must NEVER affect the primary path.
+                logger.warning(
+                    "v2 shadow: outer call failed (swallowed): %s", type(e).__name__
+                )
+
+        return v1_result
 
     async def _extract_v2_shadow_only(
         self,
@@ -345,38 +364,99 @@ class ConversationMemoryService:
         user_id: int | None,
         session_id: str | None,
         lang: str,
+        v1_outcome: str | None = None,
+        v1_extracted_count: int | None = None,
+        v1_latency_seconds: float | None = None,
     ) -> None:
-        """Run v2 in shadow mode — does not affect main DB state.
+        """Run v2 in shadow mode + log v1 vs v2 outcome to memory_v2_shadow_log.
 
-        Calls extract_and_save_v2 (which runs the LLM + drift check), then
-        ROLLS BACK any writes via a savepoint. The v2 result is logged
-        so the diff against v1 is visible in production logs until the
-        memory_v2_shadow_log table lands (Lane B/2 follow-up).
+        Calls extract_and_save_v2 (LLM + drift check), then ROLLS BACK any
+        writes via a savepoint so production state is unaffected. Writes
+        a single row to memory_v2_shadow_log capturing both v1's outcome
+        (passed in from the dispatcher, the authoritative result the user
+        saw) and v2's outcome (rolled back).
 
-        Errors in shadow mode are swallowed so they cannot affect the
-        primary v1 path.
+        Errors in shadow mode are swallowed; they cannot affect the
+        primary v1 path. Failures still land in the shadow log with
+        v2_error set, so the daily diff report sees them.
         """
+        from models.database import MemoryV2ShadowLog
+
+        v2_outcome = None
+        v2_count: int | None = None
+        v2_ops_json: str | None = None
+        v2_latency: float | None = None
+        v2_error: str | None = None
+        v2_fallback_reason: str | None = None
+        sp = None
+
+        started = time.monotonic()
         try:
-            # Use a savepoint so v2's writes can be rolled back without
-            # affecting the caller's outer transaction (chat_handler).
             sp = await self.db.begin_nested()
+            result = await self.extract_and_save_v2(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                user_id=user_id,
+                session_id=session_id,
+                lang=lang,
+            )
+            v2_latency = time.monotonic() - started
+            v2_count = len(result)
+            # Best-effort outcome classification — the dispatcher won't have
+            # access to the MemoryOpsList itself (consumed inside v2), so
+            # derive a coarse outcome from the result list.
+            if v2_count == 0:
+                v2_outcome = "noop"
+            else:
+                v2_outcome = "saved"  # mixed ADD/UPDATE/DELETE collapsed
+        except Exception as e:
+            v2_latency = time.monotonic() - started
+            v2_error = type(e).__name__
+            v2_outcome = "error"
+            logger.warning(
+                "v2 shadow: extraction failed (swallowed): %s", v2_error
+            )
+        finally:
+            if sp is not None:
+                try:
+                    await sp.rollback()
+                except Exception as e_rb:
+                    # Savepoint rollback failed — log and continue. The
+                    # outer caller's transaction will eventually decide
+                    # whether to commit (v1 writes will persist regardless).
+                    logger.warning(
+                        "v2 shadow: savepoint rollback failed (swallowed): %s",
+                        type(e_rb).__name__,
+                    )
+
+        # Write the shadow log row in its OWN savepoint so a log-table
+        # failure (e.g., schema drift, FK violation) does not cascade
+        # into the v1 transaction.
+        try:
+            log_sp = await self.db.begin_nested()
             try:
-                result = await self.extract_and_save_v2(
-                    user_message=user_message,
-                    assistant_response=assistant_response,
+                self.db.add(MemoryV2ShadowLog(
                     user_id=user_id,
                     session_id=session_id,
                     lang=lang,
-                )
-                logger.info(
-                    "v2 shadow: extracted=%d ops for user_id=%s",
-                    len(result), user_id,
-                )
+                    v1_outcome=v1_outcome,
+                    v1_extracted_count=v1_extracted_count,
+                    v1_latency_seconds=v1_latency_seconds,
+                    v2_outcome=v2_outcome,
+                    v2_ops_json=v2_ops_json,
+                    v2_extracted_count=v2_count,
+                    v2_fallback_reason=v2_fallback_reason,
+                    v2_latency_seconds=v2_latency,
+                    v2_error=v2_error,
+                ))
+                await self.db.flush()
             finally:
-                await sp.rollback()
+                # Commit the shadow log row (it's intentionally durable —
+                # the savepoint above gives us "all-or-nothing per row").
+                pass
         except Exception as e:
             logger.warning(
-                "v2 shadow: extraction failed (swallowed): %s", type(e).__name__
+                "v2 shadow: log-row write failed (swallowed): %s", type(e).__name__
             )
 
     async def _extract_and_save_v1_impl(
