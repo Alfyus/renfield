@@ -128,21 +128,28 @@ Each run produces two files in `--output-dir`:
   you commit into `docs/memory/v1-baselines-<date>.md` once Phase 0
   measurement is complete.
 
-## Corpus growth plan
+## Corpus composition
 
-First drop ships 24 turns covering all 8 categories (8/8 represented):
+The corpus is at the target 150 turns (100 Reva + 50 Renfield), covering all
+8 categories. Each turn is hand-curated; no programmatic generation.
 
-| Category | First drop | Target |
-|---|---|---|
-| dedup | 4 (2 Reva + 2 Renfield) | 23 (15 + 8) |
-| within_turn_contradiction | 2 (1+1) | 23 (15 + 8) |
-| generic_query | 4 (3+1) | 30 (20 + 10) |
-| role_injection | 3 (2+1) | 14 (10 + 4) |
-| pure_add | 6 (4+2) | 32 (20 + 12) |
-| cross_session_stale | 3 (2+1) | 14 (10 + 4) |
-| circle_leakage | 2 (1+1) | 7 (5 + 2) |
-| wrong_substrate | 2 (2+0) | 7 (5 + 2) |
-| **Total** | **24** | **150 (100 + 50)** |
+| Category | Reva | Renfield | Total |
+|---|---|---|---|
+| dedup | 15 | 8 | 23 |
+| within_turn_contradiction | 15 | 8 | 23 |
+| generic_query | 20 | 10 | 30 |
+| role_injection | 10 | 4 | 14 |
+| pure_add | 20 | 12 | 32 |
+| cross_session_stale | 10 | 4 | 14 |
+| circle_leakage | 5 | 2 | 7 |
+| wrong_substrate | 5 | 2 | 7 |
+| **Total** | **100** | **50** | **150** |
+
+At n=150 the four locked baselines have confidence intervals of roughly ±2.5%
+at p=0.5 (95% CI). The smallest per-category buckets are circle_leakage and
+wrong_substrate at n=7 — those metrics are coarser (±20% CI) but exist
+primarily as regression guards, not statistical measurements; a single
+failure is the signal.
 
 The corpus is hand-curated rather than sampled from real prod transcripts because:
 - Deterministic — same turns every run, comparable across v1/v2/shadow
