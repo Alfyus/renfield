@@ -696,8 +696,17 @@ class ConversationMemoryService:
                 {"k": self._user_lock_key(user_id)},
             )
         except Exception as e:
-            # Don't propagate — if the session is already in error state
-            # the lock releases when the session disconnects anyway.
+            # Don't propagate — the connection pool's `before_checkin`
+            # event handler in services/database.py runs
+            # pg_advisory_unlock_all() as a defensive sweep before the
+            # connection returns to the pool, so a release-here failure
+            # does NOT leak the lock to the next caller. The earlier
+            # comment claiming "the lock releases when the session
+            # disconnects anyway" was wrong: pg_advisory_lock is
+            # session-level (= per-connection), and a pool checkin does
+            # NOT disconnect the underlying connection. Without the
+            # before_checkin handler this release failure would block
+            # all subsequent v2 calls for the same user_id indefinitely.
             logger.warning(f"v2 extract: pg_advisory_unlock failed: {e}")
 
     async def _call_extract_v2_llm(
