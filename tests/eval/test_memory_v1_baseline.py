@@ -16,17 +16,31 @@ These tests exist to:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-# Allow importing the script directly. It is under bin/ which is not
-# on sys.path by default.
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT / "bin") not in sys.path:
-    sys.path.insert(0, str(ROOT / "bin"))
+# The runner script lives at <repo>/bin/memory_v1_baseline.py, which is
+# NOT on Python's default sys.path. Discover it via:
+#   1. MEMORY_BASELINE_RUNNER_DIR env var (explicit override for CI / the
+#      .159 docker container, where /opt/renfield/bin is not mounted)
+#   2. Standard local-dev layout: <test_file>/../../../bin/
+_env_dir = os.environ.get("MEMORY_BASELINE_RUNNER_DIR")
+if _env_dir:
+    _runner_dir = Path(_env_dir)
+else:
+    _runner_dir = Path(__file__).resolve().parents[2] / "bin"
+if not (_runner_dir / "memory_v1_baseline.py").exists():
+    raise RuntimeError(
+        f"memory_v1_baseline.py not found in {_runner_dir}. "
+        f"Set MEMORY_BASELINE_RUNNER_DIR to override, or copy the runner "
+        f"into a directory reachable from the test's mount."
+    )
+if str(_runner_dir) not in sys.path:
+    sys.path.insert(0, str(_runner_dir))
 
 import memory_v1_baseline as runner  # noqa: E402
 
