@@ -1,3 +1,5 @@
+[English](CHANGELOG.en.md) | **Deutsch**
+
 # Changelog
 
 Alle markanten Änderungen an Renfield, seit Release `v1.2.0`. Format lehnt sich an [Keep a Changelog](https://keepachangelog.com/de/1.1.0/) an; Versionierung folgt [SemVer](https://semver.org/lang/de/).
