@@ -459,6 +459,395 @@ class ConversationMemoryService:
             return []
 
     # =========================================================================
+    # Extract v2 — Mem0-style batched extraction (Lane B/2)
+    # =========================================================================
+    #
+    # Single LLM tool call emits a MemoryOpsList for the whole turn (was: 1
+    # extract call + N per-fact contradiction calls in v1). Schema enforced
+    # by services/memory_ops.py. Prompt at prompts/memory.yaml:extraction_v2_*.
+    #
+    # Lock semantics: session-level pg_advisory_lock held only around
+    # retrieve + apply, dropped for the LLM call. Optimistic concurrency:
+    # at apply time, re-retrieve and check whether the candidate-id set has
+    # drifted; if so, reject the batch and fall back to v1. Caller controls
+    # the outer transaction; this method does NOT call self.db.commit().
+
+    _LOCK_KEY_NAMESPACE = 0x4D454D30  # ASCII "MEM0"
+
+    @staticmethod
+    def _user_lock_key(user_id: int) -> int:
+        """Build a 64-bit bigint key for pg_advisory_lock(bigint).
+
+        High 32 bits namespace = "MEM0", low 32 bits = user_id (masked).
+        Prevents collision with any future feature using advisory locks.
+        """
+        return (ConversationMemoryService._LOCK_KEY_NAMESPACE << 32) | (int(user_id) & 0xFFFFFFFF)
+
+    async def _acquire_user_lock(self, user_id: int | None) -> None:
+        """Session-level lock. Pair with `_release_user_lock` in try/finally."""
+        if user_id is None:
+            return
+        await self.db.execute(
+            text("SELECT pg_advisory_lock(:k)"),
+            {"k": self._user_lock_key(user_id)},
+        )
+
+    async def _release_user_lock(self, user_id: int | None) -> None:
+        if user_id is None:
+            return
+        try:
+            await self.db.execute(
+                text("SELECT pg_advisory_unlock(:k)"),
+                {"k": self._user_lock_key(user_id)},
+            )
+        except Exception as e:
+            # Don't propagate — if the session is already in error state
+            # the lock releases when the session disconnects anyway.
+            logger.warning(f"v2 extract: pg_advisory_unlock failed: {e}")
+
+    async def _call_extract_v2_llm(
+        self,
+        user_message: str,
+        assistant_response: str,
+        existing_memories: list[dict],
+        lang: str,
+    ):
+        """Build the v2 prompt, call the chat LLM, parse JSON → MemoryOpsList.
+
+        Returns a MemoryOpsList on success, or None on any parse / schema /
+        LLM failure. The caller treats None as schema-reject and falls
+        back to v1.
+        """
+        import pydantic as _p
+        from services.memory_ops import MemoryOpsList
+        from services.prompt_manager import prompt_manager
+        from utils.llm_client import extract_response_content, get_classification_chat_kwargs
+
+        # Render the existing-memories block.
+        if existing_memories:
+            existing_text = "\n".join(
+                f"- id={int(c.get('id'))}: {c.get('content', '')} "
+                f"(category={c.get('category', '')}, importance={c.get('importance', 0.5)})"
+                for c in existing_memories if c.get("id") is not None
+            )
+        else:
+            existing_text = (
+                "(keine bestehenden Erinnerungen)" if lang == "de"
+                else "(no existing memories)"
+            )
+
+        try:
+            prompt = prompt_manager.get(
+                "memory", "extraction_v2_prompt", lang=lang,
+                user_message=user_message,
+                assistant_response=assistant_response,
+                existing_memories=existing_text,
+            )
+            system_msg = prompt_manager.get("memory", "extraction_v2_system", lang=lang)
+        except Exception as e:
+            logger.warning(f"v2 extract: prompt render failed: {type(e).__name__}: {e}")
+            return None
+
+        llm_options = prompt_manager.get_config("memory", "llm_options") or {}
+
+        try:
+            client = await self._get_chat_client()
+            extraction_model = settings.memory_extraction_model or settings.ollama_model
+            response = await client.chat(
+                model=extraction_model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ],
+                options=llm_options,
+                **get_classification_chat_kwargs(extraction_model),
+            )
+            raw_text = extract_response_content(response)
+        except Exception as e:
+            logger.warning(f"v2 extract: LLM call failed: {type(e).__name__}")
+            return None
+
+        # Two-step: use v1's robust JSON-array parser to handle markdown
+        # fences + extra prose, then validate via MemoryOpsList.
+        ops_dicts = self._parse_extraction_response(raw_text)
+        if not ops_dicts and raw_text.strip():
+            logger.warning("v2 extract: parse_error on non-empty LLM response")
+            return None
+
+        try:
+            return MemoryOpsList(root=ops_dicts)
+        except _p.ValidationError as e:
+            logger.warning(f"v2 extract: MemoryOpsList schema reject: {e}")
+            return None
+
+    async def _apply_add_v2(
+        self,
+        *,
+        content: str,
+        category: str,
+        importance: float,
+        user_id: int | None,
+        session_id: str | None,
+    ) -> ConversationMemory | None:
+        """Insert a new memory + atom + history row WITHOUT committing.
+
+        Differs from `save()` in three ways:
+          1. No internal commit (caller's session controls).
+          2. No dedup fast-path (v2 dedups via the LLM seeing candidates).
+          3. No max-per-user enforcement (handled semantically by the
+             batched LLM call).
+        """
+        if category not in MEMORY_CATEGORIES:
+            logger.warning(f"v2 extract: invalid category {category!r}")
+            return None
+
+        embedding = None
+        try:
+            embedding = await self._get_embedding(content)
+        except Exception as e:
+            logger.warning(f"v2 extract: embedding failed on ADD: {type(e).__name__}")
+
+        owner_id = await self._resolve_owner_user_id(user_id)
+        default_tier = 0
+        atom_id: str | None = None
+        atom_svc = self._atom_service()
+        if owner_id is not None:
+            atom_id = await atom_svc.create_with_source(
+                atom_type="conversation_memory",
+                owner_user_id=owner_id,
+                tier=default_tier,
+            )
+
+        memory = ConversationMemory(
+            content=content,
+            category=category,
+            user_id=owner_id,
+            embedding=embedding,
+            importance=importance,
+            source_session_id=session_id,
+            source=MEMORY_SOURCE_LLM_INFERRED,
+            scope=MEMORY_SCOPE_USER,
+            atom_id=atom_id,
+            circle_tier=default_tier,
+        )
+        self.db.add(memory)
+        await self.db.flush()
+        if atom_id is not None:
+            await atom_svc.finalize_source_id(atom_id, memory.id)
+        await self._record_history(
+            memory_id=memory.id,
+            action=MEMORY_ACTION_CREATED,
+            new_content=content,
+            new_category=category,
+            new_importance=importance,
+            changed_by=MEMORY_CHANGED_BY_SYSTEM,
+        )
+        return memory
+
+    async def _apply_update_v2(
+        self,
+        *,
+        target_id: int,
+        content: str,
+        category: str | None,
+        importance: float | None,
+    ) -> bool:
+        """Apply UPDATE op to an existing row. Re-embeds the new content.
+        No internal commit."""
+        new_embedding = None
+        try:
+            new_embedding = await self._get_embedding(content)
+        except Exception as e:
+            logger.warning(f"v2 extract: re-embedding failed on UPDATE: {type(e).__name__}")
+
+        values: dict = {
+            "content": content,
+            "last_accessed_at": datetime.now(UTC).replace(tzinfo=None),
+            "access_count": ConversationMemory.access_count + 1,
+        }
+        if category is not None:
+            if category not in MEMORY_CATEGORIES:
+                logger.warning(f"v2 UPDATE: invalid category {category!r}; preserving existing")
+            else:
+                values["category"] = category
+        if importance is not None:
+            values["importance"] = importance
+        if new_embedding is not None:
+            values["embedding"] = new_embedding
+
+        result = await self.db.execute(
+            update(ConversationMemory)
+            .where(ConversationMemory.id == target_id)
+            .values(**values)
+        )
+        if result.rowcount > 0:
+            await self._record_history(
+                memory_id=target_id,
+                action=MEMORY_ACTION_UPDATED,
+                new_content=content,
+                new_category=category,
+                new_importance=importance,
+                changed_by=MEMORY_CHANGED_BY_RESOLUTION,
+            )
+            return True
+        return False
+
+    async def _apply_delete_v2(self, *, target_id: int) -> bool:
+        """Apply DELETE op — soft-delete via is_active=false. No internal commit.
+
+        Per the retention-posture decision: DELETE fires ONLY on explicit
+        user retraction. No automated process flips is_active. The row
+        stays recoverable via `/admin/recall?include_inactive=true`.
+        """
+        result = await self.db.execute(
+            update(ConversationMemory)
+            .where(ConversationMemory.id == target_id)
+            .values(
+                is_active=False,
+                last_accessed_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+        )
+        if result.rowcount > 0:
+            await self._record_history(
+                memory_id=target_id,
+                action=MEMORY_ACTION_DELETED,
+                changed_by=MEMORY_CHANGED_BY_USER,
+            )
+            return True
+        return False
+
+    async def extract_and_save_v2(
+        self,
+        user_message: str,
+        assistant_response: str,
+        user_id: int | None = None,
+        session_id: str | None = None,
+        lang: str = "de",
+    ) -> list[ConversationMemory]:
+        """Mem0-style batched extraction.
+
+        Replaces v1's per-fact contradiction-resolution loop with a single
+        LLM tool call that emits a MemoryOpsList for the whole turn.
+        Returns the list of memories added/updated (NOOP ops omitted).
+        Caller is responsible for committing the session.
+
+        Failure path: any LLM / parse / schema / drift error falls back to
+        `extract_and_save` (v1). v1 commits internally — callers wanting
+        strict rollback must wrap this in a savepoint.
+
+        Required setting: `memory_extraction_retrieve_k` (default 5).
+        Honors the same `should_extract_memories` injection /
+        transactional gate as v1.
+        """
+        from services.memory_ops import OpType, validate_against_candidates
+        from services.memory_retrieval import MemoryRetrieval
+
+        if not self.should_extract_memories(user_message, assistant_response):
+            return []
+
+        retrieve_k = max(1, int(settings.memory_extraction_retrieve_k))
+
+        # ---- Phase 1: lock + retrieve (no LLM call inside the lock) ----
+        candidates: list[dict] = []
+        await self._acquire_user_lock(user_id)
+        try:
+            candidates = await MemoryRetrieval(self.db).retrieve(
+                message=user_message, user_id=user_id, limit=retrieve_k,
+            )
+        finally:
+            await self._release_user_lock(user_id)
+
+        candidate_ids_initial: set[int] = {
+            int(c["id"]) for c in candidates if c.get("id") is not None
+        }
+
+        # ---- Phase 2: LLM call (no lock held) ----
+        ops_list = await self._call_extract_v2_llm(
+            user_message=user_message,
+            assistant_response=assistant_response,
+            existing_memories=candidates,
+            lang=lang,
+        )
+        if ops_list is None:
+            logger.info("v2 extract: LLM/schema rejected → fallback to v1")
+            return await self.extract_and_save(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                user_id=user_id,
+                session_id=session_id,
+                lang=lang,
+            )
+
+        # ---- Phase 3: re-lock + drift check + apply ops ----
+        saved: list[ConversationMemory] = []
+        await self._acquire_user_lock(user_id)
+        try:
+            # Re-retrieve to detect candidate drift since the LLM was called.
+            fresh = await MemoryRetrieval(self.db).retrieve(
+                message=user_message, user_id=user_id, limit=retrieve_k,
+            )
+            fresh_ids = {int(c["id"]) for c in fresh if c.get("id") is not None}
+
+            rejection = validate_against_candidates(ops_list, fresh_ids)
+            if rejection is not None:
+                logger.info(f"v2 extract: drift rejected ({rejection}) → fallback to v1")
+                return await self.extract_and_save(
+                    user_message=user_message,
+                    assistant_response=assistant_response,
+                    user_id=user_id,
+                    session_id=session_id,
+                    lang=lang,
+                )
+
+            touched: set[int] = set()
+            for op in ops_list.ops:
+                if op.op == OpType.NOOP:
+                    continue
+                elif op.op == OpType.ADD:
+                    memory = await self._apply_add_v2(
+                        content=op.content,
+                        category=op.category,
+                        importance=op.importance if op.importance is not None else 0.5,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                    if memory is not None:
+                        saved.append(memory)
+                elif op.op == OpType.UPDATE:
+                    if op.target_id is not None and await self._apply_update_v2(
+                        target_id=op.target_id,
+                        content=op.content or "",
+                        category=op.category,
+                        importance=op.importance,
+                    ):
+                        touched.add(op.target_id)
+                elif op.op == OpType.DELETE:
+                    if op.target_id is not None and await self._apply_delete_v2(
+                        target_id=op.target_id,
+                    ):
+                        touched.add(op.target_id)
+
+            # Bump last_accessed_at on retrieved-but-not-touched rows so the
+            # recency-decay ranking (Lane C) reflects this turn's relevance.
+            now = datetime.now(UTC).replace(tzinfo=None)
+            untouched = candidate_ids_initial - touched
+            for cid in untouched:
+                await self.db.execute(
+                    update(ConversationMemory)
+                    .where(ConversationMemory.id == cid)
+                    .values(
+                        last_accessed_at=now,
+                        access_count=ConversationMemory.access_count + 1,
+                    )
+                )
+
+            await self.db.flush()  # surface FK / constraint errors before exit
+        finally:
+            await self._release_user_lock(user_id)
+
+        return saved
+
+    # =========================================================================
     # Retrieve
     # =========================================================================
 
