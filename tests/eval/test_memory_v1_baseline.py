@@ -465,6 +465,41 @@ class TestCorpusLint:
                     assert isinstance(pre["age_days"], (int, float)) and pre["age_days"] >= 0
 
     @pytest.mark.unit
+    def test_extraction_eval_fixture_well_formed(self):
+        """Lint the Lane B/2 CI eval fixture (memory_extraction_eval.yaml).
+
+        Catches structural drift at PR time: every case must declare
+        an id, user_message, assistant_response, candidates list, and
+        an expect block with at least one of the supported assertion keys.
+        """
+        yaml = pytest.importorskip("yaml")
+        path = Path(__file__).resolve().parents[2] / "tests" / "eval" / "memory_extraction_eval.yaml"
+        with open(path) as f:
+            doc = yaml.safe_load(f)
+        cases = doc.get("cases") or []
+        assert cases, "eval fixture must declare at least one case"
+        required_keys = {"id", "user_message", "assistant_response", "candidates", "expect"}
+        valid_expect_keys = {
+            "ops",
+            "ops_count_at_most",
+            "ops_must_contain_op_types",
+            "ops_must_not_contain_op_types",
+            "ops_must_target_id_in_candidates",
+        }
+        ids_seen = set()
+        for case in cases:
+            missing = required_keys - set(case.keys())
+            assert not missing, f"case {case.get('id')} missing fields: {missing}"
+            assert case["id"] not in ids_seen, f"duplicate case id: {case['id']}"
+            ids_seen.add(case["id"])
+            assert isinstance(case["candidates"], list)
+            expect = case["expect"]
+            assert set(expect.keys()) & valid_expect_keys, (
+                f"case {case['id']}: expect block has no supported assertion keys "
+                f"({sorted(valid_expect_keys)})"
+            )
+
+    @pytest.mark.unit
     def test_wtc_subcategories_well_formed(self, corpus):
         """Every within_turn_contradiction turn must declare a subcategory.
 
