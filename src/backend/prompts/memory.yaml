@@ -144,10 +144,23 @@ de:
 
   extraction_v2_system: |
     Du extrahierst Operationen aus einem Dialog + bestehenden Erinnerungen.
-    Antworte NUR mit einem JSON-Array von Operations-Objekten. Honoriere
-    Widerrufs-Marker im selben Turn (eigentlich nicht / actually not / lieber /
-    stattdessen / ach nein) — diese zwingen NOOP oder UPDATE/DELETE, niemals
-    ADD des zurueckgezogenen Satzes.
+    Antworte NUR mit einem JSON-Array von Operations-Objekten.
+
+    DEFAULT-VERHALTEN: Wenn der Benutzer einen erinnerungswuerdigen
+    Fakt aeussert (Praeferenz, Anweisung, persoenliche Information),
+    ist die Default-Aktion ADD. Eine leere Kandidatenliste ist KEIN
+    Grund fuer NOOP — sie ist der haeufige Normalfall fuer neue Fakten.
+
+    NOOP setzt POSITIVE Evidenz voraus:
+      - Widerrufs-Marker im selben Turn ("eigentlich nicht", "actually not",
+        "lieber", "stattdessen", "ach nein") → NOOP oder UPDATE/DELETE,
+        niemals ADD des zurueckgezogenen Satzes
+      - Operative Abfrage ("liste alle X", "zeig mir Y")
+      - Identische Erinnerung schon vorhanden
+      - Kein erinnerungswuerdiger Inhalt (Smalltalk, Systemantwort)
+
+    Im Zweifelsfall: ADD lieber als NOOP. NOOP nur wenn ein konkreter
+    Grund aus der Liste oben zutrifft.
 
 en:
   extraction_prompt: |
@@ -279,10 +292,23 @@ en:
 
   extraction_v2_system: |
     You extract operations from a dialog + existing memories. Reply ONLY
-    with a JSON array of operation objects. Honor within-turn retraction
-    markers (actually not / eigentlich nicht / instead / rather / scratch
-    that) — these force NOOP or UPDATE/DELETE, never an ADD of the
-    retracted clause.
+    with a JSON array of operation objects.
+
+    DEFAULT BEHAVIOR: When the user states a memorable fact (preference,
+    instruction, personal info), the default action is ADD. An empty
+    candidate list is NOT a reason to NOOP — it's the common case for
+    a new fact.
+
+    NOOP requires POSITIVE evidence:
+      - Within-turn retraction marker ("actually not", "eigentlich nicht",
+        "instead", "rather", "wait no") → NOOP or UPDATE/DELETE, never
+        ADD of the retracted clause
+      - Operational query ("list all X", "show me Y")
+      - Identical memory already present
+      - No memorable content (smalltalk, system response)
+
+    When in doubt: prefer ADD over NOOP. NOOP only when a concrete
+    reason from the list above applies.
 
 # LLM options for extraction (low temperature for consistency)
 llm_options:
