@@ -11,6 +11,14 @@
 #                          generic_query | role_injection | pure_add |
 #                          cross_session_stale | circle_leakage |
 #                          wrong_substrate
+#   subcategory:           OPTIONAL refinement of category. For
+#                          within_turn_contradiction: blunt_retraction
+#                          (must NOOP — "eigentlich/actually/ach nein"
+#                          flips) vs hedged_refinement (NOOP or nuanced
+#                          ADD acceptable — "naja/das hängt/eher"
+#                          fuzzy phrasings). See
+#                          docs/MEMORY_V1_WTC_ANALYSIS.md for
+#                          rationale.
 #   flavor:                reva | renfield
 #   lang:                  de | en
 #   user_message:          what the user said this turn
@@ -354,6 +362,7 @@ corpus:
 
   - id: reva-wtc-01
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: de
     user_message: "Ich liebe das XLR-Dashboard. Eigentlich finde ich es nervig."
@@ -363,6 +372,7 @@ corpus:
 
   - id: reva-wtc-02
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: de
     user_message: "Ich brauche XLR-Reports täglich. Eigentlich reichen wöchentliche."
@@ -371,6 +381,7 @@ corpus:
 
   - id: reva-wtc-03
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: de
     user_message: "Mobile-Releases haben höchste Priorität. Naja, Web ist gerade wichtiger."
@@ -379,6 +390,7 @@ corpus:
 
   - id: reva-wtc-04
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: en
     user_message: "I prefer dark mode. Actually I find it hard to read."
@@ -387,6 +399,7 @@ corpus:
 
   - id: reva-wtc-05
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: de
     user_message: "Maria ist die RM für 2.0. Ach nein, Stefan hat das übernommen."
@@ -396,6 +409,7 @@ corpus:
 
   - id: reva-wtc-06
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: de
     user_message: "Wir launchen am Freitag. Eigentlich verschoben auf Montag."
@@ -404,6 +418,7 @@ corpus:
 
   - id: reva-wtc-07
     category: within_turn_contradiction
+    subcategory: hedged_refinement
     flavor: reva
     lang: de
     user_message: "Hotfixes laufen immer über UAT. Naja, nicht immer, das hängt vom Risiko ab."
@@ -412,6 +427,7 @@ corpus:
 
   - id: reva-wtc-08
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: en
     user_message: "I want stage runs nightly. Actually, daily during freeze."
@@ -420,6 +436,7 @@ corpus:
 
   - id: reva-wtc-09
     category: within_turn_contradiction
+    subcategory: hedged_refinement
     flavor: reva
     lang: de
     user_message: "Backend-Team macht den Cut. Naja, Web-Team eigentlich auch."
@@ -428,6 +445,7 @@ corpus:
 
   - id: reva-wtc-10
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: de
     user_message: "Release 2.0 ist auf Track. Eigentlich gibt's etwas Verzögerung."
@@ -436,6 +454,7 @@ corpus:
 
   - id: reva-wtc-11
     category: within_turn_contradiction
+    subcategory: hedged_refinement
     flavor: reva
     lang: de
     user_message: "Ich pinge die Ops bei Issues. Nicht direkt, eher per Ticket."
@@ -444,6 +463,7 @@ corpus:
 
   - id: reva-wtc-12
     category: within_turn_contradiction
+    subcategory: hedged_refinement
     flavor: reva
     lang: de
     user_message: "Wir mergen direkt nach Code-Review. Naja, wir warten auf CI."
@@ -452,6 +472,7 @@ corpus:
 
   - id: reva-wtc-13
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: de
     user_message: "Confluence-Pages sind die Source of Truth. Eigentlich die Jira-Tickets."
@@ -460,6 +481,7 @@ corpus:
 
   - id: reva-wtc-14
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: reva
     lang: en
     user_message: "I rely on the dashboard. Actually I check email more often."
@@ -468,6 +490,7 @@ corpus:
 
   - id: reva-wtc-15
     category: within_turn_contradiction
+    subcategory: hedged_refinement
     flavor: reva
     lang: de
     user_message: "Quartals-Retros sind Pflicht. Manchmal lassen wir sie aus."
@@ -476,6 +499,7 @@ corpus:
 
   - id: renfield-wtc-01
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: renfield
     lang: de
     user_message: "Ich liebe Mangos. Naja, eigentlich mag ich keine Mangos."
@@ -485,6 +509,7 @@ corpus:
 
   - id: renfield-wtc-02
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: renfield
     lang: de
     user_message: "Ich liebe Hip-Hop. Eigentlich Pop ist besser."
@@ -493,6 +518,7 @@ corpus:
 
   - id: renfield-wtc-03
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: renfield
     lang: de
     user_message: "Frühstück um 8 Uhr. Naja, lieber 9 Uhr."
@@ -501,6 +527,7 @@ corpus:
 
   - id: renfield-wtc-04
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: renfield
     lang: en
     user_message: "I want my living room at 22°C. Actually 20°C is fine."
@@ -509,6 +536,7 @@ corpus:
 
   - id: renfield-wtc-05
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: renfield
     lang: de
     user_message: "Schau Netflix. Eigentlich Disney+ heute."
@@ -517,6 +545,7 @@ corpus:
 
   - id: renfield-wtc-06
     category: within_turn_contradiction
+    subcategory: hedged_refinement
     flavor: renfield
     lang: de
     user_message: "Ich mag rote Weine. Weisse passen besser zum Sommer."
@@ -525,6 +554,7 @@ corpus:
 
   - id: renfield-wtc-07
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: renfield
     lang: en
     user_message: "I always shower in the morning. Actually evenings work better."
@@ -533,6 +563,7 @@ corpus:
 
   - id: renfield-wtc-08
     category: within_turn_contradiction
+    subcategory: blunt_retraction
     flavor: renfield
     lang: de
     user_message: "Geh zur Bäckerei auf der Hauptstraße. Lieber die andere, an der Ecke."

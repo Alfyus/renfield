@@ -464,6 +464,31 @@ class TestCorpusLint:
                 if "age_days" in pre:
                     assert isinstance(pre["age_days"], (int, float)) and pre["age_days"] >= 0
 
+    @pytest.mark.unit
+    def test_wtc_subcategories_well_formed(self, corpus):
+        """Every within_turn_contradiction turn must declare a subcategory.
+
+        Added in the wtc analysis (docs/MEMORY_V1_WTC_ANALYSIS.md):
+        - blunt_retraction: "eigentlich/actually/ach nein" flips → must NOOP
+        - hedged_refinement: "naja/das hängt/eher" fuzzy → NOOP or nuanced
+                             ADD both acceptable
+
+        Lane B/2's eval YAML splits its assertion logic on this field.
+        """
+        wtc = [t for t in corpus if t["category"] == "within_turn_contradiction"]
+        assert wtc, "Corpus should contain within_turn_contradiction turns"
+        for turn in wtc:
+            assert "subcategory" in turn, (
+                f"Turn {turn['id']} (within_turn_contradiction) is missing "
+                f"required `subcategory` field. Pick blunt_retraction or "
+                f"hedged_refinement."
+            )
+            assert turn["subcategory"] in {"blunt_retraction", "hedged_refinement"}, (
+                f"Turn {turn['id']}: subcategory must be one of "
+                f"blunt_retraction / hedged_refinement, got "
+                f"{turn['subcategory']!r}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # JSON round-trip for the --aggregate-only path
