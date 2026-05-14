@@ -563,11 +563,18 @@ async def run_one_turn(
     #    Stable across processes via hashlib — see stable_test_user_id docstring.
     test_user_id = stable_test_user_id(turn["id"])
 
-    # 2. Seed preexisting memories with backdated last_accessed_at.
-    #    Restrict circle_tier to 0 unless --allow-cross-tier passed.
-    #    Otherwise a corpus YAML edit could seed at tier 4 (global) and
-    #    expose those seeded rows to every household member via Circles v1.
-    rows_to_seed = []
+    # 2. Seed preexisting memories via the canonical service.save() so the
+    #    Wissensbasis longitudinal atom_id wiring + embeddings are handled
+    #    automatically (the WIP branch has conversation_memories.atom_id
+    #    NOT NULL with a FK to atoms.atom_id; direct INSERTs fail).
+    #    Backdate last_accessed_at + created_at via a raw UPDATE after
+    #    save() commits.
+    #
+    #    Restrict circle_tier to 0 unless --allow-cross-tier passed —
+    #    a malicious or careless YAML edit could otherwise seed at tier 4
+    #    (global) and expose to every household member via Circles v1.
+    from sqlalchemy import update
+    seeded_ids_to_backdate = []
     for pre in turn.get("preexisting_memories") or []:
         seed_tier = pre.get("circle_tier", 0)
         if seed_tier != 0 and not allow_cross_tier:
@@ -576,36 +583,55 @@ async def run_one_turn(
                 f"but --allow-cross-tier was not passed. Cross-tier seeding is a "
                 f"security-sensitive operation."
             )
-        age_days = pre.get("age_days", 0)
-        seeded_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=age_days)
-        # Re-namespace owner_user_id too — cross-tier-leakage corpus turns
-        # reference an "other user" via owner_user_id=99 in the YAML, which
-        # collides with real user 99. Map through stable_owner_user_id so
-        # they (a) live in the test namespace and (b) never collide with
-        # test_user_id (different bands inside the namespace).
+        # Re-namespace owner_user_id — circle_leakage corpus turns reference
+        # an "other user" via owner_user_id=99 in the YAML, which collides
+        # with real user 99. stable_owner_user_id puts owners in a separate
+        # band inside the test namespace.
         raw_owner = pre.get("owner_user_id")
         if raw_owner is None:
             owner_id = test_user_id
         else:
             owner_id = stable_owner_user_id(raw_owner)
-        rows_to_seed.append(
-            ConversationMemory(
-                content=pre["content"],
-                category=pre["category"],
-                importance=pre.get("importance", 0.5),
-                user_id=owner_id,
-                is_active=True,
-                access_count=0,
-                last_accessed_at=seeded_at,
-                created_at=seeded_at,
-                circle_tier=seed_tier,
-            )
+        # Use the canonical save path. service.save() commits internally,
+        # creates the atom row, generates the embedding, and writes the
+        # MemoryHistory entry. We capture the resulting id for backdating.
+        saved = await service.save(
+            content=pre["content"],
+            category=pre["category"],
+            user_id=owner_id,
+            importance=pre.get("importance", 0.5),
+            source_session_id=f"baseline-seed-{turn['id']}",
         )
-    if rows_to_seed:
-        db_session.add_all(rows_to_seed)
-        await db_session.flush()
-    # NOTE: no commit here. The outer `run_corpus` wraps the whole turn
-    # in `session.begin()` and decides whether to commit or rollback.
+        if saved is None:
+            raise RuntimeError(
+                f"Turn {turn['id']}: service.save() returned None for seed "
+                f"({pre['content']!r}, category={pre['category']!r}). "
+                f"Likely an embedding failure or invalid category."
+            )
+        age_days = pre.get("age_days", 0)
+        if age_days > 0:
+            seeded_ids_to_backdate.append((saved.id, age_days))
+        # circle_tier override (service.save defaults to tier=0; we need
+        # tier>0 for some circle_leakage cases). Apply per-row via UPDATE.
+        if seed_tier != 0:
+            await db_session.execute(
+                update(ConversationMemory)
+                .where(ConversationMemory.id == saved.id)
+                .values(circle_tier=seed_tier)
+            )
+            await db_session.commit()
+
+    # Backdate seed timestamps so cross_session_stale + dedup turns
+    # exercise the recency-decay path the way real prod data would.
+    for seed_id, age_days in seeded_ids_to_backdate:
+        seeded_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=age_days)
+        await db_session.execute(
+            update(ConversationMemory)
+            .where(ConversationMemory.id == seed_id)
+            .values(last_accessed_at=seeded_at, created_at=seeded_at)
+        )
+    if seeded_ids_to_backdate:
+        await db_session.commit()
 
     # 3. Snapshot existing rows BEFORE the extract call.
     from sqlalchemy import select
