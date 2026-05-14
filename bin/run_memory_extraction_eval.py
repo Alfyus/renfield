@@ -141,18 +141,33 @@ def summarize_ops(ops_list) -> str:
 # ---------------------------------------------------------------------------
 
 async def run_one_case(service, case: dict) -> CaseResult:
-    """Invoke service._call_extract_v2_llm against one case + assert."""
+    """Invoke the v2 extraction path against one case + assert.
+
+    Mirrors the production gate sequence: `should_extract_memories` runs
+    first; if it blocks (injection pattern or transactional query) the
+    extractor is skipped entirely and the runner reports an empty ops list.
+    This matches what extract_and_save_v2 does in production at line ~919.
+    """
     candidates = case.get("candidates") or []
     candidate_ids = {int(c["id"]) for c in candidates if "id" in c}
 
-    # _call_extract_v2_llm builds the prompt, calls the LLM, parses JSON,
-    # and validates via MemoryOpsList. Returns None on any failure.
-    ops_list = await service._call_extract_v2_llm(
-        user_message=case["user_message"],
-        assistant_response=case["assistant_response"],
-        existing_memories=candidates,
-        lang=case.get("lang", "de"),
-    )
+    if not service.should_extract_memories(
+        case["user_message"], case["assistant_response"]
+    ):
+        # Gate blocked extraction (injection / transactional / etc).
+        # Production returns [] from extract_and_save_v2; mirror that with
+        # an empty MemoryOpsList so the assertion shape is uniform.
+        from services.memory_ops import MemoryOpsList
+        ops_list = MemoryOpsList(root=[])
+    else:
+        # _call_extract_v2_llm builds the prompt, calls the LLM, parses
+        # JSON, and validates via MemoryOpsList. Returns None on failure.
+        ops_list = await service._call_extract_v2_llm(
+            user_message=case["user_message"],
+            assistant_response=case["assistant_response"],
+            existing_memories=candidates,
+            lang=case.get("lang", "de"),
+        )
 
     passed, failures = check_expectations(ops_list, case["expect"], candidate_ids)
     return CaseResult(

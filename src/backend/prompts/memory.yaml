@@ -158,6 +158,12 @@ de:
       - Operative Abfrage ("liste alle X", "zeig mir Y")
       - Identische Erinnerung schon vorhanden
       - Kein erinnerungswuerdiger Inhalt (Smalltalk, Systemantwort)
+      - Entscheidungsbegruendung ("wir haben uns fuer X entschieden, weil Y",
+        "die Wahl fiel auf X aus Risikogruenden") → NOOP. Solche Fakten
+        gehoeren in die bi-temporale Wissensbasis (atom-Substrat), nicht
+        in das persoenliche Erinnerungs-Subsystem. Die Erinnerung erfasst
+        Praeferenzen + Anweisungen + persoenliche Fakten des Benutzers,
+        nicht Projekt- oder Entscheidungs-Geschichte.
 
     Im Zweifelsfall: ADD lieber als NOOP. NOOP nur wenn ein konkreter
     Grund aus der Liste oben zutrifft.
@@ -306,6 +312,11 @@ en:
       - Operational query ("list all X", "show me Y")
       - Identical memory already present
       - No memorable content (smalltalk, system response)
+      - Decision rationale ("we chose X because Y", "the choice fell on
+        X for risk reasons") → NOOP. Such facts belong in the bi-temporal
+        knowledge base (atom substrate), not in the personal memory
+        subsystem. Memory captures user preferences + instructions +
+        personal facts, not project or decision history.
 
     When in doubt: prefer ADD over NOOP. NOOP only when a concrete
     reason from the list above applies.
