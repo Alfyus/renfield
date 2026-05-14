@@ -441,8 +441,7 @@ class ConversationMemoryService:
                     # outer caller's transaction will eventually decide
                     # whether to commit (v1 writes will persist regardless).
                     logger.warning(
-                        "v2 shadow: savepoint rollback failed (swallowed): %s",
-                        type(e_rb).__name__,
+                        f"v2 shadow: savepoint rollback failed (swallowed): {type(e_rb).__name__}: {e_rb}"
                     )
 
         # Write the shadow log row in its OWN savepoint so a log-table

@@ -425,45 +425,53 @@ class KnowledgeGraphService:
         # atom_id=None (the source-row ORM column is nullable). Production
         # always has the bootstrap admin, so the atom-backed path is the one
         # that actually runs.
-        # Order-of-operations fix (2026-05-14): previously this created the
-        # atom row FIRST with a "__pending__" source_id, then inserted the
-        # kg_entity, then UPDATEd the atom's source_id with the entity's
-        # real PK. If anything between those steps failed (validation,
-        # embedding flush, dedup query) AND the atom's flush had already
-        # been committed by another code path (e.g. atom_service.upsert_atom
-        # internal commit), production ended up with orphan atoms pointing
-        # at kg_entities IDs that never existed — every subsequent attempt
-        # to create a kg_entity then hit `uq_atoms_source` and failed,
-        # blocking the entire KG-extraction pipeline indefinitely.
+        # Atomicity fix (2026-05-14): the entity/atom creation must be
+        # all-or-nothing. The original code flushed the atom row (with
+        # __pending__ source_id) and then flushed the entity row in
+        # separate db.flush() calls, relying on the outer transaction to
+        # commit both together. But upsert_atom-style internal commits
+        # elsewhere — or a partial-failure path that committed the atom
+        # before the entity flush — left 192 orphan kg_node atoms in
+        # prod, blocking every subsequent kg_entity insert on
+        # uq_atoms_source. Wrapping the entire dance in begin_nested()
+        # makes the savepoint roll back atomically on ANY failure inside.
         #
-        # Insert the entity first (in a savepoint so a rollback doesn't
-        # poison the outer transaction), get its real PK, then create the
-        # atom with that PK — no placeholder, no later UPDATE step. The
-        # savepoint also guarantees that if the atom insert fails the
-        # entity insert is rolled back atomically.
-        entity = KGEntity(
-            user_id=owner_id,
-            name=name,
-            entity_type=entity_type if entity_type in KG_ENTITY_TYPES else "thing",
-            description=description,
-            embedding=embedding,
-            atom_id=None,
-            circle_tier=default_tier,
-        )
+        # Ordering stays atom-first because kg_entities.atom_id is
+        # NOT NULL at the DB level (alembic migration pc20260420 sets the
+        # FK as NOT NULL non-deferrable — the ORM column nullable=True
+        # comment in models/database.py is misleading drift). The
+        # placeholder-then-finalize pattern is preserved; the atomicity
+        # comes from the savepoint.
         atom_id: str | None = None
         if owner_id is not None:
             async with self.db.begin_nested():
-                self.db.add(entity)
-                await self.db.flush()  # assigns entity.id
                 atom_id = await self._atom_service().create_with_source(
                     atom_type="kg_node",
                     owner_user_id=owner_id,
                     tier=default_tier,
-                    source_id=entity.id,
                 )
-                entity.atom_id = atom_id
-                await self.db.flush()
+                entity = KGEntity(
+                    user_id=owner_id,
+                    name=name,
+                    entity_type=entity_type if entity_type in KG_ENTITY_TYPES else "thing",
+                    description=description,
+                    embedding=embedding,
+                    atom_id=atom_id,
+                    circle_tier=default_tier,
+                )
+                self.db.add(entity)
+                await self.db.flush()  # entity.id assigned
+                await self._atom_service().finalize_source_id(atom_id, entity.id)
         else:
+            entity = KGEntity(
+                user_id=owner_id,
+                name=name,
+                entity_type=entity_type if entity_type in KG_ENTITY_TYPES else "thing",
+                description=description,
+                embedding=embedding,
+                atom_id=None,
+                circle_tier=default_tier,
+            )
             self.db.add(entity)
             await self.db.flush()
         logger.debug(f"KG: New entity '{name}' ({entity_type}) id={entity.id} atom_id={atom_id}")
