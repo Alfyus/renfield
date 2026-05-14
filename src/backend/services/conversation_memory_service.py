@@ -291,12 +291,106 @@ class ConversationMemoryService:
         session_id: str | None = None,
         lang: str = "de",
     ) -> list[ConversationMemory]:
-        """Extract memorable facts from a conversation exchange and save them.
+        """Dispatcher — routes to v1 or v2 based on settings flags.
 
-        Uses the LLM to analyze the dialog, then saves extracted memories
-        with embeddings and deduplication.
+        Flag matrix:
+          v2_authoritative=True  -> extract_and_save_v2 (v2 path; falls back
+                                    to v1 on LLM/schema/drift failure)
+          v2_shadow=True (only)  -> v1 returns; v2 also runs as a background
+                                    fire-and-forget task that logs its
+                                    output (and lands in memory_v2_shadow_log
+                                    once that alembic table exists in Lane B/2
+                                    follow-up).
+          both False (default)   -> v1 only (current behavior)
 
-        Returns list of saved/deduplicated memories.
+        Public API kept stable so chat_handler and other callers don't
+        change. The v2 path's fallback uses the private `_extract_and_save_v1_impl`
+        directly to avoid an infinite dispatcher recursion when
+        v2_authoritative is on.
+        """
+        if settings.memory_extraction_v2_authoritative:
+            return await self.extract_and_save_v2(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                user_id=user_id,
+                session_id=session_id,
+                lang=lang,
+            )
+
+        if settings.memory_extraction_v2_shadow:
+            # Fire v2 as a background task — does not block the v1 return
+            # path. v2's outcome is logged for later diff analysis once
+            # the memory_v2_shadow_log table lands (Lane B/2 follow-up).
+            import asyncio as _asyncio
+            _asyncio.create_task(self._extract_v2_shadow_only(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                user_id=user_id,
+                session_id=session_id,
+                lang=lang,
+            ))
+
+        return await self._extract_and_save_v1_impl(
+            user_message=user_message,
+            assistant_response=assistant_response,
+            user_id=user_id,
+            session_id=session_id,
+            lang=lang,
+        )
+
+    async def _extract_v2_shadow_only(
+        self,
+        user_message: str,
+        assistant_response: str,
+        user_id: int | None,
+        session_id: str | None,
+        lang: str,
+    ) -> None:
+        """Run v2 in shadow mode — does not affect main DB state.
+
+        Calls extract_and_save_v2 (which runs the LLM + drift check), then
+        ROLLS BACK any writes via a savepoint. The v2 result is logged
+        so the diff against v1 is visible in production logs until the
+        memory_v2_shadow_log table lands (Lane B/2 follow-up).
+
+        Errors in shadow mode are swallowed so they cannot affect the
+        primary v1 path.
+        """
+        try:
+            # Use a savepoint so v2's writes can be rolled back without
+            # affecting the caller's outer transaction (chat_handler).
+            sp = await self.db.begin_nested()
+            try:
+                result = await self.extract_and_save_v2(
+                    user_message=user_message,
+                    assistant_response=assistant_response,
+                    user_id=user_id,
+                    session_id=session_id,
+                    lang=lang,
+                )
+                logger.info(
+                    "v2 shadow: extracted=%d ops for user_id=%s",
+                    len(result), user_id,
+                )
+            finally:
+                await sp.rollback()
+        except Exception as e:
+            logger.warning(
+                "v2 shadow: extraction failed (swallowed): %s", type(e).__name__
+            )
+
+    async def _extract_and_save_v1_impl(
+        self,
+        user_message: str,
+        assistant_response: str,
+        user_id: int | None = None,
+        session_id: str | None = None,
+        lang: str = "de",
+    ) -> list[ConversationMemory]:
+        """v1 extraction implementation. Called directly by:
+          - the public extract_and_save() dispatcher when both v2 flags are off
+          - extract_and_save_v2's fallback path on any v2 failure
+        Do NOT add the v2 flag dispatch here — would recurse.
         """
         # Guard: Skip extraction for injection attempts and transactional queries
         if not self.should_extract_memories(user_message, assistant_response):
@@ -770,7 +864,9 @@ class ConversationMemoryService:
         )
         if ops_list is None:
             logger.info("v2 extract: LLM/schema rejected → fallback to v1")
-            return await self.extract_and_save(
+            # Call v1 impl directly — going through the dispatcher would
+            # recurse if v2_authoritative is on.
+            return await self._extract_and_save_v1_impl(
                 user_message=user_message,
                 assistant_response=assistant_response,
                 user_id=user_id,
@@ -791,7 +887,8 @@ class ConversationMemoryService:
             rejection = validate_against_candidates(ops_list, fresh_ids)
             if rejection is not None:
                 logger.info(f"v2 extract: drift rejected ({rejection}) → fallback to v1")
-                return await self.extract_and_save(
+                # Call v1 impl directly (see comment in the schema-reject branch above).
+                return await self._extract_and_save_v1_impl(
                     user_message=user_message,
                     assistant_response=assistant_response,
                     user_id=user_id,

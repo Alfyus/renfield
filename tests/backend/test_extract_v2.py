@@ -105,6 +105,73 @@ class TestExtractV2Gating:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_dispatcher_calls_v1_by_default(self):
+        """Default flags (both v2 flags False) → public extract_and_save
+        dispatches to _extract_and_save_v1_impl."""
+        from utils.config import settings
+        service = self._make_service()
+        service._extract_and_save_v1_impl = AsyncMock(return_value=["v1"])
+        service.extract_and_save_v2 = AsyncMock(return_value=["v2"])
+        with patch.object(settings, "memory_extraction_v2_authoritative", False), \
+             patch.object(settings, "memory_extraction_v2_shadow", False):
+            result = await service.extract_and_save(
+                user_message="Hello",
+                assistant_response="Hi",
+                user_id=1,
+            )
+        assert result == ["v1"]
+        service._extract_and_save_v1_impl.assert_called_once()
+        service.extract_and_save_v2.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_dispatcher_calls_v2_when_authoritative(self):
+        """v2_authoritative=True → dispatcher calls extract_and_save_v2."""
+        from utils.config import settings
+        service = self._make_service()
+        service._extract_and_save_v1_impl = AsyncMock(return_value=["v1"])
+        service.extract_and_save_v2 = AsyncMock(return_value=["v2"])
+        with patch.object(settings, "memory_extraction_v2_authoritative", True), \
+             patch.object(settings, "memory_extraction_v2_shadow", False):
+            result = await service.extract_and_save(
+                user_message="Hello",
+                assistant_response="Hi",
+                user_id=1,
+            )
+        assert result == ["v2"]
+        service.extract_and_save_v2.assert_called_once()
+        service._extract_and_save_v1_impl.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_dispatcher_shadow_runs_both(self):
+        """v2_shadow=True (authoritative=False) → v1 result returned,
+        v2 fired as a background task."""
+        import asyncio
+        from utils.config import settings
+        service = self._make_service()
+        service._extract_and_save_v1_impl = AsyncMock(return_value=["v1"])
+        # Track that shadow task is created (we don't await it in production
+        # — but the AsyncMock test environment needs the shadow coroutine
+        # to be awaited or it warns. So mock _extract_v2_shadow_only to
+        # complete immediately.)
+        service._extract_v2_shadow_only = AsyncMock(return_value=None)
+        with patch.object(settings, "memory_extraction_v2_authoritative", False), \
+             patch.object(settings, "memory_extraction_v2_shadow", True):
+            result = await service.extract_and_save(
+                user_message="Hello",
+                assistant_response="Hi",
+                user_id=1,
+            )
+            # Let the create_task scheduling complete
+            await asyncio.sleep(0)
+        assert result == ["v1"]
+        service._extract_and_save_v1_impl.assert_called_once()
+        # Shadow coroutine should have been launched (call_count >= 1)
+        assert service._extract_v2_shadow_only.call_count == 1
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_v1_fallback_when_v2_llm_returns_none(self):
         """When _call_extract_v2_llm returns None (parse/schema failure),
         the method must fall back to v1 extract_and_save."""
@@ -115,8 +182,9 @@ class TestExtractV2Gating:
         with patch("services.memory_retrieval.MemoryRetrieval", return_value=mock_retriever):
             # Mock the v2 LLM call to return None (simulates parse error)
             service._call_extract_v2_llm = AsyncMock(return_value=None)
-            # Mock v1 extract_and_save so we can detect the fallback
-            service.extract_and_save = AsyncMock(return_value=["v1_result"])
+            # Mock the v1 IMPLEMENTATION (not the dispatcher) — fallback
+            # bypasses the dispatcher to avoid recursion.
+            service._extract_and_save_v1_impl = AsyncMock(return_value=["v1_result"])
             result = await service.extract_and_save_v2(
                 user_message="Mein Lieblingsrelease ist Product A 1.2.3",
                 assistant_response="Notiert.",
@@ -124,7 +192,7 @@ class TestExtractV2Gating:
                 lang="de",
             )
             assert result == ["v1_result"]
-            service.extract_and_save.assert_called_once()
+            service._extract_and_save_v1_impl.assert_called_once()
             # Lock was acquired + released around retrieve (Phase 1) but NOT
             # the apply phase, since we short-circuited to v1.
             assert service.db.execute.call_count >= 2  # at least lock + unlock
