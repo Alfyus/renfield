@@ -1090,6 +1090,52 @@ class MemoryHistory(Base):
     memory = relationship("ConversationMemory", foreign_keys=[memory_id])
 
 
+# Memory v2 Shadow Log — Lane B/2 phase-A comparison substrate.
+#
+# Records every turn the dispatcher routes through v2-shadow mode.
+# Stores both v1's outcome (what the user actually saw — committed) and
+# v2's outcome (what would have happened — rolled back via savepoint).
+# Enables a daily diff report measuring v1-vs-v2 parity before flipping
+# memory_extraction_v2_authoritative=True.
+#
+# Operational rule (per the locked plan's "Forgetting (new) — DROPPED"
+# decision and the v2 shadow protocol): this table grows monotonically;
+# no auto-cleanup. Operators can prune via a one-shot SQL after the
+# Phase B flip lands.
+
+class MemoryV2ShadowLog(Base):
+    """Per-turn v1/v2 outcome record for Phase A shadow-mode validation."""
+    __tablename__ = "memory_v2_shadow_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
+    # ON DELETE SET NULL must mirror the alembic migration. Without
+    # ondelete= here, create_all() (used by CI test fixtures) emits a
+    # RESTRICT FK that diverges from the production migration and
+    # fails user-deletion with IntegrityError.
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    session_id = Column(String(255), nullable=True, index=True)
+    lang = Column(String(10), nullable=True)
+
+    # v1: what actually shipped to the user (authoritative).
+    v1_outcome = Column(String(20), nullable=True)  # e.g. "saved_3" or "noop_should_extract_false"
+    v1_extracted_count = Column(Integer, nullable=True)
+    v1_latency_seconds = Column(Float, nullable=True)
+
+    # v2: what would have happened (rolled back via savepoint).
+    v2_outcome = Column(String(20), nullable=True)  # "noop" | "add" | "update" | "delete" | "fallback" | "error"
+    v2_ops_json = Column(Text, nullable=True)       # full MemoryOpsList serialization
+    v2_extracted_count = Column(Integer, nullable=True)
+    v2_fallback_reason = Column(String(40), nullable=True)  # parse_error|llm_timeout|id_reject|schema_reject|null
+    v2_latency_seconds = Column(Float, nullable=True)
+    v2_error = Column(String(80), nullable=True)  # type(exc).__name__ when shadow swallowed an exception
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
 # ==========================================================================
 # BLE Presence Detection (moved to ha_glue/models/database.py — re-exported below)
 # ==========================================================================

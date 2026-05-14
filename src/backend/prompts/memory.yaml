@@ -47,6 +47,132 @@ de:
 
   contradiction_resolution_system: "Du vergleichst Fakten mit bestehenden Erinnerungen. Antworte NUR mit einem JSON-Objekt."
 
+  # =====================================================================
+  # v2 — Mem0-style batched extraction (Lane B/2 of memory architecture
+  # upgrade). Combines the v1 extraction + per-fact contradiction-resolution
+  # calls into a SINGLE LLM tool call that emits a list of MemoryOps.
+  #
+  # Schema is enforced by services/memory_ops.py (Pydantic v2). This prompt
+  # references field names but does NOT redeclare them — that would
+  # silently drift. Reva's override prompt only adds negative constraints
+  # (release-management, GDPR/BetrVG); it must not redeclare the op
+  # vocabulary either.
+  #
+  # Retraction-marker instruction motivated by docs/MEMORY_V1_WTC_ANALYSIS.md:
+  # v1 qwen3.6 fails on 15/19 turns containing "eigentlich"/"actually"
+  # within a single turn (extracts the first half, ignores the retraction).
+  # v2 must explicitly scan for retraction markers before emitting any op.
+  # =====================================================================
+  extraction_v2_prompt: |
+    Analysiere den Dialog UND die bereits gespeicherten Erinnerungen. Entscheide,
+    welche Operationen auf die Erinnerungs-Datenbank notwendig sind.
+
+    DIALOG:
+    User: {user_message}
+    Assistent: {assistant_response}
+
+    BEREITS GESPEICHERT (top-K nach Aehnlichkeit zur User-Nachricht):
+    {existing_memories}
+
+    REGELN:
+    1. WIDERRUFS-MARKER IM SELBEN TURN — kritisch:
+       Wenn die User-Nachricht einen Marker enthaelt, der einen frueheren
+       Satz im selben Turn zurueckzieht, NIE den zurueckgezogenen Satz
+       extrahieren. Marker (Deutsch): "eigentlich nicht", "doch nicht",
+       "lieber", "stattdessen", "ach nein", "naja, nicht...". Marker
+       (Englisch): "actually not", "wait no", "scratch that", "instead",
+       "rather". In diesem Fall entweder NOOP oder nur die zurueckgezogene
+       Variante speichern.
+
+    2. WENN eine bestehende Erinnerung semantisch identisch ist -> NOOP.
+    3. WENN eine bestehende Erinnerung sich aendert (neuer Wert)        -> UPDATE.
+    4. WENN der Benutzer ausdruecklich etwas vergessen will             -> DELETE.
+    5. WENN der Fakt neu und nicht im bestehenden Set ist               -> ADD.
+    6. WENN nichts Erinnerungswuerdiges -> leere Liste oder [{{"op": "NOOP"}}].
+
+    FELDER PRO OPERATION (Schema-validiert; keine Felder umbenennen):
+    - op:         "ADD" | "UPDATE" | "DELETE" | "NOOP"
+    - target_id:  integer; REQUIRED fuer UPDATE/DELETE, muss aus
+                  "BEREITS GESPEICHERT" stammen
+    - content:    string; REQUIRED fuer ADD/UPDATE
+    - category:   "preference" | "fact" | "context" | "instruction" | "procedural"
+                  REQUIRED fuer ADD; optional fuer UPDATE
+    - importance: float 0.1-1.0
+    - reason:     kurzer string, optional, fuer menschliches Review
+
+    BEISPIELE:
+
+    User: "Ich bin Release Manager fuer Release 2.1."
+    Bestehend: (keine bestehenden Erinnerungen)
+    -> Klarer persoenlicher Fakt, kein Widerruf, nichts widerspricht.
+    -> [{{"op": "ADD", "content": "Is Release Manager for Release 2.1",
+          "category": "fact", "importance": 0.9}}]
+
+    User: "Sprich mich bitte mit Du an."
+    -> Stehende Anweisung. Auch wenn die Kandidatenliste leer ist:
+       ADD den Fakt. Leere Kandidaten heisst NICHT NOOP per default.
+    -> [{{"op": "ADD", "content": "Prefers informal address",
+          "category": "procedural", "importance": 0.8}}]
+
+    User: "Ich liebe Mangos. Eigentlich mag ich keine Mangos."
+    -> Widerrufs-Marker "Eigentlich" + Negation. NICHT "liebt Mangos" speichern.
+    -> [{{"op": "NOOP", "reason": "user retracted within turn"}}]
+
+    User: "Ich liebe Hip-Hop. Eigentlich Pop ist besser."
+    Bestehend: [id=42, "Loves hip-hop"]
+    -> Wertaenderung relativ zu id=42.
+    -> [{{"op": "UPDATE", "target_id": 42, "content": "Prefers pop music",
+          "category": "preference", "importance": 0.7}}]
+
+    User: "Hotfixes laufen meistens ueber UAT. Naja, manchmal nicht, das haengt vom Risiko ab."
+    -> Bedingte Praxis (kein Widerruf, sondern Refinement).
+    -> Beides akzeptabel:
+       [{{"op": "ADD", "content": "Hotfixes meist via UAT, risk-based Ausnahmen",
+          "category": "context", "importance": 0.5}}]
+       ODER [{{"op": "NOOP", "reason": "process with caveats, no clean fact"}}]
+
+    User: "Vergiss meine Praeferenz fuer Jazz."
+    Bestehend: [id=10, "Loves jazz"]
+    -> Expliziter User-Widerruf.
+    -> [{{"op": "DELETE", "target_id": 10, "reason": "user retracted"}}]
+
+    User: "Liste alle Releases"
+    -> Operative Abfrage, kein persoenlicher Fakt.
+    -> [{{"op": "NOOP", "reason": "operational query"}}]
+
+    Antworte als JSON-Array.
+
+  extraction_v2_system: |
+    Du extrahierst Operationen aus einem Dialog + bestehenden Erinnerungen.
+    Antworte NUR mit einem JSON-Array von Operations-Objekten.
+
+    DEFAULT-VERHALTEN: Wenn der Benutzer einen erinnerungswuerdigen
+    Fakt aeussert (Praeferenz, Anweisung, persoenliche Information),
+    ist die Default-Aktion ADD. Eine leere Kandidatenliste ist KEIN
+    Grund fuer NOOP — sie ist der haeufige Normalfall fuer neue Fakten.
+
+    NOOP setzt POSITIVE Evidenz voraus:
+      - Widerrufs-Marker im selben Turn ("eigentlich nicht", "actually not",
+        "lieber", "stattdessen", "ach nein") → NOOP oder UPDATE/DELETE,
+        niemals ADD des zurueckgezogenen Satzes
+      - Operative Abfrage ("liste alle X", "zeig mir Y")
+      - Identische Erinnerung schon vorhanden
+      - Kein erinnerungswuerdiger Inhalt (Smalltalk, Systemantwort)
+      - Reine Entscheidungsbegruendung ("wir haben uns fuer X entschieden,
+        weil Y", "die Wahl fiel auf X aus Risikogruenden") → NOOP. Solche
+        Fakten gehoeren in die bi-temporale Wissensbasis (atom-Substrat),
+        nicht in das persoenliche Erinnerungs-Subsystem. Die Erinnerung
+        erfasst Praeferenzen + Anweisungen + persoenliche Fakten +
+        relevanten Benutzerkontext (laufende Plaene, Deadlines) — nicht
+        Projekt- oder Entscheidungs-Geschichte. Mischt eine Aeusserung
+        einen neuen Benutzerkontext mit einer Begruendung ("wir wechseln
+        zu Postgres, weil MySQL der Bottleneck ist"), ADD den Kontext-
+        Teil ("Plant Migration zu Postgres"); die Begruendung selbst
+        gehoert nicht in die Erinnerung.
+
+    Im Zweifelsfall: ADD lieber als NOOP. NOOP nur wenn ein konkreter
+    Grund aus der Liste oben zutrifft.
+
 en:
   extraction_prompt: |
     Analyze the following dialog and extract memorable facts about the user.
@@ -91,6 +217,119 @@ en:
     {{"action": "ADD|UPDATE|DELETE|NOOP", "target_memory_id": null, "updated_content": null, "reason": "..."}}
 
   contradiction_resolution_system: "You compare facts with existing memories. Reply ONLY with a JSON object."
+
+  # =====================================================================
+  # v2 — Mem0-style batched extraction (Lane B/2 of memory architecture
+  # upgrade). See the de section above for full rationale + Lane B/1
+  # schema reference. Same shape, English text.
+  # =====================================================================
+  extraction_v2_prompt: |
+    Analyze the dialog AND the already-stored memories. Decide which operations
+    on the memory database are necessary.
+
+    DIALOG:
+    User: {user_message}
+    Assistant: {assistant_response}
+
+    ALREADY STORED (top-K by similarity to the user message):
+    {existing_memories}
+
+    RULES:
+    1. WITHIN-TURN RETRACTION MARKERS — critical:
+       If the user message contains a marker that retracts an earlier
+       clause in the same turn, NEVER extract the retracted clause.
+       English markers: "actually not", "wait no", "scratch that",
+       "instead", "rather". German markers: "eigentlich nicht", "doch
+       nicht", "lieber", "stattdessen", "ach nein", "naja, nicht...".
+       In that case either NOOP or store only the retracted-to variant.
+
+    2. IF an existing memory is semantically identical -> NOOP.
+    3. IF an existing memory needs updating (new value)  -> UPDATE.
+    4. IF the user explicitly retracts something         -> DELETE.
+    5. IF the fact is genuinely new and not in the set   -> ADD.
+    6. IF nothing is memorable -> empty list or [{{"op": "NOOP"}}].
+
+    FIELDS PER OPERATION (schema-validated; do not rename fields):
+    - op:         "ADD" | "UPDATE" | "DELETE" | "NOOP"
+    - target_id:  integer; REQUIRED for UPDATE/DELETE, must come from
+                  the ALREADY STORED list above
+    - content:    string; REQUIRED for ADD/UPDATE
+    - category:   "preference" | "fact" | "context" | "instruction" | "procedural"
+                  REQUIRED for ADD; optional for UPDATE
+    - importance: float 0.1-1.0
+    - reason:     short string, optional, for human review
+
+    EXAMPLES:
+
+    User: "I am the Release Manager for Release 2.1."
+    Existing: (no existing memories)
+    -> Clean personal fact. No retraction, nothing contradicting.
+    -> [{{"op": "ADD", "content": "Is Release Manager for Release 2.1",
+          "category": "fact", "importance": 0.9}}]
+
+    User: "Always respond in English."
+    -> Standing instruction. Empty candidates list is NOT a reason to NOOP —
+       ADD the fact. NOOP is only for retractions or non-memorable turns.
+    -> [{{"op": "ADD", "content": "Always respond in English",
+          "category": "procedural", "importance": 0.8}}]
+
+    User: "I love mangoes. Actually I don't like mangoes."
+    -> Retraction marker "Actually" + negation. Do NOT save "loves mangoes".
+    -> [{{"op": "NOOP", "reason": "user retracted within turn"}}]
+
+    User: "I love hip-hop. Actually pop is better."
+    Existing: [id=42, "Loves hip-hop"]
+    -> Value change relative to id=42.
+    -> [{{"op": "UPDATE", "target_id": 42, "content": "Prefers pop music",
+          "category": "preference", "importance": 0.7}}]
+
+    User: "Hotfixes usually go through UAT. Well, sometimes not — risk-dependent."
+    -> Conditional practice (not a retraction, a refinement).
+    -> Either is acceptable:
+       [{{"op": "ADD", "content": "Hotfixes mostly via UAT, risk-based exceptions",
+          "category": "context", "importance": 0.5}}]
+       OR [{{"op": "NOOP", "reason": "process with caveats, no clean fact"}}]
+
+    User: "Forget that I like jazz."
+    Existing: [id=10, "Loves jazz"]
+    -> Explicit user retraction.
+    -> [{{"op": "DELETE", "target_id": 10, "reason": "user retracted"}}]
+
+    User: "List all releases"
+    -> Operational query, not a personal fact.
+    -> [{{"op": "NOOP", "reason": "operational query"}}]
+
+    Reply as a JSON array.
+
+  extraction_v2_system: |
+    You extract operations from a dialog + existing memories. Reply ONLY
+    with a JSON array of operation objects.
+
+    DEFAULT BEHAVIOR: When the user states a memorable fact (preference,
+    instruction, personal info), the default action is ADD. An empty
+    candidate list is NOT a reason to NOOP — it's the common case for
+    a new fact.
+
+    NOOP requires POSITIVE evidence:
+      - Within-turn retraction marker ("actually not", "eigentlich nicht",
+        "instead", "rather", "wait no") → NOOP or UPDATE/DELETE, never
+        ADD of the retracted clause
+      - Operational query ("list all X", "show me Y")
+      - Identical memory already present
+      - No memorable content (smalltalk, system response)
+      - Pure decision rationale ("we chose X because Y", "the choice
+        fell on X for risk reasons") → NOOP. Such facts belong in the
+        bi-temporal knowledge base (atom substrate / wissensbasis), not
+        in the personal memory subsystem. Memory captures user
+        preferences + instructions + personal facts + relevant user
+        context (current plans, deadlines) — not project or decision
+        history. If an utterance mixes new user-context with a rationale
+        ("we're migrating to Postgres because MySQL is bottlenecking"),
+        ADD the context part ("Plans migration to Postgres"); the
+        rationale itself does not belong in memory.
+
+    When in doubt: prefer ADD over NOOP. NOOP only when a concrete
+    reason from the list above applies.
 
 # LLM options for extraction (low temperature for consistency)
 llm_options:
