@@ -302,6 +302,22 @@ class Settings(BaseSettings):
     memory_extraction_retrieve_k: int = Field(default=5, ge=1, le=50)       # Top-K candidates for v2 extract LLM prompt
     memory_extraction_v2_shadow: bool = False                                # Phase A: run v2 in shadow mode alongside v1
     memory_extraction_v2_authoritative: bool = False                         # Phase B: v2 is primary; v1 becomes legacy fallback
+    # Lane D — separate retrieval threshold for the v2 extract pipeline.
+    # Chat retrieval uses `memory_retrieval_threshold=0.7` for high
+    # precision (don't surface tangential memories to the user). Extract
+    # is a different surface: high recall is what matters, and the LLM
+    # plus the drift check together replace the score gate. Defaulting
+    # to 0.0 means the LLM sees top-K candidates regardless of similarity.
+    #
+    # Empirical basis: the 0.7 default produced cross_session_update
+    # detection of 0.143; setting this to 0.0 raised it to 0.929 with no
+    # regression on any of the four locked baselines. See
+    # `docs/lane-d-extract-retrieval-threshold.md` for the full A/B.
+    #
+    # If you want to experiment with intermediate values, set this via
+    # env var (MEMORY_EXTRACT_RETRIEVAL_THRESHOLD). 0.0 is the production
+    # default; do not raise above 0.5 without re-running the corpus.
+    memory_extract_retrieval_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
     # Lane C two-stage retrieval with recency-aware rerank. Opt-in via
     # `ranker="recency_aware"` on MemoryRetrieval.retrieve(). v2 callers
     # use it by default; web chat / retrieve_for_prompt still on the
@@ -542,6 +558,26 @@ class Settings(BaseSettings):
         if self.default_language not in voice_map:
             voice_map[self.default_language] = self.piper_default_voice
         return voice_map
+
+    @model_validator(mode="after")
+    def warn_deprecated_extract_mode_env(self) -> "Settings":
+        """Surface stale `MEMORY_EXTRACT_RETRIEVAL_MODE` env vars.
+
+        The mode enum (`threshold_filter`/`no_filter`/`score_aware`) was an
+        experiment-only knob introduced and removed within the 2026-05-15
+        Lane D work. Silent-ignore is the Pydantic Settings default for
+        unknown env vars; operators who followed internal notes and set
+        the env var would think the knob is still wired. Bark loudly so
+        they switch to `MEMORY_EXTRACT_RETRIEVAL_THRESHOLD`.
+        """
+        if os.getenv("MEMORY_EXTRACT_RETRIEVAL_MODE"):
+            logger.warning(
+                "MEMORY_EXTRACT_RETRIEVAL_MODE is set but no longer recognised "
+                "(removed in PR #583). Use MEMORY_EXTRACT_RETRIEVAL_THRESHOLD "
+                "(float 0.0-1.0; production default 0.0) instead. See "
+                "docs/lane-d-extract-retrieval-threshold.md."
+            )
+        return self
 
     @model_validator(mode="after")
     def assemble_database_url(self) -> "Settings":
