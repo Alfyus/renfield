@@ -105,6 +105,7 @@ class MemoryRetrieval:
         user_id: int | None = None,
         limit: int | None = None,
         threshold: float | None = None,
+        ranker: str = "default",
     ) -> list[dict]:
         """
         Retrieve relevant memories using cosine similarity search.
@@ -114,6 +115,16 @@ class MemoryRetrieval:
         memories from circle peers (per `circle_sql.conversation_memories_circles_filter`).
         For anonymous callers (`user_id is None`) only public-tier memories
         are returned.
+
+        `ranker` controls the SQL ordering:
+          - "default": single-stage ORDER BY similarity * importance * confidence
+            (legacy behavior, used by web chat + retrieve_for_prompt).
+          - "recency_aware": two-stage CTE — Stage-1 HNSW recall over
+            `memory_retrieval_recall_k` candidates, Stage-2 rerank with
+            recency factor on `last_accessed_at`. Used by Lane B/2 v2
+            extractor (improves cross_session_stale detection by widening
+            the candidate window and surfacing recently-touched rows that
+            the user is contradicting).
 
         Returns list of dicts with id, content, category, importance, similarity.
         Side effect: updates access_count + last_accessed_at on returned rows.
@@ -130,27 +141,65 @@ class MemoryRetrieval:
         embedding_str = f"[{','.join(map(str, query_embedding))}]"
         circles_clause, circles_params = self._memory_circles_filter(user_id)
 
-        sql = text(f"""
-            SELECT
-                id,
-                content,
-                category,
-                importance,
-                confidence,
-                access_count,
-                created_at,
-                1 - (embedding <=> CAST(:embedding AS vector)) as similarity
-            FROM conversation_memories m
-            WHERE is_active = true
-              AND embedding IS NOT NULL
-              AND {circles_clause}
-            ORDER BY (1 - (embedding <=> CAST(:embedding AS vector))) * importance * confidence DESC
-            LIMIT :limit
-        """)
-
-        params: dict[str, Any] = {
-            "embedding": embedding_str, "limit": limit, **circles_params,
-        }
+        if ranker == "recency_aware":
+            recall_k = max(int(settings.memory_retrieval_recall_k), int(limit))
+            sql = text(f"""
+                WITH candidates AS (
+                    SELECT
+                        id, content, category, importance, confidence, access_count,
+                        created_at, last_accessed_at,
+                        (1 - (embedding <=> CAST(:embedding AS vector))) AS similarity
+                    FROM conversation_memories m
+                    WHERE is_active = true
+                      AND embedding IS NOT NULL
+                      AND {circles_clause}
+                    ORDER BY (embedding <=> CAST(:embedding AS vector)) ASC
+                    LIMIT :recall_k
+                )
+                SELECT
+                    id, content, category, importance, confidence,
+                    access_count, created_at, similarity
+                FROM candidates
+                ORDER BY (
+                    similarity * importance * confidence
+                    * (1.0 + :recency_weight * EXP(
+                        - GREATEST(
+                            0,
+                            EXTRACT(EPOCH FROM (NOW() - COALESCE(last_accessed_at, created_at)))
+                          ) / 86400.0 / :half_life_days
+                    ))
+                ) DESC
+                LIMIT :limit
+            """)
+            params: dict[str, Any] = {
+                "embedding": embedding_str,
+                "limit": limit,
+                "recall_k": recall_k,
+                "recency_weight": float(settings.memory_retrieval_recency_weight),
+                "half_life_days": float(settings.memory_retrieval_recency_half_life_days),
+                **circles_params,
+            }
+        else:
+            sql = text(f"""
+                SELECT
+                    id,
+                    content,
+                    category,
+                    importance,
+                    confidence,
+                    access_count,
+                    created_at,
+                    1 - (embedding <=> CAST(:embedding AS vector)) as similarity
+                FROM conversation_memories m
+                WHERE is_active = true
+                  AND embedding IS NOT NULL
+                  AND {circles_clause}
+                ORDER BY (1 - (embedding <=> CAST(:embedding AS vector))) * importance * confidence DESC
+                LIMIT :limit
+            """)
+            params = {
+                "embedding": embedding_str, "limit": limit, **circles_params,
+            }
 
         result = await self.db.execute(sql, params)
         rows = result.fetchall()

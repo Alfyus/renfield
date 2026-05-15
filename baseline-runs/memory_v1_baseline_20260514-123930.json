@@ -1,0 +1,192 @@
+{
+  "run_started": "2026-05-14T12:39:30.308001+00:00",
+  "corpus_path": "/tests/eval/memory_v1_baseline_corpus.yaml",
+  "report": {
+    "total_turns": 14,
+    "turns_by_category": {
+      "cross_session_stale": 14
+    },
+    "outcome_distribution": {
+      "ADD": 14
+    },
+    "parse_error_rate": 0.0,
+    "embedding_error_rate": 0.0,
+    "latency_p50": 5.398968106135726,
+    "latency_p95": 6.791557799093425,
+    "latency_p99": 6.791557799093425,
+    "noop_rate_on_generic_queries": 0.0,
+    "duplicate_rate": 0.0,
+    "cross_session_update_detection": 0.0,
+    "schema_validation_rate": 1.0
+  },
+  "results": [
+    {
+      "turn_id": "reva-stale-01",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 4.9696692558936775,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Plan \u00a7283 case 6 verbatim."
+    },
+    {
+      "turn_id": "reva-stale-02",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 4.439817637670785,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-stale-03",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 4.617421322967857,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-stale-04",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.398968106135726,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-stale-05",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.372626760043204,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-stale-06",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 8.798677971586585,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-stale-07",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.533348293043673,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-stale-08",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.492252889089286,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-stale-09",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.324555463157594,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "reva-stale-10",
+      "category": "cross_session_stale",
+      "flavor": "reva",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 6.672183978836983,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "renfield-stale-01",
+      "category": "cross_session_stale",
+      "flavor": "renfield",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 6.791557799093425,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Explicit retraction phrasing \u2014 UPDATE or DELETE+ADD both acceptable; classifier emits DELETE if soft-delete fires first."
+    },
+    {
+      "turn_id": "renfield-stale-02",
+      "category": "cross_session_stale",
+      "flavor": "renfield",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 4.539725940208882,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "renfield-stale-03",
+      "category": "cross_session_stale",
+      "flavor": "renfield",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.173829264007509,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    },
+    {
+      "turn_id": "renfield-stale-04",
+      "category": "cross_session_stale",
+      "flavor": "renfield",
+      "expected_outcome": "UPDATE",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.829356484115124,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": ""
+    }
+  ]
+}

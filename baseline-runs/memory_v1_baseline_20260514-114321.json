@@ -1,0 +1,109 @@
+{
+  "run_started": "2026-05-14T11:43:21.419583+00:00",
+  "corpus_path": "/tests/eval/memory_v1_baseline_corpus.yaml",
+  "report": {
+    "total_turns": 7,
+    "turns_by_category": {
+      "wrong_substrate": 7
+    },
+    "outcome_distribution": {
+      "ADD": 6,
+      "NOOP": 1
+    },
+    "parse_error_rate": 0.0,
+    "embedding_error_rate": 0.0,
+    "latency_p50": 6.004925517830998,
+    "latency_p95": 7.372715075034648,
+    "latency_p99": 7.372715075034648,
+    "noop_rate_on_generic_queries": 0.14285714285714285,
+    "duplicate_rate": 0.0,
+    "cross_session_update_detection": 0.0,
+    "schema_validation_rate": 1.0
+  },
+  "results": [
+    {
+      "turn_id": "reva-sub-01",
+      "category": "wrong_substrate",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.435997028835118,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Decision rationale \u2014 belongs in wissensbasis atoms with bi-temporal provenance, not in conversation_memories."
+    },
+    {
+      "turn_id": "reva-sub-02",
+      "category": "wrong_substrate",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 7.372715075034648,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Ownership-change history \u2014 the bi-temporal valid_from/valid_to use case in wissensbasis."
+    },
+    {
+      "turn_id": "reva-sub-03",
+      "category": "wrong_substrate",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 6.004925517830998,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Schedule-change rationale with temporal facets \u2014 belongs in atom history with valid_from."
+    },
+    {
+      "turn_id": "reva-sub-04",
+      "category": "wrong_substrate",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "NOOP",
+      "extracted_count": 0,
+      "latency_seconds": 1.4936276860535145,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Cancellation rationale \u2014 wissensbasis atom with valid_to set on the release entity."
+    },
+    {
+      "turn_id": "reva-sub-05",
+      "category": "wrong_substrate",
+      "flavor": "reva",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 9.687586057931185,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Personnel-change history with rationale \u2014 wissensbasis atoms, not user-personalization memory."
+    },
+    {
+      "turn_id": "renfield-sub-01",
+      "category": "wrong_substrate",
+      "flavor": "renfield",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 5.4119111727923155,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Household-decision rationale \u2014 belongs in wissensbasis-style atoms (purchase history with provenance), not in personalization memory."
+    },
+    {
+      "turn_id": "renfield-sub-02",
+      "category": "wrong_substrate",
+      "flavor": "renfield",
+      "expected_outcome": "NOOP",
+      "actual_outcome": "ADD",
+      "extracted_count": 1,
+      "latency_seconds": 6.021774807944894,
+      "parse_error": false,
+      "embedding_error": false,
+      "notes": "Household-member history with rationale \u2014 wissensbasis atoms with valid_from/valid_to on the household-member entity."
+    }
+  ]
+}

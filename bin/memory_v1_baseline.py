@@ -114,6 +114,14 @@ TEST_USER_ID_HASH_BYTES = 3  # 2^24 collision space = 16_777_216 buckets
 # attributing the "other user's" row to the asker.
 OWNER_ID_NAMESPACE_OFFSET = 1 << 23  # 8_388_608
 
+# Static fake bcrypt-shaped password hash, mirroring the convention in
+# `tests/backend/conftest.py::sample_user_data`. Baseline users never
+# authenticate, so going through `get_password_hash()` would only burn
+# bcrypt rounds (~150 per run) for no functional benefit. The hash is
+# bcrypt-shaped solely so the column's VARCHAR(255) shape is realistic.
+_BASELINE_FAKE_PASSWORD_HASH = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4wPpY/ABCDEFGH"
+
+
 
 # URL patterns that ALMOST CERTAINLY indicate prod infra. Substring
 # match (lower-cased). The runner refuses to proceed if any match
@@ -231,17 +239,44 @@ def check_database_url_safety(db_url: str, allow_prod: bool = False) -> Optional
     rather than accidentally writing. Operators who really do want to
     point at prod (e.g. for forensic re-runs against a snapshot) pass
     `--i-know-this-is-prod`.
+
+    Match scope: hostname only. The earlier implementation lower-cased
+    the entire URL and ran substring matches — that produced both
+    false-positives (a password containing 'treehouse' refused a safe
+    URL) and false-negatives (a credentials-free 'prod-alias.local'
+    URL passed when the pattern list didn't include that exact alias).
+    Parsing the URL and matching `urlparse(...).hostname` removes
+    both classes of bug.
     """
-    lower = db_url.lower()
+    from urllib.parse import urlparse
+
+    # SQLAlchemy URLs have the form `dialect+driver://...`. urlparse
+    # handles the embedded `+` correctly because it sees `dialect+driver`
+    # as the scheme; `.hostname` returns the post-`@` host part regardless.
+    try:
+        host = (urlparse(db_url).hostname or "").lower()
+    except ValueError:
+        # Malformed URL — refuse rather than try to interpret it.
+        return (
+            f"Refusing to run: BASELINE_DATABASE_URL is not a parseable URL. "
+            f"Set a valid postgres connection string."
+        )
+
+    if not host:
+        # No hostname at all (e.g. unix-socket DSNs). Don't trip on this —
+        # if it's local enough to lack a hostname, it's not prod.
+        return None
+
     for pattern in PROD_URL_PATTERNS:
-        if pattern in lower:
+        if pattern in host:
             if allow_prod:
                 return None
             return (
-                f"Refusing to run: BASELINE_DATABASE_URL contains {pattern!r}, "
-                f"which looks like production. Set a dedicated test-DB URL, or "
-                f"pass --i-know-this-is-prod if you genuinely want to write to "
-                f"this database (DESTRUCTIVE for real users)."
+                f"Refusing to run: BASELINE_DATABASE_URL hostname {host!r} "
+                f"matches production pattern {pattern!r}. Set a dedicated "
+                f"test-DB URL, or pass --i-know-this-is-prod if you "
+                f"genuinely want to write to this database (DESTRUCTIVE "
+                f"for real users)."
             )
     return None
 
@@ -729,6 +764,79 @@ async def run_one_turn(
     )
 
 
+async def ensure_baseline_users(db_session, corpus: list[dict]) -> None:
+    """Create the User rows the corpus will reference.
+
+    The runner allocates IDs via stable_test_user_id() /
+    stable_owner_user_id() in the >= 2_000_000_000 namespace. Those IDs
+    used to live only on memory rows where the FK to users.id didn't
+    exist. Since `atoms.owner_user_id` became `FK NOT NULL → users.id`,
+    every referenced ID must resolve to a real users row before any
+    extract path can write an atom.
+
+    Mirrors the `tests/backend/conftest.py::test_user` pattern: direct
+    `User(...)` ORM write with a static fake bcrypt hash, role pulled
+    from `auth_service.ensure_default_roles` (the same seeder the
+    backend lifecycle uses at startup). Pre-check via `WHERE id IN (...)`
+    makes the call idempotent across re-runs against the same DB.
+
+    Defense in depth:
+      - `is_active=False` — baseline users must never authenticate.
+        The static fake hash is also structurally invalid so
+        `verify_password` returns False; setting is_active=False makes
+        the intent explicit and removes the dependency on PassLib's
+        behavior for malformed hashes.
+      - `role_id = Gast` — least-privilege role. A leaked baseline user
+        carries no admin / settings / MCP grants even if the
+        is_active guard ever drifted.
+
+    Caller note: pass the FULL corpus (unfiltered) so seeding stays
+    idempotent across filter combinations. Seeding only the
+    filter-narrowed subset would cause FK violations on a later
+    unfiltered run against the same DB.
+    """
+    from models.database import User
+    from services.auth_service import ensure_default_roles
+    from sqlalchemy import select
+
+    roles = await ensure_default_roles(db_session)
+    gast_role_id = next(r.id for r in roles if r.name == "Gast")
+
+    needed_ids: set[int] = set()
+    for turn in corpus:
+        needed_ids.add(stable_test_user_id(turn["id"]))
+        for pre in turn.get("preexisting_memories") or []:
+            raw_owner = pre.get("owner_user_id")
+            if raw_owner is not None:
+                needed_ids.add(stable_owner_user_id(raw_owner))
+
+    existing = set(
+        (
+            await db_session.execute(
+                select(User.id).where(User.id.in_(needed_ids))
+            )
+        ).scalars()
+    )
+    to_create = needed_ids - existing
+
+    for uid in sorted(to_create):
+        db_session.add(
+            User(
+                id=uid,
+                username=f"baseline-test-{uid}",
+                password_hash=_BASELINE_FAKE_PASSWORD_HASH,
+                role_id=gast_role_id,
+                is_active=False,
+                preferred_language="de",
+            )
+        )
+    await db_session.commit()
+    logging.info(
+        "Baseline users ensured: %d referenced, %d existed, %d created.",
+        len(needed_ids), len(existing), len(to_create),
+    )
+
+
 async def run_corpus(
     corpus_path: Path,
     category_filter: Optional[str],
@@ -796,8 +904,18 @@ async def run_corpus(
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     with open(corpus_path) as f:
-        corpus = yaml.safe_load(f)["corpus"]
+        full_corpus = yaml.safe_load(f)["corpus"]
 
+    # Setup phase: seed users for the FULL corpus, NOT the filter-narrowed
+    # subset. A `--category foo` run followed by an unfiltered run on the
+    # same DB would otherwise FK-fail on every turn whose user wasn't in
+    # the first filter — `ensure_baseline_users` is idempotent only
+    # across the same set of IDs. Seeding the full corpus keeps the
+    # contract "any subsequent run against this DB just works."
+    async with Session() as setup_session:
+        await ensure_baseline_users(setup_session, full_corpus)
+
+    corpus = full_corpus
     if category_filter:
         corpus = [t for t in corpus if t["category"] == category_filter]
     if flavor_filter:
