@@ -560,6 +560,26 @@ class Settings(BaseSettings):
         return voice_map
 
     @model_validator(mode="after")
+    def warn_deprecated_extract_mode_env(self) -> "Settings":
+        """Surface stale `MEMORY_EXTRACT_RETRIEVAL_MODE` env vars.
+
+        The mode enum (`threshold_filter`/`no_filter`/`score_aware`) was an
+        experiment-only knob introduced and removed within the 2026-05-15
+        Lane D work. Silent-ignore is the Pydantic Settings default for
+        unknown env vars; operators who followed internal notes and set
+        the env var would think the knob is still wired. Bark loudly so
+        they switch to `MEMORY_EXTRACT_RETRIEVAL_THRESHOLD`.
+        """
+        if os.getenv("MEMORY_EXTRACT_RETRIEVAL_MODE"):
+            logger.warning(
+                "MEMORY_EXTRACT_RETRIEVAL_MODE is set but no longer recognised "
+                "(removed in PR #583). Use MEMORY_EXTRACT_RETRIEVAL_THRESHOLD "
+                "(float 0.0-1.0; production default 0.0) instead. See "
+                "docs/lane-d-extract-retrieval-threshold.md."
+            )
+        return self
+
+    @model_validator(mode="after")
     def assemble_database_url(self) -> "Settings":
         """Baut DATABASE_URL aus Einzelteilen zusammen, falls nicht explizit gesetzt."""
         if self.database_url is None:
