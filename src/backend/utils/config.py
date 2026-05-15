@@ -302,6 +302,22 @@ class Settings(BaseSettings):
     memory_extraction_retrieve_k: int = Field(default=5, ge=1, le=50)       # Top-K candidates for v2 extract LLM prompt
     memory_extraction_v2_shadow: bool = False                                # Phase A: run v2 in shadow mode alongside v1
     memory_extraction_v2_authoritative: bool = False                         # Phase B: v2 is primary; v1 becomes legacy fallback
+    # Lane D — separate retrieval threshold for the v2 extract pipeline.
+    # Chat retrieval uses `memory_retrieval_threshold=0.7` for high
+    # precision (don't surface tangential memories to the user). Extract
+    # is a different surface: high recall is what matters, and the LLM
+    # plus the drift check together replace the score gate. Defaulting
+    # to 0.0 means the LLM sees top-K candidates regardless of similarity.
+    #
+    # Empirical basis: the 0.7 default produced cross_session_update
+    # detection of 0.143; setting this to 0.0 raised it to 0.929 with no
+    # regression on any of the four locked baselines. See
+    # `docs/lane-d-extract-retrieval-threshold.md` for the full A/B.
+    #
+    # If you want to experiment with intermediate values, set this via
+    # env var (MEMORY_EXTRACT_RETRIEVAL_THRESHOLD). 0.0 is the production
+    # default; do not raise above 0.5 without re-running the corpus.
+    memory_extract_retrieval_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
     # Lane C two-stage retrieval with recency-aware rerank. Opt-in via
     # `ranker="recency_aware"` on MemoryRetrieval.retrieve(). v2 callers
     # use it by default; web chat / retrieve_for_prompt still on the

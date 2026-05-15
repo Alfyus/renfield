@@ -973,6 +973,11 @@ class ConversationMemoryService:
             return []
 
         retrieve_k = max(1, int(settings.memory_extraction_retrieve_k))
+        # Lane D — extract pipeline uses its own (lower) threshold than chat
+        # retrieval. See `memory_extract_retrieval_threshold` in utils/config.py
+        # and `docs/lane-d-extract-retrieval-threshold.md` for the A/B that
+        # locked the production default at 0.0.
+        extract_threshold = float(settings.memory_extract_retrieval_threshold)
 
         # ---- Phase 1: lock + retrieve (no LLM call inside the lock) ----
         candidates: list[dict] = []
@@ -980,6 +985,7 @@ class ConversationMemoryService:
         try:
             candidates = await MemoryRetrieval(self.db).retrieve(
                 message=user_message, user_id=user_id, limit=retrieve_k,
+                threshold=extract_threshold,
                 ranker="recency_aware",
             )
         finally:
@@ -1026,8 +1032,11 @@ class ConversationMemoryService:
         await self._acquire_user_lock(user_id)
         try:
             # Re-retrieve to detect candidate drift since the LLM was called.
+            # Use the same threshold strategy as Phase 1 so the drift check
+            # sees the same candidate ID set.
             fresh = await MemoryRetrieval(self.db).retrieve(
                 message=user_message, user_id=user_id, limit=retrieve_k,
+                threshold=extract_threshold,
                 ranker="recency_aware",
             )
             fresh_ids = {int(c["id"]) for c in fresh if c.get("id") is not None}
