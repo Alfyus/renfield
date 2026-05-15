@@ -173,7 +173,8 @@ A second corpus seeded from real transcripts can be added later as `memory_v1_ba
 
 - A **static fake bcrypt-shaped password hash** (`$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4wPpY/ABCDEFGH`) — the exact value pinned in `tests/backend/conftest.py::sample_user_data`. The runner intentionally does NOT call `auth_service.get_password_hash()` because bcrypt cost for ~150 users per run is wasted work for accounts that never authenticate.
 - A username built from the namespaced ID (`f"baseline-test-{uid}"`) — not validated against `auth_service.create_user`'s uniqueness logic.
-- A role pulled from `auth_service.ensure_default_roles()` — this part IS canonical.
+- **`is_active=False`** — defense in depth. The static fake hash is also structurally invalid (PassLib's `verify_password` returns False), but `is_active=False` makes the intent explicit and removes the dependency on PassLib's behavior with malformed digests.
+- **`role_id = Gast`** (least privilege) — a leaked baseline user carries no admin / settings / MCP grants even if `is_active` ever drifted. Pulled from `auth_service.ensure_default_roles()` — this part IS canonical.
 
 **Why this is debt, not a bug:** the pytest test suite (`tests/backend/conftest.py::test_user`) uses the same direct-ORM pattern, so the runner is consistent with existing convention. But both the runner and the test fixture skip `auth_service.create_user`'s side effects: `validate_password`, email-uniqueness check, username-conflict check, role-existence verification, and the `db.refresh(user, ["role"])` that primes the role relationship.
 
