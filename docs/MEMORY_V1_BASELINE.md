@@ -164,3 +164,26 @@ A second corpus seeded from real transcripts can be added later as `memory_v1_ba
 - Real-LLM execution against the corpus (needs DB + cuda.local + k8s-gpu-1 access)
 - Per-PR CI integration (the 8-case eval YAML is a separate file/test, planned for Lane B/D)
 - Comparison against a v2 shadow-mode run (planned for Lane B once the shadow-log table exists)
+
+## Tech debt — fixture user creation bypasses `auth_service.create_user`
+
+**Status:** documented, not yet paid down. Acceptable for now; revisit on the next platform-side `users` schema change.
+
+`bin/memory_v1_baseline.py::ensure_baseline_users` mints `users` rows by directly instantiating the `User` ORM model with:
+
+- A **static fake bcrypt-shaped password hash** (`$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4wPpY/ABCDEFGH`) — the exact value pinned in `tests/backend/conftest.py::sample_user_data`. The runner intentionally does NOT call `auth_service.get_password_hash()` because bcrypt cost for ~150 users per run is wasted work for accounts that never authenticate.
+- A username built from the namespaced ID (`f"baseline-test-{uid}"`) — not validated against `auth_service.create_user`'s uniqueness logic.
+- A role pulled from `auth_service.ensure_default_roles()` — this part IS canonical.
+
+**Why this is debt, not a bug:** the pytest test suite (`tests/backend/conftest.py::test_user`) uses the same direct-ORM pattern, so the runner is consistent with existing convention. But both the runner and the test fixture skip `auth_service.create_user`'s side effects: `validate_password`, email-uniqueness check, username-conflict check, role-existence verification, and the `db.refresh(user, ["role"])` that primes the role relationship.
+
+**What could break it:**
+
+1. A `users` schema migration that adds a NOT NULL column without a server default (the ORM `User(...)` call will fail to insert).
+2. A migration that swaps password hashing (e.g. `bcrypt → argon2`) and adds a CHECK constraint validating the hash shape.
+3. A new FK chain anchored at `users.id` that the runner doesn't satisfy via `ensure_baseline_users` (the latest example is `atoms.owner_user_id`, which is why the function exists at all — see commit message of the fix).
+4. A platform-level enforcement that `User` rows must own at least one `Circle` or similar relationship.
+
+**How to pay this down:** factor `User(...)` construction out of `auth_service.create_user` into a `_build_user(...)` helper that takes already-hashed credentials and already-resolved role_id, then have both `create_user` (web path) AND the test fixture / baseline runner call `_build_user`. That gives a single source of truth for "what a valid `User` row looks like" without forcing test fixtures through `validate_password` / `HTTPException` / bcrypt rounds.
+
+Same caveat applies in spirit to `tests/backend/conftest.py::test_user` — pay both down together.

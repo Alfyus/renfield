@@ -114,6 +114,14 @@ TEST_USER_ID_HASH_BYTES = 3  # 2^24 collision space = 16_777_216 buckets
 # attributing the "other user's" row to the asker.
 OWNER_ID_NAMESPACE_OFFSET = 1 << 23  # 8_388_608
 
+# Static fake bcrypt-shaped password hash, mirroring the convention in
+# `tests/backend/conftest.py::sample_user_data`. Baseline users never
+# authenticate, so going through `get_password_hash()` would only burn
+# bcrypt rounds (~150 per run) for no functional benefit. The hash is
+# bcrypt-shaped solely so the column's VARCHAR(255) shape is realistic.
+_BASELINE_FAKE_PASSWORD_HASH = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4wPpY/ABCDEFGH"
+
+
 
 # URL patterns that ALMOST CERTAINLY indicate prod infra. Substring
 # match (lower-cased). The runner refuses to proceed if any match
@@ -729,6 +737,64 @@ async def run_one_turn(
     )
 
 
+async def ensure_baseline_users(db_session, corpus: list[dict]) -> None:
+    """Create the User rows the corpus will reference.
+
+    The runner allocates IDs via stable_test_user_id() /
+    stable_owner_user_id() in the >= 2_000_000_000 namespace. Those IDs
+    used to live only on memory rows where the FK to users.id didn't
+    exist. Since `atoms.owner_user_id` became `FK NOT NULL → users.id`,
+    every referenced ID must resolve to a real users row before any
+    extract path can write an atom.
+
+    Mirrors the `tests/backend/conftest.py::test_user` pattern: direct
+    `User(...)` ORM write with a static fake bcrypt hash, role pulled
+    from `auth_service.ensure_default_roles` (the same seeder the
+    backend lifecycle uses at startup). Pre-check via `WHERE id IN (...)`
+    makes the call idempotent across re-runs against the same DB.
+    """
+    from models.database import User
+    from services.auth_service import ensure_default_roles
+    from sqlalchemy import select
+
+    roles = await ensure_default_roles(db_session)
+    admin_role_id = next(r.id for r in roles if r.name == "Admin")
+
+    needed_ids: set[int] = set()
+    for turn in corpus:
+        needed_ids.add(stable_test_user_id(turn["id"]))
+        for pre in turn.get("preexisting_memories") or []:
+            raw_owner = pre.get("owner_user_id")
+            if raw_owner is not None:
+                needed_ids.add(stable_owner_user_id(raw_owner))
+
+    existing = set(
+        (
+            await db_session.execute(
+                select(User.id).where(User.id.in_(needed_ids))
+            )
+        ).scalars()
+    )
+    to_create = needed_ids - existing
+
+    for uid in sorted(to_create):
+        db_session.add(
+            User(
+                id=uid,
+                username=f"baseline-test-{uid}",
+                password_hash=_BASELINE_FAKE_PASSWORD_HASH,
+                role_id=admin_role_id,
+                is_active=True,
+                preferred_language="de",
+            )
+        )
+    await db_session.commit()
+    logging.info(
+        "Baseline users ensured: %d referenced, %d existed, %d created.",
+        len(needed_ids), len(existing), len(to_create),
+    )
+
+
 async def run_corpus(
     corpus_path: Path,
     category_filter: Optional[str],
@@ -802,6 +868,12 @@ async def run_corpus(
         corpus = [t for t in corpus if t["category"] == category_filter]
     if flavor_filter:
         corpus = [t for t in corpus if t["flavor"] == flavor_filter]
+
+    # Setup phase: ensure default roles + a User row for every test_user_id
+    # and stable_owner_user_id the (filtered) corpus references. Runs in
+    # its own session so the per-turn rollback semantics stay clean.
+    async with Session() as setup_session:
+        await ensure_baseline_users(setup_session, corpus)
 
     results: list[BaselineResult] = []
     for turn in corpus:
