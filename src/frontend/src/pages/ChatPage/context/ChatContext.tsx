@@ -37,6 +37,7 @@ import type {
 } from '../hooks/useChatWebSocket';
 import type { UploadStates, UploadedDocument } from '../hooks/useDocumentUpload';
 import type { Conversation } from '../../../types/chat';
+import type { TraceEntity } from '../../../api/resources/wissensbasis';
 import { useConfirmDialog } from '../../../components/ConfirmDialog';
 
 const SESSION_STORAGE_KEY = 'renfield_current_session';
@@ -86,6 +87,27 @@ export interface ChatUiMessage {
   federationProgress?: Record<string, FederationProgressEntry>;
   attachments?: MessageAttachment[];
   card?: Record<string, unknown>;
+  // Entities resolved during THIS turn, persisted per-message by Reva's
+  // on_pre_save_message. Lets the chip renderer wrap mentions per bubble
+  // instead of smearing the session-last reasoning trace across all of them.
+  entities?: TraceEntity[];
+}
+
+/** Map a persisted history message to the in-memory UI shape. */
+function historyToUiMessage(m: {
+  role: string;
+  content: string;
+  metadata?: unknown;
+}): ChatUiMessage {
+  const meta = m.metadata as
+    | { attachments?: MessageAttachment[]; wb_entities?: TraceEntity[] }
+    | undefined;
+  return {
+    role: m.role === 'system' ? 'assistant' : (m.role as 'user' | 'assistant'),
+    content: m.content,
+    ...(meta?.attachments && meta.attachments.length > 0 && { attachments: meta.attachments }),
+    ...(meta?.wb_entities && meta.wb_entities.length > 0 && { entities: meta.wb_entities }),
+  };
 }
 
 interface EmailDialogState {
@@ -1248,14 +1270,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
         try {
           const history = await loadConversationHistory(sessionId);
           if (history.length > 0) {
-            setMessages(history.map((m) => {
-              const meta = m.metadata as { attachments?: MessageAttachment[] } | undefined;
-              return {
-                role: m.role === 'system' ? 'assistant' : m.role,
-                content: m.content,
-                ...(meta?.attachments && meta.attachments.length > 0 && { attachments: meta.attachments }),
-              };
-            }));
+            setMessages(history.map(historyToUiMessage));
           }
         } catch (err) {
           console.error('Failed to load conversation history:', err);
@@ -1278,14 +1293,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     setHistoryLoading(true);
     try {
       const history = await loadConversationHistory(newSessionId);
-      setMessages(history.map((m) => {
-        const meta = m.metadata as { attachments?: MessageAttachment[] } | undefined;
-        return {
-          role: m.role === 'system' ? 'assistant' : m.role,
-          content: m.content,
-          ...(meta?.attachments && meta.attachments.length > 0 && { attachments: meta.attachments }),
-        };
-      }));
+      setMessages(history.map(historyToUiMessage));
       setSessionId(newSessionId);
       localStorage.setItem(SESSION_STORAGE_KEY, newSessionId);
       setSidebarOpen(false);
