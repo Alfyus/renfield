@@ -1619,7 +1619,7 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
             # ContextVar (it's Reva-internal agent-loop state, not
             # available here), so the kwarg is left None — it exists as a
             # test-injection override only.
-            if settings.card_emit_inline and session_id and full_response:
+            if settings.card_emit_inline and msg_session_id and full_response:
                 try:
                     from utils.hooks import run_hooks
                     _card_results = await run_hooks(
@@ -1631,14 +1631,13 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                         session_id=msg_session_id,
                         rid=request_id_var.get("--------"),
                     )
-                    _card_payload = next(
-                        (
-                            r for r in (_card_results or [])
-                            if isinstance(r, dict) and r.get("card")
-                        ),
-                        None,
-                    )
-                    if _card_payload:
+                    # run_hooks already filters None (the handler returns
+                    # None for no-card), so results[0] is the first
+                    # registered handler's card — strict registration-order
+                    # precedence per the hook contract. The .get("card")
+                    # check stays as a shape guard.
+                    _card_payload = (_card_results or [None])[0]
+                    if isinstance(_card_payload, dict) and _card_payload.get("card"):
                         _ws_card: dict = {
                             "type": "card",
                             "card": _card_payload["card"],
