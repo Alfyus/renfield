@@ -1604,6 +1604,55 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                     room_context, full_response, websocket
                 )
 
+            # Card-emit-inline: build + send the Adaptive Card BEFORE the
+            # `done` marker so it lands in the same logical event as the
+            # streamed prose (no "prose first, card overlays a second
+            # later" flip). The `build_assistant_card` hook is
+            # transport-pure by contract — it returns the payload; this
+            # call site owns the send + its own try/except. Gated on
+            # `card_emit_inline`; when off (default), the legacy
+            # fire-and-forget `post_message` hook still emits the card
+            # after `done`. `run_hooks` runs every handler and returns a
+            # list — we take the first well-shaped result (registration
+            # order is precedence, per the hook contract). The Reva
+            # handler sources `tool_summaries` from its own request-scoped
+            # ContextVar (it's Reva-internal agent-loop state, not
+            # available here), so the kwarg is left None — it exists as a
+            # test-injection override only.
+            if settings.card_emit_inline and session_id and full_response:
+                try:
+                    from utils.hooks import run_hooks
+                    _card_results = await run_hooks(
+                        "build_assistant_card",
+                        tool_summaries=None,
+                        assistant_msg=full_response,
+                        lang=ollama.default_lang,
+                        user_id=user_id,
+                        session_id=msg_session_id,
+                        rid=request_id_var.get("--------"),
+                    )
+                    _card_payload = next(
+                        (
+                            r for r in (_card_results or [])
+                            if isinstance(r, dict) and r.get("card")
+                        ),
+                        None,
+                    )
+                    if _card_payload:
+                        _ws_card: dict = {
+                            "type": "card",
+                            "card": _card_payload["card"],
+                        }
+                        if _card_payload.get("replace_text"):
+                            _ws_card["replace_text"] = _card_payload["replace_text"]
+                        await websocket.send_json(_ws_card)
+                except Exception as e:
+                    # Never block `done` on a card-build/send failure.
+                    logger.warning(
+                        f"[{request_id_var.get('--------')}] "
+                        f"card_emit_inline failed: {e}"
+                    )
+
             # Stream finished - tell frontend if TTS was handled server-side
             done_msg = {
                 "type": "done",
