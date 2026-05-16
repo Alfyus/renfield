@@ -27,6 +27,25 @@ HOOK_EVENTS: frozenset[str] = frozenset({
     "register_tools",
     "execute_tool",
     "post_message",
+    # Synchronous Adaptive-Card build — fired by the WebSocket chat
+    # handler AFTER the agent loop produces its final answer but BEFORE
+    # the `done` marker is sent. Unlike `post_message` (fire-and-forget,
+    # runs after `done`), this hook is awaited inline so the card lands
+    # in the same logical event as the streamed prose — eliminates the
+    # "prose first, card overlays a second later" flip web-chat users
+    # see on release-list and similar card-able responses.
+    #
+    # Kwargs: `tool_summaries: list[tuple[str,str]] | None`,
+    # `assistant_msg: str`, `lang: str`, `user_id: int | None`,
+    # `session_id: str`, `rid: str`. Handlers return a dict
+    # `{"card": <adaptive-card>, "replace_text": <1-line lede>}` (the
+    # `replace_text` key is optional) or None to contribute nothing.
+    # First well-shaped non-None result wins — registration order is
+    # precedence. Handlers MUST be pure with respect to transport (no
+    # WebSocket send, no DB write); the caller owns emission. Handler
+    # exceptions are caught by `run_hooks` and logged — a card-build
+    # failure degrades to no-card, never blocks the response.
+    "build_assistant_card",
     "post_document_ingest",
     "retrieve_context",
     "pre_agent_context",
