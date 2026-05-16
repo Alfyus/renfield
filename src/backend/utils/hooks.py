@@ -40,11 +40,17 @@ HOOK_EVENTS: frozenset[str] = frozenset({
     # `session_id: str`, `rid: str`. Handlers return a dict
     # `{"card": <adaptive-card>, "replace_text": <1-line lede>}` (the
     # `replace_text` key is optional) or None to contribute nothing.
-    # First well-shaped non-None result wins — registration order is
-    # precedence. Handlers MUST be pure with respect to transport (no
-    # WebSocket send, no DB write); the caller owns emission. Handler
-    # exceptions are caught by `run_hooks` and logged — a card-build
-    # failure degrades to no-card, never blocks the response.
+    #
+    # `run_hooks` does NOT short-circuit — it runs every registered
+    # handler and returns a list of all non-None results. The caller is
+    # responsible for picking `results[0]` (registration order is
+    # precedence) and emitting exactly one card. Handlers MUST be pure
+    # with respect to transport: no WebSocket send, no DB write. The
+    # caller owns emission — a handler that sends a card itself will
+    # double-send (the caller emits results[0] AND the handler already
+    # sent), producing two cards with no warning. Handler exceptions are
+    # caught by `run_hooks` and logged — a card-build failure degrades
+    # to no-card, never blocks the response.
     "build_assistant_card",
     "post_document_ingest",
     "retrieve_context",
