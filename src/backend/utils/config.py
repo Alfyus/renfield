@@ -199,6 +199,24 @@ class Settings(BaseSettings):
     agent_router_model: str | None = None  # Dedicated router model (default: ollama_intent_model)
     agent_router_url: str | None = None    # Dedicated Ollama URL for router (default: agent_ollama_url)
     agent_orchestrator_enabled: bool = False  # Enable cross-MCP query orchestration (opt-in)
+    # Card-emit-inline (card-flip UX fix). When True, the WebSocket chat
+    # handler awaits the `build_assistant_card` hook AFTER the agent loop
+    # produces its final answer but BEFORE the `done` marker, and emits
+    # the card in the same logical event as the streamed prose. When
+    # False (default), the call site is dormant and cards are emitted by
+    # the fire-and-forget `post_message` hook after `done` (legacy
+    # behaviour — prose appears, card overlays it ~1s later).
+    #
+    # Default False on purpose: the renfield call site and the Reva-side
+    # `on_post_message` card-branch gate land as separate PRs with a
+    # submodule bump between. A deploy window with new-renfield +
+    # old-Reva would emit TWO cards (chat_handler inline AND the
+    # un-gated post_message hook) if this defaulted True. Ship both
+    # halves, deploy, verify both SHAs in /api/health, THEN flip to True
+    # via a ConfigMap patch (no rebuild) — and flip back the same way if
+    # `reva_cards_render_errors_total` spikes. See the Reva repo
+    # docs/plans/card-emit-inline.md "Rollout" section.
+    card_emit_inline: bool = False
     # W5 — previously hardcoded timeouts now configurable
     agent_preselect_timeout: float = Field(default=10.0, ge=1.0, le=60.0)
     """Timeout for tool pre-selection LLM call in agent_service.py:_preselect_tools.
