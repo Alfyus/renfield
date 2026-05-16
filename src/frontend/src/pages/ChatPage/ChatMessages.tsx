@@ -303,7 +303,7 @@ export default function ChatMessages() {
               </ul>
             )}
 
-            {message.role === 'assistant' ? renderMessageContent(message.content, t('chat.albumArt'), chipEntities, `msg-${index}`) : <p className="whitespace-pre-wrap">{message.content}</p>}
+            {message.role === 'assistant' ? renderMessageContent(message.content, t('chat.albumArt'), message.entities ?? chipEntities, `msg-${index}`) : <p className="whitespace-pre-wrap">{message.content}</p>}
 
             {/* Adaptive Card (from WebSocket card message) */}
             {message.card && (
