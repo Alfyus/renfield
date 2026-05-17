@@ -1,28 +1,34 @@
 /**
- * WissensbasisSidePanel — chat-page right-side panel showing the
+ * WissensbasisSidePanel — chat-page RIGHT-side panel showing the
  * composed A2 (reasoning subgraph) + A4 (focus neighborhood) layout.
  *
- * - Reads role mix from /api/wissensbasis/me/mix to size A2/A4 split.
- * - Reads trace from /api/wissensbasis/trace?session_id=…
- * - Reads focus from /api/wissensbasis/focus?entity_id=… (driven by
- *   WissensbasisContext, which a CitationChip click updates).
- * - Desktop (≥768px): collapsible aside docked right.
- * - Mobile (<768px): floating FAB; tapping opens a full-width bottom
- *   sheet overlay with backdrop + close affordance.
+ * Interaction mirrors the left nav rail (components/Layout.tsx) but
+ * stays IN-FLOW on desktop (the old panel was a `md:flex w-96 shrink-0`
+ * flex child; making it `position: fixed` would overlay the chat
+ * messages + input — there is no right-side gutter compensation on the
+ * chat page, unlike the left rail whose width the page shell reserves):
  *
- * The four (collapsed × isMobile) states map cleanly:
- *   - desktop + expanded → inline aside
- *   - desktop + collapsed → floating FAB to expand
- *   - mobile + collapsed → floating FAB to open the sheet
- *   - mobile + expanded → bottom-sheet overlay
+ *   - Desktop (lg+): an in-flow flex child. Collapsed → a slim w-14
+ *     rail showing only a hamburger; the chat column keeps its space.
+ *     Clicking the hamburger expands it to w-96 (chat column shrinks
+ *     beside it, exactly like the original); the header X collapses
+ *     back to the rail. The heavy interactive body is mounted ONLY
+ *     when expanded, so the collapsed rail has no off-screen/hidden
+ *     tabbables (WCAG 2.4.3 — matches the original's conditional
+ *     render). No floating FAB.
+ *   - Mobile (<lg): the rail has no room, so a fixed right-edge
+ *     hamburger opens a full-height slide-over from the right with a
+ *     dimmed backdrop (same pattern as the left nav on mobile). The
+ *     sheet is a real modal: scroll lock + focus trap + Esc + initial
+ *     focus, and it is unmounted when closed (no hidden tabbables).
  *
- * The earlier implementation routed mobile to the FAB regardless of
- * `collapsed`, which left the panel permanently inaccessible on phones.
+ * `collapsed` (from WissensbasisContext) is the single source of truth.
+ * A CitationChip click sets the focus entity via the same context.
  */
 
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronRight, Layers, X } from 'lucide-react';
+import { Menu, X } from 'lucide-react';
 
 import {
   useFocusQuery,
@@ -34,7 +40,14 @@ import { useWissensbasis } from '../../context/WissensbasisContext';
 import { FocusNeighborhood } from './FocusNeighborhood';
 import { ReasoningSubgraph } from './ReasoningSubgraph';
 
-const MOBILE_BREAKPOINT_PX = 768;
+// Must stay in lockstep with Tailwind's `lg` (the `hidden lg:flex` /
+// `lg:hidden` split below). If Tailwind's lg breakpoint ever changes,
+// update this too, or a narrow band could mount both headers.
+const MOBILE_BREAKPOINT_PX = 1024; // Tailwind lg
+
+// Everything Tab can land on — used by the mobile focus trap.
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 export interface WissensbasisSidePanelProps {
   sessionId: string | null;
@@ -49,10 +62,11 @@ export interface WissensbasisSidePanelProps {
 export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanelProps) {
   const { t } = useTranslation();
   const { focusEntityId, collapsed, toggleCollapsed } = useWissensbasis();
+  const open = !collapsed;
+
   const [isMobile, setIsMobile] = useState<boolean>(() =>
     typeof window !== 'undefined' && window.innerWidth < MOBILE_BREAKPOINT_PX,
   );
-
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < MOBILE_BREAKPOINT_PX);
     window.addEventListener('resize', onResize);
@@ -62,8 +76,60 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
   const traceQ = useTraceQuery(sessionId);
   const focusQ = useFocusQuery(focusEntityId);
   const mixQ = useRoleMixQuery(role);
-
   const mix = mixQ.data ?? { a2: 60, a4: 40, source: 'default' as const, role: null };
+
+  const sheetRef = useRef<HTMLDivElement | null>(null);
+  const closeBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  // The mobile slide-over is a true modal. All of these effects are
+  // gated on `isMobile && open` so the desktop in-flow rail is never a
+  // focus trap and never captures global keys.
+  const mobileSheetOpen = isMobile && open;
+
+  useEffect(() => {
+    if (!mobileSheetOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [mobileSheetOpen]);
+
+  useEffect(() => {
+    if (mobileSheetOpen) closeBtnRef.current?.focus();
+  }, [mobileSheetOpen]);
+
+  useEffect(() => {
+    if (!mobileSheetOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        toggleCollapsed();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const sheet = sheetRef.current;
+      if (!sheet) return;
+      const focusables = Array.from(
+        sheet.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+      ).filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      } else if (active && !sheet.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mobileSheetOpen, toggleCollapsed]);
 
   const panelBody = (
     <>
@@ -95,188 +161,93 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
     </>
   );
 
-  // Collapsed → render only the floating expand button. On mobile this
-  // is the only entry point; on desktop the user can also use the
-  // header chevron (rendered when expanded).
-  if (collapsed) {
-    return <ExpandFab onClick={toggleCollapsed} label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')} shortLabel={t('wissensbasis.panel.expandShort', 'Wissensbasis')} />;
-  }
-
-  // Mobile + expanded → bottom-sheet overlay with backdrop.
-  if (isMobile) {
-    return (
-      <MobileBottomSheet
-        onClose={toggleCollapsed}
-        ariaLabel={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
-        heading={t('wissensbasis.panel.heading', 'Wissensbasis')}
-        closeLabel={t('wissensbasis.panel.collapse', 'Collapse panel')}
+  const headerBar = (
+    <header className="flex items-center justify-between h-12 px-3 border-b border-gray-200 dark:border-gray-700 shrink-0">
+      <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100 whitespace-nowrap overflow-hidden">
+        {t('wissensbasis.panel.heading', 'Wissensbasis')}
+      </h2>
+      <button
+        ref={closeBtnRef}
+        type="button"
+        onClick={toggleCollapsed}
+        className="shrink-0 p-1.5 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-900
+          dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 focus:outline-hidden
+          focus:ring-2 focus:ring-primary-500 transition-colors"
+        aria-label={t('wissensbasis.panel.collapse', 'Collapse panel')}
       >
-        {panelBody}
-      </MobileBottomSheet>
-    );
-  }
-
-  // Desktop + expanded → inline aside.
-  return (
-    <aside
-      className="hidden md:flex flex-col h-full w-96 shrink-0 border-l border-gray-200
-        dark:border-gray-700 bg-white dark:bg-gray-900 overflow-hidden"
-      aria-label={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
-    >
-      <header className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700">
-        <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">
-          {t('wissensbasis.panel.heading', 'Wissensbasis')}
-        </h2>
-        <button
-          type="button"
-          onClick={toggleCollapsed}
-          className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-          aria-label={t('wissensbasis.panel.collapse', 'Collapse panel')}
-        >
-          <ChevronRight className="h-4 w-4 text-gray-600 dark:text-gray-300" />
-        </button>
-      </header>
-      {panelBody}
-    </aside>
+        <X className="w-4 h-4" aria-hidden="true" />
+      </button>
+    </header>
   );
-}
-
-interface ExpandFabProps {
-  onClick: () => void;
-  label: string;
-  shortLabel: string;
-}
-
-function ExpandFab({ onClick, label, shortLabel }: ExpandFabProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="fixed bottom-4 right-4 z-30 inline-flex items-center gap-1.5
-        rounded-full bg-primary-600 text-white shadow-lg px-4 py-2 text-sm font-medium
-        hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2
-        focus-visible:ring-primary-300"
-      aria-label={label}
-    >
-      <Layers className="h-4 w-4" aria-hidden="true" />
-      {shortLabel}
-    </button>
-  );
-}
-
-interface MobileBottomSheetProps {
-  children: ReactNode;
-  onClose: () => void;
-  ariaLabel: string;
-  heading: string;
-  closeLabel: string;
-}
-
-// Selector for everything Tab can normally land on. Used by the focus
-// trap to find the first/last focusable element inside the sheet.
-const FOCUSABLE_SELECTOR =
-  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
-
-function MobileBottomSheet({
-  children,
-  onClose,
-  ariaLabel,
-  heading,
-  closeLabel,
-}: MobileBottomSheetProps) {
-  const sheetRef = useRef<HTMLDivElement | null>(null);
-  const closeBtnRef = useRef<HTMLButtonElement | null>(null);
-
-  // Body scroll lock while the sheet is open — without this, scrolling
-  // inside the sheet cascades up to the chat list once the sheet content
-  // is at its top, which feels broken on touch devices.
-  useEffect(() => {
-    const previous = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = previous;
-    };
-  }, []);
-
-  // WCAG SC 2.4.3 — initial focus moves into the dialog on open.
-  // Lands on the close button: predictable, doesn't focus a content
-  // chip the user has to dismiss before getting back to the close
-  // affordance.
-  useEffect(() => {
-    closeBtnRef.current?.focus();
-  }, []);
-
-  // WCAG SC 2.1.2 — focus trap. Esc closes; Tab/Shift+Tab cycle within
-  // the sheet's focusable elements rather than escaping to the chat
-  // input behind the backdrop.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-      const sheet = sheetRef.current;
-      if (!sheet) return;
-      const focusables = Array.from(
-        sheet.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
-      ).filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
-      if (focusables.length === 0) return;
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      const active = document.activeElement as HTMLElement | null;
-      if (e.shiftKey && active === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
-      } else if (active && !sheet.contains(active)) {
-        // Focus drifted outside the sheet (e.g. a hidden tabbable link
-        // in the underlying chat). Pull it back in.
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
 
   return (
     <>
-      <div
-        className="fixed inset-0 z-40 bg-black/40 md:hidden motion-safe:transition-opacity"
-        onClick={onClose}
-        aria-hidden="true"
-      />
-      <div
-        ref={sheetRef}
-        role="dialog"
-        aria-modal="true"
-        aria-label={ariaLabel}
-        className="fixed inset-x-0 bottom-0 z-50 max-h-[85vh] flex flex-col
-          bg-white dark:bg-gray-900 rounded-t-xl shadow-2xl border-t border-gray-200
-          dark:border-gray-700 md:hidden motion-safe:transition-transform"
+      {/* ---------- Desktop: in-flow flex child (no overlay) ---------- */}
+      <aside
+        className={`hidden lg:flex flex-col h-full shrink-0 bg-white dark:bg-gray-900
+          border-l border-gray-200 dark:border-gray-700 overflow-hidden
+          transition-[width] duration-300 ease-out ${collapsed ? 'w-14' : 'w-96'}`}
+        aria-label={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
+        role="complementary"
       >
-        {/* Drag handle pill — purely visual cue that this is a sheet,
-            not a fixed dialog. Drag-to-dismiss is deferred to v2. */}
-        <div className="pt-2 pb-1 flex justify-center" aria-hidden="true">
-          <span className="block w-10 h-1 rounded-full bg-gray-300 dark:bg-gray-600" />
-        </div>
-        <header className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700">
-          <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">{heading}</h2>
-          <button
-            ref={closeBtnRef}
-            type="button"
-            onClick={onClose}
-            className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-            aria-label={closeLabel}
+        {collapsed ? (
+          <div className="flex items-center justify-center h-12 border-b border-gray-200 dark:border-gray-700 shrink-0">
+            <button
+              type="button"
+              onClick={toggleCollapsed}
+              className="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-900
+                dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors active:scale-95"
+              aria-label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')}
+            >
+              <Menu className="w-5 h-5" aria-hidden="true" />
+            </button>
+          </div>
+        ) : (
+          <>
+            {headerBar}
+            {panelBody}
+          </>
+        )}
+      </aside>
+
+      {/* ---------- Mobile: fixed right slide-over (modal) ---------- */}
+      {/* Closed → just a fixed right-edge hamburger opener. The sheet
+          itself is unmounted while closed, so no off-screen tabbables. */}
+      {collapsed && (
+        <button
+          type="button"
+          onClick={toggleCollapsed}
+          className="lg:hidden fixed top-1/2 -translate-y-1/2 right-0 z-30 p-2.5
+            rounded-l-lg bg-primary-600 text-white shadow-lg hover:bg-primary-700
+            focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-300"
+          aria-label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')}
+        >
+          <Menu className="h-5 w-5" aria-hidden="true" />
+        </button>
+      )}
+
+      {mobileSheetOpen && (
+        <>
+          <div
+            className="lg:hidden fixed inset-0 z-40 bg-black/50 dark:bg-black/60
+              backdrop-blur-xs motion-safe:transition-opacity"
+            aria-hidden="true"
+            onClick={toggleCollapsed}
+          />
+          <div
+            ref={sheetRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
+            className="lg:hidden fixed inset-y-0 right-0 z-50 w-80 max-w-[85vw] flex flex-col
+              bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-700 shadow-2xl
+              motion-safe:transition-transform"
           >
-            <X className="h-4 w-4 text-gray-600 dark:text-gray-300" />
-          </button>
-        </header>
-        <div className="flex-1 flex flex-col overflow-hidden">{children}</div>
-      </div>
+            {headerBar}
+            <div className="flex-1 flex flex-col overflow-hidden">{panelBody}</div>
+          </div>
+        </>
+      )}
     </>
   );
 }
@@ -300,29 +271,5 @@ function SectionHeading({
         </span>
       )}
     </div>
-  );
-}
-
-/**
- * Convenience back-button variant for use inside a left-collapsed layout —
- * shown in the chat header when the panel is collapsed and the user is
- * NOT on a mobile breakpoint, so they have a non-floating affordance too.
- */
-export function WissensbasisExpandButton() {
-  const { t } = useTranslation();
-  const { collapsed, toggleCollapsed } = useWissensbasis();
-  if (!collapsed) return null;
-  return (
-    <button
-      type="button"
-      onClick={toggleCollapsed}
-      className="hidden md:inline-flex items-center gap-1 px-2 py-1 text-xs rounded
-        bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600
-        text-gray-700 dark:text-gray-200"
-      aria-label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')}
-    >
-      <Layers className="h-3 w-3" aria-hidden="true" />
-      {t('wissensbasis.panel.expandShort', 'Wissensbasis')}
-    </button>
   );
 }
