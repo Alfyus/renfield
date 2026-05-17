@@ -40,6 +40,9 @@ import { useWissensbasis } from '../../context/WissensbasisContext';
 import { FocusNeighborhood } from './FocusNeighborhood';
 import { ReasoningSubgraph } from './ReasoningSubgraph';
 
+// Must stay in lockstep with Tailwind's `lg` (the `hidden lg:flex` /
+// `lg:hidden` split below). If Tailwind's lg breakpoint ever changes,
+// update this too, or a narrow band could mount both headers.
 const MOBILE_BREAKPOINT_PX = 1024; // Tailwind lg
 
 // Everything Tab can land on — used by the mobile focus trap.
