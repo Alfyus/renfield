@@ -2,23 +2,28 @@
  * WissensbasisSidePanel — chat-page RIGHT-side panel showing the
  * composed A2 (reasoning subgraph) + A4 (focus neighborhood) layout.
  *
- * Interaction mirrors the left nav rail (components/Layout.tsx):
- *   - Desktop (lg+): a persistent slim rail docked on the right edge
- *     with a hamburger icon. Hovering the rail expands it (pure CSS,
- *     group/wb), and clicking the hamburger PINS it open. The header X
- *     collapses it back to the rail. No floating FAB.
- *   - Mobile (<lg): the rail has no room, so a small fixed hamburger on
- *     the right edge opens a full-height slide-over (from the right)
- *     with a dimmed backdrop — same pattern as the left nav on mobile.
+ * Interaction mirrors the left nav rail (components/Layout.tsx) but
+ * stays IN-FLOW on desktop (the old panel was a `md:flex w-96 shrink-0`
+ * flex child; making it `position: fixed` would overlay the chat
+ * messages + input — there is no right-side gutter compensation on the
+ * chat page, unlike the left rail whose width the page shell reserves):
  *
- * `collapsed` (from WissensbasisContext) is the single source of truth:
- *   collapsed = rail / closed; !collapsed = pinned open / sheet open.
+ *   - Desktop (lg+): an in-flow flex child. Collapsed → a slim w-14
+ *     rail showing only a hamburger; the chat column keeps its space.
+ *     Clicking the hamburger expands it to w-96 (chat column shrinks
+ *     beside it, exactly like the original); the header X collapses
+ *     back to the rail. The heavy interactive body is mounted ONLY
+ *     when expanded, so the collapsed rail has no off-screen/hidden
+ *     tabbables (WCAG 2.4.3 — matches the original's conditional
+ *     render). No floating FAB.
+ *   - Mobile (<lg): the rail has no room, so a fixed right-edge
+ *     hamburger opens a full-height slide-over from the right with a
+ *     dimmed backdrop (same pattern as the left nav on mobile). The
+ *     sheet is a real modal: scroll lock + focus trap + Esc + initial
+ *     focus, and it is unmounted when closed (no hidden tabbables).
+ *
+ * `collapsed` (from WissensbasisContext) is the single source of truth.
  * A CitationChip click sets the focus entity via the same context.
- *
- * Accessibility: the mobile slide-over is a real modal (scroll lock +
- * focus trap + Esc + initial focus). The desktop rail is a persistent
- * complementary region — NOT modal — so those traps are gated to mobile
- * to avoid trapping the whole page behind a hover panel.
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -35,7 +40,7 @@ import { useWissensbasis } from '../../context/WissensbasisContext';
 import { FocusNeighborhood } from './FocusNeighborhood';
 import { ReasoningSubgraph } from './ReasoningSubgraph';
 
-const MOBILE_BREAKPOINT_PX = 1024; // Tailwind lg — matches the rail's lg: prefixes
+const MOBILE_BREAKPOINT_PX = 1024; // Tailwind lg
 
 // Everything Tab can land on — used by the mobile focus trap.
 const FOCUSABLE_SELECTOR =
@@ -70,38 +75,39 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
   const mixQ = useRoleMixQuery(role);
   const mix = mixQ.data ?? { a2: 60, a4: 40, source: 'default' as const, role: null };
 
-  const panelRef = useRef<HTMLElement | null>(null);
+  const sheetRef = useRef<HTMLDivElement | null>(null);
   const closeBtnRef = useRef<HTMLButtonElement | null>(null);
 
-  // Mobile slide-over is modal: lock body scroll while it's open.
+  // The mobile slide-over is a true modal. All of these effects are
+  // gated on `isMobile && open` so the desktop in-flow rail is never a
+  // focus trap and never captures global keys.
+  const mobileSheetOpen = isMobile && open;
+
   useEffect(() => {
-    if (!isMobile || !open) return;
+    if (!mobileSheetOpen) return;
     const previous = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     return () => {
       document.body.style.overflow = previous;
     };
-  }, [isMobile, open]);
+  }, [mobileSheetOpen]);
 
-  // WCAG 2.4.3 — move focus into the sheet on open (mobile only).
   useEffect(() => {
-    if (isMobile && open) closeBtnRef.current?.focus();
-  }, [isMobile, open]);
+    if (mobileSheetOpen) closeBtnRef.current?.focus();
+  }, [mobileSheetOpen]);
 
-  // Esc closes (both breakpoints — harmless on desktop). Tab/Shift+Tab
-  // are trapped only on the mobile modal, never on the desktop rail.
   useEffect(() => {
-    if (!open) return;
+    if (!mobileSheetOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         toggleCollapsed();
         return;
       }
-      if (e.key !== 'Tab' || !isMobile) return;
-      const panel = panelRef.current;
-      if (!panel) return;
+      if (e.key !== 'Tab') return;
+      const sheet = sheetRef.current;
+      if (!sheet) return;
       const focusables = Array.from(
-        panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+        sheet.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
       ).filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
       if (focusables.length === 0) return;
       const first = focusables[0];
@@ -113,14 +119,14 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
       } else if (!e.shiftKey && active === last) {
         e.preventDefault();
         first.focus();
-      } else if (active && !panel.contains(active)) {
+      } else if (active && !sheet.contains(active)) {
         e.preventDefault();
         first.focus();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, isMobile, toggleCollapsed]);
+  }, [mobileSheetOpen, toggleCollapsed]);
 
   const panelBody = (
     <>
@@ -152,27 +158,58 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
     </>
   );
 
-  // Content fades in when the rail is hovered or pinned; in the
-  // collapsed rail state it's hidden so the w-14 strip stays clean.
-  const revealOnHover = collapsed
-    ? 'lg:opacity-0 lg:group-hover/wb:opacity-100'
-    : '';
+  const headerBar = (
+    <header className="flex items-center justify-between h-12 px-3 border-b border-gray-200 dark:border-gray-700 shrink-0">
+      <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100 whitespace-nowrap overflow-hidden">
+        {t('wissensbasis.panel.heading', 'Wissensbasis')}
+      </h2>
+      <button
+        ref={closeBtnRef}
+        type="button"
+        onClick={toggleCollapsed}
+        className="shrink-0 p-1.5 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-900
+          dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 focus:outline-hidden
+          focus:ring-2 focus:ring-primary-500 transition-colors"
+        aria-label={t('wissensbasis.panel.collapse', 'Collapse panel')}
+      >
+        <X className="w-4 h-4" aria-hidden="true" />
+      </button>
+    </header>
+  );
 
   return (
     <>
-      {/* Mobile backdrop — only when the sheet is open */}
-      <div
-        className={`fixed inset-0 bg-black/50 dark:bg-black/60 backdrop-blur-xs z-40 transition-opacity duration-300 lg:hidden ${
-          open ? 'opacity-100' : 'opacity-0 pointer-events-none'
-        }`}
-        aria-hidden="true"
-        onClick={toggleCollapsed}
-      />
+      {/* ---------- Desktop: in-flow flex child (no overlay) ---------- */}
+      <aside
+        className={`hidden lg:flex flex-col h-full shrink-0 bg-white dark:bg-gray-900
+          border-l border-gray-200 dark:border-gray-700 overflow-hidden
+          transition-[width] duration-300 ease-out ${collapsed ? 'w-14' : 'w-96'}`}
+        aria-label={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
+        role="complementary"
+      >
+        {collapsed ? (
+          <div className="flex items-center justify-center h-12 border-b border-gray-200 dark:border-gray-700 shrink-0">
+            <button
+              type="button"
+              onClick={toggleCollapsed}
+              className="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-900
+                dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors active:scale-95"
+              aria-label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')}
+            >
+              <Menu className="w-5 h-5" aria-hidden="true" />
+            </button>
+          </div>
+        ) : (
+          <>
+            {headerBar}
+            {panelBody}
+          </>
+        )}
+      </aside>
 
-      {/* Mobile opener — fixed right-edge hamburger, only when closed.
-          The rail has no room on phones, so this is the entry point
-          (the old floating FAB stranded users; this mirrors the left
-          nav's mobile hamburger). */}
+      {/* ---------- Mobile: fixed right slide-over (modal) ---------- */}
+      {/* Closed → just a fixed right-edge hamburger opener. The sheet
+          itself is unmounted while closed, so no off-screen tabbables. */}
       {collapsed && (
         <button
           type="button"
@@ -186,59 +223,28 @@ export function WissensbasisSidePanel({ sessionId, role }: WissensbasisSidePanel
         </button>
       )}
 
-      <aside
-        ref={panelRef}
-        className={`group/wb fixed top-0 right-0 h-full flex flex-col bg-white dark:bg-gray-900
-          border-l border-gray-200 dark:border-gray-700 z-50 transform transition-all duration-300 ease-out
-          w-80 ${collapsed ? 'lg:w-14 lg:hover:w-96' : 'lg:w-96'} lg:translate-x-0
-          ${open ? 'translate-x-0' : 'translate-x-full'}`}
-        aria-label={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
-        role={isMobile && open ? 'dialog' : 'complementary'}
-        aria-modal={isMobile && open ? true : undefined}
-      >
-        <header className="relative flex items-center h-12 px-3 border-b border-gray-200 dark:border-gray-700 shrink-0">
-          {/* Rail hamburger — desktop, collapsed, hidden on hover */}
-          {collapsed && (
-            <div className="hidden lg:flex lg:group-hover/wb:hidden items-center justify-center absolute inset-0">
-              <button
-                type="button"
-                onClick={toggleCollapsed}
-                className="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-900
-                  dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors active:scale-95"
-                aria-label={t('wissensbasis.panel.expand', 'Open Wissensbasis panel')}
-              >
-                <Menu className="w-5 h-5" aria-hidden="true" />
-              </button>
-            </div>
-          )}
-
-          {/* Title + collapse — mobile always; desktop on hover or when pinned */}
+      {mobileSheetOpen && (
+        <>
           <div
-            className={`flex items-center justify-between w-full ${revealOnHover} transition-opacity duration-200`}
+            className="lg:hidden fixed inset-0 z-40 bg-black/50 dark:bg-black/60
+              backdrop-blur-xs motion-safe:transition-opacity"
+            aria-hidden="true"
+            onClick={toggleCollapsed}
+          />
+          <div
+            ref={sheetRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('wissensbasis.panel.ariaLabel', 'Wissensbasis composed view')}
+            className="lg:hidden fixed inset-y-0 right-0 z-50 w-80 max-w-[85vw] flex flex-col
+              bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-700 shadow-2xl
+              motion-safe:transition-transform"
           >
-            <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100 whitespace-nowrap overflow-hidden">
-              {t('wissensbasis.panel.heading', 'Wissensbasis')}
-            </h2>
-            <button
-              ref={closeBtnRef}
-              type="button"
-              onClick={toggleCollapsed}
-              className="shrink-0 p-1.5 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-900
-                dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 focus:outline-hidden
-                focus:ring-2 focus:ring-primary-500 transition-colors"
-              aria-label={t('wissensbasis.panel.collapse', 'Collapse panel')}
-            >
-              <X className="w-4 h-4" aria-hidden="true" />
-            </button>
+            {headerBar}
+            <div className="flex-1 flex flex-col overflow-hidden">{panelBody}</div>
           </div>
-        </header>
-
-        <div
-          className={`flex-1 flex flex-col overflow-hidden ${revealOnHover} transition-opacity duration-200`}
-        >
-          {panelBody}
-        </div>
-      </aside>
+        </>
+      )}
     </>
   );
 }
