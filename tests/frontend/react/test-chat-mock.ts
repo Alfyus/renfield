@@ -58,6 +58,7 @@ export const defaultChatContextValue: ChatContextValue = {
   recording: false,
   audioLevel: 0,
   silenceTimeRemaining: 0,
+  partialText: '',
   toggleRecording: () => {},
 
   // RAG
