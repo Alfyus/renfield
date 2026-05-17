@@ -94,7 +94,7 @@ export interface ChatUiMessage {
 }
 
 /** Map a persisted history message to the in-memory UI shape. */
-function historyToUiMessage(m: {
+export function historyToUiMessage(m: {
   role: string;
   content: string;
   metadata?: unknown;
