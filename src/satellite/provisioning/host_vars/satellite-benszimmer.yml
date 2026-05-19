@@ -8,7 +8,8 @@ satellite_room: "BensZimmer"
 # Audio (XVF3800 delivers pre-processed mono via USB Audio Class 2.0)
 audio_device: "plughw:Array,0"
 audio_playback_device: "plughw:Array,0"
-audio_channels: 1
+audio_channels: 1            # 1 channel post-DSP delivered over USB
+audio_physical_mics: 4       # the array is physically 4 mics
 beamforming_enabled: false
 
 # LEDs (XVF3800 12x WS2812B controlled via xvf_host over USB)

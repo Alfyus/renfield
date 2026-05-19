@@ -135,7 +135,7 @@ GET /api/satellites
         "led_count": 12,
         "button": true,
         "led_type": "xvf3800",
-        "mic_channels": 4,
+        "mic_count": 4,
         "has_camera": true,
         "has_display": false,
         "has_enviro": true

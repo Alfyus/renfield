@@ -33,7 +33,7 @@ class SatelliteCapabilitiesResponse(BaseModel):
     led_count: int = 3
     button: bool = True
     led_type: str | None = None
-    mic_channels: int = 1
+    mic_count: int = 1   # physical mics, not post-DSP capture channels
     has_camera: bool = False
     has_display: bool = False
     has_enviro: bool = False

@@ -32,7 +32,9 @@ export interface SatelliteCapabilities {
   /** "apa102" | "gpio_rgb" | "xvf3800" | "none" — runtime LED/array hint
    *  (true Ansible hat_type is not transmitted by the device). */
   led_type?: string | null;
-  mic_channels?: number;
+  /** Physical mic count from the hardware (NOT post-DSP capture channels —
+   *  XVF3800 / AC108 4-mic arrays deliver 1 channel after beamforming). */
+  mic_count?: number;
   has_camera?: boolean;
   has_display?: boolean;
   has_enviro?: boolean;

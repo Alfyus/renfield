@@ -19,6 +19,12 @@ audio:
   sample_rate: 16000
   chunk_size: 1280
   channels: {{ audio_channels }}
+  # Physical mic count (the HARDWARE, not the post-DSP capture channels).
+  # XVF3800 4-mic array and AC108 4-mic HAT both deliver 1 channel post
+  # beamforming → audio_channels=1 is misleading as a "how many mics?"
+  # signal. Set audio_physical_mics in host_vars where the array size
+  # differs from audio_channels; defaults to audio_channels otherwise.
+  physical_mics: {{ audio_physical_mics | default(audio_channels) }}
   device: "{{ audio_device }}"
   playback_device: "{{ audio_playback_device }}"
   beamforming:
@@ -44,6 +50,12 @@ led:
   type: "{{ led_type | default('apa102') }}"
   brightness: {{ led_brightness }}
   idle_color: "{{ led_idle_color | default('blue') }}"
+  # num_leds is emitted for EVERY led_type so the satellite's capability
+  # report (sent to the fleet page) reflects this device. Pre-fix the
+  # xvf3800 and gpio_rgb branches skipped it → the satellite fell back to
+  # the Python default of 3 regardless of host_vars (the sat-benszimmer
+  # 12-LEDs / sat-arbeitszimmer 0-LEDs drift, 2026-05).
+  num_leds: {{ led_num | default(0) }}
 {% if led_type | default('apa102') == 'gpio_rgb' %}
   gpio_red: {{ led_gpio_red }}
   gpio_green: {{ led_gpio_green }}
@@ -51,7 +63,6 @@ led:
 {% elif led_type | default('apa102') == 'xvf3800' %}
   xvf_host_path: "{{ xvf_host_path | default('/opt/renfield-satellite/bin/xvf_host') }}"
 {% elif led_type | default('apa102') != 'none' %}
-  num_leds: {{ led_num }}
   spi_bus: 0
   spi_device: {{ led_spi_device }}
 {% if led_power_pin is not none %}

@@ -52,10 +52,24 @@ class AudioConfig:
     sample_rate: int = 16000
     chunk_size: int = 1280  # 80ms at 16kHz
     channels: int = 1
+    # Physical mic count (the HARDWARE — separate from `channels` which is
+    # the post-DSP capture stream). For XVF3800-USB / AC108 4-mic arrays
+    # `channels=1` post-beamforming but `physical_mics=4`; the satellite
+    # reports this as a capability so the fleet page can show the actual
+    # array size. Defaults to ``channels`` for 2-mic HATs where the two
+    # match — provisioning sets it explicitly only when they differ.
+    physical_mics: int | None = None
     use_arecord: bool = False  # Use arecord subprocess (required for AC108 4-mic + onnxruntime)
     device: str = "plughw:1,0"  # ReSpeaker default
     playback_device: str = "plughw:1,0"
     beamforming: BeamformingConfig = field(default_factory=BeamformingConfig)
+
+    @property
+    def effective_physical_mics(self) -> int:
+        """Resolve `physical_mics` (explicit hw count) or fall back to
+        `channels`. Single read-site so callers never accidentally treat
+        capture channels as a mic count."""
+        return self.physical_mics if self.physical_mics is not None else self.channels
 
 
 @dataclass
@@ -216,6 +230,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.audio.sample_rate = aud.get("sample_rate", config.audio.sample_rate)
         config.audio.chunk_size = aud.get("chunk_size", config.audio.chunk_size)
         config.audio.channels = aud.get("channels", config.audio.channels)
+        if "physical_mics" in aud:
+            config.audio.physical_mics = aud["physical_mics"]
         config.audio.use_arecord = aud.get("use_arecord", config.audio.use_arecord)
         config.audio.device = aud.get("device", config.audio.device)
         config.audio.playback_device = aud.get("playback_device", config.audio.playback_device)

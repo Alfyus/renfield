@@ -41,7 +41,7 @@ class SatelliteCapabilities:
 
     Defaults are conservative: a satellite running an older client that
     does not report the richer fields keeps working and simply shows the
-    base badges. ``led_type`` is None / ``mic_channels`` 1 / has_* False
+    base badges. ``led_type`` is None / ``mic_count`` 1 / has_* False
     until the device reports its real config.
     """
     local_wakeword: bool = True
@@ -49,7 +49,9 @@ class SatelliteCapabilities:
     led_count: int = 3
     button: bool = True
     led_type: str | None = None
-    mic_channels: int = 1
+    # Physical mic count from the hardware, NOT post-DSP capture channels
+    # (XVF3800 / AC108 4-mic arrays deliver 1 channel after beamforming).
+    mic_count: int = 1
     has_camera: bool = False
     has_display: bool = False
     has_enviro: bool = False
@@ -183,7 +185,7 @@ class SatelliteManager:
                 led_count=capabilities.get("led_count", 3),
                 button=capabilities.get("button", True),
                 led_type=capabilities.get("led_type"),
-                mic_channels=capabilities.get("mic_channels", 1),
+                mic_count=capabilities.get("mic_count", 1),
                 has_camera=capabilities.get("has_camera", False),
                 has_display=capabilities.get("has_display", False),
                 has_enviro=capabilities.get("has_enviro", False),
@@ -629,7 +631,7 @@ class SatelliteManager:
                     "speaker": sat.capabilities.speaker,
                     "led_count": sat.capabilities.led_count,
                     "led_type": sat.capabilities.led_type,
-                    "mic_channels": sat.capabilities.mic_channels,
+                    "mic_count": sat.capabilities.mic_count,
                     "has_camera": sat.capabilities.has_camera,
                     "has_display": sat.capabilities.has_display,
                     "has_enviro": sat.capabilities.has_enviro,
