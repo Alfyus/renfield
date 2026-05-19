@@ -210,6 +210,19 @@ class Satellite:
             reconnect_interval=self.config.server.reconnect_interval,
             heartbeat_interval=self.config.server.heartbeat_interval,
             language=self.config.satellite.language,
+            # Real hardware capabilities so the fleet page reflects THIS
+            # device, not a hardcoded "3 LEDs" for every satellite.
+            # hat_type is an Ansible host_var, not in the runtime config;
+            # led_type ("apa102"/"gpio_rgb"/"xvf3800"/"none") + mic_channels
+            # are the truthful runtime hardware hints.
+            capabilities={
+                "led_count": self.config.led.num_leds,
+                "led_type": self.config.led.type,
+                "mic_channels": self.config.audio.channels,
+                "has_camera": self.config.camera.enabled,
+                "has_display": self.config.display.enabled,
+                "has_enviro": self.config.enviro.enabled,
+            },
         )
 
         # Service discovery for auto-finding server

@@ -50,6 +50,69 @@ class TestSatelliteManager:
         assert manager.satellites["test-satellite"].language == "de"
 
     @pytest.mark.unit
+    async def test_register_reports_rich_hardware_capabilities(self, manager):
+        """A modern satellite reports its real hardware; the values must
+        survive into get_all_satellites() so the fleet page shows THIS
+        device (not the legacy hardcoded '3 LEDs' for everyone)."""
+        await manager.register(
+            satellite_id="benszimmer",
+            room="BensZimmer",
+            websocket=AsyncMock(),
+            capabilities={
+                "local_wakeword": True,
+                "speaker": True,
+                "led_count": 12,
+                "led_type": "xvf3800",
+                "mic_channels": 4,
+                "has_camera": True,
+                "has_display": False,
+                "has_enviro": True,
+            },
+            language="de",
+        )
+
+        caps = manager.satellites["benszimmer"].capabilities
+        assert caps.led_count == 12
+        assert caps.led_type == "xvf3800"
+        assert caps.mic_channels == 4
+        assert caps.has_camera is True
+        assert caps.has_display is False
+        assert caps.has_enviro is True
+
+        # Serialized payload the REST route forwards to the frontend
+        serialized = next(
+            s for s in manager.get_all_satellites()
+            if s["satellite_id"] == "benszimmer"
+        )["capabilities"]
+        assert serialized["led_count"] == 12
+        assert serialized["led_type"] == "xvf3800"
+        assert serialized["mic_channels"] == 4
+        assert serialized["has_camera"] is True
+        assert serialized["has_display"] is False
+        assert serialized["has_enviro"] is True
+
+    @pytest.mark.unit
+    async def test_register_legacy_client_falls_back_to_safe_defaults(self, manager):
+        """An older satellite that does not report the rich fields must
+        still register and yield conservative defaults (no crash, no
+        misleading hardware claims)."""
+        await manager.register(
+            satellite_id="old-sat",
+            room="Wohnzimmer",
+            websocket=AsyncMock(),
+            capabilities={"local_wakeword": True, "speaker": True},
+            language="de",
+        )
+
+        caps = manager.satellites["old-sat"].capabilities
+        assert caps.led_count == 3
+        assert caps.led_type is None
+        assert caps.mic_channels == 1
+        assert caps.has_camera is False
+        assert caps.has_display is False
+        assert caps.has_enviro is False
+
+    @pytest.mark.unit
     async def test_register_reconnect(self, manager):
         """Test reconnecting an existing satellite"""
         mock_ws1 = AsyncMock()

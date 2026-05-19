@@ -351,3 +351,70 @@ class TestZeroconfDiscovery:
         props = mock_zeroconf_discovery["properties"]
         assert "ws_path" in props
         assert props["ws_path"] == "/ws/satellite"
+
+
+# ============================================================================
+# WebSocket register payload — real hardware capabilities
+# ============================================================================
+
+class TestWebSocketClientCapabilities:
+    """The satellite must report its REAL hardware in the register payload
+    so the fleet page reflects this device, not a hardcoded '3 LEDs'.
+    The contract is decoupled: satellite.py builds the dict from Config and
+    passes it in; websocket_client merges it over conservative defaults."""
+
+    def _client(self, **kw):
+        from renfield_satellite.network.websocket_client import WebSocketClient
+        return WebSocketClient(satellite_id="sat-x", room="Room", **kw)
+
+    def test_no_capabilities_keeps_safe_defaults(self):
+        """Backward compat: an old caller that passes nothing must not
+        crash and must carry an empty override set."""
+        client = self._client()
+        assert client._capabilities == {}
+
+    def test_capabilities_stored(self):
+        caps = {"led_count": 12, "mic_channels": 4, "has_camera": True}
+        client = self._client(capabilities=caps)
+        assert client._capabilities == caps
+
+    async def test_register_payload_merges_device_caps_over_defaults(self):
+        """The register message must contain the device's real values,
+        with conservative defaults filling anything not reported."""
+        import json
+
+        client = self._client(capabilities={
+            "led_count": 12,
+            "led_type": "xvf3800",
+            "mic_channels": 4,
+            "has_camera": True,
+            "has_display": False,
+            "has_enviro": True,
+        })
+
+        sent = {}
+
+        async def _capture(message):
+            sent.update(message)
+
+        client._send = _capture
+        client._ws = AsyncMock()
+        client._ws.recv = AsyncMock(return_value=json.dumps({
+            "type": "register_ack", "success": True,
+            "config": {}, "protocol_version": "1.0",
+        }))
+
+        await client._register()
+
+        caps = sent["capabilities"]
+        # Defaults still present
+        assert caps["local_wakeword"] is True
+        assert caps["speaker"] is True
+        assert caps["button"] is True
+        # Device-reported values win
+        assert caps["led_count"] == 12
+        assert caps["led_type"] == "xvf3800"
+        assert caps["mic_channels"] == 4
+        assert caps["has_camera"] is True
+        assert caps["has_display"] is False
+        assert caps["has_enviro"] is True

@@ -26,11 +26,17 @@ router = APIRouter()
 # =============================================================================
 
 class SatelliteCapabilitiesResponse(BaseModel):
-    """Satellite hardware capabilities"""
+    """Satellite hardware capabilities (as reported by the device on
+    register; conservative defaults for older clients)."""
     local_wakeword: bool = True
     speaker: bool = True
     led_count: int = 3
     button: bool = True
+    led_type: str | None = None
+    mic_channels: int = 1
+    has_camera: bool = False
+    has_display: bool = False
+    has_enviro: bool = False
 
 
 class SatelliteMetricsResponse(BaseModel):

@@ -28,6 +28,14 @@ export interface SatelliteCapabilities {
   local_wakeword?: boolean;
   speaker?: boolean;
   led_count?: number;
+  button?: boolean;
+  /** "apa102" | "gpio_rgb" | "xvf3800" | "none" — runtime LED/array hint
+   *  (true Ansible hat_type is not transmitted by the device). */
+  led_type?: string | null;
+  mic_channels?: number;
+  has_camera?: boolean;
+  has_display?: boolean;
+  has_enviro?: boolean;
 }
 
 export interface SatelliteSession {

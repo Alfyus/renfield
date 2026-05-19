@@ -37,11 +37,22 @@ class SatelliteState(str, Enum):
 
 @dataclass
 class SatelliteCapabilities:
-    """Hardware capabilities of a satellite"""
+    """Hardware capabilities of a satellite.
+
+    Defaults are conservative: a satellite running an older client that
+    does not report the richer fields keeps working and simply shows the
+    base badges. ``led_type`` is None / ``mic_channels`` 1 / has_* False
+    until the device reports its real config.
+    """
     local_wakeword: bool = True
     speaker: bool = True
     led_count: int = 3
     button: bool = True
+    led_type: str | None = None
+    mic_channels: int = 1
+    has_camera: bool = False
+    has_display: bool = False
+    has_enviro: bool = False
 
 
 @dataclass
@@ -170,7 +181,12 @@ class SatelliteManager:
                 local_wakeword=capabilities.get("local_wakeword", True),
                 speaker=capabilities.get("speaker", True),
                 led_count=capabilities.get("led_count", 3),
-                button=capabilities.get("button", True)
+                button=capabilities.get("button", True),
+                led_type=capabilities.get("led_type"),
+                mic_channels=capabilities.get("mic_channels", 1),
+                has_camera=capabilities.get("has_camera", False),
+                has_display=capabilities.get("has_display", False),
+                has_enviro=capabilities.get("has_enviro", False),
             )
 
             # Register satellite
@@ -611,7 +627,12 @@ class SatelliteManager:
                 "capabilities": {
                     "local_wakeword": sat.capabilities.local_wakeword,
                     "speaker": sat.capabilities.speaker,
-                    "led_count": sat.capabilities.led_count
+                    "led_count": sat.capabilities.led_count,
+                    "led_type": sat.capabilities.led_type,
+                    "mic_channels": sat.capabilities.mic_channels,
+                    "has_camera": sat.capabilities.has_camera,
+                    "has_display": sat.capabilities.has_display,
+                    "has_enviro": sat.capabilities.has_enviro,
                 },
                 # Version and update info
                 "version": sat.version,
