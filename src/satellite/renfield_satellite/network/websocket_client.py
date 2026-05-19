@@ -68,6 +68,7 @@ class WebSocketClient:
         reconnect_interval: int = 5,
         heartbeat_interval: int = 30,
         language: str = "de",
+        capabilities: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize WebSocket client.
@@ -79,6 +80,11 @@ class WebSocketClient:
             reconnect_interval: Seconds between reconnect attempts
             heartbeat_interval: Seconds between heartbeats
             language: Language code for STT/TTS (e.g., 'de', 'en')
+            capabilities: Real hardware capabilities derived from this
+                satellite's config (led_count, mic_channels, has_camera,
+                has_display, led_type). Merged over conservative defaults in
+                the register payload; passing None keeps the safe defaults so
+                an older caller never breaks.
         """
         self.server_url = server_url
         self.satellite_id = satellite_id
@@ -86,6 +92,7 @@ class WebSocketClient:
         self.reconnect_interval = reconnect_interval
         self.heartbeat_interval = heartbeat_interval
         self.language = language
+        self._capabilities = capabilities or {}
 
         self._ws: Optional["WebSocketClientProtocol"] = None
         self._state = ConnectionState.DISCONNECTED
@@ -315,11 +322,14 @@ class WebSocketClient:
             "room": self.room,
             "language": self.language,
             "version": __version__,
+            # Conservative defaults, overridden by real config-derived
+            # values passed in at construction (see __init__ `capabilities`).
             "capabilities": {
                 "local_wakeword": True,
                 "speaker": True,
                 "led_count": 3,
                 "button": True,
+                **self._capabilities,
             },
             "protocol_version": self._protocol_version
         }

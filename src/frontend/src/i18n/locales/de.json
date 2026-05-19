@@ -717,6 +717,15 @@
     "english": "English"
   },
   "satellites": {
+    "caps": {
+      "wakeWord": "Wake Word",
+      "speaker": "Lautsprecher",
+      "leds": "{{count}} LEDs",
+      "mics": "{{count}} Mikrofone",
+      "camera": "Kamera",
+      "display": "Display",
+      "enviro": "Umweltsensor"
+    },
     "title": "Satelliten-Monitor",
     "subtitle": "Live-Status der verbundenen Satelliten",
     "loadError": "Satelliten konnten nicht geladen werden",

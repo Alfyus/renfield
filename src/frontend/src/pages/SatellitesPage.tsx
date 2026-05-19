@@ -304,16 +304,34 @@ function SatelliteCard({ satellite, expanded, onToggle, latestVersion, onUpdate 
             </div>
           )}
 
-          {/* Capabilities */}
+          {/* Capabilities — reported by the device on register; reflects
+              THIS satellite's real hardware (older clients fall back to the
+              base badges). */}
           <div className="flex flex-wrap gap-2">
             {satellite.capabilities?.local_wakeword && (
-              <Badge color="blue">Wake Word</Badge>
+              <Badge color="blue">{t('satellites.caps.wakeWord', 'Wake Word')}</Badge>
             )}
             {satellite.capabilities?.speaker && (
-              <Badge color="purple">Speaker</Badge>
+              <Badge color="purple">{t('satellites.caps.speaker', 'Speaker')}</Badge>
             )}
             {(satellite.capabilities?.led_count ?? 0) > 0 && (
-              <Badge color="amber">{satellite.capabilities?.led_count} LEDs</Badge>
+              <Badge color="amber">
+                {t('satellites.caps.leds', '{{count}} LEDs', { count: satellite.capabilities?.led_count })}
+              </Badge>
+            )}
+            {(satellite.capabilities?.mic_channels ?? 0) > 1 && (
+              <Badge color="teal">
+                {t('satellites.caps.mics', '{{count}} Mics', { count: satellite.capabilities?.mic_channels })}
+              </Badge>
+            )}
+            {satellite.capabilities?.has_camera && (
+              <Badge color="green">{t('satellites.caps.camera', 'Camera')}</Badge>
+            )}
+            {satellite.capabilities?.has_display && (
+              <Badge color="pink">{t('satellites.caps.display', 'Display')}</Badge>
+            )}
+            {satellite.capabilities?.has_enviro && (
+              <Badge color="accent">{t('satellites.caps.enviro', 'Environment Sensor')}</Badge>
             )}
           </div>
 

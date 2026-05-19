@@ -132,8 +132,13 @@ GET /api/satellites
       "capabilities": {
         "local_wakeword": true,
         "speaker": true,
-        "led_count": 3,
-        "button": true
+        "led_count": 12,
+        "button": true,
+        "led_type": "xvf3800",
+        "mic_channels": 4,
+        "has_camera": true,
+        "has_display": false,
+        "has_enviro": true
       },
       "metrics": {
         "audio_rms": 1234.5,
