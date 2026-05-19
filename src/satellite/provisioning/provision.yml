@@ -326,6 +326,56 @@
         name: envirophat
         virtualenv: "{{ satellite_venv }}"
 
+    # envirophat hard-imports the C extension `smbus`, provided ONLY by the
+    # apt package python3-smbus (no working pip equivalent on Raspbian). The
+    # venv is created WITHOUT --system-site-packages, so apt alone is not
+    # enough — the .so must be linked into the venv. Recreating the venv with
+    # system-site-packages would change dependency resolution for every
+    # satellite, so we link just this one ABI-matching module (system python
+    # and venv python are the same 3.11.x on Pi OS). Without these two tasks
+    # the envirophat install above imports-fails and enviro telemetry is
+    # silently dead (the sat-benszimmer drift, 2026-05).
+    - name: Install python3-smbus (envirophat C-extension dependency)
+      tags: [python, app]
+      when: enviro_phat_enabled | default(false)
+      ansible.builtin.apt:
+        name: python3-smbus
+        state: present
+
+    - name: Discover system smbus extension module
+      tags: [python, app]
+      when: enviro_phat_enabled | default(false)
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        dpkg -L python3-smbus | grep -E '/smbus\.cpython-.*\.so$' | head -1
+      args:
+        executable: /bin/bash
+      register: smbus_so
+      changed_when: false
+
+    - name: Find venv site-packages directory
+      tags: [python, app]
+      when: enviro_phat_enabled | default(false)
+      ansible.builtin.find:
+        paths: "{{ satellite_venv }}/lib"
+        patterns: "site-packages"
+        file_type: directory
+        recurse: true
+      register: venv_site_packages
+
+    - name: Link system smbus module into the venv
+      tags: [python, app]
+      when:
+        - enviro_phat_enabled | default(false)
+        - smbus_so.stdout | length > 0
+        - venv_site_packages.files | length > 0
+      become_user: "{{ ansible_user }}"
+      ansible.builtin.file:
+        src: "{{ smbus_so.stdout }}"
+        dest: "{{ venv_site_packages.files[0].path }}/{{ smbus_so.stdout | basename }}"
+        state: link
+        force: true
+
     # =========================================================================
     # APP — Deploy application code
     # =========================================================================
