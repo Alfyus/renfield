@@ -442,6 +442,41 @@ class Settings(BaseSettings):
     allow_registration: bool = True  # Allow self-registration
     require_email_verification: bool = False  # Not implemented yet
 
+    # === Pluggable auth provider registry (ebongard/renfield#591) ===
+    # Per-provider credential walk timeout. A provider exceeding this is
+    # skipped (fail-open) — see auth/registry.py.
+    auth_provider_timeout_seconds: float = 10.0
+
+    # --- LDAP credential provider (authn only; group→role authz is a
+    #     separate future layer). Default off → DB-only behavior unchanged. ---
+    ldap_auth_enabled: bool = False
+    ldap_url: str = ""  # ldaps://host:636 or ldap://host:389
+    ldap_bind_dn: str = ""  # service account DN for the user search
+    ldap_bind_password: SecretStr = ""
+    ldap_auth_user_base_dn: str = ""  # subtree to search for the user
+    ldap_auth_user_filter: str = "(uid={username})"  # {username} substituted
+    ldap_connect_timeout: int = 5
+    ldap_receive_timeout: int = 10
+
+    # --- Social redirect providers. All ship enabled=False; enabling is a
+    #     config-only change (no redeploy). Off the credential critical path. ---
+    oauth_google_enabled: bool = False
+    oauth_google_client_id: str = ""
+    oauth_google_client_secret: SecretStr = ""
+    oauth_google_redirect_uri: str = ""
+
+    oauth_github_enabled: bool = False
+    oauth_github_client_id: str = ""
+    oauth_github_client_secret: SecretStr = ""
+    oauth_github_redirect_uri: str = ""
+
+    oauth_apple_enabled: bool = False
+    oauth_apple_client_id: str = ""  # Services ID
+    oauth_apple_team_id: str = ""
+    oauth_apple_key_id: str = ""
+    oauth_apple_private_key: SecretStr = ""
+    oauth_apple_redirect_uri: str = ""
+
     # Voice authentication
     voice_auth_enabled: bool = False
     voice_auth_min_confidence: float = 0.7

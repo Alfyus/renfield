@@ -20,7 +20,6 @@ from models.database import Role, User
 from models.permissions import get_all_permissions
 from services.api_rate_limiter import limiter
 from services.auth_service import (
-    authenticate_user,
     create_access_token,
     create_refresh_token,
     create_user,
@@ -116,24 +115,40 @@ async def login(
     Uses OAuth2 password flow (username + password in form data).
     Returns access token (short-lived) and refresh token (long-lived).
     """
-    # Pluggable auth: check hooks first (e.g. LDAP, SAML, OAuth).
-    # If a hook returns a User object, skip the default DB-based auth.
-    # If all hooks return None, fall through to the default.
-    from utils.hooks import run_hooks
+    # Pluggable auth provider registry (ebongard/renfield#591). This
+    # generalizes the pre-registry "authenticate hook → bcrypt fallback"
+    # two-step without breaking it: the legacy `authenticate` hook is still
+    # honored first; the DB/LDAP/social providers run the credential walk;
+    # `post_authenticate` is fired exactly once before the JWT is minted.
+    # See auth/login_flow.py for the full resolution + standalone-fallback
+    # contract.
+    from auth.login_flow import resolve_login
 
-    hook_results = await run_hooks(
-        "authenticate",
+    outcome = await resolve_login(
+        db=db,
         username=form_data.username,
         password=form_data.password,
-        db=db,
+        channel="web",
     )
-    user = next((r for r in hook_results if r is not None), None)
 
-    # Default: DB-based bcrypt authentication
-    if user is None:
-        user = await authenticate_user(db, form_data.username, form_data.password)
+    if outcome is None:
+        # Bad credentials OR a registered post_authenticate consumer declined
+        # to resolve — both are an opaque 401 (do not leak which).
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    if not user:
+    # Re-load on the request session to mint tokens / update last_login, and
+    # enforce is_active uniformly. NOTE: pre-registry, a legacy `authenticate`
+    # hook returning a *disabled* User would still get tokens (only the bcrypt
+    # path checked is_active). The registry path now rejects inactive users on
+    # every path (intended hardening). The response is the SAME opaque 401 as
+    # bad credentials — never a distinct 403 — so login does not leak whether a
+    # disabled account exists (no user-enumeration oracle).
+    user = await get_user_by_id(db, outcome.user_id)
+    if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -144,13 +159,18 @@ async def login(
     user.last_login = datetime.now(UTC).replace(tzinfo=None)
     await db.commit()
 
-    # Create tokens
+    # Create tokens. `sub` (= renfield user id) is the only consumed identity
+    # claim; the cosmetic `username` claim now carries display_name (no
+    # consumer reads it — verified design decision #6).
     access_token = create_access_token(
-        data={"sub": str(user.id), "username": user.username}
+        data={"sub": str(user.id), "username": outcome.display_name}
     )
     refresh_token = create_refresh_token(user.id)
 
-    logger.info(f"User logged in: {user.username}")
+    logger.info(
+        f"User logged in: {user.username} "
+        f"(provider={outcome.provider_id})"
+    )
 
     return TokenResponse(
         access_token=access_token,

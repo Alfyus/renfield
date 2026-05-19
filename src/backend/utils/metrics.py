@@ -39,6 +39,7 @@ _agent_outcome_total = None
 _injection_attempts_total = None
 _budget_reductions_total = None
 _output_guard_violations_total = None
+_auth_provider_unreachable_total = None
 
 
 def _init_metrics():
@@ -52,6 +53,7 @@ def _init_metrics():
     global _mcp_tool_duration_seconds, _mcp_tool_errors_total
     global _agent_outcome_total, _injection_attempts_total
     global _budget_reductions_total, _output_guard_violations_total
+    global _auth_provider_unreachable_total
 
     if _metrics_initialized:
         return
@@ -149,6 +151,18 @@ def _init_metrics():
             "renfield_output_guard_violations_total",
             "Output guard violations detected",
             ["violation"],
+        )
+
+        # Pluggable-auth fail-open observability. Name intentionally matches
+        # the cross-repo design contract (ebongard/renfield#591) verbatim —
+        # no `renfield_` prefix — so dashboards/alerts written against the
+        # approved design resolve without translation.
+        _auth_provider_unreachable_total = Counter(
+            "auth_provider_unreachable_total",
+            "Auth provider skipped during the credential walk because it "
+            "errored or timed out (fail-open). A non-zero rate means a "
+            "provider is silently down.",
+            ["provider_id"],
         )
 
         _metrics_initialized = True
@@ -256,6 +270,14 @@ def record_budget_reduction(pass_name: str):
     if not _metrics_initialized:
         return
     _budget_reductions_total.labels(pass_name=pass_name).inc()
+
+
+def record_auth_provider_unreachable(provider_id: str):
+    """Record that a credential provider was skipped (fail-open) because it
+    errored or timed out during the registry's priority walk."""
+    if not _metrics_initialized:
+        return
+    _auth_provider_unreachable_total.labels(provider_id=provider_id).inc()
 
 
 def record_output_guard_violation(violation: str):
