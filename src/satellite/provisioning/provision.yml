@@ -312,8 +312,14 @@
         virtualenv: "{{ satellite_venv }}"
         extra_args: "--no-deps"
 
+    # Also tagged `app`: this is a host-conditional venv dependency, and the
+    # safety-recommended code-only deploy (`--tags app`, avoids driver/service
+    # restart brick-risk on Pi Zero 2 W) would otherwise skip it forever — a
+    # device enabling enviro_phat would silently never get the lib (the
+    # sat-benszimmer drift, 2026-05). This pip task notifies no restart/reboot
+    # handler, so running it on `app` deploys stays restart-free.
     - name: Install envirophat package
-      tags: [python]
+      tags: [python, app]
       when: enviro_phat_enabled | default(false)
       become_user: "{{ ansible_user }}"
       ansible.builtin.pip:
