@@ -5,6 +5,15 @@
 # never end up in the repository.
 #
 # Default SSH user on Raspberry Pi OS is `pi`. Change to match your image.
+#
+# IMPORTANT: the inventory hostname MUST match the host_vars/<name>.yml
+# filename — Ansible auto-loads host_vars by inventory_hostname. If they
+# differ, per-host settings (hat_type, camera_enabled, enviro_phat_enabled,
+# …) silently do NOT load and the device is provisioned with defaults
+# (e.g. envirophat never installed → no environment telemetry).
+#
+# hat_type selects the audio driver / asound path. Supported values:
+#   2mic | 4mic | xvf3800-usb | whisplay
 
 all:
   children:
@@ -13,9 +22,15 @@ all:
         satellite-livingroom:
           ansible_host: satellite-livingroom.local
           ansible_user: pi
+          hat_type: 2mic
         satellite-kitchen:
           ansible_host: satellite-kitchen.local
           ansible_user: pi
+          hat_type: 4mic
+        # ReSpeaker XVF3800 USB + Enviro pHAT + Pi Camera. Per-host extras
+        # (enviro_phat_enabled, camera_enabled) live in
+        # host_vars/satellite-bedroom.yml — keyed by THIS hostname.
         # satellite-bedroom:
         #   ansible_host: 192.168.1.50
         #   ansible_user: pi
+        #   hat_type: xvf3800-usb
