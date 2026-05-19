@@ -665,6 +665,39 @@ DEFAULT_ADMIN_PASSWORD=changeme
 # Voice Authentication
 VOICE_AUTH_ENABLED=false
 VOICE_AUTH_MIN_CONFIDENCE=0.7
+
+# === Pluggable auth provider registry (ebongard/renfield#591) ===
+# Per-provider credential-walk timeout; a provider exceeding this is
+# skipped fail-open (WARNING + auth_provider_unreachable_total counter).
+AUTH_PROVIDER_TIMEOUT_SECONDS=10.0
+
+# LDAP credential provider (authn only — no group→role mapping yet).
+# Default off → DB-only behavior unchanged.
+LDAP_AUTH_ENABLED=false
+LDAP_URL=                              # ldaps://host:636 or ldap://host:389
+LDAP_BIND_DN=                          # service account DN for the user search
+LDAP_BIND_PASSWORD=
+LDAP_AUTH_USER_BASE_DN=                # subtree searched for the user
+LDAP_AUTH_USER_FILTER=(uid={username}) # {username} is substituted (RFC4515-escaped)
+LDAP_CONNECT_TIMEOUT=5
+LDAP_RECEIVE_TIMEOUT=10
+
+# Social redirect providers — all ship disabled; enabling is config-only
+# (no redeploy), off the credential critical path.
+OAUTH_GOOGLE_ENABLED=false
+OAUTH_GOOGLE_CLIENT_ID=
+OAUTH_GOOGLE_CLIENT_SECRET=
+OAUTH_GOOGLE_REDIRECT_URI=
+OAUTH_GITHUB_ENABLED=false
+OAUTH_GITHUB_CLIENT_ID=
+OAUTH_GITHUB_CLIENT_SECRET=
+OAUTH_GITHUB_REDIRECT_URI=
+OAUTH_APPLE_ENABLED=false
+OAUTH_APPLE_CLIENT_ID=                 # Apple Services ID
+OAUTH_APPLE_TEAM_ID=
+OAUTH_APPLE_KEY_ID=
+OAUTH_APPLE_PRIVATE_KEY=
+OAUTH_APPLE_REDIRECT_URI=
 ```
 
 **Defaults:**
@@ -677,6 +710,9 @@ VOICE_AUTH_MIN_CONFIDENCE=0.7
 - `DEFAULT_ADMIN_PASSWORD`: `changeme`
 - `VOICE_AUTH_ENABLED`: `false`
 - `VOICE_AUTH_MIN_CONFIDENCE`: `0.7`
+- `AUTH_PROVIDER_TIMEOUT_SECONDS`: `10.0`
+- `LDAP_AUTH_ENABLED`: `false` · `LDAP_AUTH_USER_FILTER`: `(uid={username})` · `LDAP_CONNECT_TIMEOUT`: `5` · `LDAP_RECEIVE_TIMEOUT`: `10`
+- `OAUTH_{GOOGLE,GITHUB,APPLE}_ENABLED`: `false` (all social providers disabled by default — enabling is a config-only change)
 
 **Produktion:**
 ```bash

@@ -62,6 +62,18 @@ HOOK_EVENTS: frozenset[str] = frozenset({
     "presence_last_left",
     "compact_mcp_result",
     "authenticate",
+    # Pluggable-auth identity resolution — fired ONCE by /auth/login after
+    # any provider (credential-walk winner OR redirect callback) authenticates
+    # a human, BEFORE the JWT is minted. Kwarg: `result: ProviderResult`
+    # (auth/provider_contract.py — the ebongard/renfield#591 cross-repo seam).
+    # The Reva consumer adapts it, runs the canonical-identity join, and
+    # returns the resolved renfield user id (int or str-castable). First
+    # non-None result wins (registration order = precedence). If a consumer is
+    # registered but none resolve, the login is DENIED (no half-bound token).
+    # If NO consumer is registered at all (standalone Renfield), /auth/login
+    # falls back to legacy behavior (JWT from the authenticated User row) —
+    # see the post_authenticate contract docstring in provider_contract.py.
+    "post_authenticate",
     # Intent classification fallback — fired by the LLM intent dispatcher
     # when JSON parsing fails and a domain-specific consumer (e.g. HA via
     # ha_glue) might still recognize the user's intent from raw keywords.
@@ -382,6 +394,17 @@ async def run_hooks_with_errors(
                 f"Hook {getattr(fn, '__qualname__', repr(fn))} failed for {event}"
             )
     return results, errors
+
+
+def has_hook(event: str) -> bool:
+    """True if at least one handler is registered for *event*.
+
+    Lets a caller distinguish "no consumer registered" from "consumer
+    registered but returned nothing" — `run_hooks` collapses both to an empty
+    list. `/auth/login` uses this for the standalone legacy-fallback decision
+    (see the post_authenticate contract).
+    """
+    return bool(_hooks.get(event))
 
 
 def clear_hooks() -> None:

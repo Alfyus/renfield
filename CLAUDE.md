@@ -89,6 +89,36 @@ Dispatch for both is a special case in `services/action_executor.py` that inject
 
 Failed tool turns are persisted with `action_success: False` in message metadata. The `conv_context` builder in `services/agent_service.py` prepends `[VORHERIGE_FEHLGESCHLAGENE_AKTION]` to those assistant messages when re-injecting history into the next agent turn. The `conv_context_template` in `prompts/agent.yaml` carries a hint telling the LLM to treat marker lines as historical, not as current state — so a repeated user request retries the tool instead of echoing the old error.
 
+### Pluggable auth provider registry (ebongard/renfield#591)
+
+`/auth/login` no longer hard-codes "an `authenticate` hook then bcrypt". It
+delegates to `auth/login_flow.py::resolve_login`, which: (1) still honors the
+legacy `authenticate` hook first (a plugin returning a `User` is authoritative
+— unchanged backward-compat seam), then (2) runs the **provider registry**
+credential walk (`auth/registry.py`): providers ordered by ascending
+`priority`, multi-active, per-provider `enabled` gate, **first non-None wins**.
+A provider that raises or exceeds `auth_provider_timeout_seconds` is
+**skipped fail-open** — WARNING log + `auth_provider_unreachable_total{provider_id}`
+counter + continue the walk. (3) On a `ProviderResult`, the **single
+`post_authenticate` hook** fires exactly once *before* the JWT is minted.
+
+The cross-repo contract is `auth/provider_contract.py` (`ProviderResult` frozen
+dataclass + `AuthProvider` Protocol + `PROVIDER_RESULT_CONTRACT_VERSION`).
+Renfield owns authn; the Reva consumer (a `post_authenticate` handler) owns
+identity resolution and returns the renfield user id. **Standalone fallback:**
+0 handlers registered → JWT minted from the `db` provider's subject (legacy
+behavior, keeps the renfield test suite green); ≥1 handler registered but none
+resolve → login denied (no half-bound token). JWT `sub` unchanged; the cosmetic
+`username` claim now carries `display_name` (no consumer reads it).
+
+Built-ins (`auth/providers/`): `db` (priority 100, always on, wraps bcrypt),
+`ldap` (priority 50, authn-only — no local-user create; that is the
+identity consumer's job; config-gated), `google`/`github`/`apple` (redirect
+providers, **`enabled=False` by default**, enabling is config-only). The
+group→role **authz seam is defined in docstrings only**, not implemented this
+delivery (`extras["ldap_member_of"]` is carried but unused). New config:
+`ldap_auth_*`, `oauth_{google,github,apple}_*`, `auth_provider_timeout_seconds`.
+
 ### Circles v1 (access tiers)
 
 Detailed user-facing and architectural documentation: [`docs/CIRCLES.md`](docs/CIRCLES.md). Narrative of the broader knowledge system (the four subsystems circles protect): [`docs/SECOND_BRAIN.md`](docs/SECOND_BRAIN.md). Code-level summary below.
