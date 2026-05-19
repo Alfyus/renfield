@@ -319,9 +319,9 @@ function SatelliteCard({ satellite, expanded, onToggle, latestVersion, onUpdate 
                 {t('satellites.caps.leds', '{{count}} LEDs', { count: satellite.capabilities?.led_count })}
               </Badge>
             )}
-            {(satellite.capabilities?.mic_channels ?? 0) > 1 && (
+            {(satellite.capabilities?.mic_count ?? 0) > 1 && (
               <Badge color="teal">
-                {t('satellites.caps.mics', '{{count}} Mics', { count: satellite.capabilities?.mic_channels })}
+                {t('satellites.caps.mics', '{{count}} Mics', { count: satellite.capabilities?.mic_count })}
               </Badge>
             )}
             {satellite.capabilities?.has_camera && (

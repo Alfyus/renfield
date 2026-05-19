@@ -10,7 +10,8 @@ satellite_room: "Fitnessraum"
 # Native S32_LE/4ch capture is blocked by AC108 driver kernel panic — see TECHNICAL_DEBT.md
 audio_device: "capture"
 audio_playback_device: "plughw:vc4hdmi"
-audio_channels: 1
+audio_channels: 1            # ALSA plug converts S32_LE/4ch → S16_LE/1ch
+audio_physical_mics: 4       # AC108 array is physically 4 mics
 beamforming_enabled: false
 
 # LEDs (4-Mic Array: 12 LEDs on SPI 0:1, GPIO5 power)

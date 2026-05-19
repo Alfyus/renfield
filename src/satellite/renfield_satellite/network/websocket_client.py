@@ -81,7 +81,7 @@ class WebSocketClient:
             heartbeat_interval: Seconds between heartbeats
             language: Language code for STT/TTS (e.g., 'de', 'en')
             capabilities: Real hardware capabilities derived from this
-                satellite's config (led_count, mic_channels, has_camera,
+                satellite's config (led_count, mic_count, has_camera,
                 has_display, led_type). Merged over conservative defaults in
                 the register payload; passing None keeps the safe defaults so
                 an older caller never breaks.

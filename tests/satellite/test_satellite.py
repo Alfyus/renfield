@@ -374,7 +374,7 @@ class TestWebSocketClientCapabilities:
         assert client._capabilities == {}
 
     def test_capabilities_stored(self):
-        caps = {"led_count": 12, "mic_channels": 4, "has_camera": True}
+        caps = {"led_count": 12, "mic_count": 4, "has_camera": True}
         client = self._client(capabilities=caps)
         assert client._capabilities == caps
 
@@ -386,7 +386,7 @@ class TestWebSocketClientCapabilities:
         client = self._client(capabilities={
             "led_count": 12,
             "led_type": "xvf3800",
-            "mic_channels": 4,
+            "mic_count": 4,
             "has_camera": True,
             "has_display": False,
             "has_enviro": True,
@@ -414,7 +414,7 @@ class TestWebSocketClientCapabilities:
         # Device-reported values win
         assert caps["led_count"] == 12
         assert caps["led_type"] == "xvf3800"
-        assert caps["mic_channels"] == 4
+        assert caps["mic_count"] == 4
         assert caps["has_camera"] is True
         assert caps["has_display"] is False
         assert caps["has_enviro"] is True

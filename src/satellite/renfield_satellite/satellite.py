@@ -213,12 +213,16 @@ class Satellite:
             # Real hardware capabilities so the fleet page reflects THIS
             # device, not a hardcoded "3 LEDs" for every satellite.
             # hat_type is an Ansible host_var, not in the runtime config;
-            # led_type ("apa102"/"gpio_rgb"/"xvf3800"/"none") + mic_channels
+            # led_type ("apa102"/"gpio_rgb"/"xvf3800"/"none") + mic_count
             # are the truthful runtime hardware hints.
             capabilities={
                 "led_count": self.config.led.num_leds,
                 "led_type": self.config.led.type,
-                "mic_channels": self.config.audio.channels,
+                # Physical mic count, NOT capture channels (XVF3800 / AC108
+                # 4-mic arrays deliver 1 channel post-DSP — channels would
+                # be a misleading "how many mics" signal). See
+                # AudioConfig.effective_physical_mics.
+                "mic_count": self.config.audio.effective_physical_mics,
                 "has_camera": self.config.camera.enabled,
                 "has_display": self.config.display.enabled,
                 "has_enviro": self.config.enviro.enabled,

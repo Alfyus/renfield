@@ -63,7 +63,7 @@ class TestSatelliteManager:
                 "speaker": True,
                 "led_count": 12,
                 "led_type": "xvf3800",
-                "mic_channels": 4,
+                "mic_count": 4,
                 "has_camera": True,
                 "has_display": False,
                 "has_enviro": True,
@@ -74,7 +74,7 @@ class TestSatelliteManager:
         caps = manager.satellites["benszimmer"].capabilities
         assert caps.led_count == 12
         assert caps.led_type == "xvf3800"
-        assert caps.mic_channels == 4
+        assert caps.mic_count == 4
         assert caps.has_camera is True
         assert caps.has_display is False
         assert caps.has_enviro is True
@@ -86,7 +86,7 @@ class TestSatelliteManager:
         )["capabilities"]
         assert serialized["led_count"] == 12
         assert serialized["led_type"] == "xvf3800"
-        assert serialized["mic_channels"] == 4
+        assert serialized["mic_count"] == 4
         assert serialized["has_camera"] is True
         assert serialized["has_display"] is False
         assert serialized["has_enviro"] is True
@@ -107,7 +107,7 @@ class TestSatelliteManager:
         caps = manager.satellites["old-sat"].capabilities
         assert caps.led_count == 3
         assert caps.led_type is None
-        assert caps.mic_channels == 1
+        assert caps.mic_count == 1
         assert caps.has_camera is False
         assert caps.has_display is False
         assert caps.has_enviro is False
