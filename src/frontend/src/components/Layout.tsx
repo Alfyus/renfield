@@ -113,6 +113,16 @@ export default function Layout({ children }: LayoutProps) {
 
   const { user, isAuthenticated, authEnabled, logout, hasAnyPermission, isFeatureEnabled } = useAuth();
 
+  // Display name fallback chain. Post auth-provider-registry, usernames are
+  // keyed on `<provider_id>:<subject>` (e.g. `entra:62d9da60-…`, `ldap:<uuid>`)
+  // — raw they look ugly. Prefer the human first+last, then first alone,
+  // then username.
+  const userDisplayName = user
+    ? ([user.first_name, user.last_name].filter(Boolean).join(' ').trim()
+        || user.first_name
+        || user.username)
+    : '';
+
   // Backend-gated Reva features that aren't in Renfield's feature dict.
   // wissensbasisAvailable: true when /api/wissensbasis/me/mix is reachable
   // (route mounted), undefined while the probe is in flight (don't flash
@@ -294,12 +304,12 @@ export default function Layout({ children }: LayoutProps) {
                 <button
                   onClick={handleLogout}
                   className="flex items-center space-x-2 px-3 py-1.5 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
-                  title={`${t('auth.loggedInAs')} ${user?.username}`}
+                  title={`${t('auth.loggedInAs')} ${userDisplayName}`}
                 >
                   <div className="w-7 h-7 rounded-full bg-primary-600/30 flex items-center justify-center">
                     <User className="w-4 h-4 text-primary-600 dark:text-primary-400" />
                   </div>
-                  <span className="hidden sm:block text-sm">{user?.username}</span>
+                  <span className="hidden sm:block text-sm">{userDisplayName}</span>
                 </button>
               ) : (
                 <Link
@@ -432,7 +442,7 @@ export default function Layout({ children }: LayoutProps) {
                         <User className="w-4 h-4 text-primary-600 dark:text-primary-400" />
                       </div>
                       <div className="flex-1 min-w-0 lg:opacity-0 lg:group-hover/sidebar:opacity-100 transition-opacity duration-200">
-                        <p className="text-sm font-medium text-gray-900 dark:text-white truncate">{user?.username}</p>
+                        <p className="text-sm font-medium text-gray-900 dark:text-white truncate">{userDisplayName}</p>
                         <p className="text-xs text-gray-500 dark:text-gray-400 truncate">{user?.role?.name}</p>
                       </div>
                     </div>
