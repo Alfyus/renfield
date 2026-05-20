@@ -720,8 +720,10 @@
     "caps": {
       "wakeWord": "Wake Word",
       "speaker": "Speaker",
-      "leds": "{{count}} LEDs",
-      "mics": "{{count}} Mics",
+      "leds_one": "1 LED",
+      "leds_other": "{{count}} LEDs",
+      "mics_one": "1 Mic",
+      "mics_other": "{{count}} Mics",
       "camera": "Camera",
       "display": "Display",
       "enviro": "Environment Sensor"
