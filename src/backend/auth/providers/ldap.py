@@ -96,6 +96,21 @@ class LDAPProvider:
             connect_timeout=settings.ldap_connect_timeout,
         )
 
+        # OpenLDAP (entryUUID/uid) vs AD (objectGUID/sAMAccountName) split the
+        # subject + username attrs. Strict OpenLDAP rejects the WHOLE search
+        # with LDAPAttributeError "invalid attribute type objectGUID" when an
+        # unknown attr is in the explicit list — fail-open then swallows it
+        # and the walk falls through to db, returning 401. Try the AD-aware
+        # superset first; on LDAPAttributeError, retry without the AD-only
+        # names. entryUUID/uid alone still gives a stable subject + username
+        # for OpenLDAP; AD continues to get objectGUID/sAMAccountName.
+        _attrs_full = [
+            "entryUUID", "objectGUID", "displayName", "mail", "memberOf",
+            "uid", "cn", "sn", "givenName", "sAMAccountName",
+        ]
+        _attrs_openldap = [
+            a for a in _attrs_full if a not in ("objectGUID", "sAMAccountName")
+        ]
         try:
             # Step 1: service-account bind → locate the user entry.
             with Connection(
@@ -107,22 +122,22 @@ class LDAPProvider:
                 client_strategy=SAFE_SYNC,
             ) as conn:
                 # SAFE_SYNC → entries live in `response`, not conn.entries.
-                _ok, _result, response, _request = conn.search(
-                    search_base=user_base_dn,
-                    search_filter=user_filter,
-                    attributes=[
-                        "entryUUID",
-                        "objectGUID",
-                        "displayName",
-                        "mail",
-                        "memberOf",
-                        "uid",
-                        "cn",
-                        "sn",
-                        "givenName",
-                        "sAMAccountName",
-                    ],
-                )
+                try:
+                    _ok, _result, response, _request = conn.search(
+                        search_base=user_base_dn,
+                        search_filter=user_filter,
+                        attributes=_attrs_full,
+                    )
+                except ldap3.core.exceptions.LDAPAttributeError:
+                    logger.debug(
+                        "LDAP auth: directory rejected AD-only attrs — "
+                        "retrying as OpenLDAP (entryUUID/uid only)"
+                    )
+                    _ok, _result, response, _request = conn.search(
+                        search_base=user_base_dn,
+                        search_filter=user_filter,
+                        attributes=_attrs_openldap,
+                    )
                 entries = [
                     r
                     for r in (response or [])
