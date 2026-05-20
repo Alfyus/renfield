@@ -67,7 +67,14 @@ export default defineConfig({
         // invisible to every returning visitor (the SW is installed).
         // curl works (no SW); real browsers don't. RegExps are
         // evaluated on every navigation, so keep them minimal.
-        navigateFallbackDenylist: [/^\/auth\//, /^\/api\//],
+        navigateFallbackDenylist: [
+          /^\/auth\//,         // OIDC / social redirect login + callback
+          /^\/oauth2\//,       // OAuth2 redirect paths some IdPs mount
+          /^\/saml\//,         // SAML ACS / SLO callbacks
+          /^\/api\//,          // backend JSON API (same-origin)
+          /^\/ws\//,           // WebSocket upgrade paths
+          /^\/\.well-known\//, // OIDC discovery, ACME, etc.
+        ],
         // Exclude large WASM files from precaching (ONNX Runtime)
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
         // Skip large files silently instead of erroring
