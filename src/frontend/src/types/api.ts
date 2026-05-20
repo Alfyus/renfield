@@ -133,6 +133,8 @@ export interface ApiError {
 export interface User {
   id: number;
   username: string;
+  first_name?: string | null;
+  last_name?: string | null;
   email?: string;
   is_active: boolean;
   role_id: number;
