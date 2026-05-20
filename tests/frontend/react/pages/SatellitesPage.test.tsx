@@ -93,4 +93,37 @@ describe('SatellitesPage capability badges', () => {
     expect(screen.queryByText('Kamera')).not.toBeInTheDocument();
     expect(screen.queryByText('Umweltsensor')).not.toBeInTheDocument();
   });
+
+  it('uses singular form when a satellite reports exactly one LED', async () => {
+    // sat-arbeitszimmer-style: whisplay HAT has 1 status RGB LED.
+    // i18next picks _one over _other for count=1 → "1 LED", not "1 LEDs".
+    mockSatellites({
+      ...base,
+      satellite_id: 'arbeitszimmer',
+      room: 'Arbeitszimmer',
+      capabilities: {
+        local_wakeword: true,
+        speaker: true,
+        led_count: 1,
+        led_type: 'gpio_rgb',
+        mic_count: 2,
+        has_camera: true,
+        has_display: true,
+        has_enviro: false,
+      },
+    });
+
+    renderWithProviders(<SatellitesPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Arbeitszimmer')).toBeInTheDocument();
+    });
+    await userEvent.click(screen.getByText('Arbeitszimmer'));
+
+    expect(await screen.findByText('1 LED')).toBeInTheDocument();
+    expect(screen.queryByText('1 LEDs')).not.toBeInTheDocument();
+    expect(screen.getByText('2 Mikrofone')).toBeInTheDocument();
+    expect(screen.getByText('Kamera')).toBeInTheDocument();
+    expect(screen.getByText('Display')).toBeInTheDocument();
+  });
 });
