@@ -59,6 +59,15 @@ export default defineConfig({
         ]
       },
       workbox: {
+        // The SPA navigateFallback (index.html) must NOT swallow
+        // server-handled routes. Without this denylist the Workbox
+        // service worker returns the cached app shell for /auth/*
+        // navigations, so OIDC/SAML redirect logins AND their IdP
+        // callbacks never reach the backend — the auth dance is
+        // invisible to every returning visitor (the SW is installed).
+        // curl works (no SW); real browsers don't. RegExps are
+        // evaluated on every navigation, so keep them minimal.
+        navigateFallbackDenylist: [/^\/auth\//, /^\/api\//],
         // Exclude large WASM files from precaching (ONNX Runtime)
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
         // Skip large files silently instead of erroring
