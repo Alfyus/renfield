@@ -428,6 +428,8 @@ async def get_auth_status(
             role_id=user.role_id,
             permissions=user.get_permissions(),
             is_active=user.is_active,
+            personality_style=user.personality_style,
+            personality_prompt=user.personality_prompt,
             created_at=user.created_at,
             last_login=user.last_login,
             speaker_id=user.speaker_id
