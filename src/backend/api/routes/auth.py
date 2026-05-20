@@ -421,6 +421,8 @@ async def get_auth_status(
         user_response = UserResponse(
             id=user.id,
             username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
             email=user.email,
             role=user.role.name,
             role_id=user.role_id,
