@@ -43,6 +43,7 @@ import type { UploadStates, UploadedDocument } from '../hooks/useDocumentUpload'
 import type { Conversation } from '../../../types/chat';
 import type { TraceEntity } from '../../../api/resources/wissensbasis';
 import { useConfirmDialog } from '../../../components/ConfirmDialog';
+import { drainSentenceTts, type SentenceStreamState } from './sentenceStream';
 
 const SESSION_STORAGE_KEY = 'renfield_current_session';
 // How long sendMessageInternal waits for the WebSocket handshake before
@@ -424,13 +425,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
   // when interleaved on the wire. Empirically saves ~22 s of
   // perceived latency on a typical Qwen3.6 German response (29.4 s
   // → 7.1 s end-to-end final-transcript-to-last-audio).
-  const sentenceStreamRef = useRef<{
-    accumulated: string;
-    dispatchedIdx: number;
-    active: boolean;
-    pending: Set<string>;
-    streamDone: boolean;
-  }>({
+  const sentenceStreamRef = useRef<SentenceStreamState>({
     accumulated: '',
     dispatchedIdx: 0,
     active: false,
@@ -980,8 +975,10 @@ export function ChatProvider({ children }: ChatProviderProps) {
     const stream = sentenceStreamRef.current;
     if (!stream.active) return;
     debug.log('sentence-streaming TTS settled', requestId, outcome);
-    stream.pending.delete(requestId);
-    if (stream.streamDone && stream.pending.size === 0) {
+    // drainSentenceTts drains on every outcome — done / cancelled /
+    // error alike (plan finding 8) — and reports when the turn is fully
+    // settled.
+    if (drainSentenceTts(stream, requestId)) {
       // Reset for the next utterance.
       stream.active = false;
       stream.accumulated = '';

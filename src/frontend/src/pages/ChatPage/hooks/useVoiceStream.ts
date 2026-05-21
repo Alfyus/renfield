@@ -31,7 +31,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getWebSocketUrl } from '../../../utils/env';
 import { debug } from '../../../utils/debug';
-import { computeRms } from './voiceAudioUtils';
+import { computeRms, detectBargeIn } from './voiceAudioUtils';
 
 const RFWA_MAGIC = new Uint8Array([0x52, 0x46, 0x57, 0x41]); // "RFWA"
 const HEADER_LEN = 24; // 4 magic + 16 uuid + 4 sequence
@@ -49,6 +49,19 @@ const PENDING_TTS_WATCHDOG_MS = 60000;
 // the gaps between sentences; holding it true through the gap makes it
 // one clean edge per reply instead of one per sentence.
 const PLAYBACK_IDLE_GRACE_MS = 600;
+
+// --- Fork A barge-in listener (plan §6.2) ----------------------------
+// RMS threshold (0..255 scale) above which the mic counts as "voiced"
+// while TTS plays. The Phase 0 AEC spike measured TTS-only RMS p95 ≈ 8
+// vs human-speech median ≈ 54 on laptop speakers (6.8× margin); 20 sits
+// well clear of the TTS floor (geo-mean of the two was ≈ 20.7).
+const BARGE_IN_RMS_THRESHOLD = 20;
+// Voiced energy must hold this long continuously before it counts as a
+// barge-in — rejects transient clicks, coughs, and key taps.
+const BARGE_IN_SUSTAIN_MS = 150;
+// Suppress detection for this long after the listener opens, so browser
+// AEC has settled and playback has actually begun.
+const BARGE_IN_WARMUP_MS = 250;
 
 // Timing diagnostics for voice pipeline. Toggle in browser console:
 //   localStorage.setItem('renfield_voice_timing', '1') → enable
@@ -190,6 +203,22 @@ export function useVoiceStream({
   const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
   // Debounce timer for the playbackActive false-edge (hysteresis).
   const playbackIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // --- Fork A barge-in listener (plan §6.2/6.3) --------------------
+  // A dedicated analyser-only mic stream, opened for the duration of a
+  // TTS reply. On detection the SAME stream is promoted to the recorder
+  // (§6.3), so the user's interrupting utterance is captured, not lost.
+  const bargeInStreamRef = useRef<MediaStream | null>(null);
+  const bargeInAnalyserRef = useRef<AnalyserNode | null>(null);
+  const bargeInFrameRef = useRef<number | null>(null);
+  const bargeInVoicedSinceRef = useRef<number | null>(null);
+  const bargeInStartedAtRef = useRef<number>(0);
+  // Latched once a barge-in fires so the rAF loop cannot double-trigger
+  // between detection and teardown.
+  const bargeInFiredRef = useRef(false);
+  // Indirection so the listener effect never lists the handler as a
+  // dependency — the listener must open exactly once per reply.
+  const bargeInHandlerRef = useRef<() => void>(() => {});
 
   const [recording, setRecording] = useState(false);
   const [partialText, setPartialText] = useState<string>('');
@@ -501,42 +530,14 @@ export function useVoiceStream({
     return handshake;
   }, [token, handleTextMessage, enqueuePlayback, clearAllPendingTts]);
 
-  const startRecording = useCallback(async (): Promise<void> => {
-    if (recording) return;
-
-    if (!MediaRecorder.isTypeSupported(VOICE_CODEC)) {
-      onError?.('codec_unsupported', `browser does not support codec ${VOICE_CODEC}`);
-      return;
-    }
-
-    let ws: WebSocket;
-    try {
-      ws = await ensureSocket();
-    } catch (e) {
-      onError?.('ws_open_failed', e instanceof Error ? e.message : String(e));
-      return;
-    }
-
-    // Each utterance gets its own session_start so the server can
-    // spawn a fresh decoder. Without this, the first utterance works
-    // (decoder created on WS open), but every subsequent recording
-    // hits "decoder is None" on the server (finalize tore it down).
-    // Server's session_start handler is idempotent. WS message order
-    // is preserved end-to-end and the receive loop is sequential, so
-    // the session_start fully completes (decoder up) before the
-    // first MediaRecorder chunk arrives 100 ms later.
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'session_start', codec: VOICE_CODEC }));
-    }
-
-    let stream: MediaStream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch (e) {
-      onError?.('mic_denied', e instanceof Error ? e.message : String(e));
-      return;
-    }
-
+  // Build the MediaRecorder + VAD loop on an already-open mic stream
+  // and start streaming. Shared by startRecording (which gets a fresh
+  // getUserMedia stream) and the barge-in promotion (§6.3, which reuses
+  // the already-open listener stream — no second getUserMedia).
+  const beginRecordingWithStream = useCallback(async (
+    stream: MediaStream,
+    ws: WebSocket,
+  ): Promise<void> => {
     streamRef.current = stream;
     const recorder = new MediaRecorder(stream, { mimeType: VOICE_CODEC });
     recorderRef.current = recorder;
@@ -650,7 +651,43 @@ export function useVoiceStream({
 
     recorder.start(CHUNK_INTERVAL_MS);
     setRecording(true);
-  }, [recording, ensureSocket, ensureAudioContext, onError, onRecordingStart, onRecordingStop]);
+  }, [ensureAudioContext, onRecordingStart, onRecordingStop]);
+
+  const startRecording = useCallback(async (): Promise<void> => {
+    if (recording) return;
+
+    if (!MediaRecorder.isTypeSupported(VOICE_CODEC)) {
+      onError?.('codec_unsupported', `browser does not support codec ${VOICE_CODEC}`);
+      return;
+    }
+
+    let ws: WebSocket;
+    try {
+      ws = await ensureSocket();
+    } catch (e) {
+      onError?.('ws_open_failed', e instanceof Error ? e.message : String(e));
+      return;
+    }
+
+    // Each utterance gets its own session_start so the server spawns a
+    // fresh decoder (the first works off the WS-open decoder; later ones
+    // would hit "decoder is None" after finalize). Idempotent server-
+    // side; message order guarantees the decoder is up before the first
+    // chunk arrives ~100 ms later.
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'session_start', codec: VOICE_CODEC }));
+    }
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      onError?.('mic_denied', e instanceof Error ? e.message : String(e));
+      return;
+    }
+
+    await beginRecordingWithStream(stream, ws);
+  }, [recording, ensureSocket, beginRecordingWithStream, onError]);
 
   const stopRecording = useCallback((): void => {
     const rec = recorderRef.current;
@@ -728,6 +765,147 @@ export function useVoiceStream({
     maybeEndPlayback();
   }, [cancelTts, maybeEndPlayback]);
 
+  // --- Fork A: barge-in detected → promote listener to recorder (§6.3)
+  const handleBargeInDetected = useCallback((): void => {
+    if (bargeInFiredRef.current) return;
+    bargeInFiredRef.current = true;
+    vlog('barge_in_detected');
+    // Stop the listening loop now; KEEP the stream — it is about to
+    // become the recording stream.
+    if (bargeInFrameRef.current !== null) {
+      cancelAnimationFrame(bargeInFrameRef.current);
+      bargeInFrameRef.current = null;
+    }
+    bargeInAnalyserRef.current = null;
+    const stream = bargeInStreamRef.current;
+    // Null the ref before the playbackActive effect's teardown can run,
+    // so teardown sees no listener stream to stop — ownership has moved.
+    bargeInStreamRef.current = null;
+
+    // Stop the assistant.
+    cancelAllPlayback();
+
+    if (!stream || recording) {
+      // No stream to promote, or a recording is somehow already live —
+      // the cancel above is all that was needed.
+      stream?.getTracks().forEach((tr) => tr.stop());
+      return;
+    }
+
+    // Promote the listener's stream straight into the recorder so the
+    // user's interrupting utterance becomes the next query — captured,
+    // not discarded (plan finding 6). No second getUserMedia.
+    void (async () => {
+      let ws: WebSocket;
+      try {
+        ws = await ensureSocket();
+      } catch (e) {
+        onError?.('ws_open_failed', e instanceof Error ? e.message : String(e));
+        stream.getTracks().forEach((tr) => tr.stop());
+        return;
+      }
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'session_start', codec: VOICE_CODEC }));
+      }
+      await beginRecordingWithStream(stream, ws);
+    })();
+  }, [cancelAllPlayback, ensureSocket, beginRecordingWithStream, onError, recording]);
+
+  // Keep the ref pointed at the latest handler so the listener effect
+  // below never depends on its identity — the listener opens exactly
+  // once per reply, not on every handler re-creation.
+  bargeInHandlerRef.current = handleBargeInDetected;
+
+  // The barge-in listener (plan §6.2): a dedicated analyser-only mic
+  // stream, open for the duration of a TTS reply, watching for the user
+  // to talk over the assistant. Gated on the hysteresis-debounced
+  // `playbackActive` so it is one open per reply, not one per sentence.
+  // Phase 0 measured browser AEC keeps the assistant's own TTS well
+  // below BARGE_IN_RMS_THRESHOLD on laptop speakers.
+  useEffect(() => {
+    if (!playbackActive) return undefined;
+    let cancelled = false;
+
+    const open = async (): Promise<void> => {
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+        });
+      } catch (e) {
+        // Mic permission revoked between turns — degrade silently to
+        // no-barge-in for this reply (finding 3B). Mic button + wake
+        // word still work; the reply just plays uninterruptibly.
+        debug.log('voice: barge-in listener mic unavailable — barge-in off this reply', e);
+        return;
+      }
+      if (cancelled || unmountedRef.current) {
+        stream.getTracks().forEach((tr) => tr.stop());
+        return;
+      }
+      bargeInStreamRef.current = stream;
+      bargeInFiredRef.current = false;
+      bargeInVoicedSinceRef.current = null;
+      bargeInStartedAtRef.current = performance.now();
+      try {
+        const ctx = ensureAudioContext();
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = VAD.FFT_SIZE;
+        analyser.smoothingTimeConstant = VAD.SMOOTHING;
+        source.connect(analyser);
+        bargeInAnalyserRef.current = analyser;
+        const scratch = new Uint8Array(analyser.frequencyBinCount);
+
+        const tick = (): void => {
+          const a = bargeInAnalyserRef.current;
+          if (!a || bargeInFiredRef.current) {
+            bargeInFrameRef.current = null;
+            return;
+          }
+          const now = performance.now();
+          if (now - bargeInStartedAtRef.current >= BARGE_IN_WARMUP_MS) {
+            const rms = computeRms(a, scratch);
+            const r = detectBargeIn(
+              rms, bargeInVoicedSinceRef.current, now,
+              BARGE_IN_RMS_THRESHOLD, BARGE_IN_SUSTAIN_MS,
+            );
+            bargeInVoicedSinceRef.current = r.voicedSince;
+            if (r.bargeIn) {
+              bargeInFrameRef.current = null;
+              bargeInHandlerRef.current();
+              return;
+            }
+          }
+          bargeInFrameRef.current = requestAnimationFrame(tick);
+        };
+        bargeInFrameRef.current = requestAnimationFrame(tick);
+      } catch (e) {
+        debug.log('voice: barge-in analyser setup failed', e);
+        stream.getTracks().forEach((tr) => tr.stop());
+        bargeInStreamRef.current = null;
+      }
+    };
+    void open();
+
+    return () => {
+      cancelled = true;
+      if (bargeInFrameRef.current !== null) {
+        cancelAnimationFrame(bargeInFrameRef.current);
+        bargeInFrameRef.current = null;
+      }
+      bargeInAnalyserRef.current = null;
+      // Stop the stream ONLY if it is still the listener's. If a
+      // barge-in fired, the handler nulled this ref and handed the
+      // stream to the recorder — leave that one running.
+      const s = bargeInStreamRef.current;
+      if (s) {
+        s.getTracks().forEach((tr) => tr.stop());
+        bargeInStreamRef.current = null;
+      }
+    };
+  }, [playbackActive, ensureAudioContext]);
+
   // Cleanup on unmount.
   useEffect(() => {
     return () => {
@@ -746,6 +924,14 @@ export function useVoiceStream({
       if (ws && ws.readyState !== WebSocket.CLOSED) {
         try { ws.close(); } catch { /* ignore */ }
       }
+      // Tear down the barge-in listener if one is still open.
+      if (bargeInFrameRef.current !== null) {
+        cancelAnimationFrame(bargeInFrameRef.current);
+        bargeInFrameRef.current = null;
+      }
+      bargeInAnalyserRef.current = null;
+      bargeInStreamRef.current?.getTracks().forEach((tr) => tr.stop());
+      bargeInStreamRef.current = null;
       // Clear any queued chunks so the drain loop exits promptly.
       chunkQueueRef.current = [];
       // Drop pending-TTS watchdog timers + the playback-idle timer so

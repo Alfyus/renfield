@@ -135,6 +135,10 @@ class MockAudioContext {
   // When false, decodeAudioData returns a promise the test resolves by
   // hand — lets a barge-in land while a decode is mid-flight.
   static autoDecode = true;
+  // Frequency-domain frame served by every analyser this context makes.
+  // Default [] → all zero → RMS 0 (silence). Tests set it loud to
+  // simulate the user speaking over the assistant.
+  static frequencyFrame: number[] = [];
 
   state = 'running';
   destination = {};
@@ -161,7 +165,11 @@ class MockAudioContext {
       fftSize: 0,
       smoothingTimeConstant: 0,
       frequencyBinCount: 16,
-      getByteFrequencyData: () => {},
+      getByteFrequencyData: (arr: Uint8Array): void => {
+        for (let i = 0; i < arr.length; i += 1) {
+          arr[i] = MockAudioContext.frequencyFrame[i] ?? 0;
+        }
+      },
       connect: () => {},
     };
   }
@@ -191,6 +199,45 @@ function lastCtx(): MockAudioContext {
 async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 8; i += 1) await Promise.resolve();
 }
+
+// --- MediaRecorder + getUserMedia mocks (recording + barge-in paths) -
+class MockMediaRecorder {
+  static instances: MockMediaRecorder[] = [];
+  static isTypeSupported = (): boolean => true;
+
+  state: 'inactive' | 'recording' | 'paused' = 'inactive';
+  stream: MediaStream;
+  mimeType: string;
+  ondataavailable: ((e: unknown) => void) | null = null;
+  onstop: (() => void) | null = null;
+  start = vi.fn((): void => { this.state = 'recording'; });
+  stop = vi.fn((): void => {
+    this.state = 'inactive';
+    this.onstop?.();
+  });
+
+  constructor(stream: MediaStream, opts?: { mimeType?: string }) {
+    this.stream = stream;
+    this.mimeType = opts?.mimeType ?? '';
+    MockMediaRecorder.instances.push(this);
+  }
+}
+
+function makeFakeStream(): MediaStream {
+  const track = { stop: vi.fn(), kind: 'audio' as const };
+  return {
+    getTracks: () => [track],
+    getAudioTracks: () => [track],
+  } as unknown as MediaStream;
+}
+
+// getUserMedia mock. Flip `getUserMediaShouldReject` to exercise the
+// barge-in listener's silent-degrade path (finding 3B).
+let getUserMediaShouldReject = false;
+const getUserMediaMock = vi.fn(async (): Promise<MediaStream> => {
+  if (getUserMediaShouldReject) throw new DOMException('denied', 'NotAllowedError');
+  return makeFakeStream();
+});
 
 type VoiceHook = ReturnType<typeof useVoiceStream>;
 
@@ -235,9 +282,26 @@ beforeEach(() => {
   MockVoiceWebSocket.instances = [];
   MockAudioContext.instances = [];
   MockAudioContext.autoDecode = true;
+  MockAudioContext.frequencyFrame = [];
+  MockMediaRecorder.instances = [];
+  getUserMediaShouldReject = false;
+  getUserMediaMock.mockClear();
   vi.stubGlobal('WebSocket', MockVoiceWebSocket);
   vi.stubGlobal('AudioContext', MockAudioContext);
-  vi.useFakeTimers();
+  vi.stubGlobal('MediaRecorder', MockMediaRecorder);
+  Object.defineProperty(navigator, 'mediaDevices', {
+    value: { getUserMedia: getUserMediaMock },
+    configurable: true,
+  });
+  // Fake rAF + performance too: the barge-in listener's
+  // requestAnimationFrame loop and its performance.now() warmup/sustain
+  // clock must both advance under vi.advanceTimersByTime.
+  vi.useFakeTimers({
+    toFake: [
+      'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date',
+      'performance', 'requestAnimationFrame', 'cancelAnimationFrame',
+    ],
+  });
 });
 
 afterEach(() => {
@@ -414,7 +478,11 @@ describe('useVoiceStream — barge-in plumbing', () => {
       ws.emitMessage(makeRfwaFrame('00000000-0000-4000-8000-000000000000'));
     });
     expect(result.current.playbackActive).toBe(false);
-    expect(MockAudioContext.instances).toHaveLength(0); // never reached playback
+    // The barge-in listener may have built an AudioContext, but a dropped
+    // frame must never reach drainQueue — so no buffer source is created.
+    const sourcesPlayed = MockAudioContext.instances
+      .reduce((n, c) => n + c.createdSources.length, 0);
+    expect(sourcesPlayed).toBe(0);
   });
 
   it('a binary frame for an in-flight request passes the rid gate and reaches playback', async () => {
@@ -462,5 +530,96 @@ describe('useVoiceStream — barge-in plumbing', () => {
       await flushMicrotasks();
     });
     expect(ctx.createdSources).toHaveLength(0);
+  });
+
+  it('the barge-in listener does not fire while the mic is silent', async () => {
+    MockAudioContext.frequencyFrame = []; // silence
+    const { result } = renderHook(() => useVoiceStream({ token: null }));
+    const { ws } = await speakAndConnect(result);
+    await act(async () => { await flushMicrotasks(); }); // listener open() settles
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+      await flushMicrotasks();
+    });
+    expect(sentOfType(ws, 'cancel')).toHaveLength(0);
+    expect(MockMediaRecorder.instances).toHaveLength(0);
+  });
+
+  it('voiced energy within the warmup window does not fire a barge-in', async () => {
+    MockAudioContext.frequencyFrame = new Array(16).fill(200); // loud
+    const { result } = renderHook(() => useVoiceStream({ token: null }));
+    const { ws } = await speakAndConnect(result);
+    await act(async () => { await flushMicrotasks(); });
+    // Only 200ms elapse — short of the 250ms warmup, so detection is
+    // suppressed even though the mic is loud.
+    await act(async () => {
+      vi.advanceTimersByTime(200);
+      await flushMicrotasks();
+    });
+    expect(sentOfType(ws, 'cancel')).toHaveLength(0);
+    expect(MockMediaRecorder.instances).toHaveLength(0);
+  });
+
+  it('sustained voiced energy fires a barge-in: cancels TTS and promotes to recording', async () => {
+    MockAudioContext.frequencyFrame = new Array(16).fill(200); // user speaking
+    const { result } = renderHook(() => useVoiceStream({ token: null }));
+    const { ws } = await speakAndConnect(result);
+    await act(async () => { await flushMicrotasks(); });
+
+    // Past warmup (250ms) + sustain (150ms) — the rAF loop detects it.
+    await act(async () => {
+      vi.advanceTimersByTime(600);
+      await flushMicrotasks(); // let the promotion's async IIFE settle
+    });
+
+    expect(sentOfType(ws, 'cancel').length).toBeGreaterThan(0); // TTS cancelled
+    expect(MockMediaRecorder.instances.length).toBeGreaterThan(0); // promoted
+    expect(MockMediaRecorder.instances[0].start).toHaveBeenCalled();
+  });
+
+  it('a denied mic disables barge-in for the reply without surfacing an error', async () => {
+    getUserMediaShouldReject = true;
+    MockAudioContext.frequencyFrame = new Array(16).fill(200);
+    const onError = vi.fn();
+    const { result } = renderHook(() => useVoiceStream({ token: null, onError }));
+    const { ws } = await speakAndConnect(result);
+    await act(async () => {
+      vi.advanceTimersByTime(600);
+      await flushMicrotasks();
+    });
+    // Listener never opened → no barge-in, and the degradation is silent.
+    expect(sentOfType(ws, 'cancel')).toHaveLength(0);
+    expect(MockMediaRecorder.instances).toHaveLength(0);
+    expect(onError).not.toHaveBeenCalled();
+  });
+});
+
+describe('useVoiceStream — checkSilence regression (plan §8.3)', () => {
+  // IRON RULE: the computeRms extraction (T4a) refactored checkSilence.
+  // This proves end-of-utterance auto-stop still fires.
+  it('still auto-stops the recorder after trailing silence', async () => {
+    const { result } = renderHook(() => useVoiceStream({ token: null }));
+    let startP!: Promise<void>;
+    act(() => { startP = result.current.startRecording(); });
+    const ws = lastWs();
+    await act(async () => {
+      ws.fireOpen();
+      ws.emitJson({ type: 'session_ready' });
+      await startP;
+      await flushMicrotasks();
+    });
+    const recorder = MockMediaRecorder.instances[0];
+    expect(recorder).toBeDefined();
+    expect(recorder.start).toHaveBeenCalled();
+
+    // Speak for a bit — sets speechSeen and clears the min-recording gate.
+    MockAudioContext.frequencyFrame = new Array(16).fill(200);
+    act(() => { vi.advanceTimersByTime(900); });
+    expect(recorder.stop).not.toHaveBeenCalled();
+
+    // Fall silent past SILENCE_DURATION_MS (1500ms) — VAD must auto-stop.
+    MockAudioContext.frequencyFrame = [];
+    act(() => { vi.advanceTimersByTime(1700); });
+    expect(recorder.stop).toHaveBeenCalled();
   });
 });
