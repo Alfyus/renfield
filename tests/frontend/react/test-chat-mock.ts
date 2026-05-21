@@ -60,6 +60,8 @@ export const defaultChatContextValue: ChatContextValue = {
   silenceTimeRemaining: 0,
   partialText: '',
   toggleRecording: () => {},
+  playbackActive: false,
+  cancelAllPlayback: () => {},
 
   // RAG
   useRag: false,
