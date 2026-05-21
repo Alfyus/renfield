@@ -117,7 +117,7 @@ Endpoint: `wss://renfield.local/ws/voice`. One bidirectional connection per voic
 | binary frame | audio chunk in the codec announced by `session_start` | every ~100 ms while recording |
 | `{type: "stt_flush"}` | — | client-side VAD or "stop" button — commits the STT pipeline. Renamed from `audio_end` (see R3) to disambiguate from the server-side TTS-done message. |
 | `{type: "tts_request", request_id, text, language?, voice?}` | full assistant answer to synthesize | after chat response received from backend. `request_id` correlates downstream events. |
-| `{type: "cancel", request_id}` | — | reserved for Phase B.next (barge-in). Cancels the matching `tts_request`. |
+| `{type: "cancel", request_id}` | — | barge-in — cancels the matching in-flight `tts_request`. The frontend's `cancelAllPlayback()` sends one per pending request when the user interrupts. |
 | `{type: "ping"}` | — | keepalive, server replies with `pong` |
 
 #### Server → Client
@@ -128,6 +128,7 @@ Endpoint: `wss://renfield.local/ws/voice`. One bidirectional connection per voic
 | `{type: "final_transcript", text, language, speaker_embedding: float32[192], audio_duration_s}` | committed result on VAD silence | `speaker_embedding` is the raw ECAPA-TDNN output (192 floats, ~2 KB JSON) — the frontend forwards it on the chat WebSocket; backend's `services/speaker_service.py` does the cosine match + auto-enrolment. `audio_duration_s` lets the backend tag the SpeakerEmbedding row with what was sampled. |
 | binary frame | WAV chunk (22 kHz PCM, with WAV header) | one frame per synthesized sentence. **Self-describing format (review-cycle 3 GAP-3 fix):** the binary payload begins with a fixed 24-byte header — `magic` (4 bytes, ASCII `RFWA`), `request_id` (16 bytes, UUID), `sequence` (4 bytes, big-endian uint32). The remaining bytes are the standard WAV file. This removes the JSON-meta-frame ordering trap from v1.2 — the frontend can route every binary frame to the right playback queue without maintaining a "last-seen meta" cursor. The `audio_chunk_meta` JSON message is dropped from the protocol entirely. |
 | `{type: "tts_done", request_id}` | — | TTS finished for this `request_id`. Renamed from `audio_end` (R3). |
+| `{type: "cancelled", request_id}` | — | the server honoured a client `cancel` for this `request_id` (barge-in). A clean, expected stop — kept distinct from `error` so the frontend suppresses the failure bubble. A teardown/internal cancellation still emits `error`/`tts_failed`. |
 | `{type: "error", code, message, request_id?}` | typed: `stt_failed`, `tts_failed`, `model_unavailable`, `invalid_audio`, `speaker_extract_failed` | typed errors so the frontend can recover, not bubble up as generic 500. `speaker_extract_failed` does **not** abort the transcript — backend still gets `final_transcript` without `speaker_embedding`, treats the speaker as unknown for that turn. |
 
 ### Latency budget (target, post-R4 review)
