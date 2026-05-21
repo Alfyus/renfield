@@ -13,6 +13,7 @@ import {
   useQuickActions,
   useVoiceStream,
   type FinalTranscript,
+  type TtsOutcome,
 } from '../hooks';
 
 // Phase B streaming voice pipeline. When `VITE_FEATURE_VOICE_STREAM=true`,
@@ -21,6 +22,9 @@ import {
 // during the soak period so flag-off is the safety path.
 const VOICE_STREAM_ENABLED = import.meta.env.VITE_FEATURE_VOICE_STREAM === 'true';
 const ACCESS_TOKEN_KEY = 'renfield_access_token';
+// Stable no-op for the legacy (flag-off) path's cancelAllPlayback so the
+// context value's identity doesn't churn every render.
+const NOOP = (): void => {};
 import type {
   ActionWsMessage,
   AgentFederationProgressMessage,
@@ -39,6 +43,7 @@ import type { UploadStates, UploadedDocument } from '../hooks/useDocumentUpload'
 import type { Conversation } from '../../../types/chat';
 import type { TraceEntity } from '../../../api/resources/wissensbasis';
 import { useConfirmDialog } from '../../../components/ConfirmDialog';
+import { drainSentenceTts, type SentenceStreamState } from './sentenceStream';
 
 const SESSION_STORAGE_KEY = 'renfield_current_session';
 // How long sendMessageInternal waits for the WebSocket handshake before
@@ -160,6 +165,13 @@ export interface ChatContextValue {
   // when not recording or when VITE_FEATURE_VOICE_STREAM is off.
   partialText: string;
   toggleRecording: () => void;
+  // Barge-in (plan §5.3). `playbackActive` is true while a TTS reply is
+  // pending or playing; `cancelAllPlayback` stops it. Exposed for a
+  // future manual stop-speaking control — Fork A's acoustic listener
+  // triggers cancellation from inside useVoiceStream. NOOP / false on
+  // the legacy path.
+  playbackActive: boolean;
+  cancelAllPlayback: () => void;
 
   // RAG
   useRag: boolean;
@@ -413,13 +425,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
   // when interleaved on the wire. Empirically saves ~22 s of
   // perceived latency on a typical Qwen3.6 German response (29.4 s
   // → 7.1 s end-to-end final-transcript-to-last-audio).
-  const sentenceStreamRef = useRef<{
-    accumulated: string;
-    dispatchedIdx: number;
-    active: boolean;
-    pending: Set<string>;
-    streamDone: boolean;
-  }>({
+  const sentenceStreamRef = useRef<SentenceStreamState>({
     accumulated: '',
     dispatchedIdx: 0,
     active: false,
@@ -959,14 +965,20 @@ export function ChatProvider({ children }: ChatProviderProps) {
     return () => window.removeEventListener('storage', handler);
   }, []);
 
-  // Sentence-streaming TTS bookkeeping — onTtsDone fires per dispatched
-  // sentence; when the stream is done AND no requests are in flight,
-  // resume wake word + clear the autoTTS-pending lock.
-  const handleStreamTtsDone = useCallback((requestId: string) => {
+  // Sentence-streaming TTS bookkeeping — onTtsSettled fires per
+  // dispatched sentence on EVERY terminal outcome (done / cancelled /
+  // error). Draining `pending` regardless of outcome is required: a
+  // barge-in cancels in-flight sentences, and if a `cancelled` frame
+  // did not drain the counter it would stay off-by-N and wake word
+  // would never resume (plan finding 8).
+  const handleStreamTtsSettled = useCallback((requestId: string, outcome: TtsOutcome) => {
     const stream = sentenceStreamRef.current;
     if (!stream.active) return;
-    stream.pending.delete(requestId);
-    if (stream.streamDone && stream.pending.size === 0) {
+    debug.log('sentence-streaming TTS settled', requestId, outcome);
+    // drainSentenceTts drains on every outcome — done / cancelled /
+    // error alike (plan finding 8) — and reports when the turn is fully
+    // settled.
+    if (drainSentenceTts(stream, requestId)) {
       // Reset for the next utterance.
       stream.active = false;
       stream.accumulated = '';
@@ -986,7 +998,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     token: streamToken,
     onFinal: handleStreamFinal,
     onError: handleStreamError,
-    onTtsDone: handleStreamTtsDone,
+    onTtsSettled: handleStreamTtsSettled,
     // R7 fix from B.3 review: lastInputChannelRef + autoTTSPendingRef +
     // wake-word-pause are all set in handleRecordingStart; without these
     // hooks the streaming path silently bypasses auto-TTS for voice
@@ -1018,6 +1030,10 @@ export function ChatProvider({ children }: ChatProviderProps) {
   // Falls back to empty string on the legacy path so consumers can
   // render unconditionally without checking the flag.
   const partialText = VOICE_STREAM_ENABLED ? voiceStream.partialText : '';
+  // Barge-in surface (plan §5.3). Legacy path has no streaming TTS, so
+  // playback is never "active" and there is nothing to cancel.
+  const playbackActive = VOICE_STREAM_ENABLED ? voiceStream.playbackActive : false;
+  const cancelAllPlayback = VOICE_STREAM_ENABLED ? voiceStream.cancelAllPlayback : NOOP;
   // Stable callback identities — without these the conditional ternaries
   // would create a new function every render, breaking memoization
   // downstream (the main exported context object).
@@ -1364,6 +1380,8 @@ export function ChatProvider({ children }: ChatProviderProps) {
     silenceTimeRemaining,
     partialText,
     toggleRecording,
+    playbackActive,
+    cancelAllPlayback,
 
     // RAG
     useRag,
@@ -1409,6 +1427,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     conversations, conversationsLoading,
     wsConnected,
     recording, audioLevel, silenceTimeRemaining, partialText, toggleRecording,
+    playbackActive, cancelAllPlayback,
     useRag, toggleRag, selectedKnowledgeBase,
     attachments, uploading, uploadError, handleUploadDocument, removeAttachment, uploadStates,
     wakeWord, wakeWordStatus,
