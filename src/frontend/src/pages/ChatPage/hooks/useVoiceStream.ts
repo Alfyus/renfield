@@ -823,7 +823,10 @@ export function useVoiceStream({
   // Phase 0 measured browser AEC keeps the assistant's own TTS well
   // below BARGE_IN_RMS_THRESHOLD on laptop speakers.
   useEffect(() => {
-    if (!playbackActive) return undefined;
+    // Also gate on !recording: the listener and an active recording are
+    // mutually exclusive. A manual mic-button press during TTS would
+    // otherwise leave a second mic stream open alongside the recorder.
+    if (!playbackActive || recording) return undefined;
     let cancelled = false;
 
     const open = async (): Promise<void> => {
@@ -904,7 +907,7 @@ export function useVoiceStream({
         bargeInStreamRef.current = null;
       }
     };
-  }, [playbackActive, ensureAudioContext]);
+  }, [playbackActive, recording, ensureAudioContext]);
 
   // Cleanup on unmount.
   useEffect(() => {

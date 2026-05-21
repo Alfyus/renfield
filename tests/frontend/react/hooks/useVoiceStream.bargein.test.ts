@@ -231,11 +231,24 @@ function makeFakeStream(): MediaStream {
   } as unknown as MediaStream;
 }
 
-// getUserMedia mock. Flip `getUserMediaShouldReject` to exercise the
-// barge-in listener's silent-degrade path (finding 3B).
+// getUserMedia mock. `getUserMediaShouldReject` exercises the listener's
+// silent-degrade path (finding 3B); `getUserMediaDeferred` holds the
+// promise open so a test can resolve it after the reply has already
+// ended (the open()-vs-cleanup race).
 let getUserMediaShouldReject = false;
+let getUserMediaDeferred = false;
+let getUserMediaResolvers: Array<() => void> = [];
+let lastDeferredStream: MediaStream | null = null;
 const getUserMediaMock = vi.fn(async (): Promise<MediaStream> => {
   if (getUserMediaShouldReject) throw new DOMException('denied', 'NotAllowedError');
+  if (getUserMediaDeferred) {
+    return new Promise<MediaStream>((resolve) => {
+      getUserMediaResolvers.push(() => {
+        lastDeferredStream = makeFakeStream();
+        resolve(lastDeferredStream);
+      });
+    });
+  }
   return makeFakeStream();
 });
 
@@ -285,6 +298,9 @@ beforeEach(() => {
   MockAudioContext.frequencyFrame = [];
   MockMediaRecorder.instances = [];
   getUserMediaShouldReject = false;
+  getUserMediaDeferred = false;
+  getUserMediaResolvers = [];
+  lastDeferredStream = null;
   getUserMediaMock.mockClear();
   vi.stubGlobal('WebSocket', MockVoiceWebSocket);
   vi.stubGlobal('AudioContext', MockAudioContext);
@@ -575,6 +591,9 @@ describe('useVoiceStream — barge-in plumbing', () => {
     expect(sentOfType(ws, 'cancel').length).toBeGreaterThan(0); // TTS cancelled
     expect(MockMediaRecorder.instances.length).toBeGreaterThan(0); // promoted
     expect(MockMediaRecorder.instances[0].start).toHaveBeenCalled();
+    // The promotion reuses the listener's stream — NO second getUserMedia
+    // (plan §6.3). The one call is the listener opening.
+    expect(getUserMediaMock).toHaveBeenCalledTimes(1);
   });
 
   it('a denied mic disables barge-in for the reply without surfacing an error', async () => {
@@ -591,6 +610,30 @@ describe('useVoiceStream — barge-in plumbing', () => {
     expect(sentOfType(ws, 'cancel')).toHaveLength(0);
     expect(MockMediaRecorder.instances).toHaveLength(0);
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('a listener mic that resolves after the reply ended is stopped, not leaked', async () => {
+    // open()-vs-cleanup race: getUserMedia is still in flight when the
+    // reply finishes. The cancelled-flag guard must stop the late stream.
+    getUserMediaDeferred = true;
+    const { result } = renderHook(() => useVoiceStream({ token: null }));
+    const { ws, rid } = await speakAndConnect(result);
+    await act(async () => { await flushMicrotasks(); }); // listener parked on getUserMedia
+    expect(getUserMediaResolvers).toHaveLength(1);
+
+    // The reply ends before the mic resolves → playbackActive falls →
+    // the listener effect cleanup runs (cancelled = true).
+    act(() => { ws.emitJson({ type: 'tts_done', request_id: rid }); });
+    act(() => { vi.advanceTimersByTime(600); }); // playback-idle grace
+
+    // The mic resolves only now — open() must see cancelled and stop it.
+    await act(async () => {
+      getUserMediaResolvers[0]();
+      await flushMicrotasks();
+    });
+    expect(lastDeferredStream).not.toBeNull();
+    const track = lastDeferredStream!.getTracks()[0];
+    expect(track.stop).toHaveBeenCalled(); // late stream stopped — no leak
   });
 });
 
