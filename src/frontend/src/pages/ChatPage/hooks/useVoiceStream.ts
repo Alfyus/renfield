@@ -31,6 +31,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getWebSocketUrl } from '../../../utils/env';
 import { debug } from '../../../utils/debug';
+import { computeRms } from './voiceAudioUtils';
 
 const RFWA_MAGIC = new Uint8Array([0x52, 0x46, 0x57, 0x41]); // "RFWA"
 const HEADER_LEN = 24; // 4 magic + 16 uuid + 4 sequence
@@ -571,10 +572,7 @@ export function useVoiceStream({
           vadFrameRef.current = null;
           return;
         }
-        a.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i += 1) sum += dataArray[i] * dataArray[i];
-        const rms = Math.sqrt(sum / dataArray.length);
+        const rms = computeRms(a, dataArray);
         const now = Date.now();
         const recordingTime = now - recordingStart;
 
