@@ -13,7 +13,8 @@ Server→Client:
   - partial_transcript { text, confidence }
   - final_transcript { text, language, speaker_embedding[192], audio_duration_s }
   - <binary WAV with 24-byte RFWA header>              one frame per TTS sentence
-  - tts_done { request_id }
+  - tts_done { request_id }                            synthesis finished normally
+  - cancelled { request_id }                           client `cancel` honoured (barge-in)
   - error { code, message, request_id? }
   - pong
 
@@ -22,8 +23,10 @@ See VOICE_PIPELINE_DESIGN.md § "WebSocket protocol" for the full table.
 Concurrency model:
   TTS runs as an asyncio.Task so the receive loop keeps consuming audio
   chunks, ping, and cancel while synthesis is in flight. Per-request_id
-  task tracking lets `cancel` actually stop the audio stream
-  (Phase B.next barge-in arrives "for free" once the frontend wires it).
+  task tracking lets `cancel` actually stop the audio stream. A
+  client-initiated cancel emits a distinct `cancelled` frame (so the
+  frontend can suppress error UI on barge-in); a teardown/internal
+  cancel keeps the legacy `error` frame.
 """
 
 from __future__ import annotations
@@ -75,6 +78,13 @@ class SessionState:
     last_partial_text: str = ""
     started_at: float = 0.0
     tts_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    # request_ids the client explicitly cancelled via a `cancel` message.
+    # _run_tts checks this on CancelledError to tell a client barge-in
+    # (emit a clean `cancelled` frame) apart from an internal or
+    # session-teardown cancellation (emit a genuine `error`). A marker is
+    # added only when a live task is actually cancelled, so the task's
+    # finally in _spawn_tts always runs and discards it — no leak.
+    client_cancelled: set[str] = field(default_factory=set)
     # During _finalize the decoder is closed and a fresh one is
     # spawned. Browser recorder buffers ~100 ms of chunks ahead, so
     # several arrive after the close. They previously hit
@@ -240,26 +250,39 @@ async def _finalize(
 
 async def _run_tts(
     ws: WebSocket,
+    state: SessionState,
     request_id: uuid.UUID,
     text: str,
     language: str | None,
     tts: TTSService,
 ) -> None:
     """Stream TTS frames for one request. Runs as a Task so the receive loop is unblocked."""
+    rid = str(request_id)
     try:
         async for frame in tts.stream_sentences(text, request_id, language=language):
             await ws.send_bytes(frame)
-        await _send_json(ws, {"type": "tts_done", "request_id": str(request_id)})
+        await _send_json(ws, {"type": "tts_done", "request_id": rid})
     except asyncio.CancelledError:
-        # Barge-in: client sent `cancel` for this request_id. Best-effort
-        # tts_done so the frontend cleans up its playback queue.
-        await _send_error(ws, "tts_failed", "cancelled by client", str(request_id))
+        # CancelledError reaches here from two sources: a client `cancel`
+        # message (barge-in) or the WS handler's finally cancelling
+        # in-flight tasks at session teardown. Only a client cancel is a
+        # clean, expected stop — emit a dedicated `cancelled` frame so
+        # the frontend distinguishes it from a real failure instead of
+        # surfacing a chat error bubble. Teardown keeps the legacy
+        # `error` frame (the WS is closing; delivery is best-effort).
+        if rid in state.client_cancelled:
+            try:
+                await _send_json(ws, {"type": "cancelled", "request_id": rid})
+            except Exception:
+                pass
+        else:
+            await _send_error(ws, "tts_failed", "cancelled internally", rid)
         raise
     except FileNotFoundError as e:
-        await _send_error(ws, "model_unavailable", str(e), str(request_id))
+        await _send_error(ws, "model_unavailable", str(e), rid)
     except Exception as e:
         logger.exception("tts failed for %s", request_id)
-        await _send_error(ws, "tts_failed", str(e), str(request_id))
+        await _send_error(ws, "tts_failed", str(e), rid)
 
 
 async def _spawn_tts(
@@ -288,9 +311,14 @@ async def _spawn_tts(
 
     async def _wrapped() -> None:
         try:
-            await _run_tts(ws, request_id, text, language, tts)
+            await _run_tts(ws, state, request_id, text, language, tts)
         finally:
             state.tts_tasks.pop(rid_key, None)
+            # Single discard site for the cancel marker. _cancel_tts only
+            # marks a rid whose task is live, so this finally is the one
+            # place that always runs afterwards — covers both the
+            # barge-in path and a never-cancelled normal completion.
+            state.client_cancelled.discard(rid_key)
 
     state.tts_tasks[rid_key] = asyncio.create_task(_wrapped())
 
@@ -298,9 +326,18 @@ async def _spawn_tts(
 async def _cancel_tts(state: SessionState, request_id_raw: str | None) -> None:
     if not request_id_raw:
         return
-    task = state.tts_tasks.get(str(request_id_raw))
-    if task is not None and not task.done():
-        task.cancel()
+    rid = str(request_id_raw)
+    task = state.tts_tasks.get(rid)
+    if task is None or task.done():
+        # Nothing live to cancel — the task already finished (the client
+        # raced its own tts_done) or never existed. Adding a marker here
+        # would leak: no _wrapped finally remains to discard it.
+        return
+    # Mark before cancelling so _run_tts's CancelledError handler reads
+    # it as a client barge-in. The task is live, so its finally will run
+    # and discard the marker.
+    state.client_cancelled.add(rid)
+    task.cancel()
 
 
 async def _close_decoder(state: SessionState) -> None:
