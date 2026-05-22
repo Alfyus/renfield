@@ -12,13 +12,14 @@ disable-model-invocation: true
 - **Never force-push to main** and never bypass branch protection; main merges go through a PR (see `git-workflow` skill).
 - **CI is intentionally non-functional for this project** — run tests on the .159 build box, not in CI.
 - **ConfigMap-provided files are NOT in the image.** `mcp_servers.yaml`, `agent_roles.yaml`, `kg_scopes.yaml`, `mail_accounts.yaml` live only in the `renfield-mcp-config` ConfigMap. If the build-box working copy ever grows these as untracked files or directories at `src/backend/config/*`, the resulting image breaks the pod's subPath mount with `not a directory`. Keep `src/backend/.dockerignore` carving these paths out, and clean them on .159 if you see root-owned leftovers from kubelet bind-mount artefacts.
+- **`voice-server` is a separate image and a GPU deploy.** Changes under `voice-server/` need their own image build (see "Voice-server image" below) — the backend/frontend steps do NOT cover it. It runs on a GPU node; a NVIDIA driver/library mismatch there CrashLoops new pods. See that section.
 
 ## Topology at a glance
 
 | Role | Where | Notes |
 |---|---|---|
 | Build box | `192.168.1.159` (`renfield.local` mDNS often flaky — use the IP) | Docker Compose up for dev/test only. Used for `docker build` + `docker push`. Runs the full backend/test stack so pytest is executed here. **Not production.** |
-| Container registry | `https://registry.treehouse.x-idra.de` | Harbor. Namespace paths used: `renfield/backend`, `renfield/frontend`. `harbor-pull-secret` already exists in the `renfield` k8s namespace. |
+| Container registry | `https://registry.treehouse.x-idra.de` | Harbor. Namespace paths used: `renfield/backend`, `renfield/frontend`, `renfield/voice-server`. `harbor-pull-secret` already exists in the `renfield` k8s namespace. |
 | Production | Private k8s cluster (kubectl context **`renfield-private`**) | GPU-accelerated LLM, Traefik ingress, Longhorn storage, MetalLB LB at `192.168.1.230`. Canonical doc: `docs/KUBERNETES_DEPLOYMENT.md`. |
 
 Single-VM `renfield.local` deployment on `/opt/renfield` is legacy / build-box only. Anything calling itself a "prod rsync" is referring to the build box, not production.
@@ -127,6 +128,37 @@ Always build + push a pinned tag (`:vX.Y.Z`) alongside `:latest` — gives you a
 
 **Why the image stays ~3.5 GB:** `src/backend/constraints.txt` pins `torch`/`torchaudio`/`torchvision` to the `+cpu` wheels so transitive deps (docling, easyocr, transformers) can't drag in the 2.7 GB CUDA runtime + 641 MB triton. Don't lift that constraint unless you've thought through the Harbor push timeout.
 
+### Voice-server image (build ONLY when `voice-server/` changed)
+
+`voice-server/` is a third image in the monorepo — the backend/frontend steps above do **not** cover it. Build it only when something under `voice-server/` changed. It has its own `v0.1.x` versioning, independent of the repo's `vX.Y.Z` (bump the patch digit: `v0.1.5` → `v0.1.6`).
+
+```bash
+# Rsync the voice-server build context — its own directory IS the context
+ssh evdb@192.168.1.159 "mkdir -p /tmp/renfield-build-vX.Y.Z/voice-server"
+rsync -avz --delete \
+  --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' --exclude='.env' \
+  voice-server/ evdb@192.168.1.159:/tmp/renfield-build-vX.Y.Z/voice-server/
+
+# Build + push on .159. Dockerfile is FROM nvidia/cuda:...-runtime but builds
+# fine on the CPU build box (no GPU needed to BUILD). Layers usually cache, so
+# only the changed app layer pushes — fast.
+ssh evdb@192.168.1.159
+R=registry.treehouse.x-idra.de/renfield/voice-server
+cd /tmp/renfield-build-vX.Y.Z/voice-server
+docker build -t $R:v0.1.N -t $R:latest -f Dockerfile .
+docker push $R:v0.1.N
+docker push $R:latest
+```
+
+Run its tests against the freshly built image — CI doesn't, and the .159 backend container can't import the voice-server deps:
+
+```bash
+docker run --rm -v /tmp/renfield-build-vX.Y.Z/voice-server:/work -w /work \
+  $R:v0.1.N sh -c 'python3 -m pip install -q pytest pytest-asyncio && python3 -m pytest tests/ -q'
+```
+
+**GPU-node driver drift (verified painful, v2.8.0 deploy 2026-05-22).** The `voice-server` Deployment runs on the `k8s-gpu-3` GPU node. If `apt` upgraded that node's NVIDIA driver libraries without a reboot, a *new* voice-server pod CrashLoops with `failed to initialize NVML: Driver/library version mismatch` — the *old* pod keeps running, only new pods fail, so it stays latent until the next voice-server rollout. Fix is a **node reboot**, not an image rollback (a fresh pod on the old image crashes identically). A live `modprobe -r nvidia*` reload fails — `nvidia_uvm` stays held even when `lsof /dev/nvidia*` is empty. Procedure: `kubectl cordon k8s-gpu-3` → delete the `frontend` pod so it reschedules off the node (keeps the UI up) → `ssh ... sudo reboot` → wait for `Ready` → `kubectl uncordon` → `kubectl rollout restart deploy/voice-server`. Confirm `dkms status` has the nvidia module built for the kernel the node will boot into first (a pending kernel update can switch it).
+
 ### Harbor 504 / "Client Closed Request" on the 2.66 GB pip-install layer
 
 When `requirements.txt` changes (so the deps layer cache misses), Docker tries to upload a single 2.66 GB layer to Harbor. The ingress proxy in front of Harbor has been observed timing out on this with `received unexpected HTTP status: 504 Gateway Timeout` or `unknown: Client Closed Request`. The error reproduces on the same layer ID across multiple retries (verified during the v2.3.0 deploy 2026-05-01 — 4 attempts, same `ed85...` layer, same error).
@@ -158,7 +190,21 @@ kubectl -n renfield rollout status deploy/backend --timeout=600s
 kubectl -n renfield rollout status deploy/dlna-mcp --timeout=600s
 kubectl -n renfield rollout status deploy/document-worker --timeout=600s
 kubectl -n renfield rollout status deploy/frontend --timeout=600s
+
+# voice-server is a SEPARATE, fifth deploy — roll it ONLY when its image
+# changed (see "Voice-server image"). It runs a pinned tag, so set image:
+kubectl -n renfield set image deploy/voice-server \
+  voice-server=registry.treehouse.x-idra.de/renfield/voice-server:v0.1.N
+kubectl -n renfield rollout status deploy/voice-server --timeout=600s
 ```
+
+> **Pinned deploys — `rollout restart` is a no-op for them.** In the live
+> cluster `frontend` and `voice-server` often run pinned tags (`:vX.Y.Z` /
+> `:v0.1.N`) even though the committed `k8s/*.yaml` manifests say `:latest`.
+> For a pinned deploy, `rollout restart` re-pulls the *same* tag — it does
+> NOT pick up new code. Always `kubectl set image` for those two. Check live
+> state first: `kubectl -n renfield get deploy -o
+> custom-columns=D:.metadata.name,IMG:.spec.template.spec.containers[0].image`.
 
 > **Image-pull timing.** First pull of a 3.5 GB backend image takes 2-5 minutes per node.
 > Subsequent rollouts on the same node hit the local cache and start in seconds.
@@ -234,11 +280,11 @@ curl -sI http://renfield.local/          # 308 → https
 2. ✅ Tag `vX.Y.Z` locally + push tag + create GitHub release.
 3. ✅ rsync `src/backend`, `src/frontend`, `data/wakeword-models` to `/tmp/renfield-build-vX.Y.Z` on .159 (the model dir lands INSIDE the backend build context as `wakeword-models/`).
 4. ✅ Verify staging — `Dockerfile`, `.dockerignore`, `wakeword-models/` (~9 files) all present; `config/mcp_servers.yaml` etc. NOT present (else the configmap mount breaks).
-5. ✅ Build backend (long if requirements.txt changed) and frontend (fast).
-6. ✅ Push `:latest` and `:vX.Y.Z` for both — verify each `digest:` line in the push output.
-7. ✅ `kubectl rollout restart` on backend, dlna-mcp, document-worker, frontend (all four).
-8. ✅ `kubectl rollout status` per deploy with 600s timeout.
-9. ✅ Verify image digests across all 4 deploys match what was pushed.
+5. ✅ Build backend (long if requirements.txt changed) and frontend (fast); build voice-server ONLY if `voice-server/` changed (its own `v0.1.x` tag).
+6. ✅ Push `:latest` + the pinned tag for each image built — verify each `digest:` line in the push output.
+7. ✅ Roll out: `rollout restart` backend, dlna-mcp, document-worker; `kubectl set image` for frontend (and voice-server if rebuilt) — both run pinned tags, so `rollout restart` is a no-op for them.
+8. ✅ `kubectl rollout status` per rolled deploy with 600s timeout.
+9. ✅ Verify image digests across the rolled deploys match what was pushed.
 10. ✅ Backend health smoke (`curl -sS http://localhost:8000/health` inside the pod).
 11. ✅ Browser smoke for migrated pages / new features.
 12. ✅ Cleanup `/tmp/renfield-build-vX.Y.Z` on .159.

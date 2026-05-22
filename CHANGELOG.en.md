@@ -8,6 +8,20 @@ For earlier history (v1.2.0 - v2.5.0), see [CHANGELOG.md](CHANGELOG.md) (German 
 
 ---
 
+## [v2.8.0] — 2026-05-22
+
+Voice barge-in: the user can interrupt the assistant's speech by simply talking over it (Fork A — acoustic). A Phase 0 measurement confirmed up front that the browser's echo cancellation reliably separates the assistant's own TTS from the user speaking (6.8× margin on laptop speakers). PR [#601](https://github.com/ebongard/renfield/pull/601).
+
+### Added
+
+- **Acoustic barge-in listener** (`useVoiceStream`) — during TTS playback the browser opens an analyser-only mic stream. Sustained voiced energy above threshold cancels playback; the same audio track is promoted to the recorder, so the interrupting utterance is captured as the next query — no second `getUserMedia` call ([#601](https://github.com/ebongard/renfield/pull/601)).
+- **`cancelled` acknowledgement frame** in the voice-server `/ws/voice` protocol — a client-initiated cancellation is acknowledged cleanly instead of surfacing as a chat error bubble; an internal cancellation keeps the `error` frame ([#601](https://github.com/ebongard/renfield/pull/601)).
+- **`computeRms` / `detectBargeIn`** as pure, tested helpers in `voiceAudioUtils.ts`; the existing end-of-utterance VAD now shares the same RMS implementation.
+
+### Fixed
+
+- A client-cancelled TTS request previously raised an error bubble in chat because the voice-server did not distinguish a client cancel from a genuine failure.
+
 ## [v2.6.0] — 2026-05-14
 
 Phase 0 baseline-measurement substrate plus Lane B/2 of the Mem0 memory architecture: replaces v1's per-turn LLM loop (which produced a ~91% duplicate rate) with a batched ADD/UPDATE/DELETE/NOOP extractor gated by optimistic concurrency. Architecture is landed and flag-gated. Phase A shadow rollout collects v1/v2 comparison data in `memory_v2_shadow_log` before the `memory_extraction_v2_authoritative=True` flip ([#577](https://github.com/ebongard/renfield/pull/577)).

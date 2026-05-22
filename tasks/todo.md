@@ -9,7 +9,7 @@ Shipped / superseded items from the old voice-pipeline plan:
 | Phase B.5 — XTTS-v2 evaluation | Shipped: PR #539 (decision: stay on Piper) |
 | End-of-utterance robustness | Shipped: PRs #535, #536 ("5 compounded design flaws") |
 | Voice-originated tool-call guard | Shipped: PR #542 (`verify_tool_call` hook + `voice_originated` ContextVar) |
-| **Voice barge-in (Fork A acoustic)** | **In review: PR #601** — interrupt the assistant by speaking. T1–T5 done; AEC spike passed 6.77×; two independent reviews. Plan: `tasks/voice-barge-in-plan.md`. Post-merge: run the PR's manual-test checklist on staging. |
+| **Voice barge-in (Fork A acoustic)** | **Shipped — v2.8.0** (PR #601, deployed 2026-05-22): interrupt the assistant by speaking. AEC spike passed 6.77×; two independent reviews. Plan: `tasks/voice-barge-in-plan.md`. **Open:** run the PR's 8-step manual barge-in checklist live (needs a human + mic). |
 | Cosmetic `AGENT_MODEL=qwen3.6` | Done in `k8s/configmap.yaml` |
 | `:llama-rc5` re-tag to versioned | Moot — backend is on `:latest` with `imagePullPolicy: Always` |
 | Reva submodule bump (Stage 1) | Moot — submodule pointer is current (`v2.6.1-21-g856ae13`) |
