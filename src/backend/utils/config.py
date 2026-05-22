@@ -65,10 +65,10 @@ class Settings(BaseSettings):
 
     # Ollama - Multi-Modell Konfiguration
     ollama_url: str = "http://ollama:11434"
-    ollama_model: str = "llama3.2:3b"  # Legacy fallback; recommended: qwen3:14b (see docs/LLM_MODEL_GUIDE.md)
+    ollama_model: str = "llama3.2:3b"  # Legacy fallback; recommended: qwen3:14b
     ollama_chat_model: str = "llama3.2:3b"      # Default for dev; recommended: qwen3:14b
     ollama_rag_model: str = "llama3.2:latest"   # Default for dev; recommended: qwen3:14b
-    ollama_embed_model: str = "nomic-embed-text" # Default for dev; recommended: qwen3-embedding:4b (768 dim)
+    ollama_embed_model: str = "nomic-embed-text" # Default for dev; recommended: qwen3-embedding:4b (2560 dim)
     ollama_intent_model: str = "llama3.2:3b"    # Default for dev; recommended: qwen3:8b
     ollama_num_ctx: int = 32768                   # Context window für alle Ollama-Calls
     ollama_connect_timeout: float = 10.0          # TCP connect timeout in seconds (fast-fail when host is down)
