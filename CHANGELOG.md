@@ -20,6 +20,52 @@ Voice-Barge-in: Der Nutzer kann die Sprachausgabe des Assistenten unterbrechen, 
 
 - Eine vom Client stornierte TTS-Anfrage löste zuvor eine Fehler-Blase im Chat aus, weil der voice-server nicht zwischen Client-Abbruch und echtem Fehler unterschied.
 
+## [v2.7.1] — 2026-05-20
+
+### Behoben
+
+- LED- und Mikrofon-Capability-Badges werden nun korrekt pluralisiert ([#596](https://github.com/ebongard/renfield/pull/596)).
+
+## [v2.7.0] — 2026-05-19
+
+Pluggable Auth-Provider-Registry plus wahrheitsgetreue Hardware-Meldung der Satelliten.
+
+### Hinzugefügt
+
+- **Pluggable Auth-Provider-Registry + `post_authenticate`-Hook** — `/auth/login` ist nicht länger auf "`authenticate`-Hook, dann bcrypt" festverdrahtet, sondern delegiert an eine nach Priorität geordnete, mehrfach aktive Provider-Registry. Built-ins: `db` (bcrypt), `ldap` sowie die Redirect-Provider `google`/`github`/`apple` (standardmäßig deaktiviert) ([#592](https://github.com/ebongard/renfield/pull/592)).
+- **Echte Per-Device-Hardware-Meldung der Satelliten** — Satelliten melden und zeigen ihre tatsächliche Hardware-Ausstattung statt statischer Annahmen ([#594](https://github.com/ebongard/renfield/pull/594)).
+
+### Behoben
+
+- Provisioning-Drift des enviro pHAT geschlossen; `python3-smbus` wird bereitgestellt und in das Nicht-System-Site-venv verlinkt ([#593](https://github.com/ebongard/renfield/pull/593)).
+- `num_leds`-Template-Lücke behoben; die physische Mikrofon-Anzahl wird wahrheitsgetreu gezählt ([#595](https://github.com/ebongard/renfield/pull/595)).
+
+## [v2.6.1] — 2026-05-18
+
+Stabilisierung der in v2.6.0 gelandeten Mem0-v2-Memory-Architektur, dazu mehrere Chat-UI-Funktionen.
+
+### Hinzugefügt
+
+- **`build_assistant_card`-Hook** — neues synchrones Hook-Event, das `card_emit_inline`-Flag und die zugehörige Aufrufstelle im `chat_handler` ([#584](https://github.com/ebongard/renfield/pull/584), [#585](https://github.com/ebongard/renfield/pull/585)).
+- **Citation-Chips pro Nachricht** — aus den persistierten Metadaten je Nachricht gerendert ([#587](https://github.com/ebongard/renfield/pull/587)).
+- **Wissensbasis-Panel** — das Hamburger-Menü der linken Navigation für das Wissensbasis-Panel gespiegelt ([#588](https://github.com/ebongard/renfield/pull/588)).
+- **Lane C — Two-Stage-Retrieval** (WIP) mit recency-bewusstem Rerank ([#582](https://github.com/ebongard/renfield/pull/582)).
+
+### Geändert
+
+- Der v2-Extract-Retrieval-Schwellwert ist nun vom Chat-Schwellwert getrennt; `MEMORY_EXTRACT_RETRIEVAL_MODE` ist deprecated und löst eine Warnung aus ([#583](https://github.com/ebongard/renfield/pull/583)).
+
+### Behoben
+
+- Geleakte Advisory-Locks werden beim Pool-Checkin freigegeben; die KG-Entity/Atom-Erzeugung erfolgt atomar ([#578](https://github.com/ebongard/renfield/pull/578)).
+- KG-Entity/Atom-Reihenfolge und ein Log-Format-Fehler korrigiert ([#579](https://github.com/ebongard/renfield/pull/579)).
+- `retrieve()` flusht nun statt zu committen — das Committen brach zuvor das Shadow-Savepoint ([#580](https://github.com/ebongard/renfield/pull/580)); die Shadow-Log-Zeile wird mit explizitem `db.commit()` persistiert ([#581](https://github.com/ebongard/renfield/pull/581)).
+- k8s-Init-Dependency-Gates von den auf 0 skalierten `llama-server-*`-Deployments entkoppelt ([#586](https://github.com/ebongard/renfield/pull/586)).
+
+### Für Mitwirkende
+
+- Unit-Test für `historyToUiMessage` (Per-Message-Chips-Mapper) ([#589](https://github.com/ebongard/renfield/pull/589)); fehlendes `partialText` im `defaultChatContextValue`-Mock ergänzt ([#590](https://github.com/ebongard/renfield/pull/590)).
+
 ## [v2.6.0] — 2026-05-14
 
 Phase 0 baseline-measurement substrate plus Lane B/2 der Mem0-Memory-Architecture: vom Per-Turn-LLM-Loop mit ~91 % Duplikat-Rate zu einem batched ADD/UPDATE/DELETE/NOOP-Extractor mit Optimistic Concurrency. Architektur ist gelandet und schalter-gegated — Phase A Shadow-Rollout sammelt v1/v2-Vergleichsdaten in `memory_v2_shadow_log` bevor `memory_extraction_v2_authoritative=True` geflippt wird ([#577](https://github.com/ebongard/renfield/pull/577)).
