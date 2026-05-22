@@ -6,6 +6,20 @@ Alle markanten Änderungen an Renfield, seit Release `v1.2.0`. Format lehnt sich
 
 ---
 
+## [v2.8.0] — 2026-05-22
+
+Voice-Barge-in: Der Nutzer kann die Sprachausgabe des Assistenten unterbrechen, indem er einfach weiterspricht (Fork A — akustisch). Eine Phase-0-Messung bestätigte vorab, dass die Echo-Unterdrückung des Browsers die eigene TTS-Ausgabe zuverlässig vom Sprechen des Nutzers trennt (6,8-facher Abstand auf Laptop-Lautsprechern). PR [#601](https://github.com/ebongard/renfield/pull/601).
+
+### Hinzugefügt
+
+- **Akustischer Barge-in-Listener** (`useVoiceStream`) — Während der TTS-Wiedergabe öffnet der Browser einen reinen Analyser-Mic-Stream. Anhaltende Sprachenergie über dem Schwellwert bricht die Wiedergabe ab; dieselbe Audiospur wird zum Aufnahme-Stream befördert, sodass die unterbrechende Äußerung als nächste Anfrage erfasst wird — ohne zweiten `getUserMedia`-Aufruf ([#601](https://github.com/ebongard/renfield/pull/601)).
+- **`cancelled`-Quittungsframe** im `/ws/voice`-Protokoll des voice-server — eine vom Client ausgelöste Stornierung wird sauber bestätigt statt als Fehler-Blase im Chat dargestellt; eine interne Stornierung behält den `error`-Frame ([#601](https://github.com/ebongard/renfield/pull/601)).
+- **`computeRms` / `detectBargeIn`** als reine, getestete Hilfsfunktionen in `voiceAudioUtils.ts`; die bestehende End-of-Utterance-VAD nutzt nun dieselbe RMS-Implementierung.
+
+### Behoben
+
+- Eine vom Client stornierte TTS-Anfrage löste zuvor eine Fehler-Blase im Chat aus, weil der voice-server nicht zwischen Client-Abbruch und echtem Fehler unterschied.
+
 ## [v2.6.0] — 2026-05-14
 
 Phase 0 baseline-measurement substrate plus Lane B/2 der Mem0-Memory-Architecture: vom Per-Turn-LLM-Loop mit ~91 % Duplikat-Rate zu einem batched ADD/UPDATE/DELETE/NOOP-Extractor mit Optimistic Concurrency. Architektur ist gelandet und schalter-gegated — Phase A Shadow-Rollout sammelt v1/v2-Vergleichsdaten in `memory_v2_shadow_log` bevor `memory_extraction_v2_authoritative=True` geflippt wird ([#577](https://github.com/ebongard/renfield/pull/577)).

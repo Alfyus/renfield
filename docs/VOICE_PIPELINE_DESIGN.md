@@ -43,7 +43,7 @@ User direction: **no patches**. Phase B is the structural fix. Phase C is the ar
 
 ### Non-goals (explicitly deferred)
 
-- **Barge-in / interrupt-while-speaking.** Needs full-duplex with echo cancellation and is its own design problem. Phase B.next.
+- ~~**Barge-in / interrupt-while-speaking.**~~ **Shipped in v2.8.0** (Fork A — acoustic, PR #601). A Phase 0 spike measured browser AEC sufficient on laptop speakers (6.8× TTS-vs-speech separation), so no software echo cancellation was needed. The browser opens an analyser-only mic during TTS playback and promotes that stream to the recorder on detection.
 - **Multi-language voice cloning.** Stays on `de_DE-thorsten-high` and `en_US-amy-medium`. XTTS-v2 evaluated separately.
 - **Wake-word on the server.** Frontend already runs `openwakeword` in-browser via WASM; server doesn't need to listen for hot-words.
 
