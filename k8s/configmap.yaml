@@ -39,8 +39,11 @@ data:
   #     /v1/embeddings. Same qwen3-embedding:4b model, just GPU-served
   #     (10-20x faster than the previous CPU path on k8s-gpu-2).
   #     llama-server-embed deployment is scaled to 0 (replicas=0).
-  # Vision still disabled (OLLAMA_VISION_MODEL=""); add llama-server-vision
-  # pod if/when vision tier is wanted.
+  # Vision tier ENABLED — OLLAMA_VISION_MODEL=qwen3-vl:8b (see below),
+  # served by the existing in-cluster `ollama` pod on k8s-gpu-1 (idle
+  # 16 GB RTX 5060 Ti). OLLAMA_VISION_URL already routes there, so no
+  # separate llama-server-vision pod is needed. Rollback: set the model
+  # back to "".
   LLM_OPENAI_BASE_URL: "http://cuda.local:8081/v1"
   # LLM_OPENAI_API_KEY is sourced from the `renfield-secrets`/`llm-openai-api-key`
   # Secret in backend.yaml. llama-server accepts any non-empty value today;
@@ -75,7 +78,7 @@ data:
   OLLAMA_RAG_MODEL: "qwen3:14b"
   OLLAMA_INTENT_MODEL: "qwen3:8b"
   OLLAMA_EMBED_MODEL: "qwen3-embedding:4b"
-  OLLAMA_VISION_MODEL: ""
+  OLLAMA_VISION_MODEL: "qwen3-vl:8b"
   AGENT_MODEL: "qwen3.6"
   EMBEDDING_DIMENSION: "2560"
   # B.4.d: WHISPER_MODEL, PIPER_VOICES, PIPER_DEFAULT_VOICE removed.
