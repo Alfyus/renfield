@@ -22,6 +22,52 @@ Voice barge-in: the user can interrupt the assistant's speech by simply talking 
 
 - A client-cancelled TTS request previously raised an error bubble in chat because the voice-server did not distinguish a client cancel from a genuine failure.
 
+## [v2.7.1] — 2026-05-20
+
+### Fixed
+
+- LED and microphone capability badges are now pluralised correctly ([#596](https://github.com/ebongard/renfield/pull/596)).
+
+## [v2.7.0] — 2026-05-19
+
+Pluggable auth-provider registry plus truthful satellite hardware reporting.
+
+### Added
+
+- **Pluggable auth-provider registry + `post_authenticate` hook** — `/auth/login` is no longer hard-wired to "the `authenticate` hook, then bcrypt"; it delegates to a priority-ordered, multi-active provider registry. Built-ins: `db` (bcrypt), `ldap`, and the `google`/`github`/`apple` redirect providers (disabled by default) ([#592](https://github.com/ebongard/renfield/pull/592)).
+- **Real per-device satellite hardware reporting** — satellites report and display their actual hardware instead of static assumptions ([#594](https://github.com/ebongard/renfield/pull/594)).
+
+### Fixed
+
+- Closed the enviro pHAT provisioning drift; `python3-smbus` is provisioned and linked into the non-system-site venv ([#593](https://github.com/ebongard/renfield/pull/593)).
+- Fixed the `num_leds` template gap; the physical microphone count is now counted truthfully ([#595](https://github.com/ebongard/renfield/pull/595)).
+
+## [v2.6.1] — 2026-05-18
+
+Stabilises the Mem0-v2 memory architecture landed in v2.6.0, plus several chat-UI features.
+
+### Added
+
+- **`build_assistant_card` hook** — new synchronous hook event, the `card_emit_inline` flag, and the `chat_handler` call site for it ([#584](https://github.com/ebongard/renfield/pull/584), [#585](https://github.com/ebongard/renfield/pull/585)).
+- **Per-message citation chips** — rendered from each message's persisted metadata ([#587](https://github.com/ebongard/renfield/pull/587)).
+- **Wissensbasis panel** — mirrors the left-nav hamburger menu for the Wissensbasis panel ([#588](https://github.com/ebongard/renfield/pull/588)).
+- **Lane C — two-stage retrieval** (WIP) with a recency-aware rerank ([#582](https://github.com/ebongard/renfield/pull/582)).
+
+### Changed
+
+- The v2-extract retrieval threshold is now separate from the chat threshold; `MEMORY_EXTRACT_RETRIEVAL_MODE` is deprecated and warns ([#583](https://github.com/ebongard/renfield/pull/583)).
+
+### Fixed
+
+- Leaked advisory locks are released at pool check-in; KG entity/atom creation is atomic ([#578](https://github.com/ebongard/renfield/pull/578)).
+- Corrected KG entity/atom ordering and a log-format bug ([#579](https://github.com/ebongard/renfield/pull/579)).
+- `retrieve()` now flushes instead of committing — committing broke the shadow savepoint ([#580](https://github.com/ebongard/renfield/pull/580)); the shadow-log row is persisted with an explicit `db.commit()` ([#581](https://github.com/ebongard/renfield/pull/581)).
+- Decoupled the k8s init dependency-gates from the scaled-to-0 `llama-server-*` deployments ([#586](https://github.com/ebongard/renfield/pull/586)).
+
+### For contributors
+
+- Unit test for `historyToUiMessage` (the per-message chips mapper) ([#589](https://github.com/ebongard/renfield/pull/589)); added the missing `partialText` to the `defaultChatContextValue` mock ([#590](https://github.com/ebongard/renfield/pull/590)).
+
 ## [v2.6.0] — 2026-05-14
 
 Phase 0 baseline-measurement substrate plus Lane B/2 of the Mem0 memory architecture: replaces v1's per-turn LLM loop (which produced a ~91% duplicate rate) with a batched ADD/UPDATE/DELETE/NOOP extractor gated by optimistic concurrency. Architecture is landed and flag-gated. Phase A shadow rollout collects v1/v2 comparison data in `memory_v2_shadow_log` before the `memory_extraction_v2_authoritative=True` flip ([#577](https://github.com/ebongard/renfield/pull/577)).
