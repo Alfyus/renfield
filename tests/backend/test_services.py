@@ -23,25 +23,29 @@ class TestOllamaService:
 
     @pytest.fixture
     def mock_ollama_client(self):
-        """Mock Ollama Client"""
-        with patch('services.ollama_service.ollama') as mock:
-            mock_client = MagicMock()
+        """Mock Ollama Client.
 
-            # Mock for list models
-            mock_model = MagicMock()
-            mock_model.model = "llama3.2:3b"
-            mock_list = MagicMock()
-            mock_list.models = [mock_model]
-            mock_client.list = AsyncMock(return_value=mock_list)
+        ollama_service no longer imports the ``ollama`` package directly —
+        it builds clients via ``utils.llm_client``. The tests below assign
+        this mock straight onto ``service.client``, so we just hand back a
+        configured MagicMock instead of patching a now-absent symbol.
+        """
+        mock_client = MagicMock()
 
-            # Mock for chat
-            mock_response = MagicMock()
-            mock_response.message = MagicMock()
-            mock_response.message.content = "Test response"
-            mock_client.chat = AsyncMock(return_value=mock_response)
+        # Mock for list models
+        mock_model = MagicMock()
+        mock_model.model = "llama3.2:3b"
+        mock_list = MagicMock()
+        mock_list.models = [mock_model]
+        mock_client.list = AsyncMock(return_value=mock_list)
 
-            mock.AsyncClient = MagicMock(return_value=mock_client)
-            yield mock_client
+        # Mock for chat
+        mock_response = MagicMock()
+        mock_response.message = MagicMock()
+        mock_response.message.content = "Test response"
+        mock_client.chat = AsyncMock(return_value=mock_response)
+
+        return mock_client
 
     @pytest.mark.unit
     async def test_chat_simple(self, mock_ollama_client):
@@ -118,11 +122,13 @@ class TestOllamaServiceRankedIntents:
 
     @pytest.fixture
     def mock_ollama_client(self):
-        """Mock Ollama Client"""
-        with patch('services.ollama_service.ollama') as mock:
-            mock_client = MagicMock()
-            mock.AsyncClient = MagicMock(return_value=mock_client)
-            yield mock_client
+        """Mock Ollama Client.
+
+        See TestOllamaService.mock_ollama_client — ollama_service builds
+        its client via utils.llm_client; the test assigns this mock onto
+        ``service.client`` directly.
+        """
+        return MagicMock()
 
     def _make_service(self, mock_ollama_client):
         """Create OllamaService with mocked settings."""
@@ -348,6 +354,9 @@ class TestRAGService:
         with patch('services.rag_service.settings') as mock_settings:
             mock_settings.ollama_url = "http://localhost:11434"
             mock_settings.ollama_embed_model = "nomic-embed-text"
+            # get_embedding wraps the call in asyncio.wait_for — the timeout
+            # must be a real number, not a bare MagicMock.
+            mock_settings.rag_embedding_timeout = 30.0
 
             service = RAGService(db_session)
             # Set the mock client directly
@@ -535,9 +544,14 @@ class TestActionExecutor:
         })
 
         assert result["success"] is True
+        # ActionExecutor now forwards user_permissions / user_id /
+        # progress_sink as dedicated kwargs to execute_tool.
         mock_mcp.execute_tool.assert_called_once_with(
             "mcp.homeassistant.turn_on",
-            {"entity_id": "light.test"}
+            {"entity_id": "light.test"},
+            user_permissions=None,
+            user_id=None,
+            progress_sink=None,
         )
 
     @pytest.mark.unit
@@ -599,7 +613,7 @@ class TestDeviceManager:
     @pytest.mark.unit
     def test_device_manager_init(self):
         """Testet Initialisierung"""
-        from services.device_manager import DeviceManager
+        from ha_glue.services.device_manager import DeviceManager
 
         manager = DeviceManager()
 
@@ -609,7 +623,7 @@ class TestDeviceManager:
     @pytest.mark.unit
     async def test_register_device(self):
         """Testet Geräte-Registrierung"""
-        from services.device_manager import DeviceManager
+        from ha_glue.services.device_manager import DeviceManager
 
         manager = DeviceManager()
         device_id = "test-device-123"
@@ -633,7 +647,7 @@ class TestDeviceManager:
     @pytest.mark.unit
     async def test_unregister_device(self):
         """Testet Geräte-Abmeldung"""
-        from services.device_manager import DeviceManager
+        from ha_glue.services.device_manager import DeviceManager
 
         manager = DeviceManager()
         device_id = "test-device-456"
@@ -657,7 +671,7 @@ class TestDeviceManager:
     @pytest.mark.unit
     async def test_get_devices_by_room(self):
         """Testet Geräte nach Raum filtern"""
-        from services.device_manager import DeviceManager
+        from ha_glue.services.device_manager import DeviceManager
 
         manager = DeviceManager()
 
@@ -689,7 +703,7 @@ class TestRoomServiceUnit:
     @pytest.mark.database
     async def test_create_room(self, db_session):
         """Testet Raum-Erstellung"""
-        from services.room_service import RoomService
+        from ha_glue.services.room_service import RoomService
 
         # Create a fresh session to avoid transaction issues
         service = RoomService(db_session)
@@ -710,7 +724,7 @@ class TestRoomServiceUnit:
     @pytest.mark.database
     async def test_get_room_by_alias(self, db_session, test_room):
         """Testet Raum-Abfrage nach Alias"""
-        from services.room_service import RoomService
+        from ha_glue.services.room_service import RoomService
 
         # Flush to ensure test_room is in the database
         await db_session.flush()
@@ -725,7 +739,7 @@ class TestRoomServiceUnit:
     @pytest.mark.database
     async def test_get_all_rooms(self, db_session, test_room):
         """Testet Raum-Liste"""
-        from services.room_service import RoomService
+        from ha_glue.services.room_service import RoomService
 
         # Flush to ensure test_room is in the database
         await db_session.flush()

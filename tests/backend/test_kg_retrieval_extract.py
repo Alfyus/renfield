@@ -57,8 +57,8 @@ class TestExtractQueryEntitiesParity:
 
         for cls in (KnowledgeGraphService, KGRetrieval):
             instance = cls(MagicMock())
-            instance._ollama_client = MagicMock()
-            instance._ollama_client.chat = AsyncMock(return_value=chat_resp)
+            instance._chat_client = MagicMock()
+            instance._chat_client.chat = AsyncMock(return_value=chat_resp)
             result = await instance._extract_query_entities("any query", lang="en")
             assert result == ["Anna", "Norway", "Eduard"], f"{cls.__name__} returned {result}"
 
@@ -71,8 +71,8 @@ class TestExtractQueryEntitiesParity:
 
         for cls in (KnowledgeGraphService, KGRetrieval):
             instance = cls(MagicMock())
-            instance._ollama_client = MagicMock()
-            instance._ollama_client.chat = AsyncMock(return_value=chat_resp)
+            instance._chat_client = MagicMock()
+            instance._chat_client.chat = AsyncMock(return_value=chat_resp)
             result = await instance._extract_query_entities("any query", lang="en")
             assert result == ["Mom", "recipe"]
 
@@ -84,8 +84,8 @@ class TestExtractQueryEntitiesParity:
 
         for cls in (KnowledgeGraphService, KGRetrieval):
             instance = cls(MagicMock())
-            instance._ollama_client = MagicMock()
-            instance._ollama_client.chat = AsyncMock(return_value=chat_resp)
+            instance._chat_client = MagicMock()
+            instance._chat_client.chat = AsyncMock(return_value=chat_resp)
             result = await instance._extract_query_entities("any query", lang="en")
             assert result == []
 
@@ -94,8 +94,8 @@ class TestExtractQueryEntitiesParity:
     async def test_returns_empty_on_llm_exception(self, patched_prompt_manager, patched_llm_client):
         for cls in (KnowledgeGraphService, KGRetrieval):
             instance = cls(MagicMock())
-            instance._ollama_client = MagicMock()
-            instance._ollama_client.chat = AsyncMock(side_effect=RuntimeError("ollama down"))
+            instance._chat_client = MagicMock()
+            instance._chat_client.chat = AsyncMock(side_effect=RuntimeError("ollama down"))
             result = await instance._extract_query_entities("any query", lang="en")
             assert result == []
 
@@ -108,8 +108,8 @@ class TestExtractQueryEntitiesParity:
 
         for cls in (KnowledgeGraphService, KGRetrieval):
             instance = cls(MagicMock())
-            instance._ollama_client = MagicMock()
-            instance._ollama_client.chat = AsyncMock(return_value=chat_resp)
+            instance._chat_client = MagicMock()
+            instance._chat_client.chat = AsyncMock(return_value=chat_resp)
             result = await instance._extract_query_entities("any query", lang="en")
             assert result == ["Anna", "Bob"]
 
@@ -152,7 +152,9 @@ class TestKGRetrievalSurface:
             "get_relevant_context",
             "_extract_query_entities",
             "_get_embedding",
-            "_get_ollama_client",
+            # LLM client accessor was renamed _get_ollama_client ->
+            # _get_chat_client when the client moved to utils.llm_client.
+            "_get_chat_client",
         }
         actual = {name for name in dir(KGRetrieval) if not name.startswith("__")}
         missing = required - actual

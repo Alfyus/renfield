@@ -145,19 +145,27 @@ class TestSecretsAndDatabaseUrl:
 
     @pytest.mark.unit
     def test_secret_fields_exist(self):
-        """Test: Alle Secret-Felder existieren in Settings"""
+        """Test: Alle Secret-Felder existieren in den Settings-Klassen.
+
+        Core platform secrets live on ``Settings``; integration secrets
+        (Home Assistant, Jellyfin) moved to ``HaGlueSettings`` when the
+        ha_glue boundary was extracted. ``openweather_api_key`` /
+        ``newsapi_key`` were removed entirely (those integrations are now
+        configured via MCP servers, not platform Settings fields).
+        """
         from utils.config import Settings
+        from ha_glue.utils.config import HaGlueSettings
 
         settings = Settings(database_url=None)
 
-        # Felder die als Secrets unterstützt werden
+        # Core platform secrets
         assert hasattr(settings, "postgres_password")
-        assert hasattr(settings, "home_assistant_token")
         assert hasattr(settings, "secret_key")
         assert hasattr(settings, "default_admin_password")
-        assert hasattr(settings, "openweather_api_key")
-        assert hasattr(settings, "newsapi_key")
-        assert hasattr(settings, "jellyfin_api_key")
+
+        # Integration secrets on the ha_glue settings boundary
+        assert "home_assistant_token" in HaGlueSettings.model_fields
+        assert "jellyfin_api_key" in HaGlueSettings.model_fields
 
     @pytest.mark.unit
     def test_postgres_password_from_env(self):
@@ -220,7 +228,7 @@ class TestRoomNameNormalizationEdgeCases:
     @pytest.mark.unit
     def test_numbers_preserved(self):
         """Test: Zahlen bleiben erhalten"""
-        from services.room_service import normalize_room_name
+        from ha_glue.services.room_service import normalize_room_name
 
         assert normalize_room_name("Zimmer 1") == "zimmer1"
         assert normalize_room_name("Raum 123") == "raum123"
@@ -229,7 +237,7 @@ class TestRoomNameNormalizationEdgeCases:
     @pytest.mark.unit
     def test_mixed_case(self):
         """Test: Mixed Case wird normalisiert"""
-        from services.room_service import normalize_room_name
+        from ha_glue.services.room_service import normalize_room_name
 
         assert normalize_room_name("WohnZimmer") == "wohnzimmer"
         assert normalize_room_name("KÜCHE") == "kueche"
@@ -237,7 +245,7 @@ class TestRoomNameNormalizationEdgeCases:
     @pytest.mark.unit
     def test_accented_characters(self):
         """Test: Akzentierte Zeichen"""
-        from services.room_service import normalize_room_name
+        from ha_glue.services.room_service import normalize_room_name
 
         assert normalize_room_name("Café") == "cafe"
         assert normalize_room_name("Entrée") == "entree"
@@ -245,14 +253,14 @@ class TestRoomNameNormalizationEdgeCases:
     @pytest.mark.unit
     def test_consecutive_spaces(self):
         """Test: Mehrere aufeinanderfolgende Leerzeichen"""
-        from services.room_service import normalize_room_name
+        from ha_glue.services.room_service import normalize_room_name
 
         assert normalize_room_name("Wohn    Zimmer") == "wohnzimmer"
 
     @pytest.mark.unit
     def test_underscores_and_dashes(self):
         """Test: Unterstriche und Bindestriche"""
-        from services.room_service import normalize_room_name
+        from ha_glue.services.room_service import normalize_room_name
 
         assert normalize_room_name("kinder-zimmer") == "kinderzimmer"
         assert normalize_room_name("wohn_zimmer") == "wohnzimmer"
@@ -268,7 +276,7 @@ class TestDeviceIdGenerationEdgeCases:
     @pytest.mark.unit
     def test_unknown_device_type(self):
         """Test: Unbekannter Device Type bekommt default prefix"""
-        from services.room_service import generate_device_id
+        from ha_glue.services.room_service import generate_device_id
 
         device_id = generate_device_id("unknown_type", "Test Room", "suffix")
 
@@ -277,7 +285,7 @@ class TestDeviceIdGenerationEdgeCases:
     @pytest.mark.unit
     def test_special_characters_in_room(self):
         """Test: Sonderzeichen im Raumnamen"""
-        from services.room_service import generate_device_id
+        from ha_glue.services.room_service import generate_device_id
 
         device_id = generate_device_id("satellite", "Wohn/Ess-Zimmer!", "main")
 
@@ -288,7 +296,7 @@ class TestDeviceIdGenerationEdgeCases:
     @pytest.mark.unit
     def test_empty_room_name(self):
         """Test: Leerer Raumname"""
-        from services.room_service import generate_device_id
+        from ha_glue.services.room_service import generate_device_id
 
         device_id = generate_device_id("satellite", "", "suffix")
 

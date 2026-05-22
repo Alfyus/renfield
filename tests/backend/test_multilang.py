@@ -331,7 +331,7 @@ class TestPiperServiceMultiVoice:
         """Test voice selection based on language"""
         from services.piper_service import PiperService
 
-        with patch.object(PiperService, '_check_piper_available', return_value=True):
+        with patch('services.piper_service.PIPER_AVAILABLE', True):
             with patch('services.piper_service.settings') as mock_settings:
                 mock_settings.piper_default_voice = "de_DE-thorsten-high"
                 mock_settings.piper_voice_map = {
@@ -339,6 +339,8 @@ class TestPiperServiceMultiVoice:
                     "en": "en_US-amy-medium"
                 }
                 mock_settings.default_language = "de"
+                mock_settings.tts_cache_size = 0
+                mock_settings.tts_max_concurrent = 4
 
                 service = PiperService()
 
@@ -367,7 +369,7 @@ class TestSatelliteLanguage:
         """Test SatelliteInfo dataclass has language field"""
         from unittest.mock import MagicMock
 
-        from services.satellite_manager import SatelliteCapabilities, SatelliteInfo
+        from ha_glue.services.satellite_manager import SatelliteCapabilities, SatelliteInfo
 
         mock_websocket = MagicMock()
         caps = SatelliteCapabilities()
@@ -387,7 +389,7 @@ class TestSatelliteLanguage:
         """Test SatelliteInfo defaults to German"""
         from unittest.mock import MagicMock
 
-        from services.satellite_manager import SatelliteCapabilities, SatelliteInfo
+        from ha_glue.services.satellite_manager import SatelliteCapabilities, SatelliteInfo
 
         mock_websocket = MagicMock()
         caps = SatelliteCapabilities()
@@ -406,7 +408,7 @@ class TestSatelliteLanguage:
         """Test satellite registration stores language"""
         from unittest.mock import AsyncMock, MagicMock
 
-        from services.satellite_manager import SatelliteManager
+        from ha_glue.services.satellite_manager import SatelliteManager
 
         manager = SatelliteManager()
         mock_websocket = MagicMock()

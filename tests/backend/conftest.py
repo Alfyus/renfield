@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import BigInteger
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -37,6 +38,20 @@ from sqlalchemy.pool import StaticPool
 @compiles(TSVECTOR, "sqlite")
 def _tsvector_sqlite(element, compiler, **kw):
     return "TEXT"
+
+
+@compiles(BigInteger, "sqlite")
+def _biginteger_sqlite(element, compiler, **kw):
+    # SQLite only treats a column declared exactly ``INTEGER PRIMARY KEY`` as
+    # an alias for ROWID (i.e. autoincrementing). A ``BIGINT PRIMARY KEY``
+    # column is NOT aliased, so inserts that rely on autoincrement fail with
+    # "NOT NULL constraint failed: <table>.id" under the in-memory test
+    # engine. Several production models (wb_field_provenance,
+    # wb_field_provenance_archive, wb_event_log, ...) use BigInteger PKs.
+    # Compiling BigInteger to plain INTEGER on SQLite restores autoincrement;
+    # SQLite's INTEGER is already 8-byte, so there is no range loss. Postgres
+    # DDL is unaffected — the override only fires when dialect == sqlite.
+    return "INTEGER"
 
 
 try:  # pgvector is a soft dependency in the image; tolerate its absence.
@@ -575,7 +590,7 @@ def mock_speaker_service():
 @pytest.fixture
 def room_service(db_session: AsyncSession):
     """Create RoomService with test database"""
-    from services.room_service import RoomService
+    from ha_glue.services.room_service import RoomService
     return RoomService(db_session)
 
 
@@ -615,11 +630,74 @@ def override_get_db(db_session: AsyncSession):
     return _override
 
 
+# The ha_glue-owned REST routers (camera, homeassistant, satellites, rooms,
+# presence, paperless_audit) and the device/satellite WebSockets are mounted
+# at runtime by the ``register_routes`` hook fired inside the FastAPI lifespan
+# (see api/lifecycle.py). The bare ``from main import app`` used below never
+# triggers the lifespan, so without this explicit mount every HA route 404s.
+#
+# Each router is mounted at most once: we probe ``app.routes`` for a known
+# path before calling ``include_router`` so repeated fixture invocations
+# don't stack duplicates. A per-router probe (rather than a single global
+# flag) makes this self-healing — a transient import failure on the first
+# fixture call doesn't permanently disable every HA route for the session.
+def _has_route(app, path: str) -> bool:
+    return any(getattr(r, "path", None) == path for r in app.routes)
+
+
+def _ensure_ha_glue_routes(app):
+    """Mount ha_glue REST/WS routers on the shared app, idempotently.
+
+    Mirrors ha_glue.bootstrap.ha_glue_register_routes — replicated here
+    (rather than awaited) because this runs inside an already-running
+    event loop where the coroutine cannot be driven to completion."""
+    # (module import path, include_router kwargs, sentinel path to probe)
+    specs = [
+        ("ha_glue.api.admin", {}, "/admin/refresh-keywords"),
+        ("ha_glue.api.routes.camera", {"prefix": "/api/camera"}, "/api/camera/events"),
+        (
+            "ha_glue.api.routes.homeassistant",
+            {"prefix": "/api/homeassistant"},
+            "/api/homeassistant/states",
+        ),
+        (
+            "ha_glue.api.routes.satellites",
+            {"prefix": "/api/satellites"},
+            "/api/satellites",
+        ),
+        ("ha_glue.api.routes.rooms", {"prefix": "/api/rooms"}, "/api/rooms"),
+        ("ha_glue.api.routes.presence", {}, None),
+        ("ha_glue.api.routes.paperless_audit", {}, None),
+        ("ha_glue.api.websocket.device_handler", {}, None),
+        ("ha_glue.api.websocket.satellite_handler", {}, None),
+    ]
+    import importlib
+
+    for module_path, kwargs, sentinel in specs:
+        if sentinel is not None and _has_route(app, sentinel):
+            continue
+        try:
+            module = importlib.import_module(module_path)
+            router = module.router
+        except Exception:  # noqa: BLE001 — platform-only deploy / broken module
+            continue
+        # For routers with no easily-probed sentinel path, fall back to a
+        # router-identity check so they're still mounted only once.
+        if sentinel is None and any(
+            r is route for r in app.routes for route in getattr(router, "routes", [])
+        ):
+            continue
+        app.include_router(router, **kwargs)
+
+
 @pytest.fixture
 async def app_with_test_db(override_get_db, mock_ha_client):
     """FastAPI app with test database and mocked services"""
     from main import app
     from services.database import get_db
+
+    # Mount the ha_glue routers that the lifespan would normally register.
+    _ensure_ha_glue_routes(app)
 
     # Override database
     app.dependency_overrides[get_db] = override_get_db
