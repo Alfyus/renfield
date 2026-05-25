@@ -350,6 +350,59 @@ class Settings(BaseSettings):
     memory_relevance_filter_enabled: bool = True                                  # Skip transactional queries
     memory_retrieval_budget_chars: int = Field(default=2000, ge=500, le=10000)   # Max chars for memory prompt block
 
+    # Procedural Skills (self-learning Phase 1)
+    # The agent learns multi-step tool-call recipes from complex turns and
+    # reuses them on similar future requests. See docs/SELF_LEARNING.md.
+    skills_enabled: bool = False                                            # Opt-in for the whole feature
+    skill_extract_enabled: bool = True                                       # Auto-extract from agent turns
+    skill_extract_min_tool_calls: int = Field(default=3, ge=1, le=20)        # Threshold for "complex" turn
+    skill_extract_model: str = ""                                            # Empty = use ollama_chat_model
+    skill_inject_enabled: bool = True                                        # Inject matching skills into agent prompt
+    skill_inject_top_k: int = Field(default=3, ge=1, le=10)                  # Max skills injected per turn
+    skill_inject_similarity_threshold: float = Field(default=0.75, ge=0.0, le=1.0)  # Min cosine sim
+    skill_seed_load_on_boot: bool = True                                     # Load src/backend/seed_skills/*.md at boot
+    skill_seed_directory: str = "seed_skills"                                # Relative to backend root
+    skill_auto_demote_threshold: int = Field(default=5, ge=1, le=100)        # Failures before auto-deactivate
+    skill_auto_demote_success_rate: float = Field(default=0.10, ge=0.0, le=1.0)  # Success rate below this triggers demote
+
+    # Trajectory capture (self-learning Phase 2)
+    # Captures full agent-turn traces as JSONL-exportable training data
+    # for downstream LoRA fine-tuning. See docs/SELF_LEARNING.md.
+    trajectory_capture_enabled: bool = False                                  # Master switch — implicitly requires skills_enabled
+    trajectory_capture_outcomes: str = "success,tool_fail"                    # Comma-separated: outcomes to capture
+    trajectory_retention_days: int = Field(default=30, ge=1, le=3650)        # Auto-delete after N days
+    trajectory_cleanup_interval: int = Field(default=86400, ge=300, le=604800)  # Cleanup job interval (seconds)
+    trajectory_max_per_user: int = Field(default=10000, ge=100, le=100000)   # Soft cap, oldest dropped first
+    # COUNT-then-DELETE on every save() costs N round-trips for N inserts;
+    # only the last few near the cap actually matter. Run the cap check on
+    # every Nth save (probabilistic) — drift up to N rows over the cap is
+    # harmless because the cleanup scheduler also prunes by retention.
+    trajectory_cap_check_every: int = Field(default=50, ge=1, le=1000)
+    trajectory_redact_pii: bool = False                                       # Phase 4: scrub PII into redacted_payload
+
+    # Tool outcome tracking (self-learning Phase 3)
+    # Counts every tool_result step in the agent loop; surfaces warnings
+    # in the agent prompt when a tool's per-user success rate drops below
+    # the floor. Implicitly requires skills_enabled (rides on the same
+    # post-turn fire-and-forget task).
+    tool_health_tracking_enabled: bool = False                                # Master switch
+    tool_health_warn_enabled: bool = True                                     # Inject warnings into agent prompt
+    tool_health_warn_min_uses: int = Field(default=5, ge=1, le=100)           # Min total calls before warning
+    tool_health_warn_success_rate: float = Field(default=0.5, ge=0.0, le=1.0) # Warn if below
+    tool_health_warn_top_k: int = Field(default=3, ge=1, le=10)               # Max warnings per prompt
+
+    # Skill curator (self-learning Phase 4)
+    # Periodically dedupes and archives skills the agent has accumulated.
+    # Runs as a background scheduler when enabled; can also be triggered
+    # manually via /api/skills/curator/run (admin-only).
+    skill_curator_enabled: bool = False                                       # Master switch
+    skill_curator_interval: int = Field(default=86400, ge=300, le=604800)     # Seconds between runs (default 1d)
+    skill_curator_duplicate_threshold: float = Field(default=0.92, ge=0.5, le=1.0)  # Cosine sim to consider as duplicates
+    skill_curator_stale_days: int = Field(default=90, ge=7, le=365)           # Archive after N days unused
+    skill_curator_stale_success_rate: float = Field(default=0.3, ge=0.0, le=1.0)    # Archive if rate below this AND stale
+    skill_curator_min_uses_to_consider_stale: int = Field(default=3, ge=1, le=100)  # Avoid archiving rarely-tested skills
+    skill_curator_max_merges_per_run: int = Field(default=20, ge=1, le=200)   # Safety cap
+
     # Knowledge Graph (Entity-Relation triples from conversations)
     knowledge_graph_enabled: bool = False                                        # Opt-in
     kg_extraction_model: str = ""                                                # Empty = use default model

@@ -34,8 +34,11 @@ from api.routes import (
     notifications,
     preferences,
     roles,
+    skills,
     speakers,
     tasks,
+    tool_health,
+    trajectories,
     users,
 )
 from api.routes import knowledge_graph as kg_routes
@@ -176,6 +179,9 @@ app.include_router(preferences.router, prefix="/api/preferences", tags=["Prefere
 app.include_router(mcp_routes.router, prefix="/api/mcp", tags=["MCP"])
 app.include_router(intents.router, prefix="/api/intents", tags=["Intents"])
 app.include_router(feedback.router, prefix="/api/feedback", tags=["Feedback"])
+app.include_router(skills.router, prefix="/api/skills", tags=["Skills"])
+app.include_router(trajectories.router, prefix="/api/trajectories", tags=["Trajectories"])
+app.include_router(tool_health.router, prefix="/api/tool-health", tags=["Tool Health"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(kg_routes.router, prefix="/api/knowledge-graph", tags=["Knowledge Graph"])
 app.include_router(atoms.router, prefix="/api/atoms", tags=["Circles - Atoms"])

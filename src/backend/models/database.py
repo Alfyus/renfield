@@ -982,6 +982,223 @@ class EpisodicMemory(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
+# ProceduralSkill / Atom-type discriminators — defined here (in front of
+# the ORM classes that reference them as Column defaults) instead of at
+# the file's tail-end constant block. Column(default=X) evaluates X at
+# class-construction time, so the constants must exist before the class
+# body runs. The tier integers + ATOM_TYPE_* + SKILL_SOURCE_* tables at
+# the bottom of this file are the canonical exports — these forward-
+# declarations are kept in sync with them and re-asserted below.
+SKILL_SOURCE_AUTO_EXTRACTED = "auto_extracted"
+SKILL_SOURCE_SEED = "seed"
+SKILL_SOURCE_USER_CREATED = "user_created"
+
+
+class ProceduralSkill(Base):
+    """
+    Procedural skill — agent-learned how-to recipe for a class of tasks.
+
+    Self-learning Phase 1: the agent extracts a Skill after a complex turn
+    (≥ ``settings.skill_extract_min_tool_calls`` successful tool calls).
+    On a future similar request, the SkillService retrieves the top-K
+    similar skills by embedding cosine and injects them into the agent
+    prompt as procedural memory (parallel to how memory_context and
+    tool_corrections are injected today).
+
+    Lifecycle:
+      - source="auto_extracted": created by SkillExtractor after a turn.
+      - source="seed":           loaded from src/backend/seed_skills/*.md
+                                  at boot. user_id=NULL, circle_tier=4 (public).
+                                  Bypasses the atom registry (no per-user owner).
+      - source="user_created":   authored via /api/skills.
+      - success_count / failure_count: bumped by the agent loop based on
+        the outcome of a turn that used the skill. Used by the curator
+        (Phase 4) to merge / archive / demote.
+
+    Circles:
+      atom_id is nullable. Auto-extracted and user-created skills register
+      with AtomService.upsert_atom (atom_type=procedural_skill) and get a
+      real atom_id + per-user policy. Seeds bypass the atom registry —
+      circle_tier=4 means "visible to everyone", retrieval treats the NULL
+      user_id as "system-owned, no access check needed".
+    """
+    __tablename__ = "procedural_skills"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+
+    title = Column(String(255), nullable=False)
+    body_md = Column(Text, nullable=False)
+    trigger_examples = Column(JSON, nullable=False, default=list)
+    tool_sequence = Column(JSON, nullable=False, default=list)
+
+    source = Column(String(20), nullable=False, default=SKILL_SOURCE_AUTO_EXTRACTED)
+    learned_from_conversation_id = Column(
+        Integer, ForeignKey("conversations.id"), nullable=True
+    )
+    version = Column(Integer, nullable=False, default=1)
+
+    success_count = Column(Integer, nullable=False, default=0)
+    failure_count = Column(Integer, nullable=False, default=0)
+    last_used_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    pinned = Column(Boolean, nullable=False, default=False)
+
+    embedding = Column(
+        Vector(EMBEDDING_DIMENSION) if PGVECTOR_AVAILABLE else Text,
+        nullable=True,
+    )
+
+    atom_id = Column(
+        String(36),
+        ForeignKey("atoms.atom_id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    circle_tier = Column(Integer, nullable=False, default=0)
+
+    # Curator audit trail (Phase 4). When the curator merges two
+    # near-duplicate skills, the loser's row is kept (audit) with
+    # is_active=False AND merged_into_id pointing at the winner. NULL on
+    # all non-archived rows and on archived-but-not-merged rows
+    # (e.g. auto-demoted by record_outcome).
+    merged_into_id = Column(
+        Integer,
+        ForeignKey("procedural_skills.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = relationship("User", foreign_keys=[user_id])
+    learned_from = relationship(
+        "Conversation", foreign_keys=[learned_from_conversation_id]
+    )
+    merged_into = relationship(
+        "ProceduralSkill",
+        foreign_keys=[merged_into_id],
+        remote_side="ProceduralSkill.id",
+    )
+
+
+# AgentTrajectory.outcome discriminators.
+TRAJECTORY_OUTCOME_SUCCESS = "success"        # final_answer + no error step
+TRAJECTORY_OUTCOME_TOOL_FAIL = "tool_fail"    # tool steps had failures but eventually answered
+TRAJECTORY_OUTCOME_ABORT = "abort"            # loop exhausted / circuit broken / timeout
+TRAJECTORY_OUTCOME_USER_CORRECTED = "user_corrected"  # post-hoc correction via /api/feedback
+
+
+class AgentTrajectory(Base):
+    """
+    Full trace of a single agent turn, captured for offline training data.
+
+    Self-learning Phase 2: rather than just learning "did this skill help?"
+    (success_count vs failure_count on ProceduralSkill), we keep the full
+    {user message, tool calls, tool results, final answer, outcome} trace
+    of every turn the agent runs. Exported as JSONL via /api/trajectories
+    for downstream LoRA fine-tuning of the local chat / agent model.
+
+    Retention is bounded by ``settings.trajectory_retention_days`` (default
+    30); the cleanup scheduler in lifecycle.py deletes older rows unless
+    ``flagged_for_retention=True`` (e.g., the turn produced an
+    auto-extracted skill — we want to keep those forever as gold examples).
+
+    Privacy: ``redacted_payload`` is left nullable in v1 because PII
+    redaction is a Phase 4 concern. Producers populate ``raw_payload`` and
+    callers MUST NOT export rows whose ``redacted_payload`` is NULL
+    once Phase 4 lands.
+
+    Schema is deliberately denormalized JSONB (one row per turn) rather
+    than a relational join over messages + steps: the trace is the unit
+    of training, and exporting JSONL is the only read path that matters.
+    """
+    __tablename__ = "agent_trajectories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True)
+
+    # The complete trace. Keys: user_message, system_role, steps[],
+    # final_answer, lang, tools_available[]. See TrajectoryService.save
+    # for the schema.
+    raw_payload = Column(JSON, nullable=False)
+    # PII-scrubbed export-ready payload. Phase 4 will populate this in a
+    # follow-up scheduled job; v1 leaves it NULL.
+    redacted_payload = Column(JSON, nullable=True)
+
+    # Quick-filter fields denormalized out of raw_payload for indexed lookups.
+    outcome = Column(String(20), nullable=False, default=TRAJECTORY_OUTCOME_SUCCESS, index=True)
+    tool_count = Column(Integer, nullable=False, default=0)
+    distinct_tool_count = Column(Integer, nullable=False, default=0)
+    token_count = Column(Integer, nullable=True)  # input+output for the turn
+
+    # Linkage to ProceduralSkill if this turn produced or used a skill.
+    extracted_skill_id = Column(
+        Integer, ForeignKey("procedural_skills.id", ondelete="SET NULL"), nullable=True
+    )
+    # IDs of injected skills (JSON list); used for offline skill-effectiveness analytics.
+    used_skill_ids = Column(JSON, nullable=True)
+
+    flagged_for_retention = Column(Boolean, nullable=False, default=False, index=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+    __table_args__ = (
+        Index("idx_trajectories_user_created", "user_id", "created_at"),
+        Index("idx_trajectories_outcome_created", "outcome", "created_at"),
+    )
+
+    user = relationship("User", foreign_keys=[user_id])
+    conversation = relationship("Conversation", foreign_keys=[conversation_id])
+    extracted_skill = relationship("ProceduralSkill", foreign_keys=[extracted_skill_id])
+
+
+class ToolOutcomeStat(Base):
+    """
+    Rolling success/failure counters per (user, tool) pair.
+
+    Self-learning Phase 3: every ``tool_result`` step in the agent loop
+    bumps either ``success_count`` or ``failure_count`` on the row keyed
+    by (user_id, tool_name). At prompt-build time the agent reads the
+    stats for the current asker and injects a ``{tool_health_warnings}``
+    block when a tool's success rate has dropped below
+    ``settings.tool_health_warn_success_rate`` AND it has been used at
+    least ``settings.tool_health_warn_min_uses`` times — keeps the LLM
+    from confidently picking a tool that's been broken in production.
+
+    Stats are PER-USER (not global) so a permission-gated tool that's
+    perfectly fine for Alice but always errors for Bob (who lacks the
+    grant) doesn't pollute Alice's prompt.
+
+    The ``last_failure_summary`` text helps the LLM disambiguate
+    "this tool's broken for me right now" vs "this tool returns weird
+    data shapes for this kind of query" without re-reading the full
+    trace — one-sentence summary captured from the latest fail.
+    """
+    __tablename__ = "tool_outcome_stats"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    tool_name = Column(String(128), nullable=False, index=True)
+
+    success_count = Column(Integer, nullable=False, default=0)
+    failure_count = Column(Integer, nullable=False, default=0)
+    last_used_at = Column(DateTime, nullable=True)
+    last_failure_at = Column(DateTime, nullable=True)
+    last_failure_summary = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "tool_name", name="uq_tool_outcome_user_tool"),
+        Index("idx_tool_outcome_user_tool", "user_id", "tool_name"),
+    )
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
 # Memory History — Audit trail for memory modifications
 MEMORY_ACTION_CREATED = "created"
 MEMORY_ACTION_UPDATED = "updated"
@@ -1200,6 +1417,15 @@ ATOM_TYPE_KB_DOCUMENT = "kb_document"
 ATOM_TYPE_KG_NODE = "kg_node"
 ATOM_TYPE_KG_EDGE = "kg_edge"
 ATOM_TYPE_CONVERSATION_MEMORY = "conversation_memory"
+ATOM_TYPE_PROCEDURAL_SKILL = "procedural_skill"
+
+# ProceduralSkill.source discriminators are declared up-file (in front of
+# the ORM class body that references them as Column defaults). Asserting
+# the canonical values here so a future drift between the two declaration
+# sites fails at import time instead of silently desyncing.
+assert SKILL_SOURCE_AUTO_EXTRACTED == "auto_extracted"
+assert SKILL_SOURCE_SEED == "seed"
+assert SKILL_SOURCE_USER_CREATED == "user_created"
 
 # Atom explicit grant permission levels — mirrors the legacy KB_PERM_*
 # values for migration parity.

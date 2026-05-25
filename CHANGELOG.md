@@ -6,6 +6,20 @@ Alle markanten Änderungen an Renfield, seit Release `v1.2.0`. Format lehnt sich
 
 ---
 
+## [Unreleased]
+
+### Hinzugefuegt
+
+- **Self-Learning Phase 1 — prozedurale Skills** (`SKILLS_ENABLED=true`). Der Agent destilliert nach komplexen Turns (>= `SKILL_EXTRACT_MIN_TOOL_CALLS` erfolgreiche Tool-Calls, mehrere unterschiedliche Tools, sauberer final_answer) automatisch eine wiederverwendbare Schritt-fuer-Schritt-Prozedur und legt sie als neuen Atom-Subtype `procedural_skill` ab. Bei aehnlichen Folge-Anfragen werden die Top-K passenden Skills per Embedding-Similarity in den Agent-Prompt injiziert (parallel zur bestehenden `IntentFeedbackService`-Few-Shot-Injection). Auto-Demote bei wiederholten Fehlschlaegen, geschuetzt durch `pinned`-Flag.
+- **Bundled Seed-Skills** in `src/backend/seed_skills/*.md` (5 Default-Prozeduren: DLNA-Album-Playback, Paperless-Mail-Versand, Licht-Steuerung, Wetter-Abfrage, KB-Suche). Boot-Loader schreibt sie idempotent als `source=seed`, `circle_tier=public` in die DB.
+- **`/api/skills`-Route** — CRUD + Pin/Unpin + Tier-Aenderung (cascade via `AtomService.update_tier`).
+- **Self-Learning Phase 2 — Trajectory Capture** (`TRAJECTORY_CAPTURE_ENABLED=true`). Persistiert die vollstaendige Trace jedes Agent-Turns (User-Message, Tool-Calls, Tool-Results, final_answer, Outcome) als JSONL-exportierbare Trainingsdaten fuer zukuenftiges LoRA-Fine-Tuning. Outcome-Klassifikation (success/tool_fail/abort) wird heuristisch aus der Trace abgeleitet. Auto-Flagging fuer Turns die eine neue Skill extrahiert haben (Gold-Beispiele werden nie auto-geloescht). Admin-only Export-Endpunkt mit Streaming-Response.
+- **`/api/trajectories`-Route** — Listing + JSONL-Export + Flag-toggle + Stats (alle admin-only).
+- **Self-Learning Phase 3 — Tool Health Tracking** (`TOOL_HEALTH_TRACKING_ENABLED=true`). Pro (User, Tool) rollende Success/Failure-Counter; wenn ein Tool unter `TOOL_HEALTH_WARN_MIN_USES` Aufrufe haeufiger fehlschlaegt als `TOOL_HEALTH_WARN_SUCCESS_RATE` erlaubt, wird eine kompakte Warnung in den Agent-Prompt injiziert (neuer `{tool_health_warnings}`-Slot in allen agent_prompt-Varianten inkl. smart_home). Letzte Fehlermeldung wird mitgesichert. Counter sind pro User — nicht global — sodass benutzerspezifische Permission-/Grant-Asymmetrien sich nicht in andere User durchschlagen.
+- **`/api/tool-health`-Route** — Stats-Listing + Warning-Preview (alle admin-only).
+- **Self-Learning Phase 4 — Skill Curator** (`SKILL_CURATOR_ENABLED=true`). Periodisch laufender Background-Job, der pro User (a) near-duplicate Skills (Cosine-Similarity >= `SKILL_CURATOR_DUPLICATE_THRESHOLD`) zusammenfuehrt — Winner-by-success-rate, Trigger werden zusammengefuehrt + dedupliziert, Outcome-Counter werden uebertragen, Loser archiviert mit `merged_into_id` als Audit-Pointer — und (b) stale Skills (lange ungenutzt + niedrige Success-Rate) soft-archiviert. Pinned-Skills sind immer ausgenommen. Manueller Trigger via `POST /api/skills/curator/run` (admin-only).
+- Neue Settings: `SKILLS_ENABLED`, `SKILL_EXTRACT_*`, `SKILL_INJECT_*`, `SKILL_AUTO_DEMOTE_*`, `SKILL_SEED_LOAD_ON_BOOT`, `TRAJECTORY_CAPTURE_*`, `TRAJECTORY_RETENTION_DAYS`, `TRAJECTORY_CLEANUP_INTERVAL`, `TRAJECTORY_MAX_PER_USER`, `TOOL_HEALTH_TRACKING_ENABLED`, `TOOL_HEALTH_WARN_*`, `SKILL_CURATOR_*`.
+
 ## [v2.8.1] — 2026-05-22
 
 ### Geändert

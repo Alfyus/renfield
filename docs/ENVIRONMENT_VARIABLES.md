@@ -500,6 +500,130 @@ Wenn `MEMORY_CONTRADICTION_RESOLUTION=true` (und `MEMORY_EXTRACTION_ENABLED=true
 
 ---
 
+### Procedural Skills (Self-Learning Phase 1)
+
+```bash
+# Master-Schalter — ohne dies passiert nichts
+SKILLS_ENABLED=false
+
+# Auto-Extraktion nach Agent-Turns
+SKILL_EXTRACT_ENABLED=true               # LLM-Skill-Extraktion nach komplexen Turns
+SKILL_EXTRACT_MIN_TOOL_CALLS=3           # Schwellwert "komplexer Turn"
+SKILL_EXTRACT_MODEL=                      # Leer = ollama_chat_model
+
+# Prompt-Injection — gelernte Skills in den Agent-Prompt einfuegen
+SKILL_INJECT_ENABLED=true
+SKILL_INJECT_TOP_K=3                      # Max injizierte Skills pro Turn
+SKILL_INJECT_SIMILARITY_THRESHOLD=0.75   # Min cosine similarity
+
+# Auto-Demote — wiederholt fehlgeschlagene Skills deaktivieren
+SKILL_AUTO_DEMOTE_THRESHOLD=5            # Failures bis zum Check
+SKILL_AUTO_DEMOTE_SUCCESS_RATE=0.10      # success_rate < dieser Wert -> deaktivieren
+
+# Seed-Skills aus src/backend/seed_skills/*.md beim Boot laden
+SKILL_SEED_LOAD_ON_BOOT=true
+SKILL_SEED_DIRECTORY=seed_skills          # Relativ zu src/backend/
+```
+
+**Verhalten:**
+Wenn `SKILLS_ENABLED=true`, laeuft nach jedem Agent-Turn ein Background-Task: er prueft die Trace-Heuristik (>= `SKILL_EXTRACT_MIN_TOOL_CALLS` erfolgreiche Tool-Calls, mehrere unterschiedliche Tools, sauberer final_answer) und schickt erfolgreiche Traces an den `SkillExtractor`-LLM-Call. Liefert dieser ein JSON-Objekt mit `{title, body_md, trigger_examples, tool_sequence}`, wird die Skill in `procedural_skills` (Atom-Typ `procedural_skill`, Owner-Tier `self`) gespeichert.
+
+Bei zukuenftigen Anfragen sucht der Agent vor dem LLM-Call mit dem User-Message-Embedding nach den Top-K aktiven Skills (eigene + public seeds) und injiziert sie als `{learned_skills}`-Block in den Prompt — analog zur bestehenden `{tool_corrections}`-Injection. Bei jedem Turn der eine Skill nutzt, wird `success_count` oder `failure_count` aktualisiert; Skills mit ueberwiegend Fehlschlaegen werden automatisch deaktiviert (ausser `pinned=true`).
+
+Owner-Sichtbarkeit ueber `/api/skills` (CRUD + pin/unpin + Tier-Aenderung).
+
+---
+
+### Trajectory Capture (Self-Learning Phase 2)
+
+```bash
+# Master-Schalter — wenn aus, kein Capture, kein Export, kein Cleanup
+TRAJECTORY_CAPTURE_ENABLED=false
+
+# Welche Outcomes erfasst werden (Komma-separiert)
+TRAJECTORY_CAPTURE_OUTCOMES=success,tool_fail
+
+# Auto-Cleanup
+TRAJECTORY_RETENTION_DAYS=30                  # nicht-flagged Rows werden aelter geloescht
+TRAJECTORY_CLEANUP_INTERVAL=86400             # Sekunden zwischen Cleanup-Laeufen (default 1d)
+TRAJECTORY_MAX_PER_USER=10000                 # Soft-Cap; aelteste nicht-flagged Rows werden gedroppt
+
+# Phase-4-Vorbereitung — wenn true, exportiert /export.jsonl nur Rows
+# mit gesetztem redacted_payload. v1 schreibt nie redacted_payload, dh
+# bei =true bleibt der Export leer (kontrollierter Privacy-Gate).
+TRAJECTORY_REDACT_PII=false
+```
+
+**Verhalten:**
+Wenn `TRAJECTORY_CAPTURE_ENABLED=true` und `SKILLS_ENABLED=true`, persistiert der Post-Turn-Background-Task in `agent_service.py` nach jedem Agent-Turn die vollstaendige Trace (`user_message`, `tools_available`, `steps[]`, `final_answer`, Outcome) als JSON in `agent_trajectories`. Outcomes werden ueber `outcome_from_steps()` abgeleitet:
+- `success` — final_answer + keine Tool-Fehler
+- `tool_fail` — final_answer + mindestens ein fehlgeschlagener Tool-Call (Agent hat trotzdem geantwortet)
+- `abort` — kein final_answer (Loop-Exhaustion, Circuit-Breaker, Timeout)
+
+Nur Outcomes aus `TRAJECTORY_CAPTURE_OUTCOMES` werden erfasst.
+
+Wenn der Turn eine neue Skill extrahiert hat, wird die Trajectory automatisch mit `flagged_for_retention=True` markiert — der Cleanup-Scheduler ueberspringt sie. Gold-Beispiele fuer spaeteres Fine-Tuning.
+
+Admin-only Export-Endpunkt: `GET /api/trajectories/export.jsonl` streamt das gesamte Corpus als Line-Delimited-JSON. Filter via Query-Parametern (`outcome`, `since_days`, `flagged_only`, `require_redacted`).
+
+---
+
+### Tool Health Tracking (Self-Learning Phase 3)
+
+```bash
+# Master-Schalter — wenn aus, kein Counter-Update, keine Warnings
+TOOL_HEALTH_TRACKING_ENABLED=false
+
+# Prompt-Injection
+TOOL_HEALTH_WARN_ENABLED=true                # {tool_health_warnings}-Block einfuegen
+TOOL_HEALTH_WARN_MIN_USES=5                  # Min Tool-Calls vor Warnung
+TOOL_HEALTH_WARN_SUCCESS_RATE=0.5            # Warnung wenn rate < dieser Wert
+TOOL_HEALTH_WARN_TOP_K=3                     # Max gleichzeitige Warnungen
+```
+
+**Verhalten:**
+Jeder `tool_result` Schritt im Agent-Loop bumpst pro (user_id, tool_name) entweder `success_count` oder `failure_count` in `tool_outcome_stats`. Die letzte Fehlermeldung wird mitgesichert (`last_failure_summary`, max 500 Zeichen).
+
+Beim Prompt-Build wird fuer den aktuellen User die Liste der Tools geladen, die ueber `TOOL_HEALTH_WARN_MIN_USES` Aufrufe haben UND deren Success-Rate unter `TOOL_HEALTH_WARN_SUCCESS_RATE` liegt. Die Top-K (sortiert nach Fehlern absteigend) werden als `{tool_health_warnings}`-Block in den Agent-Prompt injiziert — analog zu `{tool_corrections}` und `{learned_skills}`.
+
+Counter sind **pro User**, nicht global — ein Tool das fuer Alice gut funktioniert aber bei Bob immer scheitert (Permission-Gate fehlt) verschmutzt nicht Alices Prompt.
+
+Admin-only Endpunkte:
+- `GET /api/tool-health` — Listing der jüngsten (user, tool) Stats
+- `GET /api/tool-health/warnings/{user_id}` — Vorschau auf den Warnungs-Block den der User aktuell sehen wuerde
+
+---
+
+### Skill Curator (Self-Learning Phase 4)
+
+```bash
+# Master-Schalter — wenn aus, kein Scheduler-Run, kein /curator/run-Endpunkt
+SKILL_CURATOR_ENABLED=false
+
+# Scheduler
+SKILL_CURATOR_INTERVAL=86400                  # Sekunden zwischen Laeufen (default 1d)
+
+# Duplikat-Merge
+SKILL_CURATOR_DUPLICATE_THRESHOLD=0.92        # Cosine-Sim ab wann zwei Skills als Duplikat gelten
+SKILL_CURATOR_MAX_MERGES_PER_RUN=20           # Safety-Cap pro Lauf
+
+# Stale-Archivierung
+SKILL_CURATOR_STALE_DAYS=90                   # Tage seit last_used_at nach denen "stale"
+SKILL_CURATOR_STALE_SUCCESS_RATE=0.3          # Erfolgsrate unter der archiviert wird
+SKILL_CURATOR_MIN_USES_TO_CONSIDER_STALE=3    # Untere Schwelle: nicht jede selten genutzte Skill ist gleich stale
+```
+
+**Verhalten:**
+Wenn `SKILL_CURATOR_ENABLED=true` (und `SKILLS_ENABLED=true`), startet ein Background-Scheduler der pro `SKILL_CURATOR_INTERVAL` Sekunden ueber alle Owner mit aktiven non-seed Skills iteriert und fuer jeden `SkillCuratorService.run_for_user(user_id)` ausfuehrt. Zwei Phasen:
+
+1. **Duplicate-Dedupe**: pgvector-Self-Join findet Skill-Paare desselben Users mit Cosine-Similarity >= `SKILL_CURATOR_DUPLICATE_THRESHOLD`. Pro Paar wird der "Winner" gewaehlt (hoehere Success-Rate gewinnt, tie-break auf Usage-Count und last_used_at), Trigger werden zusammengefuehrt (dedupliziert, max 10), Outcome-Counter ueberfuehrt, Winner-`version` gebumpt, Winner-Embedding neu berechnet. Der Loser wird `is_active=False` + `merged_into_id=<winner.id>` markiert (Audit-Trail bleibt).
+
+2. **Stale-Archivierung**: Skills die >= `SKILL_CURATOR_STALE_DAYS` Tage ungenutzt sind, mindestens `SKILL_CURATOR_MIN_USES_TO_CONSIDER_STALE` Aufrufe haben UND eine Success-Rate unter `SKILL_CURATOR_STALE_SUCCESS_RATE` werden soft-archiviert. `pinned=true` skips immer.
+
+Manueller Trigger: `POST /api/skills/curator/run` (admin-only). Optional `{"user_id": <id>}` im Body fuer einen einzelnen User.
+
+---
+
 ### Satellite System
 
 ```bash
