@@ -7,7 +7,8 @@ import {
   useSetLanguagePreference,
 } from '../api/resources/preferences';
 
-type LanguageCode = 'de' | 'en';
+// Aggiunto 'it' al tipo LanguageCode
+type LanguageCode = 'de' | 'en' | 'it';
 
 interface Language {
   code: LanguageCode;
@@ -15,9 +16,11 @@ interface Language {
   flag: string;
 }
 
+// Aggiunta la lingua italiana all'array
 const LANGUAGES: Language[] = [
   { code: 'de', name: 'Deutsch', flag: '🇩🇪' },
   { code: 'en', name: 'English', flag: '🇬🇧' },
+  { code: 'it', name: 'Italiano', flag: '🇮🇹' },
 ];
 
 interface LanguageSwitcherProps {
