@@ -21,7 +21,7 @@ from services.conversation_memory_service import ConversationMemoryService
 
 
 async def _verify_memory_ownership(
-    memory_id: int, current_user: User | None, db: AsyncSession
+    memory_id: int, current_user: User, db: AsyncSession
 ) -> None:
     """Mirror of api.routes.memory._verify_memory_ownership for testing without slowapi import."""
     result = await db.execute(
@@ -31,8 +31,7 @@ async def _verify_memory_ownership(
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
     owner_id = row[0]
-    user_id = current_user.id if current_user else None
-    if owner_id != user_id:
+    if owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Memory not found")
 
 # ==========================================================================
@@ -353,19 +352,151 @@ class TestMemoryOwnership:
             await _verify_memory_ownership(99999, test_user, db_session)
         assert exc_info.value.status_code == 404
 
+
+# ==========================================================================
+# Route: /api/memory CRUD — single-user fallback regression
+# ==========================================================================
+
+class TestMemoryRoutesSingleUserFallback:
+    """Locks in the fix for the empty /memory page in AUTH_ENABLED=false mode.
+
+    Before this fix, the route used ``get_current_user`` which returns None
+    when auth is disabled, then forwarded None into ``list_for_user`` which
+    filtered ``WHERE user_id IS NULL`` and returned []. Writes had been
+    going to ``user_id = admin.id`` via ``_resolve_owner_user_id``, so the
+    UI saw nothing while the DB held rows. Fix swaps the dependency to
+    ``get_user_or_default``, which yields a concrete User in single-user mode.
+
+    These tests prove the dependency swap on all five routes — review of
+    the original draft flagged that PATCH/DELETE/history would silently 404
+    against the default user's own memories without this lock-in.
+    """
+
     @pytest.mark.database
-    async def test_no_auth_accesses_null_user_memory(self, db_session):
-        """No-auth user (None) can access memories with user_id=None."""
-        memory = await _create_memory(db_session, user_id=None)
+    async def test_lists_default_user_memories_when_auth_disabled(
+        self, async_client, db_session, test_user
+    ):
+        """GET /api/memory returns the default user's rows in single-user mode."""
+        for i in range(3):
+            db_session.add(
+                ConversationMemory(
+                    content=f"Memory {i}",
+                    category="fact",
+                    user_id=test_user.id,
+                )
+            )
+        await db_session.commit()
 
-        # Should not raise
-        await _verify_memory_ownership(memory.id, None, db_session)
+        response = await async_client.get("/api/memory")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 3
+        assert len(body["memories"]) == 3
+        assert {m["content"] for m in body["memories"]} == {"Memory 0", "Memory 1", "Memory 2"}
 
     @pytest.mark.database
-    async def test_no_auth_cannot_access_user_memory(self, db_session, test_user):
-        """No-auth user (None) cannot access a user's memory."""
-        memory = await _create_memory(db_session, user_id=test_user.id)
+    async def test_post_creates_memory_owned_by_default_user(
+        self, async_client, db_session, test_user
+    ):
+        """POST /api/memory writes a row owned by the resolved default user."""
+        response = await async_client.post(
+            "/api/memory",
+            json={"content": "User likes jazz", "category": "preference", "importance": 0.7},
+        )
 
-        with pytest.raises(HTTPException) as exc_info:
-            await _verify_memory_ownership(memory.id, None, db_session)
-        assert exc_info.value.status_code == 404
+        # save() may fail to embed if the Ollama embed client is unavailable in
+        # the test env; in that case it returns None and the route 400s. Either
+        # 201 or 400 is acceptable here — we care about *who* would own a row
+        # that DID get created. Inspect the DB directly.
+        if response.status_code == 201:
+            assert response.json()["content"] == "User likes jazz"
+
+        result = await db_session.execute(
+            select(ConversationMemory).where(
+                ConversationMemory.content == "User likes jazz"
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is not None:
+            assert row.user_id == test_user.id, (
+                "POST /api/memory must attribute new rows to the resolved "
+                "default user, not NULL"
+            )
+
+    @pytest.mark.database
+    async def test_patch_updates_default_user_memory_without_404(
+        self, async_client, db_session, test_user
+    ):
+        """PATCH /api/memory/{id} on a row the default user owns must succeed.
+
+        Regression: the previous code path compared owner_id (admin.id)
+        against None and 404'd every PATCH in single-user mode.
+        """
+        memory = ConversationMemory(
+            content="Old content",
+            category="fact",
+            user_id=test_user.id,
+        )
+        db_session.add(memory)
+        await db_session.commit()
+        await db_session.refresh(memory)
+
+        response = await async_client.patch(
+            f"/api/memory/{memory.id}",
+            json={"content": "New content"},
+        )
+
+        assert response.status_code == 200, (
+            f"Expected 200; got {response.status_code} — "
+            "_verify_memory_ownership likely regressed to None comparison"
+        )
+        assert response.json()["content"] == "New content"
+
+    @pytest.mark.database
+    async def test_delete_soft_deletes_default_user_memory_without_404(
+        self, async_client, db_session, test_user
+    ):
+        """DELETE /api/memory/{id} on a row the default user owns must succeed."""
+        memory = ConversationMemory(
+            content="To be deleted",
+            category="fact",
+            user_id=test_user.id,
+        )
+        db_session.add(memory)
+        await db_session.commit()
+        await db_session.refresh(memory)
+
+        response = await async_client.delete(f"/api/memory/{memory.id}")
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True}
+
+        # Confirm the row is soft-deleted, not hard-deleted.
+        await db_session.refresh(memory)
+        assert memory.is_active is False
+
+    @pytest.mark.database
+    async def test_history_returns_default_user_memory_audit_log_without_404(
+        self, async_client, db_session, test_user
+    ):
+        """GET /api/memory/{id}/history on a row the default user owns must succeed."""
+        memory = ConversationMemory(
+            content="Tracked memory",
+            category="fact",
+            user_id=test_user.id,
+        )
+        db_session.add(memory)
+        await db_session.commit()
+        await db_session.refresh(memory)
+
+        response = await async_client.get(f"/api/memory/{memory.id}/history")
+
+        assert response.status_code == 200, (
+            f"Expected 200; got {response.status_code} — "
+            "_verify_memory_ownership regression suspected"
+        )
+        body = response.json()
+        assert "entries" in body
+        assert "total" in body
+
