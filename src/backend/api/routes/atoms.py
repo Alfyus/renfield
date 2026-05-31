@@ -17,7 +17,7 @@ Per the design doc:
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -26,13 +26,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.database import Atom as AtomModel, User
+from models.database import Atom as AtomModel, Document, KnowledgeBase, User
 from services.atom_service import AtomService
 from services.atom_types import Atom
 from services.auth_service import get_user_or_default
 from services.circle_resolver import CircleResolver, atom_from_orm
 from services.database import get_db
+from services.document_fact_retrieval import DocumentFactRetrieval
 from services.polymorphic_atom_store import PolymorphicAtomStore
+from utils.config import settings
 
 router = APIRouter()
 
@@ -84,6 +86,27 @@ class UpdateTierRequest(BaseModel):
     )
 
 
+class DocumentFactResponse(BaseModel):
+    """A single Schicht A fact. Extra keys from the retrieval dict (e.g.
+    ``similarity``) are ignored by Pydantic's default extra='ignore'."""
+    id: int
+    document_id: int
+    atom_id: str | None = None
+    category: str
+    kind: str
+    value: str
+    normalized_value: str | None = None
+    excerpt: str | None = None
+    obligation_date: str | None = None
+    amount_value: float | None = None
+    amount_currency: str | None = None
+    legal_gate: bool = False
+    payment_method: str | None = None
+    confidence: float | None = None
+    source: str | None = None
+    circle_tier: int = 0
+
+
 # =============================================================================
 # Routes
 # =============================================================================
@@ -124,6 +147,79 @@ async def query_atoms(
         )
         for m in matches
     ]
+
+
+# NOTE: the two routes below MUST be declared before `GET /{atom_id}` — a
+# literal path like `/obligations` would otherwise be captured by the
+# `/{atom_id}` parameter route (the route-order class of bug from #615).
+
+
+@router.get("/obligations", response_model=list[DocumentFactResponse])
+async def get_obligations(
+    due_before: date | None = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_user_or_default),
+):
+    """
+    List circle-visible obligation facts (bills + Behörde deadlines) with a
+    printed Frist, soonest first. Optional ``due_before`` caps the horizon.
+
+    List endpoint — circle-filter only (returns what the asker can see; no
+    404/403, consistent with the list-vs-single-resource convention).
+    """
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    facts = await DocumentFactRetrieval(db).obligations(
+        asker_id=current_user.id, due_before=due_before, limit=limit,
+    )
+    return [DocumentFactResponse(**f) for f in facts]
+
+
+@router.get("/documents/{document_id}/facts", response_model=list[DocumentFactResponse])
+async def get_document_facts(
+    document_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_user_or_default),
+):
+    """
+    All Schicht A facts of one document, circle-access-gated on the parent
+    Document (mirrors the house convention in knowledge.py): 404 if the doc
+    doesn't exist, 403 if the asker can't reach it, else the facts ([] means
+    genuinely factless, NOT inaccessible).
+    """
+    document = (await db.execute(
+        select(Document).where(Document.id == document_id)
+    )).scalar_one_or_none()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Dokument nicht gefunden")
+
+    if settings.auth_enabled:
+        if document.atom_id is not None:
+            # Facts inherit the document atom's policy — get_atom returns None
+            # for both not-found and not-authorized (the circle check).
+            atom = await PolymorphicAtomStore(db).get_atom(
+                document.atom_id, asker_id=current_user.id,
+            )
+            if atom is None:
+                raise HTTPException(status_code=403, detail="No access to this document")
+        else:
+            # Pre-atom legacy doc (no atom to gate on): fall back to KB
+            # ownership and fail closed. Such docs predate Schicht A and have
+            # no facts, but we deny rather than leak.
+            owner_id = None
+            if document.knowledge_base_id is not None:
+                kb = (await db.execute(
+                    select(KnowledgeBase).where(KnowledgeBase.id == document.knowledge_base_id)
+                )).scalar_one_or_none()
+                owner_id = kb.owner_id if kb else None
+            if owner_id != current_user.id:
+                raise HTTPException(status_code=403, detail="No access to this document")
+
+    facts = await DocumentFactRetrieval(db).facts_for_document(
+        document_id, asker_id=current_user.id,
+    )
+    return [DocumentFactResponse(**f) for f in facts]
 
 
 @router.get("/{atom_id}", response_model=AtomResponse)
