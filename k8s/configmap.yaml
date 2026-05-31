@@ -95,6 +95,12 @@ data:
   RAG_CHUNK_OVERLAP: "50"
   RAG_TOP_K: "5"
   RAG_SIMILARITY_THRESHOLD: "0.4"
+  # Reranker disabled: the default model (mxbai-rerank-base-v1) isn't in the
+  # Ollama registry (never pullable) and _rerank is a bi-encoder cosine pass,
+  # not a true cross-encoder — it has always 404'd and fallen back to the RRF
+  # order. RRF + lexical fusion is the real ranking. A proper cross-encoder
+  # reranker is a separate TODO. (Disabled 2026-05-31.)
+  RAG_RERANK_ENABLED: "false"
 
   # Feature flags
   DEFAULT_LANGUAGE: "de"
