@@ -278,6 +278,11 @@ class AtomService:
             {"tier": new_tier, "source_id": atom_orm.source_id},
         )
 
+        # Fact atoms whose resolver cache must be invalidated after a
+        # kb_document tier change (collected inside the cascade block below;
+        # invalidated after commit alongside the parent doc atom).
+        fact_atom_ids: list[str] = []
+
         # kb_document cascade: propagate the new tier to every chunk of
         # this document in the SAME transaction — otherwise retrieval would
         # read stale document_chunks.circle_tier and leak chunks at the old
@@ -313,6 +318,19 @@ class AtomService:
                 ),
                 {"tier": new_tier, "fact_type": ATOM_TYPE_DOCUMENT_FACT, "doc_id": doc_id},
             )
+            # Collect the fact atom_ids so their per-atom resolver grant cache
+            # is invalidated after commit — otherwise retrieval would read the
+            # fact atoms' stale cached access decision at the old tier, leaking
+            # a Steuernummer/obligation. (document_facts.atom_id IS the fact's
+            # atom id.) The parent doc atom is invalidated at :invalidate below.
+            fact_atom_ids = [
+                row.atom_id for row in (await self.db.execute(
+                    text(
+                        "SELECT atom_id FROM document_facts WHERE document_id = :doc_id"
+                    ),
+                    {"doc_id": doc_id},
+                )).fetchall()
+            ]
 
         # KG node cascade: incident relations recompute MIN(subject, object).
         if atom_orm.atom_type == ATOM_TYPE_KG_NODE:
@@ -342,6 +360,11 @@ class AtomService:
 
         await self.db.commit()
         self.resolver.invalidate_for_atom(atom_id)
+        # Fact atoms inherit the doc's tier; their cached access decisions are
+        # now stale too. (kg_edge atoms have the same latent gap — their cache
+        # isn't invalidated after a kg_node tier change; out of scope here.)
+        for fa in fact_atom_ids:
+            self.resolver.invalidate_for_atom(fa)
 
     # ==========================================================================
     # Read

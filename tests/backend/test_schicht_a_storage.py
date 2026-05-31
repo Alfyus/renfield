@@ -87,8 +87,12 @@ class TestTierCascade:
         # are the cascade UPDATEs we want to inspect.
         first = MagicMock()
         first.scalar_one_or_none = MagicMock(return_value=atom_orm)
+        # 6th execute is the SELECT of fact atom_ids for resolver invalidation;
+        # its .fetchall() must be iterable (empty is fine for this SQL-shape test).
+        fact_ids = MagicMock()
+        fact_ids.fetchall = MagicMock(return_value=[])
         session.execute = AsyncMock(side_effect=[first, AsyncMock(), AsyncMock(),
-                                                 AsyncMock(), AsyncMock()])
+                                                 AsyncMock(), AsyncMock(), fact_ids])
 
         svc = AtomService(session)
         svc.resolver = MagicMock()

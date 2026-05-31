@@ -132,10 +132,12 @@ class TestUpdateTier:
         atom_orm.atom_type = "kb_document"
         atom_orm.source_table = "documents"
         atom_orm.source_id = "99"
-        # kb_document path: SELECT + generic-doc UPDATE + chunks + facts + fact-atoms.
+        # kb_document path: SELECT + generic-doc UPDATE + chunks + facts +
+        # fact-atoms-policy + SELECT fact atom_ids (.fetchall() for invalidation).
+        fact_ids = MagicMock(fetchall=MagicMock(return_value=[]))
         session.execute = AsyncMock(side_effect=[
             MagicMock(scalar_one_or_none=MagicMock(return_value=atom_orm)),
-            MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), fact_ids,
         ])
         svc = AtomService(session, resolver=MagicMock(invalidate_for_atom=MagicMock()))
         await svc.update_tier("atom-x", {"tier": 3})
@@ -162,18 +164,26 @@ class TestUpdateTier:
         atom_orm.atom_type = "kb_document"
         atom_orm.source_table = "documents"
         atom_orm.source_id = "99"
+        fact_atoms_result = MagicMock()
+        fact_atoms_result.fetchall = MagicMock(return_value=[
+            MagicMock(atom_id="fact-atom-1"),
+            MagicMock(atom_id="fact-atom-2"),
+        ])
         session.execute = AsyncMock(side_effect=[
             MagicMock(scalar_one_or_none=MagicMock(return_value=atom_orm)),
             MagicMock(),  # UPDATE documents.circle_tier
             MagicMock(),  # UPDATE document_chunks.circle_tier — cascade
             MagicMock(),  # UPDATE document_facts.circle_tier — Schicht A cascade
             MagicMock(),  # UPDATE atoms.policy for the fact atoms
+            fact_atoms_result,  # SELECT atom_id FROM document_facts (for invalidation)
         ])
-        svc = AtomService(session, resolver=MagicMock(invalidate_for_atom=MagicMock()))
+        resolver = MagicMock(invalidate_for_atom=MagicMock())
+        svc = AtomService(session, resolver=resolver)
         await svc.update_tier("atom-x", {"tier": 3})
 
-        # 5 executes: SELECT atom + UPDATE documents + chunks + facts + fact-atoms.
-        assert session.execute.await_count == 5
+        # 6 executes: SELECT atom + UPDATE documents + chunks + facts + fact-atoms
+        # + SELECT fact atom_ids (for resolver-cache invalidation).
+        assert session.execute.await_count == 6
         cascade_sql = str(session.execute.await_args_list[2].args[0])
         assert "UPDATE document_chunks" in cascade_sql
         assert "document_id = :doc_id" in cascade_sql
@@ -184,7 +194,13 @@ class TestUpdateTier:
         assert "UPDATE document_facts" in facts_sql
         assert "document_id = :doc_id" in facts_sql
         assert session.execute.await_args_list[3].args[1] == {"tier": 3, "doc_id": 99}
+        # The fact-atom-id SELECT for invalidation.
+        select_sql = str(session.execute.await_args_list[5].args[0])
+        assert "SELECT atom_id FROM document_facts" in select_sql
         session.commit.assert_awaited_once()
+        # Resolver cache invalidated for the parent doc atom AND each fact atom.
+        invalidated = {c.args[0] for c in resolver.invalidate_for_atom.call_args_list}
+        assert invalidated == {"atom-x", "fact-atom-1", "fact-atom-2"}
 
     @pytest.mark.asyncio
     @pytest.mark.unit
