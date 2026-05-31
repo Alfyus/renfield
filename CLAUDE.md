@@ -16,6 +16,8 @@ Renfield is a fully offline-capable, self-hosted **digital assistant** — a per
 
 **NIEMALS `git push` ohne explizite Erlaubnis des Benutzers ausfuehren!** Nach jedem Commit fragen: "Soll ich pushen?" Diese Regel gilt auch nach Session-Komprimierung. Details: `/git-workflow` Skill.
 
+**PR-Lifecycle-Gate: Nach `/review`, VOR dem Merge, IMMER ALLE relevanten Dokumentation aktualisieren.** Kein Nachfragen nötig — das ist Pflicht-Schritt, nicht optional. Sweep statt raten: `grep -rliE "<feature-begriffe>" docs/ README.md CLAUDE.md` und jede betroffene Datei anpassen (typischerweise `CLAUDE.md`, `docs/CIRCLES.md`, `docs/SECOND_BRAIN.md`, `docs/FEATURES.md`). Doc-Update als eigener Commit in denselben PR, dann auf explizite Merge-Freigabe warten. Reihenfolge: `/review` → Docs aktualisieren → warten → merge.
+
 ---
 
 ## Development Guidelines
