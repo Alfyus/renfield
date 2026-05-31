@@ -111,7 +111,9 @@ Jedes Subsystem, das Inhalte dem LLM präsentiert, wendet den Circle-Filter an:
 
 | Route | Zweck |
 |---|---|
-| `GET /api/atoms` | Unified Cross-Source-Search (`/brain` Frontend) |
+| `GET /api/atoms` | Unified Cross-Source-Search (`/brain` Frontend); `document_fact` ist eine fusionierte RRF-Quelle (Schicht-A-Fakten erscheinen mit grünem „Fakt"-Badge) |
+| `GET /api/atoms/documents/{id}/facts` | Alle Schicht-A-Fakten eines Dokuments; 404/403 am Eltern-Dokument circle-gated |
+| `GET /api/atoms/obligations` | Verpflichtungen (Rechnungen + Behörden-Fristen), nächste Frist zuerst |
 | `PATCH /api/atoms/{id}` | Tier ändern; cascade auf incidente Relationen |
 | `GET /api/circles/me` | Eigene Circle-Konfiguration laden |
 | `GET /api/circles/me/members` | Mitgliederlisten pro Tier |

@@ -1150,7 +1150,8 @@
       "kb_document": "Dokument",
       "kg_node": "Entität",
       "kg_edge": "Beziehung",
-      "conversation_memory": "Erinnerung"
+      "conversation_memory": "Erinnerung",
+      "document_fact": "Fakt"
     },
     "couldNotLoad": "Konnte Daten nicht laden.",
     "couldNotSave": "Konnte Änderungen nicht speichern.",

@@ -48,12 +48,16 @@ from models.database import (
     AtomExplicitGrant,
     CircleMembership,
     ConversationMemory,
+    Document,
+    DocumentChunk,
     KGEntity,
+    KnowledgeBase,
     Role,
     User,
 )
 from services.circle_sql import (
     conversation_memories_circles_filter,
+    document_chunks_circles_filter,
     kg_entities_circles_filter,
 )
 
@@ -405,3 +409,137 @@ async def test_conversation_memories_clause_no_alias_shadow_on_postgres(
     assert seeded_circle_world["mem_household_id"] in ids, (
         "household member at tier=2 must reach owner's tier=2 memory"
     )
+
+
+# ---------------------------------------------------------------------------
+# CM-1 regression: null-KB documents reach their owner via the atom-owner
+# fallback. Global-RAG / KB-less documents have knowledge_bases.owner_id IS
+# NULL after the LEFT JOIN, so the KB-owner branch can't fire — ownership
+# must come from the document's atoms.owner_user_id instead. This was a
+# latent gap in document_chunks retrieval (2/11 prod docs are null-KB,
+# including the Schicht A doc-44 verification target).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def seeded_document_world(pg_db_session: AsyncSession) -> dict:
+    """Seed an owner with TWO self-tier (tier 0) documents + chunks:
+
+    - a KB-owned document (knowledge_base_id set, kb.owner_id = owner)
+    - a null-KB document (knowledge_base_id IS NULL, owner only on the atom)
+
+    Plus a stranger with no access to either, to prove the atom-owner
+    fallback doesn't leak self-tier null-KB content to non-owners.
+    """
+    role = Role(name="doc-pg-role", description="test", permissions=[])
+    pg_db_session.add(role)
+    await pg_db_session.flush()
+
+    owner = User(username="doc-pg-owner", password_hash="x", is_active=True, role_id=role.id)
+    stranger = User(username="doc-pg-stranger", password_hash="x", is_active=True, role_id=role.id)
+    pg_db_session.add_all([owner, stranger])
+    await pg_db_session.flush()
+
+    kb = KnowledgeBase(name="doc-pg-kb", owner_id=owner.id, default_circle_tier=0)
+    pg_db_session.add(kb)
+    await pg_db_session.flush()
+
+    # Atoms first — documents.atom_id is a FK into atoms. source_id is patched
+    # after the documents flush (we don't know the doc ids yet); it isn't read
+    # by the owner-branch fallback, only by the explicit-grant path.
+    atom_kb_id = "00000000-0000-0000-0000-0000000d0001"
+    atom_null_id = "00000000-0000-0000-0000-0000000d0002"
+    # Distinct placeholder source_ids — uq_atoms_source spans
+    # (atom_type, source_table, source_id), so they must differ before the
+    # real document ids are patched in.
+    atom_kb = Atom(
+        atom_id=atom_kb_id, atom_type="kb_document",
+        source_table="documents", source_id=atom_kb_id,
+        owner_user_id=owner.id, policy={"tier": 0},
+    )
+    atom_null = Atom(
+        atom_id=atom_null_id, atom_type="kb_document",
+        source_table="documents", source_id=atom_null_id,
+        owner_user_id=owner.id, policy={"tier": 0},
+    )
+    pg_db_session.add_all([atom_kb, atom_null])
+    await pg_db_session.flush()
+
+    # KB-owned document (control: visibility comes from kb.owner_id).
+    doc_kb = Document(
+        knowledge_base_id=kb.id, filename="kb.pdf", file_path="/x/kb.pdf",
+        status="completed", circle_tier=0, atom_id=atom_kb_id,
+    )
+    # Null-KB document (the CM-1 case: kb.owner_id is NULL after LEFT JOIN).
+    doc_null = Document(
+        knowledge_base_id=None, filename="null.pdf", file_path="/x/null.pdf",
+        status="completed", circle_tier=0, atom_id=atom_null_id,
+    )
+    pg_db_session.add_all([doc_kb, doc_null])
+    await pg_db_session.flush()
+    atom_kb.source_id = str(doc_kb.id)
+    atom_null.source_id = str(doc_null.id)
+    await pg_db_session.flush()
+
+    chunk_kb = DocumentChunk(
+        document_id=doc_kb.id, content="kb chunk", chunk_index=0, circle_tier=0,
+    )
+    chunk_null = DocumentChunk(
+        document_id=doc_null.id, content="null-kb chunk", chunk_index=0, circle_tier=0,
+    )
+    pg_db_session.add_all([chunk_kb, chunk_null])
+    await pg_db_session.flush()
+
+    return {
+        "owner_id": owner.id,
+        "stranger_id": stranger.id,
+        "chunk_kb_id": chunk_kb.id,
+        "chunk_null_id": chunk_null.id,
+    }
+
+
+async def _run_chunk_clause_for(session: AsyncSession, asker_id: int) -> set[int]:
+    """Execute the document_chunks clause for `asker_id`; return visible chunk IDs."""
+    clause, params = document_chunks_circles_filter(asker_id=asker_id)
+    sql = (
+        "SELECT dc.id FROM document_chunks dc "
+        "JOIN documents d ON dc.document_id = d.id "
+        "LEFT JOIN knowledge_bases kb ON d.knowledge_base_id = kb.id "
+        f"WHERE ({clause})"
+    )
+    result = await session.execute(text(sql), params)
+    return {row.id for row in result.all()}
+
+
+async def test_document_chunks_owner_sees_null_kb_chunk(
+    pg_db_session: AsyncSession,
+    seeded_document_world: dict,
+) -> None:
+    """CM-1: the owner reaches BOTH their KB-owned and their null-KB chunk.
+
+    Before the atom-owner fallback, the null-KB chunk was invisible to its
+    own owner (kb.owner_id IS NULL, tier 0 self → no public/grant/reach
+    path). The fallback `EXISTS(atoms da … owner_user_id=:asker)` restores
+    ownership.
+    """
+    visible = await _run_chunk_clause_for(pg_db_session, seeded_document_world["owner_id"])
+    assert seeded_document_world["chunk_kb_id"] in visible, (
+        "owner must still see their KB-owned chunk (no regression)"
+    )
+    assert seeded_document_world["chunk_null_id"] in visible, (
+        "owner must now see their own null-KB chunk via the atom-owner fallback"
+    )
+
+
+async def test_document_chunks_stranger_sees_neither_self_chunk(
+    pg_db_session: AsyncSession,
+    seeded_document_world: dict,
+) -> None:
+    """The atom-owner fallback must not leak self-tier content to non-owners.
+
+    A stranger owns neither atom and has no tier reach / grant, so both
+    tier-0 chunks stay invisible — the fallback is owner-scoped.
+    """
+    visible = await _run_chunk_clause_for(pg_db_session, seeded_document_world["stranger_id"])
+    assert seeded_document_world["chunk_kb_id"] not in visible
+    assert seeded_document_world["chunk_null_id"] not in visible

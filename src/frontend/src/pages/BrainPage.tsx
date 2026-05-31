@@ -14,6 +14,7 @@ const ATOM_TYPE_COLORS: Record<AtomType, BadgeColor> = {
   kg_node: 'amber',
   kg_edge: 'purple',
   conversation_memory: 'teal',
+  document_fact: 'green',
 };
 
 export default function BrainPage() {

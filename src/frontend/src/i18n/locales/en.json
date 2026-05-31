@@ -1150,7 +1150,8 @@
       "kb_document": "Document",
       "kg_node": "Entity",
       "kg_edge": "Relation",
-      "conversation_memory": "Memory"
+      "conversation_memory": "Memory",
+      "document_fact": "Fact"
     },
     "couldNotLoad": "Could not load data.",
     "couldNotSave": "Could not save changes.",

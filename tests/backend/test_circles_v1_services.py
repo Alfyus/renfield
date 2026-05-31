@@ -38,6 +38,7 @@ from services.atom_types import (
 from services.circle_resolver import PolicyEvaluator
 from services.polymorphic_atom_store import (
     _rrf_merge,
+    _wrap_document_fact_results,
     _wrap_kg_context,
     _wrap_memory_results,
     _wrap_rag_results,
@@ -508,6 +509,65 @@ class TestSourceWrapping:
         assert result[0].atom.atom_id == "atom-5"
         assert result[0].atom.policy == {"tier": 0}
         assert result[0].score == 0.78
+
+    @pytest.mark.unit
+    def test_document_fact_wrapper_handles_exception_input(self):
+        assert _wrap_document_fact_results(RuntimeError("facts down")) == []
+
+    @pytest.mark.unit
+    def test_document_fact_wrapper_handles_empty_input(self):
+        assert _wrap_document_fact_results([]) == []
+        assert _wrap_document_fact_results(None) == []
+
+    @pytest.mark.unit
+    def test_document_fact_wrapper_extracts_fields(self):
+        fact_results = [{
+            "id": 9,
+            "document_id": 44,
+            "atom_id": "fact-atom-9",
+            "category": "obligation",
+            "kind": "zahlung",
+            "value": "Zahlung 120,00 EUR",
+            "normalized_value": None,
+            "excerpt": "… bis zum 10.06.2026 zu zahlen …",
+            "obligation_date": "2026-06-10",
+            "amount_value": 120.0,
+            "amount_currency": "EUR",
+            "legal_gate": False,
+            "payment_method": "manual",
+            "source": "llm",
+            "circle_tier": 2,
+            "similarity": 0.42,
+        }]
+        result = _wrap_document_fact_results(fact_results)
+        assert len(result) == 1
+        m = result[0]
+        assert m.atom.atom_type == "document_fact"
+        assert m.atom.atom_id == "fact-atom-9"          # real atom_id, not synthetic
+        assert m.atom.policy == {"tier": 2}
+        assert m.score == 0.42
+        assert m.rank == 1
+        assert m.snippet == "Zahlung 120,00 EUR"        # value preferred as snippet
+        # Structured payload carried for the /brain UI + obligation surfaces.
+        assert m.atom.payload["obligation_date"] == "2026-06-10"  # ISO preserved
+        assert m.atom.payload["amount_value"] == 120.0
+        assert m.atom.payload["category"] == "obligation"
+
+    @pytest.mark.unit
+    def test_document_fact_wrapper_synthetic_id_when_atom_id_missing(self):
+        result = _wrap_document_fact_results([{"id": 3, "value": "x", "circle_tier": 0}])
+        assert result[0].atom.atom_id == "document_fact:3"
+
+    @pytest.mark.unit
+    def test_document_fact_participates_in_rrf_merge(self):
+        # A fact match fuses with the other sources by atom_id like any source.
+        fact_match = _wrap_document_fact_results(
+            [{"id": 1, "atom_id": "fa-1", "value": "v", "circle_tier": 0, "similarity": 0.5}]
+        )
+        other = [_match("kb-1", 1)]
+        merged = _rrf_merge([fact_match, other], top_k=10)
+        ids = {m.atom.atom_id for m in merged}
+        assert "fa-1" in ids and "kb-1" in ids
 
 
 # =============================================================================

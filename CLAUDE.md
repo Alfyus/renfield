@@ -16,6 +16,8 @@ Renfield is a fully offline-capable, self-hosted **digital assistant** — a per
 
 **NIEMALS `git push` ohne explizite Erlaubnis des Benutzers ausfuehren!** Nach jedem Commit fragen: "Soll ich pushen?" Diese Regel gilt auch nach Session-Komprimierung. Details: `/git-workflow` Skill.
 
+**PR-Lifecycle-Gate: Nach `/review`, VOR dem Merge, IMMER ALLE relevanten Dokumentation aktualisieren.** Kein Nachfragen nötig — das ist Pflicht-Schritt, nicht optional. Sweep statt raten: `grep -rliE "<feature-begriffe>" docs/ README.md CLAUDE.md` und jede betroffene Datei anpassen (typischerweise `CLAUDE.md`, `docs/CIRCLES.md`, `docs/SECOND_BRAIN.md`, `docs/FEATURES.md`). Doc-Update als eigener Commit in denselben PR, dann auf explizite Merge-Freigabe warten. Reihenfolge: `/review` → Docs aktualisieren → warten → merge.
+
 ---
 
 ## Development Guidelines
@@ -139,9 +141,9 @@ Access to any source row = **OWNER** OR **tier == public** OR **explicit grant**
 
 Key tables: `atoms` (polymorphic registry), `circles` (per-user dimension config), `circle_memberships`, `atom_explicit_grants`. Denormalized `circle_tier` + `atom_id` columns on `document_chunks`, `kg_entities`, `kg_relations`, `conversation_memories`.
 
-Key services: `services/circle_resolver.py` (PolicyEvaluator + cache), `services/atom_service.py` (upsert + tier cascade), `services/polymorphic_atom_store.py` (cross-source RRF), `services/kb_shares_service.py` (KB-level share → per-chunk grant explosion), `services/circle_sql.py` (shared filter clause builder).
+Key services: `services/circle_resolver.py` (PolicyEvaluator + cache), `services/atom_service.py` (upsert + tier cascade), `services/polymorphic_atom_store.py` (cross-source RRF), `services/document_fact_retrieval.py` (Schicht A fact reads: keyword FTS + identifier-ILIKE + obligations, circle-filtered), `services/kb_shares_service.py` (KB-level share → per-chunk grant explosion), `services/circle_sql.py` (shared filter clause builder; the document owner-branch has an atom-owner fallback so null-KB / global-RAG docs reach their owner).
 
-Key routes: `/api/atoms` (unified search + edit), `/api/circles/me/*` (settings, members, review queue), `/api/knowledge-graph/circle-tiers` (localized ladder labels), `/api/knowledge-graph/entities/{id}/circle-tier` (tier patch with cascade to incident relations).
+Key routes: `/api/atoms` (unified search + edit; `document_fact` is a fused RRF source so Schicht A facts surface in `/brain` with a green "Fakt" badge), `/api/atoms/documents/{id}/facts` (per-doc facts, 404/403-gated on the parent document), `/api/atoms/obligations` (bills + Behörde deadlines, soonest Frist first), `/api/circles/me/*` (settings, members, review queue), `/api/knowledge-graph/circle-tiers` (localized ladder labels), `/api/knowledge-graph/entities/{id}/circle-tier` (tier patch with cascade to incident relations).
 
 Frontend pages: `/brain` (search), `/brain/review` (owner review queue), `/settings/circles` (members). Shared `TierBadge` + `TierPicker` components use `.tier-badge-{0..4}` utilities from `index.css`.
 
