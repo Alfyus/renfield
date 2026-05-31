@@ -37,13 +37,19 @@ Renfield vs the populated OSS RAG landscape, 2026-04-19:
 | Vector store | pgvector | pluggable | pluggable | own DB | pluggable | parquet |
 | BM25 / FTS | ✓ PG tsvector | — | — | ✓ | via plugins | — |
 | Hybrid (RRF) | ✓ k=60 | vector+graph | vector+graph | yes | pluggable | — |
-| Reranker | ✓ mxbai embedding | ✓ | ✓ | ✓ | ✓ | — |
+| Reranker | disabled (RRF+lexical only)¹ | ✓ | ✓ | ✓ | ✓ | — |
 | Knowledge Graph | flat triples + scope | multimodal KG | ✓ dual-level | ✓ | via plugins | ✓ hierarchical |
 | Multimodal (img/table/math) | caption only | ✓ VLM + LaTeX | text-focus | ✓ tables | OCR agent | — |
 | Contextual retrieval | ✓ (just fixed today) | — | — | — | ✓ | — |
 | Query decomposition / HyDE | — | via LightRAG | ✓ dual | ✓ | **strong suit** | — |
 | Async ingestion worker | **✓ (shipped today)** | batch | depends | ✓ | DIY | batch only |
 | Multi-tenant + RPBAC | **✓ 4 role tiers** | — | basic | ✓ | — | — |
+
+¹ Reranker disabled 2026-05-31 (`RAG_RERANK_ENABLED=false`): the configured
+`mxbai-rerank-base-v1` was never in the Ollama registry (unpullable → always
+404 → silent fallback), and `_rerank` was a bi-encoder cosine pass, not a true
+cross-encoder. RRF + lexical fusion is the ranking. A proper cross-encoder
+reranker is a tracked TODO.
 
 Ahead where it matters: BM25+RRF by default (rare in OSS), scope-based KG RPBAC
 (unique to us), production ops. Behind where it matters: multimodal VLM,
