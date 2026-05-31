@@ -44,6 +44,7 @@ def circles_filter_clause(
     source_table_value: str = "",
     owner_table_alias: str | None = None,
     source_id_expr: str | None = None,
+    owner_atom_id_expr: str | None = None,
 ) -> str:
     """
     Build a parameterized WHERE-clause snippet that enforces circle access.
@@ -85,13 +86,36 @@ def circles_filter_clause(
                            the explicit-grants join. Default: "{table_alias}.id".
                            Override when filtering through a JOIN where the
                            atom row's source_id matches a non-default column.
+        owner_atom_id_expr: SQL expression yielding the atom_id whose
+                           ``atoms.owner_user_id`` is an ALTERNATE owner source.
+                           When set, the owner branch also matches if the asker
+                           owns that atom. Needed for documents whose ownership
+                           is normally read from ``kb.owner_id`` but whose KB is
+                           NULL (global-RAG / null-KB rows) — there ``kb.owner_id``
+                           is NULL so the owner can never reach their own content
+                           via the KB-owner branch. The atom-owner fallback keeps
+                           ownership intact for KB-less documents. (CM-1 fix.)
     """
     owner_alias = owner_table_alias or table_alias
     sid_expr = source_id_expr or f"{table_alias}.id"
 
+    # Owner sees all their own atoms (regardless of tier).
+    owner_branch = f"{owner_alias}.{owner_col} = :{asker_param}"
+    if owner_atom_id_expr:
+        # Fall back to the atom owner when the structural owner column can be
+        # NULL (null-KB documents). `da` is local to this subquery — no clash
+        # with the `a` alias used by the explicit-grant EXISTS below.
+        owner_branch = (
+            f"({owner_branch} "
+            f"OR EXISTS ("
+            f"  SELECT 1 FROM atoms da "
+            f"  WHERE da.atom_id = {owner_atom_id_expr} "
+            f"  AND da.owner_user_id = :{asker_param}"
+            f"))"
+        )
+
     parts = [
-        # Owner sees all their own atoms (regardless of tier).
-        f"{owner_alias}.{owner_col} = :{asker_param}",
+        owner_branch,
         # Public-tier atoms accessible to anyone.
         f"{table_alias}.{tier_col} = :{asker_param}_pub",
     ]
@@ -213,16 +237,20 @@ def document_chunks_circles_filter(
     ``source_table='documents'``, so the explicit-grant EXISTS check must
     match against ``d.id`` (not ``dc.id``). Tier stays on ``dc.circle_tier``
     (denormalized mirror of ``d.circle_tier``) for the hot-path similarity
-    filter. Ownership still comes from ``kb.owner_id`` (documents inherit
-    from KB owner). Callers MUST join knowledge_bases under ``kb_alias``
-    AND documents under ``doc_alias``.
+    filter. Ownership comes from ``kb.owner_id`` (documents inherit from KB
+    owner) WITH a fallback to the document's atom owner: null-KB / global-RAG
+    documents have no ``knowledge_bases`` row, so ``kb.owner_id`` is NULL and
+    the owner could otherwise never reach their own content via ownership
+    (CM-1 fix — uses ``d.atom_id``). Callers MUST join knowledge_bases under
+    ``kb_alias`` (LEFT JOIN, so null-KB docs survive) AND documents under
+    ``doc_alias``.
 
     Example:
         clause, params = document_chunks_circles_filter(asker_id=42)
         sql = '''
             SELECT ... FROM document_chunks dc
             JOIN documents d ON dc.document_id = d.id
-            JOIN knowledge_bases kb ON d.knowledge_base_id = kb.id
+            LEFT JOIN knowledge_bases kb ON d.knowledge_base_id = kb.id
             WHERE ... AND ({clause})
         '''
     """
@@ -234,5 +262,6 @@ def document_chunks_circles_filter(
         source_table_value=src,
         owner_table_alias=kb_alias,
         source_id_expr=f"{doc_alias}.id",
+        owner_atom_id_expr=f"{doc_alias}.atom_id",
     )
     return clause, circles_filter_params(asker_id, source_table_value=src)
