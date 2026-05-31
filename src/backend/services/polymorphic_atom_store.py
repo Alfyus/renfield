@@ -82,6 +82,7 @@ class PolymorphicAtomStore:
         Until Lane C lands, query() returns un-filtered results from each
         source (legacy behavior preserved).
         """
+        from services.document_fact_retrieval import DocumentFactRetrieval
         from services.kg_retrieval import KGRetrieval
         from services.lexical_retrieval import LexicalRetrieval
         from services.memory_retrieval import MemoryRetrieval
@@ -109,6 +110,13 @@ class PolymorphicAtomStore:
         lexical_memories_task = lex.search_memories_lexical(
             query_text, asker_id=asker_id, top_k=candidate_k,
         )
+        # Schicht A document facts — a sixth source so structured facts
+        # (Steuernummer, issuer, obligation) surface in /brain search via the
+        # same RRF fusion. Keyword/identifier retrieval, not vector (facts are
+        # short structured strings; the parent chunk is already embedded).
+        document_fact_task = DocumentFactRetrieval(self.db).search(
+            query_text, asker_id=asker_id, top_k=candidate_k,
+        )
         # Self-learning Phase 1: procedural skills are atoms too — give
         # them a fourth source for the unified /brain search. Gated on
         # skills_enabled so the existing three-source RRF behavior is
@@ -129,10 +137,10 @@ class PolymorphicAtomStore:
         # by the _wrap_* helpers, and any actual programmer error now bubbles to FastAPI.
         (
             rag_results, kg_context, memory_results,
-            lexical_chunks, lexical_memories, skill_results,
+            lexical_chunks, lexical_memories, skill_results, document_fact_results,
         ) = await asyncio.gather(
             rag_task, kg_task, memory_task,
-            lexical_chunks_task, lexical_memories_task, skill_task,
+            lexical_chunks_task, lexical_memories_task, skill_task, document_fact_task,
             return_exceptions=True,
         )
 
@@ -142,12 +150,13 @@ class PolymorphicAtomStore:
         lexical_chunk_matches = _wrap_rag_results(lexical_chunks)
         lexical_memory_matches = _wrap_memory_results(lexical_memories)
         skill_matches = _wrap_skill_results(skill_results)
+        document_fact_matches = _wrap_document_fact_results(document_fact_results)
 
         merged = _rrf_merge(
             [
                 rag_matches, kg_matches, memory_matches,
                 lexical_chunk_matches, lexical_memory_matches,
-                skill_matches,
+                skill_matches, document_fact_matches,
             ],
             top_k=top_k,
             k=settings.rag_hybrid_rrf_k,
@@ -296,6 +305,57 @@ def _wrap_skill_results(skill_results: Any) -> list[AtomMatch]:
                 ),
                 score=float(s.get("similarity", 0.0)),
                 snippet=body[:200],
+                rank=rank,
+            )
+        )
+    return matches
+
+
+def _wrap_document_fact_results(fact_results: Any) -> list[AtomMatch]:
+    """Convert DocumentFactRetrieval.search output -> list[AtomMatch].
+
+    Each fact already carries its real ``atom_id`` (the document_fact atom),
+    so duplicates across sources fuse correctly in RRF. The snippet prefers the
+    fact ``value`` (the headline — a Steuernummer, issuer, summary) and falls
+    back to the excerpt. The payload carries the structured fields the /brain
+    UI and any obligation surface need (obligation_date ISO, amount, legal_gate,
+    source). Exceptions / empty -> [] (gather resilience).
+    """
+    if isinstance(fact_results, Exception) or not fact_results:
+        return []
+    matches: list[AtomMatch] = []
+    now = _now()
+    for rank, f in enumerate(fact_results, start=1):
+        atom_id = f.get("atom_id") or f"document_fact:{f.get('id', 0)}"
+        value = f.get("value") or ""
+        snippet = value or (f.get("excerpt") or "")
+        matches.append(
+            AtomMatch(
+                atom=Atom(
+                    atom_id=str(atom_id),
+                    atom_type="document_fact",
+                    owner_user_id=0,  # not exposed by search; not needed downstream
+                    policy={"tier": f.get("circle_tier", 0)},
+                    created_at=now,
+                    updated_at=now,
+                    payload={
+                        "fact_id": f.get("id"),
+                        "document_id": f.get("document_id"),
+                        "category": f.get("category"),
+                        "kind": f.get("kind"),
+                        "value": value,
+                        "normalized_value": f.get("normalized_value"),
+                        "excerpt": f.get("excerpt"),
+                        "obligation_date": f.get("obligation_date"),
+                        "amount_value": f.get("amount_value"),
+                        "amount_currency": f.get("amount_currency"),
+                        "legal_gate": f.get("legal_gate", False),
+                        "payment_method": f.get("payment_method"),
+                        "source": f.get("source"),
+                    },
+                ),
+                score=float(f.get("similarity", 0.0)),
+                snippet=snippet[:200],
                 rank=rank,
             )
         )
