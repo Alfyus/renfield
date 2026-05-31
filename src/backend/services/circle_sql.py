@@ -265,3 +265,44 @@ def document_chunks_circles_filter(
         owner_atom_id_expr=f"{doc_alias}.atom_id",
     )
     return clause, circles_filter_params(asker_id, source_table_value=src)
+
+
+def document_facts_circles_filter(
+    asker_id: int,
+    *,
+    fact_alias: str = "df",
+    doc_alias: str = "d",
+    kb_alias: str = "kb",
+) -> tuple[str, dict[str, Any]]:
+    """
+    Returns (clause, params) for circle-filtering ``document_facts``.
+
+    A Schicht A fact inherits the access policy of its parent Document — the
+    same access unit as ``document_chunks``. ``atom_explicit_grants`` hang on
+    the ``atoms`` row with ``source_table='documents'`` and ``source_id=d.id``;
+    ownership comes from ``kb.owner_id`` with the null-KB atom-owner fallback
+    (``d.atom_id`` → ``atoms.owner_user_id``, CM-1). Tier comes from the
+    denormalized ``df.circle_tier`` (mirrored from the parent doc). Callers
+    MUST join documents under ``doc_alias`` and LEFT JOIN knowledge_bases
+    under ``kb_alias`` (LEFT so null-KB facts survive the join).
+
+    Example:
+        clause, params = document_facts_circles_filter(asker_id=42)
+        sql = '''
+            SELECT ... FROM document_facts df
+            JOIN documents d ON df.document_id = d.id
+            LEFT JOIN knowledge_bases kb ON d.knowledge_base_id = kb.id
+            WHERE ... AND ({clause})
+        '''
+    """
+    src = "documents"
+    clause = circles_filter_clause(
+        table_alias=fact_alias,
+        owner_col="owner_id",
+        tier_col="circle_tier",
+        source_table_value=src,
+        owner_table_alias=kb_alias,
+        source_id_expr=f"{doc_alias}.id",
+        owner_atom_id_expr=f"{doc_alias}.atom_id",
+    )
+    return clause, circles_filter_params(asker_id, source_table_value=src)
