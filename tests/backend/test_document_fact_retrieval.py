@@ -65,6 +65,12 @@ class TestIdentifierTokens:
     def test_surrounding_punctuation_stripped(self):
         assert _identifier_tokens("(114/5876/5293)") == ["114/5876/5293"]
 
+    def test_all_punctuation_token_dropped(self):
+        # An all-slash run survives the digit/'/' trigger and the length gate,
+        # but has no alphanumeric char — it must not build a no-op ILIKE.
+        assert _identifier_tokens("//////") == []
+        assert _identifier_tokens("Pos //////  -.-") == []
+
 
 class _FakeResult:
     def fetchall(self):
@@ -100,6 +106,35 @@ class TestPostgresIlikeGating:
         assert "ILIKE" in sql
         assert any(k.startswith("ident_") for k in params)
         assert params["ident_0"] == "%114/5876/5293%"
+
+
+class _RaisingDb:
+    """Async db stub whose execute() always raises a given exception."""
+
+    def __init__(self, exc: Exception):
+        self.bind = MagicMock()
+        self.bind.dialect.name = "postgresql"
+        self._exc = exc
+
+    async def execute(self, sql, params):
+        raise self._exc
+
+
+@pytest.mark.asyncio
+class TestFetchErrorHandling:
+    """A broken-DB / unapplied-migration error must NOT be masked as an empty
+    corpus (F1) — operational errors re-raise; input errors swallow to []."""
+
+    async def test_operational_error_propagates(self):
+        from sqlalchemy.exc import ProgrammingError
+        db = _RaisingDb(ProgrammingError("stmt", {}, Exception("column search_vector does not exist")))
+        with pytest.raises(ProgrammingError):
+            await DocumentFactRetrieval(db).search("Finanzamt", asker_id=None, top_k=10)
+
+    async def test_input_shaped_error_swallowed_to_empty(self):
+        db = _RaisingDb(ValueError("malformed something"))
+        r = await DocumentFactRetrieval(db).search("Finanzamt", asker_id=None, top_k=10)
+        assert r == []
 
 
 # =========================================================================== #
@@ -195,13 +230,17 @@ class TestSearchFTS:
         assert [f["id"] for f in r] == [fid]
         assert r[0]["similarity"] > 0  # real ts_rank score
 
-    async def test_identifier_matches_via_ilike_when_fts_cannot(
+    async def test_identifier_query_matches_via_normalized_value(
         self, pg_db_session, df_fts_installed,
     ):
-        """The poppler letter-spacing scar: the verbatim value is space-split
-        so its tsvector can't match the compact query, but normalized_value is
-        collapsed — only the identifier-ILIKE branch finds it. Proves the
-        branch is load-bearing, not redundant with FTS.
+        """An identifier query finds a fact through its collapsed
+        normalized_value, even when the verbatim value is poppler-letter-spaced.
+
+        (The match may land via FTS-on-normalized OR the identifier-ILIKE
+        branch — the GENERATED search_vector indexes normalized_value too, so we
+        can't deterministically isolate ILIKE here; the ILIKE branch is
+        defense-in-depth for query/index tokenizer mismatch and is unit-gated in
+        TestPostgresIlikeGating. This asserts the user-visible outcome.)
         """
         doc = await _mk_doc(pg_db_session)
         fid = await _mk_fact(
@@ -213,6 +252,28 @@ class TestSearchFTS:
             "114/5876/5293", asker_id=None, top_k=10,
         )
         assert [f["id"] for f in r] == [fid]
+
+    async def test_combined_prose_and_identifier_query_matches_both(
+        self, pg_db_session, df_fts_installed,
+    ):
+        """A query carrying BOTH a prose token and an identifier token exercises
+        the OR-of-branches + GREATEST(rank...) path: a prose-only fact and an
+        identifier fact both come back from one query.
+        """
+        doc = await _mk_doc(pg_db_session)
+        prose_id = await _mk_fact(
+            pg_db_session, doc_id=doc, category="universal", kind="issuer",
+            value="Finanzverwaltung NRW",
+            excerpt="… das Finanzamt Finanzverwaltung NRW …",
+        )
+        ident_id = await _mk_fact(
+            pg_db_session, doc_id=doc, category="identifier", kind="steuernummer",
+            value="999/8888/7777", normalized_value="999/8888/7777",
+        )
+        r = await DocumentFactRetrieval(pg_db_session).search(
+            "Finanzamt 999/8888/7777", asker_id=None, top_k=10,
+        )
+        assert {f["id"] for f in r} == {prose_id, ident_id}
 
     async def test_no_match_returns_empty(self, pg_db_session, df_fts_installed):
         doc = await _mk_doc(pg_db_session)
@@ -332,3 +393,30 @@ class TestCircleFilterGate:
                        value="PublicFact", tier=TIER_PUBLIC)
         r = await DocumentFactRetrieval(pg_db_session).facts_for_document(d1, asker_id=None)
         assert {f["value"] for f in r} == {"PublicFact"}
+
+    async def test_authed_non_owner_denied_self_tier_fact(
+        self, pg_db_session, df_fts_installed, monkeypatch,
+    ):
+        """Defense-in-depth: the document_facts_circles_filter SQL itself denies
+        a real second authed user (no membership, no grant) a tier-0 fact —
+        through BOTH facts_for_document and search, not just the route gate.
+        """
+        monkeypatch.setattr(settings, "auth_enabled", True)
+        # Second user, distinct from the fixture's _owner.
+        role = Role(name="df-outsider-role", description="t", permissions=[])
+        pg_db_session.add(role)
+        await pg_db_session.flush()
+        outsider = User(username="df-outsider", password_hash="x", is_active=True, role_id=role.id)
+        pg_db_session.add(outsider)
+        await pg_db_session.flush()
+
+        d1 = await _mk_doc(pg_db_session)
+        await _mk_fact(pg_db_session, doc_id=d1, category="universal", kind="issuer",
+                       value="OwnerSecret", tier=0)
+
+        assert await DocumentFactRetrieval(pg_db_session).facts_for_document(
+            d1, asker_id=outsider.id,
+        ) == []
+        assert await DocumentFactRetrieval(pg_db_session).search(
+            "OwnerSecret", asker_id=outsider.id, top_k=10,
+        ) == []

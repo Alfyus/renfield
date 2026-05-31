@@ -30,6 +30,7 @@ from typing import Any
 
 from loguru import logger
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.database import TIER_PUBLIC
@@ -64,7 +65,9 @@ def _identifier_tokens(query: str) -> list[str]:
     for tok in (query or "").split():
         if any(c.isdigit() for c in tok) or "/" in tok:
             cleaned = re.sub(r"[^0-9A-Za-zÄÖÜäöüß/.\-]", "", tok)
-            if len(cleaned) >= 3:
+            # Require an alphanumeric char so all-punctuation runs ("//////")
+            # don't survive the length gate and build a no-op ILIKE.
+            if len(cleaned) >= 3 and any(c.isalnum() for c in cleaned):
                 out.append(cleaned)
     return out
 
@@ -137,6 +140,26 @@ class DocumentFactRetrieval:
             and self.db.bind.dialect.name == "postgresql"
         )
 
+    async def _fetch(self, sql: Any, params: dict[str, Any], label: str) -> list[Any]:
+        """Execute + fetchall, distinguishing operational from input failures.
+
+        Operational/structural errors (DB down, a column missing because the
+        migration lagged a rolling deploy) must NOT be masked as an empty
+        corpus — that makes a dark feature indistinguishable from "factless".
+        We log them at ERROR and re-raise: the routes surface a 500 (correct
+        outage signal) and the /brain RRF gather degrades just this one source
+        while the ERROR log keeps the failure visible. Other (input-shaped)
+        errors stay swallowed → [] so a single bad query can't take /brain down.
+        """
+        try:
+            return (await self.db.execute(sql, params)).fetchall()
+        except (OperationalError, ProgrammingError):
+            logger.error(f"🔍 {label}: operational DB error — re-raising (not masking as empty)")
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"🔍 {label} failed (ignored): {e}")
+            return []
+
     # ------------------------------------------------------------------ #
     # search — FTS ∪ identifier-ILIKE
     # ------------------------------------------------------------------ #
@@ -206,11 +229,7 @@ class DocumentFactRetrieval:
             LIMIT :limit
         """)
 
-        try:
-            rows = (await self.db.execute(sql, params)).fetchall()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"🔍 Document-fact search failed (ignored): {e}")
-            return []
+        rows = await self._fetch(sql, params, "Document-fact search")
         return [_row_to_dict(r, rank=r.rank) for r in rows]
 
     async def _search_sqlite(
@@ -256,11 +275,7 @@ class DocumentFactRetrieval:
             ORDER BY rank DESC, df.id DESC
             LIMIT :limit
         """)
-        try:
-            rows = (await self.db.execute(sql, params)).fetchall()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"🔍 Document-fact sqlite search failed (ignored): {e}")
-            return []
+        rows = await self._fetch(sql, params, "Document-fact sqlite search")
         return [_row_to_dict(r, rank=r.rank) for r in rows]
 
     # ------------------------------------------------------------------ #
@@ -289,11 +304,7 @@ class DocumentFactRetrieval:
               AND {circles_clause}
             ORDER BY df.category, df.kind, df.id
         """)
-        try:
-            rows = (await self.db.execute(sql, params)).fetchall()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"🔍 facts_for_document failed (ignored): {e}")
-            return []
+        rows = await self._fetch(sql, params, "facts_for_document")
         return [_row_to_dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
@@ -331,9 +342,5 @@ class DocumentFactRetrieval:
             ORDER BY df.obligation_date ASC, df.id
             LIMIT :limit
         """)
-        try:
-            rows = (await self.db.execute(sql, params)).fetchall()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"🔍 obligations query failed (ignored): {e}")
-            return []
+        rows = await self._fetch(sql, params, "obligations")
         return [_row_to_dict(r) for r in rows]
