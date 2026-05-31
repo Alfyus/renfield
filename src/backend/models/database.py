@@ -1778,6 +1778,16 @@ class DocumentFact(Base):
     circle_tier = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=_utcnow)
 
+    # Full-text search vector. Post-<id>_document_facts_fts this is a Postgres
+    # GENERATED STORED column that unions to_tsvector across all FTS_LANGUAGES
+    # over `value || normalized_value || excerpt || kind` — the lookup surface
+    # for DocumentFactRetrieval.search(). READ-ONLY from the app: Postgres
+    # rejects any INSERT/UPDATE that supplies a value. The FetchedValue()
+    # marker keeps the column out of ORM INSERTs/UPDATEs (same pattern as
+    # DocumentChunk / ConversationMemory). Sqlite test runs get a plain
+    # nullable column; the GENERATED DDL lives only in the migration.
+    search_vector = Column(TSVECTOR, FetchedValue(), nullable=True)
+
     __table_args__ = (
         Index("idx_document_facts_doc_category", "document_id", "category"),
         Index("idx_document_facts_doc_tier", "document_id", "circle_tier"),
