@@ -5,7 +5,12 @@ import { useApiQuery, useApiMutation } from '../hooks';
 import { keys, STALE } from '../keys';
 import type { CircleTier } from '../../components/TierBadge';
 
-export type AtomType = 'kb_document' | 'kg_node' | 'kg_edge' | 'conversation_memory';
+export type AtomType =
+  | 'kb_document'
+  | 'kg_node'
+  | 'kg_edge'
+  | 'conversation_memory'
+  | 'document_fact';
 
 export interface AtomMatch {
   atom: {
