@@ -336,6 +336,11 @@ class Settings(BaseSettings):
     # the obligation/alert layer that consumes these facts isn't wired yet.
     schicht_a_extraction_enabled: bool = False
     schicht_a_extraction_model: str = ""             # empty => ollama_chat_model || ollama_model
+    # Output-token budget for the obligation/universal LLM pass. 1200 truncated
+    # the JSON on content-rich docs (e.g. multi-line-item invoices) → unparseable
+    # → all LLM facts silently lost (doc 43: 0 instead of 14). 4096 fits realistic
+    # household docs; the parser also salvages a truncated tail as defense-in-depth.
+    schicht_a_extraction_num_predict: int = 4096
 
     # Conversation Memory (Long-term)
     memory_enabled: bool = False                                             # Opt-in

@@ -33,6 +33,8 @@ from services.schicht_a_extractor import (  # noqa: E402
     _facts_from_payload,
     _parse_amount,
     _parse_date,
+    _parse_llm_json,
+    _salvage_truncated_json,
     extract_identifiers,
     normalize_field_text,
 )
@@ -250,3 +252,50 @@ class TestExtract:
         result = await SchichtAExtractor(llm_client=client).extract("   ", lang="de")
         assert result.facts == []
         client.chat.assert_not_called()
+
+
+# ===================================================== truncated-JSON salvage
+class TestSalvageTruncatedJson:
+    """num_predict truncation cut the LLM JSON mid-object → strict parse failed
+    → the whole batch was discarded (doc 43 lost all 14 facts). The salvage
+    recovers the complete leading entries instead."""
+
+    # Mirrors the real doc-43 failure: two complete obligations, then a third
+    # cut off mid-value with an unterminated string (the token cap hit).
+    TRUNCATED = (
+        '{\n  "obligations": [\n'
+        '    {"kind": "zahlung", "date": "2024-11-15", '
+        '"amount": {"value": 33.82, "currency": "EUR"}},\n'
+        '    {"kind": "abschlag", "date": "2024-12-01", '
+        '"amount": {"value": 51.0, "currency": "EUR"}},\n'
+        '    {"kind": "zahlung", "date": "2025-10-15", "amount": {"value": 51.0, '
+        '"excerpt": "15.05.2025, 5 = 15.10'
+    )
+
+    def test_strict_parse_fails_on_truncation(self):
+        import json
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(self.TRUNCATED)
+
+    def test_salvage_recovers_complete_entries(self):
+        payload = _salvage_truncated_json(self.TRUNCATED)
+        assert payload is not None
+        # The two complete obligations survive; the half-written third is dropped.
+        obs = payload["obligations"]
+        assert len(obs) == 2
+        assert obs[0]["kind"] == "zahlung" and obs[0]["amount"]["value"] == 33.82
+        assert obs[1]["kind"] == "abschlag"
+
+    def test_parse_llm_json_uses_salvage(self):
+        payload = _parse_llm_json(self.TRUNCATED)
+        assert payload is not None
+        facts = _facts_from_payload(payload)
+        assert len(facts) >= 2  # both complete obligations became facts
+
+    def test_complete_json_unaffected(self):
+        good = '{"obligations": [{"kind": "zahlung", "date": "2024-11-15"}], "universal_facts": {}}'
+        assert _parse_llm_json(good)["obligations"][0]["kind"] == "zahlung"
+
+    def test_garbage_returns_none(self):
+        assert _salvage_truncated_json("not json at all") is None
+        assert _parse_llm_json("not json at all") is None

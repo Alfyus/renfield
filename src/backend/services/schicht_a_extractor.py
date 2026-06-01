@@ -245,7 +245,10 @@ class SchichtAExtractor:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            options={"temperature": 0.1, "num_predict": 1200},
+            options={
+                "temperature": 0.1,
+                "num_predict": settings.schicht_a_extraction_num_predict,
+            },
             **classification_kwargs,
         )
         raw = extract_response_content(response) or ""
@@ -328,7 +331,13 @@ def _facts_from_payload(payload: dict) -> list[ExtractedFact]:
 
 def _parse_llm_json(raw: str) -> dict | None:
     """Parse an LLM response to a dict; tolerate markdown fences + surrounding
-    prose. Returns None if nothing parseable (caller treats as failure)."""
+    prose. Returns None if nothing parseable (caller treats as failure).
+
+    Defense-in-depth: if the strict parse fails — overwhelmingly because the
+    response was truncated at the token cap mid-JSON (unbalanced braces / an
+    unterminated string) — fall back to ``_salvage_truncated_json`` so the
+    complete leading entries survive instead of discarding the whole batch
+    (the old behavior, which cost doc 43 all 14 of its facts)."""
     if not raw:
         return None
     text = raw.strip()
@@ -339,11 +348,88 @@ def _parse_llm_json(raw: str) -> dict | None:
         if text.endswith("```"):
             text = text[:-3]
         text = text.strip()
-    first, last = text.find("{"), text.rfind("}")
-    if first < 0 or last <= first:
+    first = text.find("{")
+    if first < 0:
         return None
+    body = text[first:]
+    last = body.rfind("}")
+    if last > 0:
+        try:
+            parsed = json.loads(body[:last + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    salvaged = _salvage_truncated_json(body)
+    if salvaged is not None:
+        logger.warning(
+            "Schicht A: LLM JSON unparseable (likely truncated at the token "
+            "cap) — salvaged %d complete obligation(s) from the partial payload",
+            len(salvaged.get("obligations") or []),
+        )
+    return salvaged
+
+
+def _salvage_truncated_json(s: str) -> dict | None:
+    """Best-effort recovery of a truncated JSON object.
+
+    Scan with a bracket stack; remember the last position that sits on a clean
+    boundary (just after a complete nested container, or between array
+    elements); cut there, drop the half-written trailing entry, and append the
+    missing closers. Returns a dict or None. Cuts only at array-element / nested-
+    container boundaries (never mid-object-field), so recovered entries are
+    structurally whole; ``_facts_from_payload`` tolerates any that still lack
+    optional fields."""
+    if not s or s[0] != "{":
+        return None
+    stack: list[str] = []
+    in_str = esc = False
+    cut: int | None = None
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+            if stack:  # closed a nested container, parent still open → clean cut
+                cut = i + 1
+        elif ch == "," and stack and stack[-1] == "[":  # between array elements
+            cut = i
+    if cut is None:
+        return None
+    candidate = s[:cut]
+    # Recompute the still-open containers for the candidate and close them.
+    st: list[str] = []
+    in_str = esc = False
+    for ch in candidate:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            st.append(ch)
+        elif ch in "}]":
+            if st:
+                st.pop()
+    closers = "".join("}" if c == "{" else "]" for c in reversed(st))
     try:
-        parsed = json.loads(text[first:last + 1])
+        parsed = json.loads(candidate + closers)
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
