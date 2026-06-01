@@ -373,13 +373,17 @@ def _parse_llm_json(raw: str) -> dict | None:
 def _salvage_truncated_json(s: str) -> dict | None:
     """Best-effort recovery of a truncated JSON object.
 
-    Scan with a bracket stack; remember the last position that sits on a clean
-    boundary (just after a complete nested container, or between array
-    elements); cut there, drop the half-written trailing entry, and append the
-    missing closers. Returns a dict or None. Cuts only at array-element / nested-
-    container boundaries (never mid-object-field), so recovered entries are
-    structurally whole; ``_facts_from_payload`` tolerates any that still lack
-    optional fields."""
+    Scan with a bracket stack; remember the last position just after a complete
+    nested container closes (parent still open); cut there, drop the half-written
+    trailing entry, and append the missing closers. Returns a dict or None.
+
+    The cut point is ONLY a container-close boundary — never a comma. Cutting at
+    a comma would land inside a truncated *nested* array (e.g. ``"items":[10,20``)
+    and force-close it as if complete, emitting a plausible-but-wrong value. The
+    close-only rule guarantees the recovered prefix ends at a structurally AND
+    semantically complete element; ``_facts_from_payload`` tolerates any that
+    still lack optional fields. (A truncated first element therefore recovers
+    nothing — accepted: better None than corrupt.)"""
     if not s or s[0] != "{":
         return None
     stack: list[str] = []
@@ -403,8 +407,6 @@ def _salvage_truncated_json(s: str) -> dict | None:
                 stack.pop()
             if stack:  # closed a nested container, parent still open → clean cut
                 cut = i + 1
-        elif ch == "," and stack and stack[-1] == "[":  # between array elements
-            cut = i
     if cut is None:
         return None
     candidate = s[:cut]

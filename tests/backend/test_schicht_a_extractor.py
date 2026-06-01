@@ -299,3 +299,36 @@ class TestSalvageTruncatedJson:
     def test_garbage_returns_none(self):
         assert _salvage_truncated_json("not json at all") is None
         assert _parse_llm_json("not json at all") is None
+
+    def test_truncated_nested_array_drops_element_not_completes_it(self):
+        """/review finding 4: cutting at a comma inside a truncated nested array
+        would present it as complete (e.g. [10,20,30,40<cut> → [10,20,30]) — a
+        plausible-but-wrong value. The close-only cut rule must DROP the element
+        with the truncated array, not silently complete it."""
+        s = (
+            '{"obligations": ['
+            '{"kind": "a", "date": "2024-01-01"}, '
+            '{"kind": "b", "items": [10, 20, 30, 40'
+        )
+        payload = _salvage_truncated_json(s)
+        assert payload is not None
+        obs = payload["obligations"]
+        assert len(obs) == 1          # only the fully-complete first element
+        assert obs[0]["kind"] == "a"
+        assert all("items" not in o for o in obs)  # no half-array smuggled in
+
+    @pytest.mark.parametrize("bad", [
+        "{",
+        "}}}}",
+        '{"x": "ends with backslash \\',     # unterminated string + trailing escape
+        '{"obligations": "not a list"',       # wrong-typed, truncated
+        '{"obligations": [{"kind": "trunc',   # first element incomplete → None
+        "",
+    ])
+    def test_no_crash_on_adversarial_input(self, bad):
+        """Untrusted LLM text must never raise — returns None or a dict, and a
+        returned dict must survive _facts_from_payload."""
+        out = _salvage_truncated_json(bad)
+        assert out is None or isinstance(out, dict)
+        if isinstance(out, dict):
+            _facts_from_payload(out)  # must not raise
