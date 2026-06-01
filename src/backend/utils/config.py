@@ -336,6 +336,15 @@ class Settings(BaseSettings):
     # the obligation/alert layer that consumes these facts isn't wired yet.
     schicht_a_extraction_enabled: bool = False
     schicht_a_extraction_model: str = ""             # empty => ollama_chat_model || ollama_model
+    # Output-token cap for the obligation/universal LLM pass. The old fixed 1200
+    # cap (→ OpenAI max_tokens) silently truncated rich docs' JSON → unparseable
+    # → all LLM facts lost (doc 43: 1 vs 14). Output size tracks fact DENSITY, not
+    # doc size, so no fixed cap is safe. 0 = no cap: let the model generate to
+    # completion, bounded by the server context (verified: the densest real doc,
+    # an invoice, completes at ~3.2k chars well within context). Set >0 only to
+    # deliberately bound a misbehaving model. The parser also salvages a truncated
+    # tail as defense-in-depth.
+    schicht_a_extraction_num_predict: int = 0
 
     # Conversation Memory (Long-term)
     memory_enabled: bool = False                                             # Opt-in

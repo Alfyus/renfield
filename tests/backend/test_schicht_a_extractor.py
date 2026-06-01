@@ -33,6 +33,8 @@ from services.schicht_a_extractor import (  # noqa: E402
     _facts_from_payload,
     _parse_amount,
     _parse_date,
+    _parse_llm_json,
+    _salvage_truncated_json,
     extract_identifiers,
     normalize_field_text,
 )
@@ -250,3 +252,90 @@ class TestExtract:
         result = await SchichtAExtractor(llm_client=client).extract("   ", lang="de")
         assert result.facts == []
         client.chat.assert_not_called()
+
+
+# ===================================================== truncated-JSON salvage
+class TestSalvageTruncatedJson:
+    """num_predict truncation cut the LLM JSON mid-object → strict parse failed
+    → the whole batch was discarded (doc 43 lost all 14 facts). The salvage
+    recovers the complete leading entries instead."""
+
+    # Mirrors the real doc-43 failure: two complete obligations, then a third
+    # cut off mid-value with an unterminated string (the token cap hit).
+    TRUNCATED = (
+        '{\n  "obligations": [\n'
+        '    {"kind": "zahlung", "date": "2024-11-15", '
+        '"amount": {"value": 33.82, "currency": "EUR"}},\n'
+        '    {"kind": "abschlag", "date": "2024-12-01", '
+        '"amount": {"value": 51.0, "currency": "EUR"}},\n'
+        '    {"kind": "zahlung", "date": "2025-10-15", "amount": {"value": 51.0, '
+        '"excerpt": "15.05.2025, 5 = 15.10'
+    )
+
+    def test_strict_parse_fails_on_truncation(self):
+        import json
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(self.TRUNCATED)
+
+    def test_salvage_recovers_complete_entries(self):
+        payload = _salvage_truncated_json(self.TRUNCATED)
+        assert payload is not None
+        # The two complete obligations survive; the half-written third is dropped.
+        obs = payload["obligations"]
+        assert len(obs) == 2
+        assert obs[0]["kind"] == "zahlung" and obs[0]["amount"]["value"] == 33.82
+        assert obs[1]["kind"] == "abschlag"
+
+    def test_parse_llm_json_uses_salvage(self):
+        payload = _parse_llm_json(self.TRUNCATED)
+        assert payload is not None
+        facts = _facts_from_payload(payload)
+        assert len(facts) >= 2  # both complete obligations became facts
+
+    def test_complete_json_unaffected(self):
+        good = '{"obligations": [{"kind": "zahlung", "date": "2024-11-15"}], "universal_facts": {}}'
+        assert _parse_llm_json(good)["obligations"][0]["kind"] == "zahlung"
+
+    def test_garbage_returns_none(self):
+        assert _salvage_truncated_json("not json at all") is None
+        assert _parse_llm_json("not json at all") is None
+
+    def test_truncated_nested_array_drops_element_not_completes_it(self):
+        """/review finding 4: cutting at a comma inside a truncated nested array
+        would present it as complete (e.g. [10,20,30,40<cut> → [10,20,30]) — a
+        plausible-but-wrong value. The close-only cut rule must DROP the element
+        with the truncated array, not silently complete it."""
+        s = (
+            '{"obligations": ['
+            '{"kind": "a", "date": "2024-01-01"}, '
+            '{"kind": "b", "items": [10, 20, 30, 40'
+        )
+        payload = _salvage_truncated_json(s)
+        assert payload is not None
+        obs = payload["obligations"]
+        assert len(obs) == 1          # only the fully-complete first element
+        assert obs[0]["kind"] == "a"
+        assert all("items" not in o for o in obs)  # no half-array smuggled in
+
+    def test_top_level_array_comma_cut_still_recovers_scalars(self):
+        """The comma branch is KEPT (not dropped) but depth-gated: it still
+        recovers complete scalars from a truncated OUTERMOST array — the case
+        the container-close rule alone can't handle (scalars don't bracket-close).
+        Proves we didn't take the shortcut of removing the branch."""
+        assert _salvage_truncated_json('{"vals": [1, 2, 3, 4') == {"vals": [1, 2, 3]}
+
+    @pytest.mark.parametrize("bad", [
+        "{",
+        "}}}}",
+        '{"x": "ends with backslash \\',     # unterminated string + trailing escape
+        '{"obligations": "not a list"',       # wrong-typed, truncated
+        '{"obligations": [{"kind": "trunc',   # first element incomplete → None
+        "",
+    ])
+    def test_no_crash_on_adversarial_input(self, bad):
+        """Untrusted LLM text must never raise — returns None or a dict, and a
+        returned dict must survive _facts_from_payload."""
+        out = _salvage_truncated_json(bad)
+        assert out is None or isinstance(out, dict)
+        if isinstance(out, dict):
+            _facts_from_payload(out)  # must not raise
