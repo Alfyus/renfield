@@ -660,6 +660,28 @@ async def reindex_document(
             if kb and not await check_kb_access(kb, user, "write", db):
                 raise HTTPException(status_code=403, detail="No write access to this document")
 
+    # Dedupe in-flight reindexes (/review finding): a double-click would enqueue
+    # a second user_reindex, and the worker would purge+rebuild twice — a wasted
+    # OCR pass and a second window where the doc has 0 chunks. If a reindex/ingest
+    # is already queued or running, return the in-flight doc so the client just
+    # tracks the existing run instead of starting another.
+    if doc.status in ("pending", "processing"):
+        response.status_code = 202
+        return DocumentResponse(
+            id=doc.id,
+            filename=doc.filename,
+            title=doc.title,
+            file_type=doc.file_type,
+            file_size=doc.file_size,
+            status=doc.status,
+            error_message=doc.error_message,
+            chunk_count=doc.chunk_count or 0,
+            page_count=doc.page_count,
+            knowledge_base_id=doc.knowledge_base_id,
+            created_at=doc.created_at.isoformat() if doc.created_at else "",
+            processed_at=doc.processed_at.isoformat() if doc.processed_at else None,
+        )
+
     if not await _worker_is_alive():
         raise HTTPException(
             status_code=503,
