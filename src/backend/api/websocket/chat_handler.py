@@ -1339,6 +1339,19 @@ async def websocket_endpoint(
                         server_filter=role.mcp_servers,
                         internal_filter=role.internal_tools,
                     )
+                    # Per-request tool filtering seam (mirrors pre_sub_agent for
+                    # the orchestrator path). Lets a plugin restrict the tool set
+                    # using the classified role + sub_intent before the agent
+                    # loop — e.g. deterministic sub-intent → tool-set filtering.
+                    # run_hooks swallows handler errors, so a faulty filter just
+                    # leaves the registry unfiltered.
+                    from utils.hooks import run_hooks
+                    await run_hooks(
+                        "filter_agent_tools",
+                        registry=tool_registry,
+                        role=role,
+                        message=content,
+                    )
                     agent = AgentService(tool_registry, role=role)
                     executor = ActionExecutor(mcp_manager=mcp_manager, session_id=msg_session_id)
 

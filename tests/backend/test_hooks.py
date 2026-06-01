@@ -49,6 +49,7 @@ def test_uplift_events_are_registerable():
         "pre_sub_agent",
         "post_sub_agent",
         "check_output",
+        "filter_agent_tools",
     }
     missing = uplift_events - HOOK_EVENTS
     assert not missing, (
@@ -57,6 +58,59 @@ def test_uplift_events_are_registerable():
     )
     for event in uplift_events:
         register_hook(event, AsyncMock())  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_filter_agent_tools_hook_can_narrow_registry():
+    """A plugin handler on `filter_agent_tools` may mutate the registry in place.
+
+    Mirrors the chat_handler call site: fired with `registry`, `role`, `message`
+    after AgentToolRegistry.create() and before the agent loop. Return value is
+    ignored; the handler restricts the tool set by mutating `registry._tools`.
+    """
+
+    class _Registry:
+        def __init__(self, names):
+            self._tools = {n: object() for n in names}
+
+    registry = _Registry(["a", "b", "c", "d"])
+    role = MagicMock()
+    role.name = "release"
+    role.sub_intent = "deliveries"
+
+    async def _filter(registry=None, role=None, message="", **kwargs):
+        # plugin keeps only tools tied to the classified sub-intent
+        keep = {"a", "b"}
+        for name in list(registry._tools):
+            if name not in keep:
+                registry._tools.pop(name, None)
+
+    register_hook("filter_agent_tools", _filter)
+    results = await run_hooks(
+        "filter_agent_tools", registry=registry, role=role, message="Zeige Deliveries"
+    )
+
+    assert results == []  # handler returns None → no opinion collected
+    assert set(registry._tools) == {"a", "b"}
+
+
+@pytest.mark.asyncio
+async def test_filter_agent_tools_faulty_handler_leaves_registry_unfiltered():
+    """A crashing filter degrades to the unfiltered registry (run_hooks fail-open)."""
+
+    class _Registry:
+        def __init__(self, names):
+            self._tools = {n: object() for n in names}
+
+    registry = _Registry(["a", "b", "c"])
+
+    async def _boom(**kwargs):
+        raise RuntimeError("bad filter config")
+
+    register_hook("filter_agent_tools", _boom)
+    await run_hooks("filter_agent_tools", registry=registry, role=MagicMock(), message="x")
+
+    assert set(registry._tools) == {"a", "b", "c"}  # untouched, no crash
 
 
 # --- run_hooks ---
