@@ -66,7 +66,7 @@ Siehe [SATELLITE_CAMERA.md](SATELLITE_CAMERA.md) für Details.
 
 ## Second Brain — Persönliches Wissensnetz
 
-Renfield pflegt für jeden Nutzer ein persönliches Wissenssystem aus vier Informationsarten — Dokument-Chunks (RAG), Conversation Memories, Knowledge-Graph-Entities und -Relations — die über eine gemeinsame Atom-Registry ansprechbar sind. Cross-Source-Suche unter `/brain` fusioniert diese Quellen via Reciprocal Rank Fusion. Hinzu kommen aus Dokumenten extrahierte **Schicht-A-Fakten** (`document_fact` — Steuernummer, Aussteller, Zahlungsverpflichtung), die als eigene Quelle in dieselbe Fusion einfließen (grünes „Fakt"-Badge); die Verpflichtungs-Agenda (`GET /api/atoms/obligations`, Rechnungen + Behörden-Fristen) liegt als Backend-Lesepfad bereit.
+Renfield pflegt für jeden Nutzer ein persönliches Wissenssystem aus vier Informationsarten — Dokument-Chunks (RAG), Conversation Memories, Knowledge-Graph-Entities und -Relations — die über eine gemeinsame Atom-Registry ansprechbar sind. Cross-Source-Suche unter `/brain` fusioniert diese Quellen via Reciprocal Rank Fusion. Hinzu kommen aus Dokumenten extrahierte **Schicht-A-Fakten** (`document_fact` — Steuernummer, Aussteller, Zahlungsverpflichtung), die als eigene Quelle in dieselbe Fusion einfließen (grünes „Fakt"-Badge). Jede Dokumentkarte unter `/knowledge` zeigt eine inline **Fakten**-Panel, und die **Verpflichtungs-Agenda** unter `/brain/fristen` (Rechnungen + Behörden-Fristen, nach Dringlichkeit gruppiert) macht anstehende Fristen sichtbar — beide Flächen mit Herkunfts-Markierung (✓ deterministisch / ~ Modell-Vorschlag) und `⚑ rechtlich` bei gesetzlichen Fristen.
 
 Siehe [SECOND_BRAIN.md](SECOND_BRAIN.md) für den narrativen Überblick und das Ingestion-Flow.
 

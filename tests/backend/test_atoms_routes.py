@@ -184,6 +184,29 @@ class TestObligationsRoute:
         assert resp.status_code == 200
         assert [f["value"] for f in resp.json()] == ["Soon"]
 
+    async def test_offset_pages_the_stable_order(self, pg_app, pg_db_session):
+        """D9 "Mehr laden": offset pages further into the soonest-first order
+        without skipping or repeating (the (obligation_date, id) sort is total)."""
+        owner = await _mk_user(pg_db_session, "ob-offset")
+        doc = await _mk_doc_with_atom(pg_db_session, owner.id)
+        for i, day in enumerate([10, 11, 12]):
+            await _mk_fact(pg_db_session, doc_id=doc.id, owner_id=owner.id,
+                           category="obligation", kind="zahlung", value=f"f{i}",
+                           obligation_date=dt.date(2026, 6, day))
+        _auth_as(pg_app, owner)
+        async with await _client(pg_app) as c:
+            page1 = await c.get("/api/atoms/obligations", params={"limit": 2, "offset": 0})
+            page2 = await c.get("/api/atoms/obligations", params={"limit": 2, "offset": 2})
+        assert [f["value"] for f in page1.json()] == ["f0", "f1"]
+        assert [f["value"] for f in page2.json()] == ["f2"]
+
+    async def test_negative_offset_rejected(self, pg_app, pg_db_session):
+        owner = await _mk_user(pg_db_session, "ob-negoffset")
+        _auth_as(pg_app, owner)
+        async with await _client(pg_app) as c:
+            resp = await c.get("/api/atoms/obligations", params={"offset": -1})
+        assert resp.status_code == 400
+
     async def test_obligations_not_captured_by_atom_id_route(self, pg_app, pg_db_session):
         """Route ordering guard: /obligations must hit the list endpoint, not
         GET /{atom_id} (which would 404 'Atom not found' for atom_id=obligations).

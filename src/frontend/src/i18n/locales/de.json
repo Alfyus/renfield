@@ -47,6 +47,7 @@
     "memory": "Erinnerungen",
     "brain": "Zweites Gehirn",
     "brainReview": "Überprüfung",
+    "fristen": "Fristen",
     "federationAudit": "Föderations-Verlauf",
     "circles": "Kreise",
     "intents": "Intents",
@@ -481,6 +482,20 @@
     "serverError": "Beim Hochladen ist etwas schiefgegangen.",
     "showDetails": "Details anzeigen",
     "hideDetails": "Details verbergen",
+    "facts": {
+      "toggle": "Fakten",
+      "title": "Extrahierte Fakten",
+      "loadError": "Fakten konnten nicht geladen werden.",
+      "extracting": "Fakten werden extrahiert …",
+      "empty": "Keine Fakten gefunden.",
+      "disabled": "Fakten-Extraktion ist deaktiviert.",
+      "disabledHint": "In den Einstellungen aktivierbar.",
+      "group": {
+        "identifier": "Kennzeichen",
+        "universal": "Eckdaten",
+        "obligation": "Fristen"
+      }
+    },
     "failedRetry": "Erneut hochladen",
     "pollingTimeout": "Die Verarbeitung von „{{filename}}\" dauert länger als erwartet. Bitte die Seite neu laden, um den aktuellen Status zu sehen."
   },
@@ -1107,6 +1122,41 @@
     "notConfigured": "Paperless Audit ist nicht konfiguriert. Aktiviere PAPERLESS_AUDIT_ENABLED=true und stelle sicher, dass der Paperless MCP-Server verbunden ist.",
     "error": "Fehler beim Laden der Audit-Daten"
   },
+  "obligations": {
+    "title": "Fristen",
+    "subtitle": "Anstehende Pflichten aus deinen Dokumenten",
+    "loadError": "Fristen konnten nicht geladen werden.",
+    "timeRangeLabel": "Zeitraum",
+    "group": {
+      "overdue": "Überfällig",
+      "thisWeek": "Diese Woche",
+      "later": "Später"
+    },
+    "frist": {
+      "today": "heute · {{date}}",
+      "future_one": "in {{count}} Tag · {{date}}",
+      "future_other": "in {{count}} Tagen · {{date}}",
+      "overdue_one": "seit {{count}} Tag · {{date}}",
+      "overdue_other": "seit {{count}} Tagen · {{date}}"
+    },
+    "kind": {
+      "zahlung": "Zahlung",
+      "widerspruch": "Widerspruch",
+      "klagefrist": "Klagefrist",
+      "frist": "Frist"
+    },
+    "legal": "rechtlich",
+    "legalAria": "Rechtliche Frist — erfordert Bestätigung",
+    "bestaetigen": "Bestätigen",
+    "rueckgaengig": "Rückgängig",
+    "wiederOeffnen": "Wieder öffnen",
+    "toastConfirmed": "Bestätigt",
+    "toastConfirmedAria": "Bestätigt — rückgängig in 5 Sekunden",
+    "loadMore": "Mehr laden",
+    "emptyTitle": "Keine offenen Pflichten.",
+    "emptyBody": "Alle Fristen aus deinen Dokumenten sind erledigt oder noch weiter weg.",
+    "openSource": "Dokument öffnen"
+  },
   "circles": {
     "tier": {
       "0": "Privat",
@@ -1153,6 +1203,13 @@
       "conversation_memory": "Erinnerung",
       "document_fact": "Fakt"
     },
+    "source": {
+      "deterministic": "verlässlich",
+      "deterministicTitle": "Deterministisch ermittelt — verlässlich",
+      "advisory": "Modell-Vorschlag",
+      "advisoryTitle": "Vom Sprachmodell vorgeschlagen — bitte prüfen"
+    },
+    "lowConfidence": "(geringes Vertrauen)",
     "couldNotLoad": "Konnte Daten nicht laden.",
     "couldNotSave": "Konnte Änderungen nicht speichern.",
     "score": "Relevanz",

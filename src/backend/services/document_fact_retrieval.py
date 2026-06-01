@@ -316,16 +316,19 @@ class DocumentFactRetrieval:
         asker_id: int | None,
         due_before: Any = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Circle-visible obligation facts with a printed Frist, soonest first.
 
         ``category='obligation'`` AND ``obligation_date IS NOT NULL`` (uses the
         partial index). Optional ``due_before`` (date / ISO string) caps the
-        horizon. ``ORDER BY obligation_date ASC`` — the agenda surfaces the
-        nearest deadline first.
+        horizon. ``ORDER BY obligation_date ASC, df.id`` — the agenda surfaces
+        the nearest deadline first. ``offset`` pages further into that stable
+        order for the agenda's "Mehr laden" (the ``(obligation_date, id)`` sort
+        is total, so offset paging never skips or repeats a row).
         """
         circles_clause, circles_params = self._facts_circles_filter(asker_id)
-        params: dict[str, Any] = {"limit": limit, **circles_params}
+        params: dict[str, Any] = {"limit": limit, "offset": max(0, offset), **circles_params}
         due_filter = ""
         if due_before is not None:
             params["due_before"] = due_before
@@ -340,7 +343,7 @@ class DocumentFactRetrieval:
               {due_filter}
               AND {circles_clause}
             ORDER BY df.obligation_date ASC, df.id
-            LIMIT :limit
+            LIMIT :limit OFFSET :offset
         """)
         rows = await self._fetch(sql, params, "obligations")
         return [_row_to_dict(r) for r in rows]

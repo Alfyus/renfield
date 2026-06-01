@@ -1,0 +1,104 @@
+import { useTranslation } from 'react-i18next';
+
+import type { DocumentFact } from '../api/resources/brain';
+import { daysUntil } from '../utils/frist';
+import FactProvenance from './FactProvenance';
+import TierBadge from './TierBadge';
+
+/**
+ * The shared obligation content cluster used by BOTH surfaces (D6): the Fakten
+ * panel's "Fristen" group and the obligations agenda. Renders
+ *   kind · amount · frist-distance · ⚑ rechtlich · provenance · tier
+ * Surface-specific chrome (the source-document title, the Bestätigen button,
+ * the atom-row card) is added by the caller around this cluster.
+ */
+interface ObligationRowProps {
+  fact: DocumentFact;
+  now: Date;
+  /** Strike the kind label when the obligation has been acknowledged. */
+  confirmed?: boolean;
+  className?: string;
+}
+
+function MidDot() {
+  return <span aria-hidden="true" className="text-gray-300 dark:text-gray-600">·</span>;
+}
+
+export default function ObligationRow({ fact, now, confirmed = false, className = '' }: ObligationRowProps) {
+  const { t, i18n } = useTranslation();
+  const locale = i18n.language === 'de' ? 'de-DE' : 'en-US';
+
+  const kindLabel = t(`obligations.kind.${fact.kind}`, { defaultValue: fact.kind });
+
+  let amount: string | null = null;
+  if (fact.amount_value != null) {
+    const currency = (fact.amount_currency || 'EUR').toUpperCase();
+    try {
+      amount = new Intl.NumberFormat(locale, { style: 'currency', currency }).format(
+        fact.amount_value,
+      );
+    } catch {
+      // amount_currency is LLM-extracted and NOT ISO-4217-validated (backend
+      // TODO) — an invalid code (e.g. "EURO") makes Intl.NumberFormat throw a
+      // RangeError mid-render. Fall back to a plain number + the raw code so a
+      // single bad fact can't crash the agenda/panel.
+      amount = `${new Intl.NumberFormat(locale, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(fact.amount_value)} ${currency}`;
+    }
+  }
+
+  let fristLabel = '';
+  let absDate = '';
+  if (fact.obligation_date) {
+    const days = daysUntil(fact.obligation_date, now);
+    absDate = new Date(`${fact.obligation_date.slice(0, 10)}T00:00:00`).toLocaleDateString(
+      locale,
+      { dateStyle: 'medium' },
+    );
+    if (Number.isNaN(days)) {
+      fristLabel = absDate;
+    } else if (days < 0) {
+      fristLabel = t('obligations.frist.overdue', { count: -days, date: absDate });
+    } else if (days === 0) {
+      fristLabel = t('obligations.frist.today', { date: absDate });
+    } else {
+      fristLabel = t('obligations.frist.future', { count: days, date: absDate });
+    }
+  }
+
+  return (
+    <div className={`flex flex-wrap items-center gap-x-2 gap-y-1 text-sm ${className}`}>
+      <span
+        className={
+          confirmed
+            ? 'line-through text-gray-400 dark:text-gray-500'
+            : 'font-medium text-gray-900 dark:text-white'
+        }
+      >
+        {kindLabel}
+      </span>
+      {amount && (
+        <>
+          <MidDot />
+          <span className="tabular-nums text-gray-700 dark:text-gray-300">{amount}</span>
+        </>
+      )}
+      {fristLabel && (
+        <>
+          <MidDot />
+          <span className="text-gray-500 dark:text-gray-400">{fristLabel}</span>
+        </>
+      )}
+      {fact.legal_gate && (
+        <span className="legal-flag" aria-label={t('obligations.legalAria')}>
+          <span aria-hidden="true">⚑</span>
+          {t('obligations.legal')}
+        </span>
+      )}
+      <FactProvenance source={fact.source} confidence={fact.confidence} />
+      <TierBadge tier={fact.circle_tier} className="ml-auto" />
+    </div>
+  );
+}

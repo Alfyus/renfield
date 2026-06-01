@@ -35,6 +35,7 @@ const PaperlessAuditPage = lazy(() => import('./pages/PaperlessAuditPage'));
 const RoutingDashboardPage = lazy(() => import('./pages/RoutingDashboardPage'));
 const BrainPage = lazy(() => import('./pages/BrainPage'));
 const BrainReviewPage = lazy(() => import('./pages/BrainReviewPage'));
+const ObligationsPage = lazy(() => import('./pages/ObligationsPage'));
 // WissensbasisPage was the A-LANDING 2D composed page; superseded by
 // the unified 3D Wissensgraph (see /wissensbasis redirect below).
 const CirclesSettingsPage = lazy(() => import('./pages/CirclesSettingsPage'));
@@ -117,6 +118,11 @@ function AppRoutes() {
             <Route path="/brain/review" element={
               <ProtectedRoute>
                 <BrainReviewPage />
+              </ProtectedRoute>
+            } />
+            <Route path="/brain/fristen" element={
+              <ProtectedRoute>
+                <ObligationsPage />
               </ProtectedRoute>
             } />
             <Route path="/brain/audit" element={

@@ -113,7 +113,8 @@ Jedes Subsystem, das Inhalte dem LLM präsentiert, wendet den Circle-Filter an:
 |---|---|
 | `GET /api/atoms` | Unified Cross-Source-Search (`/brain` Frontend); `document_fact` ist eine fusionierte RRF-Quelle (Schicht-A-Fakten erscheinen mit grünem „Fakt"-Badge) |
 | `GET /api/atoms/documents/{id}/facts` | Alle Schicht-A-Fakten eines Dokuments; 404/403 am Eltern-Dokument circle-gated |
-| `GET /api/atoms/obligations` | Verpflichtungen (Rechnungen + Behörden-Fristen), nächste Frist zuerst |
+| `GET /api/atoms/obligations` | Verpflichtungen (Rechnungen + Behörden-Fristen), nächste Frist zuerst; `due_before` + `limit` + `offset` (Offset-Paging für „Mehr laden") |
+| `GET /api/config/features` | Frontend-sichtbare Feature-Flags (Allowlist, derzeit `schicht_a_extraction_enabled`) — die eine bewusste Settings→Browser-Naht |
 | `PATCH /api/atoms/{id}` | Tier ändern; cascade auf incidente Relationen |
 | `GET /api/circles/me` | Eigene Circle-Konfiguration laden |
 | `GET /api/circles/me/members` | Mitgliederlisten pro Tier |
@@ -130,10 +131,13 @@ Jedes Subsystem, das Inhalte dem LLM präsentiert, wendet den Circle-Filter an:
 |---|---|
 | `/brain` | Cross-Source-Suche über eigene Wissensebene |
 | `/brain/review` | Review-Queue: vom System vorgeschlagene Tier-Zuweisungen bestätigen |
+| `/brain/fristen` | Verpflichtungs-Agenda: Fristen-Inbox nach Dringlichkeit gruppiert (Überfällig/Diese Woche/Später), `⚑ rechtlich` bei `legal_gate`, localStorage-gestütztes Bestätigen mit Undo-Toast |
 | `/settings/circles` | Circle-Mitglieder pro Stufe verwalten |
 | `/settings/circles/peers` | Federations-Peers (für externe Anfragen über die Circle-Grenze) |
 
-Shared Komponenten: `TierBadge` + `TierPicker` nutzen die `.tier-badge-{0..4}`-Utilities aus `src/frontend/src/index.css` — farbliche Zuordnung *self* (warm) → *public* (kühl), siehe `DESIGN.md`.
+Die Dokument-Karten unter `/knowledge` tragen eine inline **Fakten**-Panel (`FaktenPanel`, lazy-Fetch beim Aufklappen) und verlinken bidirektional mit der Agenda (`?doc={id}#fakten` ↔ `#frist-{id}`).
+
+Shared Komponenten: `TierBadge` + `TierPicker` + `FactProvenance` (✓ deterministisch / ~ Modell-Vorschlag) + `ObligationRow` nutzen die `.tier-badge-{0..4}` / `.fact-group` / `.legal-flag`-Utilities aus `src/frontend/src/index.css` — farbliche Zuordnung *self* (warm) → *public* (kühl), siehe `DESIGN.md`.
 
 ---
 
