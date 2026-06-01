@@ -27,6 +27,37 @@ _KEYWORD_BOOST: dict[str, list[str]] = {}
 _KEYWORD_BOOST_AMOUNT = 0.15
 
 
+def find_shadowed_sub_intent_utterances(
+    roles: dict[str, "AgentRole"],
+) -> dict[tuple[str, str], list[str]]:
+    """Find sub_intent utterances that are byte-identical to a role utterance.
+
+    ``classify`` indexes role-level and sub_intent utterances together and breaks
+    a tie in favour of the role (strict ``>`` — see the sub_intent loop). So a
+    sub_intent utterance that exactly equals one of its parent role's utterances
+    ties at sim=1.000 and the role always wins: the sub_intent is *never* selected
+    for that phrasing. That is almost always a config mistake (the sub_intent's
+    dispatch handler or tool filter silently never fires for those words).
+
+    Returns ``{(role, sub_intent): [shadowed utterances]}`` for any such overlap.
+    Pure/side-effect-free so it is cheap to unit-test; ``initialize`` calls it and
+    logs a WARNING per offending sub_intent.
+    """
+    shadowed: dict[tuple[str, str], list[str]] = {}
+    for name, role in roles.items():
+        role_utts = {str(u) for u in (role.utterances or [])}
+        if not role_utts:
+            continue
+        for si_name, si_def in (role.sub_intent_definitions or {}).items():
+            if not isinstance(si_def, dict):
+                continue
+            si_utts = {str(u) for u in (si_def.get("utterances") or [])}
+            overlap = sorted(role_utts & si_utts)
+            if overlap:
+                shadowed[(name, si_name)] = overlap
+    return shadowed
+
+
 class SemanticRouter:
     """Embedding-based fast classifier for agent routing.
 
@@ -87,6 +118,20 @@ class SemanticRouter:
 
         self._ollama_client = client
         self._initialized = True
+
+        # Lint: a sub_intent utterance identical to a role-level utterance can
+        # never win the sim=1.000 tie (ties go to the role in classify), so the
+        # sub_intent silently never fires for that phrasing. Surface it loudly
+        # at init rather than letting a plugin's dispatch/tool-filter no-op.
+        for (rname, siname), overlap in find_shadowed_sub_intent_utterances(roles).items():
+            logger.warning(
+                f"SemanticRouter: sub_intent '{rname}/{siname}' has "
+                f"{len(overlap)} utterance(s) identical to role-level utterances "
+                f"of '{rname}': {overlap}. These tie at sim=1.000 and ties go to "
+                f"the role, so '{rname}/{siname}' will NEVER be classified for "
+                f"those phrasings — move them out of the role's utterances."
+            )
+
         total_utterances = (
             sum(len(v) for v in self._role_embeddings.values())
             + sum(len(v) for v in self._sub_intent_embeddings.values())
