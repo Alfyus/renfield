@@ -41,6 +41,7 @@ from api.routes import (
     trajectories,
     users,
 )
+from api.routes import config as config_routes
 from api.routes import knowledge_graph as kg_routes
 from api.routes import mcp as mcp_routes
 from api.routes import settings as settings_routes
@@ -172,6 +173,7 @@ if settings.features["voice"]:
 # presence, paperless_audit) moved to ha_glue.api.routes and are
 # mounted via the register_routes hook in ha_glue/bootstrap.py.
 app.include_router(settings_routes.router, prefix="/api/settings", tags=["Settings"])
+app.include_router(config_routes.router, prefix="/api/config", tags=["Config"])
 app.include_router(speakers.router, prefix="/api/speakers", tags=["Speakers"])
 app.include_router(knowledge.router, prefix="/api/knowledge", tags=["Knowledge"])
 app.include_router(memory.router, prefix="/api/memory", tags=["Memory"])

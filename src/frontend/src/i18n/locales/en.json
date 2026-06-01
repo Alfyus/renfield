@@ -47,6 +47,7 @@
     "memory": "Memories",
     "brain": "Second Brain",
     "brainReview": "Review",
+    "fristen": "Deadlines",
     "federationAudit": "Federation log",
     "circles": "Circles",
     "intents": "Intents",
@@ -481,6 +482,20 @@
     "serverError": "Something went wrong during upload.",
     "showDetails": "Show details",
     "hideDetails": "Hide details",
+    "facts": {
+      "toggle": "Facts",
+      "title": "Extracted facts",
+      "loadError": "Could not load facts.",
+      "extracting": "Extracting facts …",
+      "empty": "No facts found.",
+      "disabled": "Fact extraction is disabled.",
+      "disabledHint": "Can be enabled in settings.",
+      "group": {
+        "identifier": "Identifiers",
+        "universal": "Key data",
+        "obligation": "Deadlines"
+      }
+    },
     "failedRetry": "Upload again",
     "pollingTimeout": "Processing of \"{{filename}}\" is taking longer than expected. Please refresh to see the current status."
   },
@@ -1107,6 +1122,41 @@
     "notConfigured": "Paperless Audit is not configured. Enable PAPERLESS_AUDIT_ENABLED=true and ensure the Paperless MCP server is connected.",
     "error": "Failed to load audit data"
   },
+  "obligations": {
+    "title": "Deadlines",
+    "subtitle": "Upcoming obligations from your documents",
+    "loadError": "Could not load deadlines.",
+    "timeRangeLabel": "Range",
+    "group": {
+      "overdue": "Overdue",
+      "thisWeek": "This week",
+      "later": "Later"
+    },
+    "frist": {
+      "today": "today · {{date}}",
+      "future_one": "in {{count}} day · {{date}}",
+      "future_other": "in {{count}} days · {{date}}",
+      "overdue_one": "{{count}} day overdue · {{date}}",
+      "overdue_other": "{{count}} days overdue · {{date}}"
+    },
+    "kind": {
+      "zahlung": "Payment",
+      "widerspruch": "Appeal",
+      "klagefrist": "Filing deadline",
+      "frist": "Deadline"
+    },
+    "legal": "legal",
+    "legalAria": "Legal deadline — requires confirmation",
+    "bestaetigen": "Confirm",
+    "rueckgaengig": "Undo",
+    "wiederOeffnen": "Reopen",
+    "toastConfirmed": "Confirmed",
+    "toastConfirmedAria": "Confirmed — undo within 5 seconds",
+    "loadMore": "Load more",
+    "emptyTitle": "No open obligations.",
+    "emptyBody": "All deadlines from your documents are handled or still further away.",
+    "openSource": "Open document"
+  },
   "circles": {
     "tier": {
       "0": "Self",
@@ -1153,6 +1203,13 @@
       "conversation_memory": "Memory",
       "document_fact": "Fact"
     },
+    "source": {
+      "deterministic": "verified",
+      "deterministicTitle": "Deterministically extracted — reliable",
+      "advisory": "model suggestion",
+      "advisoryTitle": "Suggested by the language model — please verify"
+    },
+    "lowConfidence": "(low confidence)",
     "couldNotLoad": "Could not load data.",
     "couldNotSave": "Could not save changes.",
     "score": "Relevance",

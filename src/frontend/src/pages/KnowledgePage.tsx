@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { ChangeEvent } from 'react';
+import { useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import type { AxiosError } from 'axios';
@@ -27,6 +28,7 @@ import Alert from '../components/Alert';
 import type { AlertVariant } from '../components/Alert';
 import Badge from '../components/Badge';
 import StatusBadge from '../components/knowledge/StatusBadge';
+import FaktenPanel from '../components/knowledge/FaktenPanel';
 import DuplicateDialog from '../components/knowledge/DuplicateDialog';
 import type { ExistingDocument } from '../components/knowledge/DuplicateDialog';
 import { useDocumentPolling } from '../hooks/useDocumentPolling';
@@ -81,6 +83,9 @@ export default function KnowledgePage() {
 
   // Per-row expansion state for showing raw `error_message` on failed docs.
   const [expandedErrors, setExpandedErrors] = useState<Record<number, boolean>>({});
+  // Per-row expansion state for the Fakten panel (controlled so the agenda
+  // deep-link can auto-expand it — D3/T6).
+  const [expandedFacts, setExpandedFacts] = useState<Record<number, boolean>>({});
   const [newKbDescription, setNewKbDescription] = useState('');
 
   // Move / Bulk selection state
@@ -109,6 +114,9 @@ export default function KnowledgePage() {
 
   const refreshAfterUpload = async () => {
     await queryClient.invalidateQueries({ queryKey: keys.knowledge.all });
+    // D5: a doc resolving (e.g. after reindex) may have changed its facts —
+    // refetch any open Fakten panel. Prefix-match invalidates all facts queries.
+    await queryClient.invalidateQueries({ queryKey: ['brain', 'facts'] });
   };
 
   // Polling for in-flight uploads (#388). Populated from 202 responses
@@ -234,6 +242,8 @@ export default function KnowledgePage() {
     if (!confirmed) return;
     try {
       await deleteDocMutation.mutateAsync(id);
+      // D5: drop the deleted doc's cached facts.
+      await queryClient.invalidateQueries({ queryKey: keys.brain.facts(id) });
     } catch {
       alert(t('knowledge.deleteFailed'));
     }
@@ -243,10 +253,52 @@ export default function KnowledgePage() {
   const handleReindexDocument = async (id: number) => {
     try {
       await reindexDocMutation.mutateAsync(id);
+      // D5: re-extraction is async — invalidate now so an open panel drops the
+      // stale set; the onResolved completion handler refetches once it finishes.
+      await queryClient.invalidateQueries({ queryKey: keys.brain.facts(id) });
     } catch {
       alert(t('knowledge.reindexFailed'));
     }
   };
+
+  // Inbound deep link from the obligations agenda: /knowledge?doc={id}#fakten
+  // (D3/T6). Reset filters so the target row is in the list regardless of the
+  // active KB/status filter, then — once the (refetched) list actually
+  // contains it — scroll to it and auto-expand its Fakten panel. Async-race
+  // safe: we gate the scroll/expand on the query having resolved with the row
+  // present, and fire exactly once via the ref so it can't loop.
+  const [searchParams] = useSearchParams();
+  const deepLinkDoc = searchParams.get('doc');
+  const deepLinkHandled = useRef(false);
+
+  useEffect(() => {
+    // New target id → allow handling again (e.g. agenda → doc A, back, → doc B).
+    deepLinkHandled.current = false;
+  }, [deepLinkDoc]);
+
+  useEffect(() => {
+    if (!deepLinkDoc || deepLinkHandled.current) return;
+    const id = Number(deepLinkDoc);
+    if (!Number.isInteger(id)) return;
+    // Widen the view so a filtered-out target still resolves (D3).
+    if (selectedKnowledgeBase !== null) setSelectedKnowledgeBase(null);
+    if (statusFilter !== 'all') setStatusFilter('all');
+    // Wait for the (possibly refetched) list before touching the DOM.
+    if (documentsQuery.isLoading || documentsQuery.isFetching) return;
+    if (!documents.some((d) => d.id === id)) return; // not reachable — fail quietly
+    deepLinkHandled.current = true;
+    setExpandedFacts((prev) => ({ ...prev, [id]: true }));
+    requestAnimationFrame(() => {
+      document.getElementById(`doc-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }, [
+    deepLinkDoc,
+    documents,
+    documentsQuery.isLoading,
+    documentsQuery.isFetching,
+    selectedKnowledgeBase,
+    statusFilter,
+  ]);
 
   // Search
   const handleSearch = async () => {
@@ -743,6 +795,14 @@ export default function KnowledgePage() {
                         )}
                       </div>
                     )}
+                    <FaktenPanel
+                      documentId={doc.id}
+                      status={doc.status}
+                      open={Boolean(expandedFacts[doc.id])}
+                      onToggle={() =>
+                        setExpandedFacts((prev) => ({ ...prev, [doc.id]: !prev[doc.id] }))
+                      }
+                    />
                   </div>
                   <div className="flex items-center gap-2">
                     <StatusBadge doc={doc} filename={doc.filename} />

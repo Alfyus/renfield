@@ -158,20 +158,25 @@ async def query_atoms(
 async def get_obligations(
     due_before: date | None = None,
     limit: int = 50,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_user_or_default),
 ):
     """
     List circle-visible obligation facts (bills + Behörde deadlines) with a
-    printed Frist, soonest first. Optional ``due_before`` caps the horizon.
+    printed Frist, soonest first. Optional ``due_before`` caps the horizon;
+    ``offset`` pages further into the stable soonest-first order (the agenda's
+    "Mehr laden").
 
     List endpoint — circle-filter only (returns what the asker can see; no
     404/403, consistent with the list-vs-single-resource convention).
     """
     if limit < 1 or limit > 200:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
     facts = await DocumentFactRetrieval(db).obligations(
-        asker_id=current_user.id, due_before=due_before, limit=limit,
+        asker_id=current_user.id, due_before=due_before, limit=limit, offset=offset,
     )
     return [DocumentFactResponse(**f) for f in facts]
 

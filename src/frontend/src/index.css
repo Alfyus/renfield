@@ -226,6 +226,52 @@
          dark:bg-gray-800 dark:border-gray-700;
 }
 
+/* =========================================================================
+   Schicht A facts — Fakten panel + Obligations agenda (DESIGN.md tokens only).
+   ========================================================================= */
+
+@utility fact-group {
+  /* One category grouping inside the Fakten panel (Aussteller/Kennzeichen/…). */
+  @apply space-y-1;
+}
+
+@utility fact-group-label {
+  /* DM Sans, NOT Cormorant — below the 24px serif floor. */
+  @apply block text-xs font-medium uppercase tracking-wide
+         text-gray-500 dark:text-gray-400 mb-1;
+}
+
+@utility legal-flag {
+  /* ⚑ rechtlich — statutory-deadline marker. Hearth cream / warm-gray dark,
+     crimson text. Symbol + visible label + ARIA (color never alone). */
+  @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-sm
+         text-xs font-medium
+         bg-cream text-primary-700 border border-primary-200
+         dark:bg-gray-800 dark:text-primary-300 dark:border-primary-700;
+}
+
+@utility empty-state {
+  /* Centered relief-as-reward empty state. The heading inside is the rare
+     center-aligned Cormorant case carved out by DESIGN.md §AI Slop. */
+  @apply flex flex-col items-center justify-center text-center py-16 px-6;
+}
+
+@utility toast {
+  /* Local (client-only) undo toast — distinct from the WS NotificationToast. */
+  @apply fixed z-50 flex flex-col gap-2 max-w-sm
+         bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700
+         rounded-lg shadow-lg px-4 py-3;
+}
+
+@layer components {
+  /* Confirmed obligation row. Compound selector (0,2,0) reliably overrides the
+     single-class atom-row bg (0,1,0). Line-through lives on the kind label in
+     the component, not here (only the label is struck, not the whole row). */
+  .atom-row.atom-row--bestaetigt {
+    @apply opacity-70 bg-cream/70 dark:bg-gray-800;
+  }
+}
+
 @layer utilities {
   /* Body base styles - Light mode default */
   body {
@@ -353,6 +399,17 @@ html.dark ::-webkit-scrollbar-thumb:hover {
   animation: gentlePulse 2s ease-in-out infinite;
 }
 
+/* Undo-toast countdown bar: shrinks 100%→0 over its visible window. The JS
+   timer owns dismissal; this bar is the visual cue only. */
+@keyframes toastCountdown {
+  from { width: 100%; }
+  to   { width: 0%; }
+}
+
+.animate-toast-countdown {
+  animation: toastCountdown var(--toast-duration, 5s) linear forwards;
+}
+
 /* Stagger helpers */
 .animate-stagger > *:nth-child(1) { animation-delay: 0ms; }
 .animate-stagger > *:nth-child(2) { animation-delay: 50ms; }
@@ -378,6 +435,7 @@ html.dark ::-webkit-scrollbar-thumb:hover {
   .animate-fade-slide-in,
   .animate-typing-dot,
   .animate-gentle-pulse,
+  .animate-toast-countdown,
   .animate-slide-in-right {
     animation: none !important;
   }
