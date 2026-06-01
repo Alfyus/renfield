@@ -124,12 +124,96 @@ class DocumentProcessingHistoryService:
         force_ocr: bool,
         trigger: ProcessingTrigger,
     ) -> int:
-        """INSERT a fresh history row in ``processing`` state. Own transaction."""
+        """INSERT a fresh history row in ``processing`` state. Own transaction.
+
+        ``initial_ingest`` is **idempotent** (the partial unique index
+        ``uq_dph_initial_ingest_per_doc`` guarantees at most one per doc — the
+        migration calls this "re-runnable"). A second attempt — e.g. the Redis
+        Streams reclaim re-delivering a stale PEL entry after a worker restart —
+        UPSERTs the existing row back to ``processing`` and returns its id
+        instead of raising ``UniqueViolation``. Before this, that violation
+        crashed ``_process_entry``, which never ACKed, so the entry stayed in the
+        PEL and re-fired (and re-crashed) on every reclaim — a poison entry that
+        also left the document stuck in ``processing``.
+        """
+        if trigger == ProcessingTrigger.INITIAL_INGEST:
+            return await self._open_initial_ingest_idempotent(document_id, force_ocr)
+        # Non-initial triggers (user_reindex / script_purge / startup_sweep)
+        # have no unique index — many per doc are expected. Plain insert.
         row = DocumentProcessingHistory(
             document_id=document_id,
             status=ProcessingStatus.PROCESSING.value,
             force_ocr=force_ocr,
             trigger=trigger.value,
+        )
+        self.db.add(row)
+        await self.db.flush()
+        await self.db.commit()
+        return row.id
+
+    async def _open_initial_ingest_idempotent(
+        self, document_id: int, force_ocr: bool,
+    ) -> int:
+        """UPSERT the single ``initial_ingest`` row for a document.
+
+        Postgres path uses ``ON CONFLICT`` against the **partial unique index**
+        by its predicate (it is an INDEX, not a CONSTRAINT, so
+        ``ON CONFLICT ON CONSTRAINT`` does not apply — the index-inference form
+        ``ON CONFLICT (col) WHERE <predicate>`` is required). The sqlite test
+        harness gets a portable SELECT-then-write fallback (the worker is a
+        single consumer, so the TOCTOU window the index would guard against does
+        not arise on that path).
+        """
+        is_postgres = (
+            self.db.bind is not None and self.db.bind.dialect.name == "postgresql"
+        )
+        if is_postgres:
+            hid = (await self.db.execute(
+                text(
+                    """
+                    INSERT INTO document_processing_history
+                        (document_id, status, force_ocr, trigger, started_at, extra)
+                    VALUES (:doc_id, 'processing', :force_ocr, 'initial_ingest', :now, '{}')
+                    ON CONFLICT (document_id) WHERE (trigger = 'initial_ingest')
+                    DO UPDATE SET
+                        status = 'processing',
+                        force_ocr = EXCLUDED.force_ocr,
+                        started_at = EXCLUDED.started_at,
+                        finished_at = NULL,
+                        error_message = NULL
+                    RETURNING id
+                    """
+                ),
+                {"doc_id": document_id, "force_ocr": force_ocr, "now": _now()},
+            )).scalar_one()
+            await self.db.commit()
+            return int(hid)
+
+        existing = (await self.db.execute(
+            select(DocumentProcessingHistory.id).where(
+                DocumentProcessingHistory.document_id == document_id,
+                DocumentProcessingHistory.trigger == ProcessingTrigger.INITIAL_INGEST.value,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if existing is not None:
+            await self.db.execute(
+                text(
+                    """
+                    UPDATE document_processing_history
+                    SET status = 'processing', force_ocr = :force_ocr,
+                        started_at = :now, finished_at = NULL, error_message = NULL
+                    WHERE id = :id
+                    """
+                ),
+                {"id": existing, "force_ocr": force_ocr, "now": _now()},
+            )
+            await self.db.commit()
+            return int(existing)
+        row = DocumentProcessingHistory(
+            document_id=document_id,
+            status=ProcessingStatus.PROCESSING.value,
+            force_ocr=force_ocr,
+            trigger=ProcessingTrigger.INITIAL_INGEST.value,
         )
         self.db.add(row)
         await self.db.flush()
@@ -255,6 +339,26 @@ class DocumentProcessingHistoryService:
             .limit(1)
         )
         result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def initial_ingest_status(self, document_id: int) -> str | None:
+        """Status of the doc's single ``initial_ingest`` row, or ``None`` if it
+        has never been ingested.
+
+        The document-worker uses this to be an idempotent consumer of the
+        at-least-once Redis stream: ``completed`` → a re-delivered entry is a
+        duplicate (drop it, don't re-ingest); ``processing``/``failed`` → an
+        incomplete first ingest to retry (purge partial chunks first); ``None``
+        → a genuine first ingest.
+        """
+        result = await self.db.execute(
+            select(DocumentProcessingHistory.status)
+            .where(
+                DocumentProcessingHistory.document_id == document_id,
+                DocumentProcessingHistory.trigger == ProcessingTrigger.INITIAL_INGEST.value,
+            )
+            .limit(1)
+        )
         return result.scalar_one_or_none()
 
     # ------------------------------------------------------------------

@@ -90,6 +90,75 @@ async def test_open_with_force_ocr_true(committing_session):
     assert row.trigger == ProcessingTrigger.SCRIPT_PURGE.value
 
 
+async def test_open_initial_ingest_is_idempotent(committing_session):
+    """REGRESSION: a second initial_ingest open() for the same doc must NOT
+    raise UniqueViolation (uq_dph_initial_ingest_per_doc). It re-opens the
+    existing row to 'processing' and returns the SAME id — so a worker-restart
+    reclaim of a stale PEL entry no longer poisons the queue / sticks the doc."""
+    doc = await _make_doc(committing_session)
+    doc_id = doc.id  # capture before expire_all (avoids async lazy-reload)
+    svc = DocumentProcessingHistoryService(committing_session)
+
+    hid1 = await svc.open(doc_id, force_ocr=False, trigger=ProcessingTrigger.INITIAL_INGEST)
+    await svc.close_success(hid1, chunks_produced=5, chunks_dropped=0, ocr_engine="docling")
+
+    # Second initial_ingest (the reclaim re-delivery) — previously raised.
+    hid2 = await svc.open(doc_id, force_ocr=True, trigger=ProcessingTrigger.INITIAL_INGEST)
+
+    assert hid2 == hid1  # same row reused, not a duplicate
+    committing_session.expire_all()
+    row = await committing_session.get(DocumentProcessingHistory, hid2)
+    assert row.status == ProcessingStatus.PROCESSING.value  # re-opened
+    assert row.force_ocr is True  # updated from the retry
+    assert row.finished_at is None  # cleared
+
+    # Exactly one initial_ingest row exists for the doc.
+    count = (await committing_session.execute(
+        text(
+            "SELECT count(*) FROM document_processing_history "
+            "WHERE document_id = :d AND trigger = 'initial_ingest'"
+        ),
+        {"d": doc_id},
+    )).scalar_one()
+    assert count == 1
+
+
+async def test_initial_ingest_status_reflects_lifecycle(committing_session):
+    """initial_ingest_status() drives the worker's idempotent-consumer branch:
+    None (never ingested) → processing (open) → completed (close_success)."""
+    doc = await _make_doc(committing_session)
+    doc_id = doc.id
+    svc = DocumentProcessingHistoryService(committing_session)
+
+    assert await svc.initial_ingest_status(doc_id) is None
+    hid = await svc.open(doc_id, force_ocr=False, trigger=ProcessingTrigger.INITIAL_INGEST)
+    assert await svc.initial_ingest_status(doc_id) == ProcessingStatus.PROCESSING.value
+    await svc.close_success(hid, chunks_produced=1, chunks_dropped=0, ocr_engine="docling")
+    committing_session.expire_all()
+    assert await svc.initial_ingest_status(doc_id) == ProcessingStatus.COMPLETED.value
+
+    # A user_reindex row must NOT be mistaken for the initial_ingest status.
+    await svc.open(doc_id, force_ocr=False, trigger=ProcessingTrigger.USER_REINDEX)
+    assert await svc.initial_ingest_status(doc_id) == ProcessingStatus.COMPLETED.value
+
+
+async def test_open_initial_ingest_coexists_with_reindex_rows(committing_session):
+    """initial_ingest idempotency must not block additional non-initial rows
+    (user_reindex etc.) — those are expected many-per-doc."""
+    doc = await _make_doc(committing_session)
+    doc_id = doc.id
+    svc = DocumentProcessingHistoryService(committing_session)
+    await svc.open(doc_id, force_ocr=False, trigger=ProcessingTrigger.INITIAL_INGEST)
+    r1 = await svc.open(doc_id, force_ocr=False, trigger=ProcessingTrigger.USER_REINDEX)
+    r2 = await svc.open(doc_id, force_ocr=False, trigger=ProcessingTrigger.USER_REINDEX)
+    assert r1 != r2
+    total = (await committing_session.execute(
+        text("SELECT count(*) FROM document_processing_history WHERE document_id = :d"),
+        {"d": doc_id},
+    )).scalar_one()
+    assert total == 3  # 1 initial_ingest + 2 user_reindex
+
+
 # ============================================================================
 # Service: close_success()
 # ============================================================================
@@ -309,17 +378,28 @@ async def test_trigger_check_constraint_rejects_invalid(committing_session):
 
 
 async def test_partial_unique_initial_ingest_per_doc(committing_session):
-    """The uq_dph_initial_ingest_per_doc partial index forbids two
-    initial_ingest rows for the same document — but allows arbitrary
-    user_reindex / script_purge rows."""
+    """The uq_dph_initial_ingest_per_doc partial index still forbids two
+    initial_ingest rows for the same document at the DB layer. (The service's
+    open() now UPSERTs on it rather than colliding — see
+    test_open_initial_ingest_is_idempotent — so this asserts index integrity
+    via a RAW second INSERT that bypasses the service's ON CONFLICT.)"""
     doc = await _make_doc(committing_session)
     svc = DocumentProcessingHistoryService(committing_session)
 
     await svc.open(doc.id, force_ocr=False, trigger=ProcessingTrigger.INITIAL_INGEST)
 
-    # Second initial_ingest must violate the partial unique constraint.
+    # A raw duplicate insert (no ON CONFLICT) must still hit the index.
     with pytest.raises(IntegrityError):
-        await svc.open(doc.id, force_ocr=False, trigger=ProcessingTrigger.INITIAL_INGEST)
+        await committing_session.execute(
+            text(
+                "INSERT INTO document_processing_history "
+                "(document_id, status, force_ocr, trigger, started_at, extra) "
+                "VALUES (:d, 'processing', false, 'initial_ingest', now(), '{}')"
+            ),
+            {"d": doc.id},
+        )
+        await committing_session.commit()
+    await committing_session.rollback()
 
 
 async def test_partial_unique_allows_many_reindexes(committing_session):
