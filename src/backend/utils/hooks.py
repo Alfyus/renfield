@@ -261,6 +261,16 @@ HOOK_EVENTS: frozenset[str] = frozenset({
     "post_orchestration",
     "pre_sub_agent",
     "post_sub_agent",
+    # Per-request tool filtering for the MAIN agent loop — fired by the
+    # WebSocket chat handler right after AgentToolRegistry.create() and before
+    # AgentService runs, with the classified role (and its `sub_intent`) in
+    # scope. The orchestrator sub-agent path already has `pre_sub_agent`; this
+    # is the symmetric seam for the single-role web-chat loop. Handlers receive
+    # `registry`, `role`, `message` and may mutate `registry._tools` in place to
+    # restrict the tool set (e.g. deterministic sub-intent → tool-set filtering).
+    # Return value is ignored; exceptions are caught (run_hooks) so a faulty
+    # filter degrades to the unfiltered registry rather than breaking the turn.
+    "filter_agent_tools",
     "check_output",
     "extract_context_vars",
     "build_synthesis_context",
