@@ -113,8 +113,11 @@ async function deleteDocumentRequest(id: number): Promise<void> {
   await apiClient.delete(`/api/knowledge/documents/${id}`);
 }
 
-async function reindexDocumentRequest(id: number): Promise<void> {
-  await apiClient.post(`/api/knowledge/documents/${id}/reindex`);
+async function reindexDocumentRequest(id: number): Promise<DocumentRow> {
+  // Async since #async-reindex: returns 202 + the doc row in `pending` so the
+  // caller can poll it to completion (was a synchronous, timeout-prone call).
+  const response = await apiClient.post<DocumentRow>(`/api/knowledge/documents/${id}/reindex`);
+  return response.data;
 }
 
 interface MoveDocumentsInput {

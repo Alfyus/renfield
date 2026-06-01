@@ -44,6 +44,7 @@ def _wire(monkeypatch, *, ingest_status: str | None):
 
     rag = MagicMock()
     rag.process_existing_document = AsyncMock()
+    rag.reindex_document = AsyncMock()
 
     progress = MagicMock()
     progress.set_stage = AsyncMock()
@@ -59,8 +60,11 @@ def _wire(monkeypatch, *, ingest_status: str | None):
     return db, rag, queue
 
 
-def _entry(doc_id: int = 5):
-    return types.SimpleNamespace(entry_id="1-0", params={"document_id": doc_id})
+def _entry(doc_id: int = 5, trigger: str | None = None):
+    params = {"document_id": doc_id}
+    if trigger is not None:
+        params["trigger"] = trigger
+    return types.SimpleNamespace(entry_id="1-0", params=params)
 
 
 async def test_completed_initial_ingest_is_skipped_and_acked(monkeypatch):
@@ -96,4 +100,18 @@ async def test_first_ingest_processes_without_purge(monkeypatch):
 
     db.execute.assert_not_called()  # no purge, no self-heal
     rag.process_existing_document.assert_awaited_once()
+    queue.ack.assert_awaited_once_with("1-0")
+
+
+async def test_user_reindex_always_reprocesses(monkeypatch):
+    """trigger=user_reindex must ALWAYS reprocess via reindex_document — even
+    when initial_ingest is completed (otherwise the idempotent-consumer guard
+    would wrongly skip every reindex). reindex_document purges+rebuilds; the
+    initial-ingest skip path must NOT run."""
+    db, rag, queue = _wire(monkeypatch, ingest_status=ProcessingStatus.COMPLETED.value)
+
+    await worker._process_entry(MagicMock(), queue, _entry(5, trigger="user_reindex"))
+
+    rag.reindex_document.assert_awaited_once()
+    rag.process_existing_document.assert_not_called()  # not the initial-ingest path
     queue.ack.assert_awaited_once_with("1-0")

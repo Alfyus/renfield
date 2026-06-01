@@ -249,12 +249,15 @@ export default function KnowledgePage() {
     }
   };
 
-  // Reindex document
+  // Reindex document — async (#async-reindex): the endpoint enqueues a
+  // user_reindex task and returns 202 with the doc in `pending`. Track it for
+  // polling so the row updates pending → processing → completed; onResolved
+  // reloads the list + invalidates facts so an open Fakten panel refreshes.
   const handleReindexDocument = async (id: number) => {
     try {
-      await reindexDocMutation.mutateAsync(id);
-      // D5: re-extraction is async — invalidate now so an open panel drops the
-      // stale set; the onResolved completion handler refetches once it finishes.
+      const doc = await reindexDocMutation.mutateAsync(id);
+      trackDocument(doc as KbDocument);
+      // Drop any stale facts immediately; onResolved refetches when done (D5).
       await queryClient.invalidateQueries({ queryKey: keys.brain.facts(id) });
     } catch {
       alert(t('knowledge.reindexFailed'));

@@ -38,7 +38,8 @@ function wire() {
     if (url.includes('/facts')) return Promise.resolve(createMockResponse([]));
     return Promise.resolve(createMockResponse([]));
   });
-  mockedPost.mockResolvedValue(createMockResponse({}));
+  // Async reindex returns 202 + the doc row in 'pending' (trackDocument polls it).
+  mockedPost.mockResolvedValue(createMockResponse({ ...DOC, status: 'pending' }, 202));
 }
 
 describe('KnowledgePage Schicht A integration', () => {

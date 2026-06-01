@@ -95,10 +95,28 @@ async def _process_entry(
 
     force_ocr = bool(entry.params.get("force_ocr", False))
     user_id = entry.params.get("user_id")
+    # trigger distinguishes an initial upload from an async user-reindex
+    # (#async-reindex). Absent → initial_ingest (back-compat with older entries).
+    trigger = str(entry.params.get("trigger") or "initial_ingest")
     progress = DocumentProgress(redis, doc_id)
     try:
         async with AsyncSessionLocal() as db:
             rag = RAGService(db)
+
+            if trigger == "user_reindex":
+                # Async reindex: ALWAYS reprocess. reindex_document purges the
+                # doc's chunks then rebuilds (records a user_reindex history row,
+                # which has no unique index). The worker is a single consumer, so
+                # concurrent reindex requests for one doc are serialized here —
+                # the overlap that duplicated chunks on the old inline path
+                # cannot happen.
+                await rag.reindex_document(
+                    doc_id, force_ocr=force_ocr, user_id=user_id,
+                )
+                await queue.ack(entry.entry_id)
+                logger.info(f"reindexed doc {doc_id} (entry {entry.entry_id})")
+                return
+
             history = DocumentProcessingHistoryService(db)
 
             # Idempotent consumer. The stream is at-least-once: reclaim_stale
