@@ -46,13 +46,44 @@ from utils.llm_client import (
     get_default_client,
 )
 
-# Obligation kinds that are ALWAYS human-confirmed regardless of what the LLM
-# says about legal_gate (golden set: widerspruch/statutory => mandatory review).
-_ALWAYS_LEGAL_GATE_KINDS = {"widerspruch"}
+# Obligations that are ALWAYS human-confirmed regardless of what the LLM says
+# about legal_gate (golden set: statutory remedy => mandatory review). Now that
+# the obligation kind is an OPEN label (no fixed enum), match keywords on the
+# kind OR the excerpt — an exact-kind set would miss e.g. a "termin" whose
+# excerpt cites a Widerspruch. Recall-first: over-gating only adds a review
+# step, a missed statutory deadline is the real harm.
+_LEGAL_GATE_KEYWORDS = (
+    "widerspruch", "einspruch", "klage", "rechtsbehelf",
+    "berufung", "beschwerde", "revision",
+)
+# Left-boundary (prefix) match, NOT \bword\b: German legal terms compound
+# ("Widerspruchsfrist", "Klageschrift"), so the right edge must stay open to keep
+# recall. The left \b kills the substring false positives where the keyword is a
+# suffix/infix ("Anklage", "Beklagte", "Preisrevision", "Verklagen").
+_LEGAL_GATE_RE = re.compile(r"\b(?:" + "|".join(_LEGAL_GATE_KEYWORDS) + r")")
 
 _MAX_DOC_CHARS = 12_000  # prompt budget; field_text beyond this is truncated
 _MAX_OBLIGATIONS = 50    # hard cap on LLM obligations (hostile/garbage JSON guard)
-_MAX_FACTS_PER_DOC = 100  # hard cap on facts stored per document (write-amplification guard)
+_MAX_OPEN_FACTS = 60     # hard cap on open LLM key-facts per source (write-amplification guard)
+# Per-doc total cap. Keep >= _MAX_OBLIGATIONS + _MAX_OPEN_FACTS so the store-side
+# slice can't silently drop already-extracted facts from a legitimately rich doc.
+_MAX_FACTS_PER_DOC = 120
+
+
+def _as_list(value: object) -> list:
+    """Coerce untrusted LLM JSON to a list. A truthy non-list (dict/int/str)
+    would otherwise survive ``x or []`` and reach a slice/iteration that raises
+    out of _facts_from_payload — discarding the whole batch. Anything that isn't
+    a list becomes []."""
+    return value if isinstance(value, list) else []
+
+
+def _is_legal_gate(kind: str, excerpt: object) -> bool:
+    """A statutory-remedy deadline (Widerspruch/Einspruch/Klage…) always needs
+    human confirmation. Keyword-matched across the kind AND the excerpt so an
+    open/free kind label can't slip a legal deadline past the gate."""
+    hay = f"{kind} {excerpt or ''}".lower()
+    return _LEGAL_GATE_RE.search(hay) is not None
 
 # Steuernummer: German tax number, NN(N)/NNN(N)/NNNN(N). Distinctive enough that
 # a keyword gate (below) is the precision guard, not the pattern alone.
@@ -268,12 +299,15 @@ class SchichtAExtractor:
 
 
 def _facts_from_payload(payload: dict) -> list[ExtractedFact]:
-    """Map the LLM JSON ({obligations:[...], universal_facts:{...}}) to facts.
-    Tolerant of missing/oddly-typed fields — a malformed entry is skipped, not
-    fatal (recall: keep the good ones)."""
+    """Map the LLM JSON to facts. Current prompt schema is
+    {obligations:[...], facts:[{category,kind,value,amount?,excerpt}, ...]}; the
+    legacy {universal_facts:{issuer,total,identifiers}} shape is still mapped as a
+    safety net in case the model emits the older shape (the prompt no longer asks
+    for it). Tolerant of missing/oddly-typed fields — a malformed entry is skipped,
+    not fatal (recall: keep the good ones)."""
     facts: list[ExtractedFact] = []
 
-    for ob in (payload.get("obligations") or [])[:_MAX_OBLIGATIONS]:
+    for ob in _as_list(payload.get("obligations"))[:_MAX_OBLIGATIONS]:
         if not isinstance(ob, dict):
             continue
         # Bound to the kind column width (String(32)). An unbounded value would
@@ -284,7 +318,7 @@ def _facts_from_payload(payload: dict) -> list[ExtractedFact]:
         if not kind:
             continue
         amount = ob.get("amount") if isinstance(ob.get("amount"), dict) else {}
-        legal_gate = bool(ob.get("legal_gate")) or kind in _ALWAYS_LEGAL_GATE_KINDS
+        legal_gate = bool(ob.get("legal_gate")) or _is_legal_gate(kind, ob.get("excerpt"))
         facts.append(ExtractedFact(
             category=DOC_FACT_CATEGORY_OBLIGATION,
             kind=kind,
@@ -318,7 +352,7 @@ def _facts_from_payload(payload: dict) -> list[ExtractedFact]:
                     amount_currency=_clean_currency(total.get("currency")),
                     confidence=0.7, source=DOC_FACT_SOURCE_LLM,
                 ))
-        for ident in uni.get("identifiers") or []:
+        for ident in _as_list(uni.get("identifiers")):
             if not isinstance(ident, dict):
                 continue
             ikind = _clean_str(ident.get("kind"), 32)
@@ -329,6 +363,38 @@ def _facts_from_payload(payload: dict) -> list[ExtractedFact]:
                     value=ival, normalized_value=re.sub(r"\s+", "", ival),
                     confidence=0.6, source=DOC_FACT_SOURCE_LLM,
                 ))
+
+    # Open key-fact list (current prompt schema). Each entry is
+    # {category, kind, value, amount?, excerpt} where the LLM's rich `category`
+    # (party|date|amount|identifier|reference|status|other) is collapsed into
+    # the two stored buckets: identifier/reference -> IDENTIFIER (carries a
+    # whitespace-stripped normalized_value for matching), everything else ->
+    # UNIVERSAL. `kind` is a free snake_case label; the deliberately open shape
+    # lets each document surface its own Eckdaten instead of fixed slots.
+    for f in _as_list(payload.get("facts"))[:_MAX_OPEN_FACTS]:
+        if not isinstance(f, dict):
+            continue
+        # .lower() AFTER the 32-char truncation (kind column width — see the
+        # obligation loop above for the StringDataRightTruncation rationale).
+        kind = (_clean_str(f.get("kind"), 32) or "").lower()
+        value = _clean_str(f.get("value"), 500)
+        if not kind or not value:
+            continue
+        # _clean_str (not raw .strip()) so a non-str category from a hostile
+        # payload can't raise AttributeError and discard the whole batch.
+        is_ident = (_clean_str(f.get("category"), 16) or "").lower() in ("identifier", "reference")
+        amount = f.get("amount") if isinstance(f.get("amount"), dict) else {}
+        facts.append(ExtractedFact(
+            category=DOC_FACT_CATEGORY_IDENTIFIER if is_ident else DOC_FACT_CATEGORY_UNIVERSAL,
+            kind=kind,
+            value=value,
+            normalized_value=re.sub(r"\s+", "", value) if is_ident else None,
+            excerpt=_clean_str(f.get("excerpt"), 500),
+            amount_value=_parse_amount(amount.get("value")),
+            amount_currency=_clean_currency(amount.get("currency")),
+            confidence=0.7,
+            source=DOC_FACT_SOURCE_LLM,
+        ))
 
     return facts
 

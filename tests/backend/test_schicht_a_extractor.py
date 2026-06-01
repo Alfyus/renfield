@@ -29,6 +29,7 @@ for _mod in _missing_stubs:
         sys.modules[_mod] = MagicMock()
 
 from services.schicht_a_extractor import (  # noqa: E402
+    _MAX_OPEN_FACTS,
     SchichtAExtractor,
     _facts_from_payload,
     _parse_amount,
@@ -177,6 +178,116 @@ class TestFactsFromPayload:
         })
         assert [f.kind for f in facts] == ["termin"]
 
+    def test_open_obligation_kind_free_label_kept(self):
+        """The obligation kind is now open — a free label like 'klagefrist' must
+        be kept, not dropped against a fixed enum."""
+        facts = _facts_from_payload({
+            "obligations": [{"kind": "klagefrist", "date": "2026-03-01",
+                             "excerpt": "Klage binnen eines Monats"}],
+        })
+        assert facts[0].kind == "klagefrist"
+        assert facts[0].legal_gate is True  # 'klage' keyword
+
+    def test_legal_gate_keyword_in_excerpt(self):
+        """A non-statutory-looking kind whose excerpt cites a statutory remedy
+        still forces the gate (keyword matched across kind AND excerpt)."""
+        facts = _facts_from_payload({
+            "obligations": [{"kind": "termin", "legal_gate": False,
+                             "excerpt": "Widerspruch binnen eines Monats moeglich"}],
+        })
+        assert facts[0].legal_gate is True
+
+    def test_ordinary_obligation_not_gated(self):
+        facts = _facts_from_payload({
+            "obligations": [{"kind": "zahlung", "excerpt": "Bitte ueberweisen Sie den Betrag"}],
+        })
+        assert facts[0].legal_gate is False
+
+    def test_open_facts_list_mapped(self):
+        """The open facts[] schema: rich category collapses to the 2 stored
+        buckets; identifier/reference get a normalized value, amounts parse."""
+        facts = _facts_from_payload({
+            "facts": [
+                {"category": "party", "kind": "aussteller", "value": "Stadtwerke",
+                 "excerpt": "Stadtwerke Musterstadt"},
+                {"category": "date", "kind": "rechnungsdatum", "value": "01.01.2020",
+                 "excerpt": "Rechnungsdatum: 01.01.2020"},
+                {"category": "identifier", "kind": "vertragskonto", "value": "20 1234 5678",
+                 "excerpt": "Vertragskonto 20 1234 5678"},
+                {"category": "amount", "kind": "gesamtbetrag", "value": "12,34",
+                 "amount": {"value": 12.34, "currency": "EUR"}, "excerpt": "12,34 EUR"},
+            ],
+        })
+        by_kind = {f.kind: f for f in facts}
+        assert by_kind["aussteller"].category == "universal"
+        assert by_kind["rechnungsdatum"].category == "universal"
+        assert by_kind["rechnungsdatum"].value == "01.01.2020"
+        # identifier-category fact lands in the IDENTIFIER bucket + normalized.
+        assert by_kind["vertragskonto"].category == "identifier"
+        assert by_kind["vertragskonto"].normalized_value == "2012345678"
+        # amount-category fact stays in the UNIVERSAL bucket (not identifier).
+        assert by_kind["gesamtbetrag"].category == "universal"
+        assert by_kind["gesamtbetrag"].amount_value == Decimal("12.34")
+        assert by_kind["gesamtbetrag"].amount_currency == "EUR"
+
+    def test_open_facts_malformed_entries_skipped(self):
+        facts = _facts_from_payload({
+            "facts": ["garbage", {"category": "date"}, {"value": "no kind"},
+                      {"category": "date", "kind": "rechnungsdatum", "value": "2024-01-01"}],
+        })
+        assert [f.kind for f in facts] == ["rechnungsdatum"]
+
+    def test_reference_category_maps_to_identifier_bucket(self):
+        """identifier AND reference both collapse to the IDENTIFIER bucket and
+        get a whitespace-stripped normalized_value."""
+        facts = _facts_from_payload({
+            "facts": [{"category": "reference", "kind": "aktenzeichen",
+                       "value": "AZ 12 3", "excerpt": "Aktenzeichen AZ 12 3"}],
+        })
+        assert facts[0].category == "identifier"
+        assert facts[0].normalized_value == "AZ123"
+
+    def test_open_facts_nonstr_category_not_fatal(self):
+        """A hostile non-str category must NOT raise out of _facts_from_payload
+        (which would discard the whole batch) — it falls back to UNIVERSAL."""
+        facts = _facts_from_payload({
+            "facts": [{"category": ["identifier"], "kind": "x", "value": "y"},
+                      {"category": 7, "kind": "z", "value": "w"}],
+        })
+        assert {f.kind for f in facts} == {"x", "z"}
+        assert all(f.category == "universal" for f in facts)
+
+    def test_nonlist_obligations_and_facts_not_fatal(self):
+        """A truthy non-list for obligations/facts must coerce to empty, not
+        raise on slice/iteration."""
+        assert _facts_from_payload({"obligations": {"k": "v"}, "facts": "nope"}) == []
+        assert _facts_from_payload({"facts": 5, "obligations": True}) == []
+
+    def test_open_facts_cap_enforced(self):
+        """The per-source open-facts cap bounds write amplification."""
+        facts = _facts_from_payload({
+            "facts": [{"category": "other", "kind": f"k{i}", "value": f"v{i}"}
+                      for i in range(_MAX_OPEN_FACTS + 25)],
+        })
+        assert len(facts) == _MAX_OPEN_FACTS
+
+    def test_legal_gate_substring_false_positive_not_gated(self):
+        """Prefix-boundary match: a routine bill whose excerpt merely contains a
+        legal keyword as a suffix/infix (Anklage, Preisrevision) is NOT gated."""
+        facts = _facts_from_payload({
+            "obligations": [{"kind": "zahlung", "legal_gate": False,
+                             "excerpt": "Preisrevision; siehe Beklagtenanschrift"}],
+        })
+        assert facts[0].legal_gate is False
+
+    def test_legal_gate_german_compound_still_gated(self):
+        """Open right edge: a compound like Widerspruchsfrist still gates."""
+        facts = _facts_from_payload({
+            "obligations": [{"kind": "termin", "legal_gate": False,
+                             "excerpt": "Die Widerspruchsfrist endet bald"}],
+        })
+        assert facts[0].legal_gate is True
+
 
 # ============================================================ hybrid extract()
 @pytest.mark.asyncio
@@ -239,6 +350,24 @@ class TestExtract:
         client = self._client(
             '{"obligations": [], "universal_facts": {"identifiers": '
             '[{"kind": "iban", "value": "DE89 3704 0044 0532 0130 00"}]}}'
+        )
+        result = await SchichtAExtractor(llm_client=client).extract(
+            "IBAN DE89 3704 0044 0532 0130 00 bei der Bank", lang="de"
+        )
+        ibans = [f for f in result.facts if f.kind == "iban"]
+        assert len(ibans) == 1
+        assert ibans[0].source == "deterministic"
+
+    async def test_open_facts_identifier_deduped_against_deterministic(self, monkeypatch):
+        """Current schema: the LLM echoes the IBAN via the open facts[] list
+        (category=identifier). It must dedup against the deterministic copy the
+        same way the legacy universal_facts path does."""
+        monkeypatch.setattr(
+            "services.schicht_a_extractor.settings.schicht_a_extraction_model", "x"
+        )
+        client = self._client(
+            '{"obligations": [], "facts": [{"category": "identifier", '
+            '"kind": "iban", "value": "DE89 3704 0044 0532 0130 00"}]}'
         )
         result = await SchichtAExtractor(llm_client=client).extract(
             "IBAN DE89 3704 0044 0532 0130 00 bei der Bank", lang="de"
