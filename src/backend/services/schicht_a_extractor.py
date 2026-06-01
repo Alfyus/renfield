@@ -239,16 +239,20 @@ class SchichtAExtractor:
 
         client = self._llm_client or get_default_client()
         classification_kwargs = get_classification_chat_kwargs(model)
+        # No num_predict by default (settings value 0) → let the model generate
+        # to completion (bounded by the server context). A fixed cap truncated
+        # rich docs → unparseable JSON → lost facts. Set >0 only to bound a
+        # misbehaving model.
+        options: dict[str, Any] = {"temperature": 0.1}
+        if settings.schicht_a_extraction_num_predict > 0:
+            options["num_predict"] = settings.schicht_a_extraction_num_predict
         response = await client.chat(
             model=model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            options={
-                "temperature": 0.1,
-                "num_predict": settings.schicht_a_extraction_num_predict,
-            },
+            options=options,
             **classification_kwargs,
         )
         raw = extract_response_content(response) or ""
@@ -373,20 +377,29 @@ def _parse_llm_json(raw: str) -> dict | None:
 def _salvage_truncated_json(s: str) -> dict | None:
     """Best-effort recovery of a truncated JSON object.
 
-    Scan with a bracket stack; remember the last position just after a complete
-    nested container closes (parent still open); cut there, drop the half-written
-    trailing entry, and append the missing closers. Returns a dict or None.
+    Scan with a bracket stack and remember the last position that sits on a clean
+    boundary, cut there, drop the half-written trailing entry, and append the
+    missing closers. Returns a dict or None.
 
-    The cut point is ONLY a container-close boundary — never a comma. Cutting at
-    a comma would land inside a truncated *nested* array (e.g. ``"items":[10,20``)
-    and force-close it as if complete, emitting a plausible-but-wrong value. The
-    close-only rule guarantees the recovered prefix ends at a structurally AND
-    semantically complete element; ``_facts_from_payload`` tolerates any that
-    still lack optional fields. (A truncated first element therefore recovers
-    nothing — accepted: better None than corrupt.)"""
+    A boundary is recorded in two cases:
+      1. just after a nested container closes (``}``/``]`` with a parent still
+         open), and
+      2. at a comma **between elements of the OUTERMOST array** only
+         (``arr_depth == 1``).
+
+    The depth gate on (2) is the load-bearing rule: a comma inside a *nested*
+    array (``arr_depth >= 2``, e.g. ``"items":[10,20,30,40``) is NOT a cut point,
+    so a truncated nested array is never force-closed as a complete (wrong)
+    value — its whole enclosing element is dropped via (1) instead. (1) alone
+    can't recover the elements of a truncated top-level array of SCALARS (they
+    don't close with a bracket), which is why (2) is kept rather than removed.
+    ``_facts_from_payload`` tolerates any recovered entry that still lacks
+    optional fields; a truncated FIRST element recovers nothing (None beats
+    corrupt)."""
     if not s or s[0] != "{":
         return None
     stack: list[str] = []
+    arr_depth = 0  # number of currently-open '[' (so we can gate comma cuts)
     in_str = esc = False
     cut: int | None = None
     for i, ch in enumerate(s):
@@ -400,13 +413,27 @@ def _salvage_truncated_json(s: str) -> dict | None:
             continue
         if ch == '"':
             in_str = True
-        elif ch in "{[":
+        elif ch == "{":
             stack.append(ch)
-        elif ch in "}]":
+        elif ch == "[":
+            stack.append(ch)
+            arr_depth += 1
+        elif ch == "}":
             if stack:
                 stack.pop()
             if stack:  # closed a nested container, parent still open → clean cut
                 cut = i + 1
+        elif ch == "]":
+            if stack:
+                stack.pop()
+            if arr_depth > 0:
+                arr_depth -= 1
+            if stack:
+                cut = i + 1
+        elif ch == "," and arr_depth == 1 and stack and stack[-1] == "[":
+            # between elements of the OUTERMOST array — a clean boundary.
+            # Gated to depth 1 so a truncated nested array can't be cut here.
+            cut = i
     if cut is None:
         return None
     candidate = s[:cut]

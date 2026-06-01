@@ -317,6 +317,13 @@ class TestSalvageTruncatedJson:
         assert obs[0]["kind"] == "a"
         assert all("items" not in o for o in obs)  # no half-array smuggled in
 
+    def test_top_level_array_comma_cut_still_recovers_scalars(self):
+        """The comma branch is KEPT (not dropped) but depth-gated: it still
+        recovers complete scalars from a truncated OUTERMOST array — the case
+        the container-close rule alone can't handle (scalars don't bracket-close).
+        Proves we didn't take the shortcut of removing the branch."""
+        assert _salvage_truncated_json('{"vals": [1, 2, 3, 4') == {"vals": [1, 2, 3]}
+
     @pytest.mark.parametrize("bad", [
         "{",
         "}}}}",
