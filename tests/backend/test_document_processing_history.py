@@ -123,6 +123,25 @@ async def test_open_initial_ingest_is_idempotent(committing_session):
     assert count == 1
 
 
+async def test_initial_ingest_status_reflects_lifecycle(committing_session):
+    """initial_ingest_status() drives the worker's idempotent-consumer branch:
+    None (never ingested) → processing (open) → completed (close_success)."""
+    doc = await _make_doc(committing_session)
+    doc_id = doc.id
+    svc = DocumentProcessingHistoryService(committing_session)
+
+    assert await svc.initial_ingest_status(doc_id) is None
+    hid = await svc.open(doc_id, force_ocr=False, trigger=ProcessingTrigger.INITIAL_INGEST)
+    assert await svc.initial_ingest_status(doc_id) == ProcessingStatus.PROCESSING.value
+    await svc.close_success(hid, chunks_produced=1, chunks_dropped=0, ocr_engine="docling")
+    committing_session.expire_all()
+    assert await svc.initial_ingest_status(doc_id) == ProcessingStatus.COMPLETED.value
+
+    # A user_reindex row must NOT be mistaken for the initial_ingest status.
+    await svc.open(doc_id, force_ocr=False, trigger=ProcessingTrigger.USER_REINDEX)
+    assert await svc.initial_ingest_status(doc_id) == ProcessingStatus.COMPLETED.value
+
+
 async def test_open_initial_ingest_coexists_with_reindex_rows(committing_session):
     """initial_ingest idempotency must not block additional non-initial rows
     (user_reindex etc.) — those are expected many-per-doc."""

@@ -341,6 +341,26 @@ class DocumentProcessingHistoryService:
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def initial_ingest_status(self, document_id: int) -> str | None:
+        """Status of the doc's single ``initial_ingest`` row, or ``None`` if it
+        has never been ingested.
+
+        The document-worker uses this to be an idempotent consumer of the
+        at-least-once Redis stream: ``completed`` → a re-delivered entry is a
+        duplicate (drop it, don't re-ingest); ``processing``/``failed`` → an
+        incomplete first ingest to retry (purge partial chunks first); ``None``
+        → a genuine first ingest.
+        """
+        result = await self.db.execute(
+            select(DocumentProcessingHistory.status)
+            .where(
+                DocumentProcessingHistory.document_id == document_id,
+                DocumentProcessingHistory.trigger == ProcessingTrigger.INITIAL_INGEST.value,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     # ------------------------------------------------------------------
     # Context manager (the seam every ingest path uses)
     # ------------------------------------------------------------------

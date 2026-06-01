@@ -35,8 +35,14 @@ import signal
 
 import redis.asyncio as aioredis
 from loguru import logger
+from sqlalchemy import delete, text
 
+from models.database import DocumentChunk
 from services.database import AsyncSessionLocal
+from services.document_processing_history import (
+    DocumentProcessingHistoryService,
+    ProcessingStatus,
+)
 from services.progress import DocumentProgress
 from services.rag_service import RAGService
 from services.task_queue import (
@@ -93,6 +99,48 @@ async def _process_entry(
     try:
         async with AsyncSessionLocal() as db:
             rag = RAGService(db)
+            history = DocumentProcessingHistoryService(db)
+
+            # Idempotent consumer. The stream is at-least-once: reclaim_stale
+            # re-delivers stale PEL entries on restart, including entries whose
+            # ingest already SUCCEEDED but was SIGKILLed before the ack below.
+            # Branch on the doc's initial-ingest state so a re-delivery never
+            # double-ingests (process_existing_document APPENDS chunks + re-fires
+            # the KG/Schicht-A hooks — it does not purge first).
+            ingest_status = await history.initial_ingest_status(doc_id)
+            if ingest_status == ProcessingStatus.COMPLETED.value:
+                # Already fully ingested → duplicate delivery. Do NOT reprocess
+                # (would append duplicate chunks + duplicate KG entities). Drop
+                # it, and self-heal a doc left stuck in 'processing' by an
+                # earlier failed re-attempt (the stuck-doc bug this guard fixes).
+                await db.execute(
+                    text(
+                        "UPDATE documents SET status = 'completed' "
+                        "WHERE id = :id AND status <> 'completed'"
+                    ),
+                    {"id": doc_id},
+                )
+                await db.commit()
+                await queue.ack(entry.entry_id)
+                logger.info(
+                    f"doc {doc_id}: initial ingest already completed — duplicate "
+                    f"delivery, acked (entry {entry.entry_id})"
+                )
+                return
+            if ingest_status in (
+                ProcessingStatus.PROCESSING.value,
+                ProcessingStatus.FAILED.value,
+            ):
+                # Incomplete first ingest being retried — purge any partial
+                # chunks (mirrors reindex_document) so the rebuild is idempotent.
+                await db.execute(
+                    delete(DocumentChunk).where(DocumentChunk.document_id == doc_id)
+                )
+                await db.commit()
+                logger.info(
+                    f"doc {doc_id}: retrying incomplete ingest — purged partial chunks"
+                )
+
             await rag.process_existing_document(
                 document_id=doc_id,
                 force_ocr=force_ocr,
