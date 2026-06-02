@@ -6,6 +6,7 @@ import AdaptiveCardRenderer from '../../components/AdaptiveCardRenderer';
 import IntentCorrectionButton from '../../components/IntentCorrectionButton';
 import AttachmentQuickActions from './AttachmentQuickActions';
 import EmailForwardDialog from './EmailForwardDialog';
+import PaperlessConfirmCard from './PaperlessConfirmCard';
 import { useChatContext } from './context/ChatContext';
 import { CitationChip } from '../../components/wissensbasis/CitationChip';
 import { useTraceQuery, type TraceEntity } from '../../api/resources/wissensbasis';
@@ -139,7 +140,7 @@ export default function ChatMessages() {
     messages, loading, historyLoading, speakText, handleFeedbackSubmit,
     actionLoading, actionResult, indexToKb, sendToPaperless, sendToBoth, handleSummarize,
     handleSendViaEmail, emailDialog, confirmSendViaEmail, cancelEmailDialog,
-    sendMessage, sessionId,
+    sendMessage, sessionId, submitPaperlessConfirm,
   } = useChatContext();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -310,6 +311,20 @@ export default function ChatMessages() {
               <div className="mt-2">
                 <AdaptiveCardRenderer card={message.card} />
               </div>
+            )}
+
+            {/* Interactive Paperless cold-start confirm card */}
+            {message.paperlessConfirm && (
+              <PaperlessConfirmCard
+                key={message.paperlessConfirm.confirmToken}
+                confirmToken={message.paperlessConfirm.confirmToken}
+                filename={message.paperlessConfirm.filename}
+                summary={message.paperlessConfirm.summary}
+                fields={message.paperlessConfirm.fields}
+                status={message.paperlessConfirm.status}
+                onSubmit={(token, decisions) => submitPaperlessConfirm(token, { decisions })}
+                onAbort={(token) => submitPaperlessConfirm(token, { abort: true })}
+              />
             )}
 
             {/* Attachment chips */}

@@ -77,6 +77,33 @@ export interface PaperlessCommittedMessage extends BaseWsMessage {
   message: string;
 }
 
+// Interactive Paperless confirm card. Pushed when an upload needs the user to
+// resolve ambiguous metadata (correspondent / type / tags). The user picks per
+// field and submits a structured decision back (no free-text parsing).
+export interface PaperlessConfirmOption {
+  action: 'use' | 'create' | 'skip';
+  value: string | null;
+  label: string;
+}
+
+export interface PaperlessConfirmField {
+  idx: number;              // 1-based over the backend proposals list
+  field: string;            // correspondent | document_type | storage_path | tag
+  label: string;            // localized field label from the backend
+  extracted_value: string | null;
+  options: PaperlessConfirmOption[];
+  default: { action: 'use' | 'create' | 'skip'; value: string | null };
+}
+
+export interface PaperlessConfirmRequestMessage extends BaseWsMessage {
+  type: 'paperless_confirm_request';
+  confirm_token: string;
+  attachment_id?: number | null;
+  filename?: string | null;
+  summary: Record<string, unknown>;
+  fields: PaperlessConfirmField[];
+}
+
 export interface AgentThinkingMessage extends BaseWsMessage {
   type: 'agent_thinking';
   step?: number;
@@ -129,6 +156,7 @@ interface UseChatWebSocketOptions {
   onDocumentError?: (data: DocumentErrorMessage) => void;
   onUploadProcessed?: (data: UploadProcessedMessage) => void;
   onPaperlessCommitted?: (data: PaperlessCommittedMessage) => void;
+  onPaperlessConfirmRequest?: (data: PaperlessConfirmRequestMessage) => void;
   onAgentThinking?: (data: AgentThinkingMessage) => void;
   onAgentToolCall?: (data: AgentToolCallMessage) => void;
   onAgentToolResult?: (data: AgentToolResultMessage) => void;
@@ -151,6 +179,7 @@ export function useChatWebSocket({
   onDocumentError,
   onUploadProcessed,
   onPaperlessCommitted,
+  onPaperlessConfirmRequest,
   onAgentThinking,
   onAgentToolCall,
   onAgentToolResult,
@@ -244,6 +273,10 @@ export function useChatWebSocket({
       } else if (data.type === 'card') {
         debug.log('Card received');
         onCard?.(data as CardMessage);
+      } else if (data.type === 'paperless_confirm_request') {
+        const msg = data as PaperlessConfirmRequestMessage;
+        debug.log('Paperless confirm request:', msg.filename, `${msg.fields?.length ?? 0} fields`);
+        onPaperlessConfirmRequest?.(msg);
       }
     };
 
@@ -262,7 +295,7 @@ export function useChatWebSocket({
     };
 
     wsRef.current = ws;
-  }, [onStreamChunk, onStreamDone, onAction, onRagContext, onIntentFeedbackRequest, onDocumentProcessing, onDocumentReady, onDocumentError, onAgentThinking, onAgentToolCall, onAgentToolResult, onAgentFederationProgress, onCard]);
+  }, [onStreamChunk, onStreamDone, onAction, onRagContext, onIntentFeedbackRequest, onDocumentProcessing, onDocumentReady, onDocumentError, onUploadProcessed, onPaperlessCommitted, onPaperlessConfirmRequest, onAgentThinking, onAgentToolCall, onAgentToolResult, onAgentFederationProgress, onCard]);
 
   useEffect(() => {
     connectWebSocket();

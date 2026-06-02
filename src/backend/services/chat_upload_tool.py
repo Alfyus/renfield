@@ -403,6 +403,14 @@ async def forward_attachment_to_paperless(
                 "confirm_token": confirm_token,
                 "attachment_id": attachment_id,
                 "filename": upload.filename,
+                # Structured payload for the interactive confirm card. The text
+                # preview above stays as the fallback; clients that render the
+                # card use this. `idx` is 1-based over the FULL proposals list so
+                # it maps straight to pending.proposals[idx-1] in the structured
+                # commit path (same convention as _parse_user_choices).
+                "confirm": _build_confirm_payload(
+                    post_fuzzy, extraction_result.metadata.resolutions,
+                ),
             },
         }
     except Exception as e:
@@ -802,3 +810,76 @@ def _render_confirm_message(
         "auf ausdrücklichen Wunsch (`neu`)."
     )
     return "\n".join(lines)
+
+
+def _build_confirm_payload(metadata: dict, resolutions: list) -> dict:
+    """Structured confirm data for the interactive confirm card.
+
+    Mirrors `_render_confirm_message` but emits machine-readable per-field
+    options instead of prose, so the frontend can render a clickable picker
+    and submit a structured decision (no free-text parsing).
+
+    `summary` is the already-resolved metadata (shown read-only on the card).
+    `fields` is one entry per resolution that still needs a user decision.
+    Each field's `idx` is **1-based over the full resolutions list** so it
+    maps straight to `pending.proposals[idx-1]` in the structured commit
+    path — the same index convention `_parse_user_choices` uses, so an
+    exact-match field we don't surface still doesn't shift the indices.
+    """
+    summary = {
+        key: metadata.get(key)
+        for key in (
+            "title", "correspondent", "document_type",
+            "tags", "storage_path", "created_date",
+        )
+    }
+
+    fields = []
+    for i, res in enumerate(resolutions or []):
+        field = res.field if hasattr(res, "field") else res.get("field")
+        extracted = (
+            res.extracted_value if hasattr(res, "extracted_value")
+            else res.get("extracted_value")
+        )
+        near = (
+            list(res.near_matches) if hasattr(res, "near_matches")
+            else list(res.get("near_matches") or [])
+        )
+        needs_decision = (
+            res.requires_user_decision if hasattr(res, "requires_user_decision")
+            else (res.get("status") != "exact" or bool(near))
+        )
+        if not needs_decision:
+            continue
+
+        # Options, in display order: each near-match (pick existing), then
+        # "create new" with the extracted value, then "leave empty".
+        options = [
+            {"action": "use", "value": candidate, "label": candidate}
+            for candidate in near
+        ]
+        options.append({
+            "action": "create",
+            "value": extracted,
+            "label": f"Neu anlegen: „{extracted}“",
+        })
+        options.append({"action": "skip", "value": None, "label": "Leer lassen"})
+
+        # Default mirrors `_default_decisions`: take the top near-match if
+        # present (the "(Vorschlag)" the text preview marks), else leave empty.
+        # NEVER default to "create" — new taxonomy entries only on explicit ask.
+        default = (
+            {"action": "use", "value": near[0]} if near
+            else {"action": "skip", "value": None}
+        )
+
+        fields.append({
+            "idx": i + 1,
+            "field": field,
+            "label": _FIELD_LABELS_DE.get(field, field),
+            "extracted_value": extracted,
+            "options": options,
+            "default": default,
+        })
+
+    return {"summary": summary, "fields": fields}

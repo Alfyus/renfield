@@ -183,6 +183,22 @@
     "emailFailed": "Failed to send email",
     "documentIndexing": "Indexing to KB...",
     "documentIndexed": "Indexed to KB",
+    "paperlessConfirm": {
+      "title": "File document in Paperless",
+      "decisionsHeading": "Please choose per field",
+      "confirm": "File it",
+      "abort": "Cancel",
+      "submitted": "Choice submitted",
+      "createValueLabel": "New entry",
+      "summaryFields": {
+        "title": "Title",
+        "correspondent": "Correspondent",
+        "document_type": "Document type",
+        "tags": "Tags",
+        "storage_path": "Storage path",
+        "created_date": "Issue date"
+      }
+    },
     "agentThinking": "Thinking...",
     "agentStepsCount": "{{count}} step completed",
     "agentStepsCount_other": "{{count}} steps completed",

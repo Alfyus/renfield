@@ -183,6 +183,22 @@
     "emailFailed": "E-Mail-Versand fehlgeschlagen",
     "documentIndexing": "Wird indexiert...",
     "documentIndexed": "In Wissensdatenbank indexiert",
+    "paperlessConfirm": {
+      "title": "Dokument in Paperless ablegen",
+      "decisionsHeading": "Bitte pro Feld wählen",
+      "confirm": "Ablegen",
+      "abort": "Abbrechen",
+      "submitted": "Auswahl gesendet",
+      "createValueLabel": "Neuer Eintrag",
+      "summaryFields": {
+        "title": "Titel",
+        "correspondent": "Korrespondent",
+        "document_type": "Dokumenttyp",
+        "tags": "Tags",
+        "storage_path": "Speicherpfad",
+        "created_date": "Ausstellungsdatum"
+      }
+    },
     "agentThinking": "Denkt nach...",
     "agentStepsCount": "{{count}} Schritt ausgeführt",
     "agentStepsCount_other": "{{count}} Schritte ausgeführt",

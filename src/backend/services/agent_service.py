@@ -1626,6 +1626,7 @@ class AgentService:
                     # capture it here and relay it instead of letting the LLM
                     # summarise (which drops the per-field choices).
                     parallel_preview: tuple[str, Any] | None = None
+                    parallel_confirm_data: dict | None = None
                     for act, res in zip(valid_actions, exec_results):
                         if isinstance(res, Exception):
                             logger.error(f"❌ Parallel tool '{act['action']}' failed: {res}")
@@ -1668,6 +1669,7 @@ class AgentService:
                             parallel_preview = (
                                 res.get("message") or "", _rd["action_required"],
                             )
+                            parallel_confirm_data = _rd
 
                     # Relay an action_required preview verbatim + stop the loop
                     # (mirrors the single-tool short-circuit below).
@@ -1681,6 +1683,17 @@ class AgentService:
                                 f"action_required={parallel_preview[1]}"
                             ),
                         )
+                        # Interactive confirm card (see single-tool path).
+                        if (
+                            isinstance(parallel_confirm_data, dict)
+                            and parallel_confirm_data.get("action_required") == "paperless_confirm"
+                            and parallel_confirm_data.get("confirm")
+                        ):
+                            yield AgentStep(
+                                step_number=step_num,
+                                step_type="paperless_confirm",
+                                data=parallel_confirm_data,
+                            )
                         return
 
                     continue  # Next iteration of ReAct loop
@@ -1891,6 +1904,19 @@ class AgentService:
                             f"action_required={tool_data['action_required']}"
                         ),
                     )
+                    # Interactive confirm card: when the tool supplied a
+                    # structured `confirm` payload, emit it as its own step so
+                    # the frontend renders a clickable picker (the preview text
+                    # above stays as the assistant bubble + fallback). Attaches
+                    # AFTER the final_answer so the bubble exists first (same
+                    # ordering the `card` step relies on).
+                    if tool_data.get("action_required") == "paperless_confirm" \
+                            and tool_data.get("confirm"):
+                        yield AgentStep(
+                            step_number=step_num,
+                            step_type="paperless_confirm",
+                            data=tool_data,
+                        )
                     return
 
             # Check for repeated empty results from the same tool
@@ -2177,6 +2203,20 @@ def step_to_ws_message(step: AgentStep) -> dict:
         if data.get("replace_text"):
             msg["replace_text"] = data["replace_text"]
         return msg
+    elif step.step_type == "paperless_confirm":
+        # Interactive Paperless confirm card. Carries the structured per-field
+        # options the frontend renders as a clickable picker; the user's choice
+        # comes back as a {type:"paperless_confirm"} frame (see chat_handler).
+        data = step.data or {}
+        confirm = data.get("confirm") or {}
+        return {
+            "type": "paperless_confirm_request",
+            "confirm_token": data.get("confirm_token"),
+            "attachment_id": data.get("attachment_id"),
+            "filename": data.get("filename"),
+            "summary": confirm.get("summary") or {},
+            "fields": confirm.get("fields") or [],
+        }
     else:
         return {
             "type": "agent_thinking",

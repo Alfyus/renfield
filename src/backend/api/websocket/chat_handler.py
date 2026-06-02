@@ -693,6 +693,70 @@ async def websocket_endpoint(
                     session_state.db_session_id = reg_sid
                 continue
 
+            # Structured Paperless-confirm decision from the interactive confirm
+            # card. The card submits {type:"paperless_confirm", confirm_token,
+            # decisions:[{idx,action,value}], abort?} instead of free text, so we
+            # route straight to internal.paperless_commit_upload with the
+            # structured decisions — bypassing the free-text parser entirely.
+            # Handled before WSChatMessage validation (which is Literal["text"]).
+            if isinstance(data, dict) and data.get("type") == "paperless_confirm":
+                confirm_token = data.get("confirm_token")
+                # Prefer the server-tracked session (set on the `register` frame
+                # / first message) over the client-supplied one — the pending
+                # lookup is session-scoped, so trusting client input here would
+                # let a leaked confirm_token cross session boundaries.
+                confirm_sid = session_state.db_session_id or data.get("session_id")
+                # `user_id` is a loop-body local (first bound after WSChatMessage
+                # validation below), so derive the connection identity locally —
+                # referencing the later local here raises UnboundLocalError when a
+                # confirm frame is the first frame on a (re)connected socket.
+                confirm_user_id = (
+                    auth_result.get("user_id") if isinstance(auth_result, dict) else None
+                )
+                if not confirm_token:
+                    await send_ws_error(
+                        websocket, WSErrorCode.INVALID_MESSAGE,
+                        "paperless_confirm requires 'confirm_token'",
+                    )
+                    continue
+                try:
+                    from services.action_executor import ActionExecutor
+                    _mcp = getattr(app.state, "mcp_manager", None)
+                    _executor = ActionExecutor(mcp_manager=_mcp, session_id=confirm_sid)
+                    _params = {"confirm_token": confirm_token}
+                    if data.get("abort"):
+                        _params["abort"] = True
+                    else:
+                        _params["decisions"] = data.get("decisions") or []
+                    action_result = await _executor.execute(
+                        {
+                            "intent": "internal.paperless_commit_upload",
+                            "parameters": _params,
+                            "confidence": 1.0,
+                        },
+                        user_id=confirm_user_id,
+                    )
+                    await websocket.send_json({
+                        "type": "action",
+                        "intent": {"intent": "internal.paperless_commit_upload"},
+                        "result": action_result,
+                    })
+                    _confirm_msg = action_result.get("message", "") or ""
+                    if _confirm_msg:
+                        await websocket.send_json({"type": "stream", "content": _confirm_msg})
+                    await websocket.send_json({"type": "done"})
+                    logger.info(
+                        f"📎 Paperless confirm card → commit token "
+                        f"{str(confirm_token)[:8]} (session {confirm_sid})"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"⚠️ Paperless confirm card handoff failed: {e}")
+                    await send_ws_error(
+                        websocket, WSErrorCode.INTERNAL_ERROR,
+                        "Bestätigung konnte nicht verarbeitet werden.",
+                    )
+                continue
+
             # Validate message
             try:
                 msg = WSChatMessage(**data)
@@ -1304,6 +1368,7 @@ async def websocket_endpoint(
                         deferred_final_answer: str | None = None
                         deferred_card: dict | None = None
                         deferred_replace_text: str | None = None
+                        deferred_paperless_confirm: dict | None = None
 
                         async def _typing_callback() -> None:
                             await websocket.send_json({"type": "typing"})
@@ -1336,6 +1401,12 @@ async def websocket_endpoint(
                                 # 1-line lede via ``replace_text`` to
                                 # collapse the streamed synthesis bubble.
                                 deferred_replace_text = (step.data or {}).get("replace_text")
+                            elif step.step_type == "paperless_confirm":
+                                # Same deferral as `card` — the interactive
+                                # confirm card attaches to the latest assistant
+                                # bubble, so hold it until the synthesis text
+                                # is on the wire.
+                                deferred_paperless_confirm = step.data
                             else:
                                 await websocket.send_json(step_to_ws_message(step))
                             if step.step_type == "tool_result" and step.success and step.data:
@@ -1412,6 +1483,16 @@ async def websocket_endpoint(
                             if deferred_replace_text:
                                 card_msg["replace_text"] = deferred_replace_text
                             await websocket.send_json(card_msg)
+
+                        if deferred_paperless_confirm:
+                            from services.agent_service import AgentStep
+                            await websocket.send_json(step_to_ws_message(
+                                AgentStep(
+                                    step_number=0,
+                                    step_type="paperless_confirm",
+                                    data=deferred_paperless_confirm,
+                                )
+                            ))
 
                         if agent_tool_results:
                             action_result = _build_agent_action_result(agent_tool_results)
