@@ -45,6 +45,7 @@ from api.routes import config as config_routes
 from api.routes import knowledge_graph as kg_routes
 from api.routes import mcp as mcp_routes
 from api.routes import settings as settings_routes
+from api.routes import wissensbasis as wissensbasis_routes
 from api.websocket import chat_router, kg_live_router
 # NOTE: device_router, satellite_router, and the HA-specific REST routers
 # (camera, homeassistant, paperless_audit, presence, rooms, satellites)
@@ -186,6 +187,7 @@ app.include_router(trajectories.router, prefix="/api/trajectories", tags=["Traje
 app.include_router(tool_health.router, prefix="/api/tool-health", tags=["Tool Health"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(kg_routes.router, prefix="/api/knowledge-graph", tags=["Knowledge Graph"])
+app.include_router(wissensbasis_routes.router, prefix="/api/wissensbasis", tags=["Wissensbasis - Graph"])
 app.include_router(atoms.router, prefix="/api/atoms", tags=["Circles - Atoms"])
 app.include_router(circles.router, prefix="/api/circles", tags=["Circles - Membership"])
 app.include_router(federation_pairing.router, prefix="/api/federation", tags=["Federation - Pairing"])
