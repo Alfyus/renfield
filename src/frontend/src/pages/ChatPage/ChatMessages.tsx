@@ -316,6 +316,7 @@ export default function ChatMessages() {
             {/* Interactive Paperless cold-start confirm card */}
             {message.paperlessConfirm && (
               <PaperlessConfirmCard
+                key={message.paperlessConfirm.confirmToken}
                 confirmToken={message.paperlessConfirm.confirmToken}
                 filename={message.paperlessConfirm.filename}
                 summary={message.paperlessConfirm.summary}

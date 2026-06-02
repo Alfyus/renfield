@@ -65,6 +65,15 @@ export default function PaperlessConfirmCard({
     return init;
   });
 
+  // Editable "create" text, tracked per field separately from the selection so
+  // it survives toggling to another option and back (the selection's `value`
+  // gets overwritten by use/skip choices).
+  const [createDrafts, setCreateDrafts] = useState<Record<number, string>>(() => {
+    const init: Record<number, string> = {};
+    for (const f of fields) init[f.idx] = f.extracted_value ?? '';
+    return init;
+  });
+
   const summaryRows = useMemo(
     () =>
       (['title', 'correspondent', 'document_type', 'tags', 'storage_path', 'created_date'] as const)
@@ -72,30 +81,34 @@ export default function PaperlessConfirmCard({
     [summary],
   );
 
-  const pickOption = (idx: number, opt: PaperlessConfirmOption, extracted: string | null): void => {
+  const pickOption = (idx: number, opt: PaperlessConfirmOption): void => {
     if (readOnly) return;
     setSelections((prev) => ({
       ...prev,
       [idx]: {
         action: opt.action,
-        // "create" keeps the editable extracted value; others take the option's.
-        value: opt.action === 'create' ? (prev[idx]?.value ?? extracted ?? '') : opt.value,
+        // "create" pulls from the persisted draft; others take the option's.
+        value: opt.action === 'create' ? (createDrafts[idx] ?? '') : opt.value,
       },
     }));
   };
 
   const editCreateValue = (idx: number, value: string): void => {
     if (readOnly) return;
+    setCreateDrafts((prev) => ({ ...prev, [idx]: value }));
     setSelections((prev) => ({ ...prev, [idx]: { action: 'create', value } }));
   };
 
   const handleSubmit = (): void => {
     if (readOnly) return;
-    const decisions = fields.map((f) => ({
-      idx: f.idx,
-      action: selections[f.idx]?.action ?? 'skip',
-      value: selections[f.idx]?.value ?? null,
-    }));
+    const decisions = fields.map((f) => {
+      const action = selections[f.idx]?.action ?? 'skip';
+      const value =
+        action === 'create'
+          ? (createDrafts[f.idx] ?? f.extracted_value ?? '')
+          : (selections[f.idx]?.value ?? null);
+      return { idx: f.idx, action, value };
+    });
     onSubmit(confirmToken, decisions);
   };
 
@@ -136,12 +149,16 @@ export default function PaperlessConfirmCard({
                 </legend>
                 <div className="space-y-1 mt-1">
                   {f.options.map((opt) => {
-                    const selected = sel?.action === opt.action
-                      && (opt.action !== 'use' || sel?.value === opt.value);
+                    // "create" matches on action alone (its value is the
+                    // editable draft); use/skip match on action + value so two
+                    // same-action options can't both highlight.
+                    const selected = opt.action === 'create'
+                      ? sel?.action === 'create'
+                      : sel?.action === opt.action && (sel?.value ?? null) === (opt.value ?? null);
                     return (
                       <label
                         key={optionKey(opt)}
-                        className={`flex items-center gap-2 px-2 py-1 rounded cursor-pointer ${
+                        className={`flex items-center gap-2 px-2 py-2 min-h-[2.75rem] rounded cursor-pointer ${
                           selected
                             ? 'bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300'
                             : 'hover:bg-gray-50 dark:hover:bg-gray-800'
@@ -152,7 +169,7 @@ export default function PaperlessConfirmCard({
                           name={`pl-confirm-${confirmToken}-${f.idx}`}
                           checked={!!selected}
                           disabled={readOnly}
-                          onChange={() => pickOption(f.idx, opt, f.extracted_value)}
+                          onChange={() => pickOption(f.idx, opt)}
                           className="accent-primary-600"
                         />
                         <span>{opt.label}</span>
@@ -163,7 +180,7 @@ export default function PaperlessConfirmCard({
                   {sel?.action === 'create' && (
                     <input
                       type="text"
-                      value={sel.value ?? ''}
+                      value={createDrafts[f.idx] ?? ''}
                       disabled={readOnly}
                       onChange={(e) => editCreateValue(f.idx, e.target.value)}
                       aria-label={t('chat.paperlessConfirm.createValueLabel')}
@@ -187,7 +204,7 @@ export default function PaperlessConfirmCard({
           <button
             type="button"
             onClick={() => onAbort(confirmToken)}
-            className="btn-secondary inline-flex items-center gap-1 text-sm"
+            className="btn-secondary inline-flex items-center gap-1 text-sm min-h-[2.75rem]"
           >
             <X className="w-4 h-4" aria-hidden="true" />
             {t('chat.paperlessConfirm.abort')}
@@ -195,7 +212,7 @@ export default function PaperlessConfirmCard({
           <button
             type="button"
             onClick={handleSubmit}
-            className="btn-primary inline-flex items-center gap-1 text-sm"
+            className="btn-primary inline-flex items-center gap-1 text-sm min-h-[2.75rem]"
           >
             <Check className="w-4 h-4" aria-hidden="true" />
             {t('chat.paperlessConfirm.confirm')}

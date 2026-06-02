@@ -977,12 +977,22 @@ export function ChatProvider({ children }: ChatProviderProps) {
       confirmToken: string,
       payload: { decisions: { idx: number; action: string; value: string | null }[] } | { abort: true },
     ): void => {
-      wsSendMessage({
+      // Only flip the card to read-only if the frame actually went out.
+      // wsSendMessage returns false when the socket isn't OPEN — marking it
+      // 'submitted' anyway would strand the confirm with no retry path.
+      const sent = wsSendMessage({
         type: 'paperless_confirm',
         confirm_token: confirmToken,
         session_id: sessionId,
         ...payload,
       });
+      if (!sent) {
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: t('errors.couldNotProcess') },
+        ]);
+        return;
+      }
       setMessages((prev) =>
         prev.map((msg) =>
           msg.paperlessConfirm?.confirmToken === confirmToken
@@ -991,7 +1001,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
         ),
       );
     },
-    [wsSendMessage, sessionId],
+    [wsSendMessage, sessionId, t],
   );
 
   // Register this session on the WS as soon as it's connected, so background

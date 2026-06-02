@@ -298,16 +298,21 @@ def _decisions_from_structured(
         action = entry.get("action")
         if action not in ("use", "create", "skip"):
             continue
-        if not isinstance(idx, int) or idx < 1 or idx > len(resolutions):
+        # bool is an int subclass — exclude it so {"idx": true} can't alias idx 1.
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            continue
+        if idx < 1 or idx > len(resolutions):
             continue
         res = resolutions[idx - 1]
-        value = entry.get("value")
+        # Coerce to str — a non-string value from a malformed payload would
+        # crash _commit_approved's `.strip()` (caught upstream, but the commit
+        # would silently never fire).
+        raw = entry.get("value")
+        value = raw if isinstance(raw, str) else ""
         if action == "create":
             value = value or _resolution_value(res)
         elif action == "skip":
             value = ""
-        else:  # use
-            value = value or ""
         decisions.append({"resolution": res, "action": action, "value": value})
     return decisions
 

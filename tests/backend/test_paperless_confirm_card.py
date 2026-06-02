@@ -146,6 +146,25 @@ class TestDecisionsFromStructured:
         assert out[0]["value"] == ""
 
     @pytest.mark.unit
+    def test_non_string_value_coerced_to_empty(self):
+        # A malformed payload value (dict/None) must not survive — it would
+        # crash _commit_approved's .strip(). "use" with junk → "".
+        out = _decisions_from_structured(
+            [{"idx": 1, "action": "use", "value": {"x": 1}}],
+            _RESOLUTIONS,
+        )
+        assert out[0]["value"] == ""
+
+    @pytest.mark.unit
+    def test_bool_idx_rejected(self):
+        # bool is an int subclass — must NOT alias idx 1.
+        out = _decisions_from_structured(
+            [{"idx": True, "action": "use", "value": "x"}],
+            _RESOLUTIONS,
+        )
+        assert out == []
+
+    @pytest.mark.unit
     def test_out_of_range_and_unknown_action_dropped(self):
         out = _decisions_from_structured(
             [
