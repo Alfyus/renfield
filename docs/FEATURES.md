@@ -546,6 +546,16 @@ String-Similarity (difflib SequenceMatcher) statt Embedding-Similarity für zuve
 - `GET /api/knowledge-graph/cleanup/duplicates` — Duplikat-Cluster per String-Similarity finden
 - `POST /api/knowledge-graph/cleanup/merge-duplicates` — Auto-Merge (Threshold 0.93+ empfohlen für sicheres Auto-Merge)
 
+### 3D-Wissensgraph (Visualisierung)
+
+Der `/knowledge-graph` Graph-Tab rendert eine 3D-Szene (`GraphView.tsx`) über native Backend-Endpunkte:
+
+- `GET /api/wissensbasis/graph` — Korpus-Ansicht: Connected-Component-Cluster mit Hub-Entities
+- `GET /api/wissensbasis/focus?entity_id=` — Nachbarschaft einer Entity (hop1 + hop2)
+- `GET /api/wissensbasis/search?q=` — Namens-Suche für das Such-Overlay
+
+Alle drei sind `KG_VIEW`-gated und circle-gefiltert (`services/kg_graph_service.py`): eine Kante erscheint nur, wenn beide Endpunkte für den Anfragenden sichtbar sind. Die Reva-eigenen Endpunkte (`/trace`, `/me/mix`) sind in der Standalone-Renfield-Variante absichtlich nicht implementiert.
+
 ## Admin Maintenance Page
 
 Zentrale Wartungsseite unter `/admin/maintenance` mit Re-Embedding, Keyword-Refresh, MCP-Status und weiteren Admin-Operationen.
