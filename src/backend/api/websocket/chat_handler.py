@@ -693,6 +693,59 @@ async def websocket_endpoint(
                     session_state.db_session_id = reg_sid
                 continue
 
+            # Structured Paperless-confirm decision from the interactive confirm
+            # card. The card submits {type:"paperless_confirm", confirm_token,
+            # decisions:[{idx,action,value}], abort?} instead of free text, so we
+            # route straight to internal.paperless_commit_upload with the
+            # structured decisions — bypassing the free-text parser entirely.
+            # Handled before WSChatMessage validation (which is Literal["text"]).
+            if isinstance(data, dict) and data.get("type") == "paperless_confirm":
+                confirm_token = data.get("confirm_token")
+                confirm_sid = data.get("session_id") or session_state.db_session_id
+                if not confirm_token:
+                    await send_ws_error(
+                        websocket, WSErrorCode.INVALID_MESSAGE,
+                        "paperless_confirm requires 'confirm_token'",
+                    )
+                    continue
+                try:
+                    from services.action_executor import ActionExecutor
+                    _mcp = getattr(app.state, "mcp_manager", None)
+                    _executor = ActionExecutor(mcp_manager=_mcp, session_id=confirm_sid)
+                    _params = {"confirm_token": confirm_token}
+                    if data.get("abort"):
+                        _params["abort"] = True
+                    else:
+                        _params["decisions"] = data.get("decisions") or []
+                    action_result = await _executor.execute(
+                        {
+                            "intent": "internal.paperless_commit_upload",
+                            "parameters": _params,
+                            "confidence": 1.0,
+                        },
+                        user_id=user_id,
+                    )
+                    await websocket.send_json({
+                        "type": "action",
+                        "intent": {"intent": "internal.paperless_commit_upload"},
+                        "result": action_result,
+                    })
+                    _confirm_msg = action_result.get("message", "") or ""
+                    if _confirm_msg:
+                        await websocket.send_json({"type": "stream", "content": _confirm_msg})
+                    await websocket.send_json({"type": "done"})
+                    logger.info(
+                        f"📎 Paperless confirm card → commit token "
+                        f"{str(confirm_token)[:8]} (session {confirm_sid})"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"⚠️ Paperless confirm card handoff failed: {e}")
+                    await send_ws_error(
+                        websocket, WSErrorCode.INTERNAL_ERROR,
+                        "Bestätigung konnte nicht verarbeitet werden.",
+                    )
+                continue
+
             # Validate message
             try:
                 msg = WSChatMessage(**data)

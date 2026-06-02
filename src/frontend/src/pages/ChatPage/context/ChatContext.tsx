@@ -38,6 +38,8 @@ import type {
   DoneMessage,
   IntentFeedbackRequestMessage,
   PaperlessCommittedMessage,
+  PaperlessConfirmField,
+  PaperlessConfirmRequestMessage,
   RagContextMessage,
   UploadProcessedMessage,
 } from '../hooks/useChatWebSocket';
@@ -96,6 +98,17 @@ export interface ChatUiMessage {
   federationProgress?: Record<string, FederationProgressEntry>;
   attachments?: MessageAttachment[];
   card?: Record<string, unknown>;
+  // Interactive Paperless confirm card (cold-start upload metadata picker).
+  // Attached to the assistant bubble that streamed the preview; the user
+  // resolves each field and submits a structured decision. `status` flips to
+  // 'submitted' once sent so the card renders read-only.
+  paperlessConfirm?: {
+    confirmToken: string;
+    filename?: string | null;
+    summary: Record<string, unknown>;
+    fields: PaperlessConfirmField[];
+    status: 'open' | 'submitted';
+  };
   // Entities resolved during THIS turn, persisted per-message by Reva's
   // on_pre_save_message. Lets the chip renderer wrap mentions per bubble
   // instead of smearing the session-last reasoning trace across all of them.
@@ -145,6 +158,12 @@ export interface ChatContextValue {
   setInput: Dispatch<SetStateAction<string>>;
   historyLoading: boolean;
   sendMessage: (text: string, fromVoice?: boolean) => Promise<void>;
+  // Submit the user's interactive Paperless-confirm decision (per-field
+  // choices, or an abort) for the given pending confirm_token.
+  submitPaperlessConfirm: (
+    confirmToken: string,
+    payload: { decisions: { idx: number; action: string; value: string | null }[] } | { abort: true },
+  ) => void;
 
   // Session
   sessionId: string | null;
@@ -902,6 +921,32 @@ export function ChatProvider({ children }: ChatProviderProps) {
     });
   }, []);
 
+  // Interactive Paperless confirm request — attach the structured picker to
+  // the assistant bubble that just streamed the preview text (same "most
+  // recent assistant message" attach as handleCard).
+  const handlePaperlessConfirmRequest = useCallback((data: PaperlessConfirmRequestMessage) => {
+    if (!data.confirm_token || !data.fields) return;
+    setMessages((prev) => {
+      const updated = [...prev];
+      for (let i = updated.length - 1; i >= 0; i--) {
+        if (updated[i].role === 'assistant') {
+          updated[i] = {
+            ...updated[i],
+            paperlessConfirm: {
+              confirmToken: data.confirm_token,
+              filename: data.filename,
+              summary: data.summary || {},
+              fields: data.fields,
+              status: 'open',
+            },
+          };
+          break;
+        }
+      }
+      return updated;
+    });
+  }, []);
+
   // WebSocket hook
   const { wsConnected, sendMessage: wsSendMessage, isReady, whenReady } = useChatWebSocket({
     onStreamChunk: handleStreamChunk,
@@ -919,7 +964,35 @@ export function ChatProvider({ children }: ChatProviderProps) {
     onAgentToolResult: handleAgentToolResult,
     onAgentFederationProgress: handleAgentFederationProgress,
     onCard: handleCard,
+    onPaperlessConfirmRequest: handlePaperlessConfirmRequest,
   });
+
+  // Submit the user's structured Paperless-confirm decision over the WS. The
+  // backend routes the {type:"paperless_confirm"} frame straight to
+  // internal.paperless_commit_upload (see chat_handler). We flip the card to
+  // 'submitted' immediately so it renders read-only; the commit's result
+  // arrives as a normal streamed assistant message.
+  const submitPaperlessConfirm = useCallback(
+    (
+      confirmToken: string,
+      payload: { decisions: { idx: number; action: string; value: string | null }[] } | { abort: true },
+    ): void => {
+      wsSendMessage({
+        type: 'paperless_confirm',
+        confirm_token: confirmToken,
+        session_id: sessionId,
+        ...payload,
+      });
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.paperlessConfirm?.confirmToken === confirmToken
+            ? { ...msg, paperlessConfirm: { ...msg.paperlessConfirm, status: 'submitted' } }
+            : msg,
+        ),
+      );
+    },
+    [wsSendMessage, sessionId],
+  );
 
   // Register this session on the WS as soon as it's connected, so background
   // pushes (e.g. async chat-upload `upload_processed`) can reach it BEFORE the
@@ -1403,6 +1476,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     setInput,
     historyLoading,
     sendMessage: sendMessageInternal,
+    submitPaperlessConfirm,
 
     // Session
     sessionId,
@@ -1467,7 +1541,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     speakText,
     handleFeedbackSubmit,
   }), [
-    messages, loading, input, historyLoading, sendMessageInternal,
+    messages, loading, input, historyLoading, sendMessageInternal, submitPaperlessConfirm,
     sessionId, sidebarOpen, switchConversation, startNewChat, handleDeleteConversation,
     conversations, conversationsLoading,
     wsConnected,

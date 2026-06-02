@@ -174,6 +174,28 @@ async def paperless_commit_upload(
     normalised = raw_response.lower()
     resolutions: list[dict[str, Any]] = list(pending.proposals or [])
 
+    # Structured path (interactive confirm card). The frontend submits the
+    # decisions directly as `params["decisions"]` — a list of
+    # {idx, action, value} — so we bypass the free-text `_parse_user_choices`
+    # entirely. `params["abort"]` is the card's "Abbrechen" button.
+    structured = params.get("decisions")
+    if structured is not None or params.get("abort"):
+        if params.get("abort"):
+            return await _abort_pending(pending)
+        if not isinstance(structured, list):
+            return {
+                "success": False,
+                "message": "'decisions' must be a list of {idx, action, value}",
+                "action_taken": False,
+            }
+        decisions = _decisions_from_structured(structured, resolutions)
+        return await _commit_approved(
+            pending,
+            mcp_manager=mcp_manager,
+            user_id=user_id,
+            decisions=decisions,
+        )
+
     if normalised in _ABORT_TOKENS:
         return await _abort_pending(pending)
 
@@ -251,6 +273,43 @@ def _default_decisions(
                 "value": "",
             })
     return out
+
+
+def _decisions_from_structured(
+    structured: list[Any],
+    resolutions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Map the interactive confirm card's structured decisions onto the
+    resolution-anchored decision shape `_commit_approved` consumes.
+
+    Each entry from the card is ``{idx, action, value}`` where ``idx`` is
+    1-based over the full proposals list (see `_build_confirm_payload`).
+    Entries with an out-of-range idx or an unknown action are dropped — a
+    field the card omits simply gets no decision, and `_commit_approved`
+    falls back to the already-resolved post_fuzzy value for it. "create"
+    backfills the extracted value when the card sent none; "skip" forces
+    an empty value so it never creates or assigns.
+    """
+    decisions: list[dict[str, Any]] = []
+    for entry in structured:
+        if not isinstance(entry, dict):
+            continue
+        idx = entry.get("idx")
+        action = entry.get("action")
+        if action not in ("use", "create", "skip"):
+            continue
+        if not isinstance(idx, int) or idx < 1 or idx > len(resolutions):
+            continue
+        res = resolutions[idx - 1]
+        value = entry.get("value")
+        if action == "create":
+            value = value or _resolution_value(res)
+        elif action == "skip":
+            value = ""
+        else:  # use
+            value = value or ""
+        decisions.append({"resolution": res, "action": action, "value": value})
+    return decisions
 
 
 def _parse_user_choices(
