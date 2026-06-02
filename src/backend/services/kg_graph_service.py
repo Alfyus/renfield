@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,7 +48,6 @@ CORPUS_ENTITY_CAP = 300          # most-mentioned N entities loaded for corpus m
 MAX_NAMED_CLUSTERS = 16          # connected components rendered as named clusters
 MAX_HUBS_PER_CLUSTER = 6         # orbiting hub spheres per cluster
 DEFAULT_MAX_PER_HOP = 30         # hop1 / hop2 node cap in focus mode
-FOCUS_ENTITY_CAP = 5000          # safety bound on accessible-set load for focus
 SEARCH_LIMIT_DEFAULT = 12
 SEARCH_LIMIT_MAX = 25
 
@@ -66,6 +65,15 @@ class _Entity:
 @dataclass
 class _Component:
     member_ids: list[int] = field(default_factory=list)
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE/ILIKE metacharacters so a user query matches literally.
+
+    Without this, a search for ``50%`` or ``a_b`` treats ``%``/``_`` as
+    wildcards. The backslash escape pairs with ``ilike(..., escape="\\")``.
+    """
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _union_find(entity_ids: list[int], edges: list[tuple[int, int]]) -> list[list[int]]:
@@ -188,7 +196,7 @@ class KGGraphService:
 
         stmt = select(KGEntity).where(
             KGEntity.is_active == True,  # noqa: E712
-            KGEntity.name.ilike(f"%{q}%"),
+            KGEntity.name.ilike(f"%{_escape_like(q)}%", escape="\\"),
         )
         if not settings.auth_enabled:
             pass
@@ -215,6 +223,64 @@ class KGGraphService:
     # ------------------------------------------------------------------
     # focus
     # ------------------------------------------------------------------
+    async def _accessible_entities_by_ids(
+        self, ids, asker_id: int | None
+    ) -> dict[int, _Entity]:
+        """Fetch the given entity ids the asker may see, keyed by id.
+
+        Same 3-branch circle gate as the other loaders, restricted to an
+        explicit id set. This keeps focus mode independent of any global load
+        cap — an accessible entity is reachable no matter how large the graph
+        grows (each node's visibility is decided individually).
+        """
+        ids = list(ids)
+        if not ids:
+            return {}
+        base = select(KGEntity).where(
+            KGEntity.is_active == True,  # noqa: E712
+            KGEntity.id.in_(ids),
+        )
+        if not settings.auth_enabled:
+            pass
+        elif asker_id is None:
+            base = base.where(KGEntity.circle_tier == TIER_PUBLIC)
+        else:
+            clause, params = kg_entities_circles_filter(asker_id, alias="kg_entities")
+            base = base.where(sa_text(clause).bindparams(**params))
+        rows = (await self.db.execute(base)).scalars().all()
+        return {
+            e.id: _Entity(
+                id=e.id, name=e.name, entity_type=e.entity_type,
+                mention_count=int(e.mention_count or 1),
+            )
+            for e in rows
+        }
+
+    async def _relations_touching(
+        self, frontier_ids
+    ) -> list[tuple[int, int, str]]:
+        """Active relations with at least one endpoint in ``frontier_ids``.
+
+        Self-loops (subject == object) are dropped so a node never lands in its
+        own neighborhood. Far-endpoint accessibility is enforced by the caller,
+        which fetches those endpoints through the circle gate.
+        """
+        frontier_ids = list(frontier_ids)
+        if not frontier_ids:
+            return []
+        q = select(
+            KGRelation.subject_id, KGRelation.object_id, KGRelation.predicate
+        ).where(
+            KGRelation.is_active == True,  # noqa: E712
+            KGRelation.subject_id != KGRelation.object_id,
+            or_(
+                KGRelation.subject_id.in_(frontier_ids),
+                KGRelation.object_id.in_(frontier_ids),
+            ),
+        )
+        rows = (await self.db.execute(q)).all()
+        return [(int(s), int(o), p) for s, o, p in rows]
+
     async def focus(
         self,
         entity_id: int,
@@ -224,54 +290,68 @@ class KGGraphService:
     ) -> dict | None:
         """1-hop (+2-hop) neighborhood for an entity.
 
+        Authorizes the focus entity directly, then walks its relations one
+        frontier at a time, fetching each frontier of neighbors through the
+        circle gate. No global entity cap: visibility is decided per node, so
+        an accessible entity is always reachable regardless of graph size.
+        Neighbors and edges the asker cannot see are dropped.
+
         Returns ``None`` when the entity does not exist or is not accessible to
-        the asker (the route maps that to 404, identical responses so existence
-        of an inaccessible entity does not leak).
+        the asker (the route maps that to 404 — identical responses so an
+        inaccessible entity's existence does not leak).
         """
         max_per_hop = max(1, max_per_hop)
-        entities, _ = await self._load_entities(asker_id, FOCUS_ENTITY_CAP)
-        by_id = {e.id: e for e in entities}
-        focus_entity = by_id.get(entity_id)
+
+        focus_map = await self._accessible_entities_by_ids([entity_id], asker_id)
+        focus_entity = focus_map.get(entity_id)
         if focus_entity is None:
             return None
 
-        relations = await self._load_relations(list(by_id.keys()))
+        by_id: dict[int, _Entity] = dict(focus_map)
 
-        # Undirected adjacency for neighborhood walk.
-        adj: dict[int, set[int]] = defaultdict(set)
-        for s, o, _pred in relations:
-            adj[s].add(o)
-            adj[o].add(s)
+        def sort_ids(ids) -> list[int]:
+            return sorted(ids, key=lambda i: (by_id[i].mention_count, i), reverse=True)
 
-        def sort_by_mentions(ids: set[int]) -> list[int]:
-            return sorted(
-                ids,
-                key=lambda i: (by_id[i].mention_count, i),
-                reverse=True,
-            )
+        # hop1: accessible neighbors of the focus node.
+        rel1 = await self._relations_touching([entity_id])
+        cand1 = {(o if s == entity_id else s) for s, o, _ in rel1}
+        cand1.discard(entity_id)
+        hop1_map = await self._accessible_entities_by_ids(cand1, asker_id)
+        by_id.update(hop1_map)
+        hop1_all = sort_ids(hop1_map.keys())
 
-        hop1_all = sort_by_mentions(adj.get(entity_id, set()))
-        hop1_set = set(hop1_all)
-
-        hop2_all: set[int] = set()
-        if hops >= 2:
-            for h1 in hop1_set:
-                hop2_all |= adj.get(h1, set())
-            hop2_all -= hop1_set
-            hop2_all.discard(entity_id)
-        hop2_sorted = sort_by_mentions(hop2_all)
+        # hop2: accessible neighbors of hop1, minus the focus and hop1 sets.
+        rel2: list[tuple[int, int, str]] = []
+        hop2_all: list[int] = []
+        if hops >= 2 and hop1_all:
+            rel2 = await self._relations_touching(hop1_all)
+            hop1_set = set(hop1_all)
+            cand2: set[int] = set()
+            for s, o, _ in rel2:
+                if s in hop1_set:
+                    cand2.add(o)
+                if o in hop1_set:
+                    cand2.add(s)
+            cand2 -= hop1_set
+            cand2.discard(entity_id)
+            hop2_map = await self._accessible_entities_by_ids(cand2, asker_id)
+            by_id.update(hop2_map)
+            hop2_all = sort_ids(hop2_map.keys())
 
         overflow_hop1 = max(0, len(hop1_all) - max_per_hop)
-        overflow_hop2 = max(0, len(hop2_sorted) - max_per_hop)
+        overflow_hop2 = max(0, len(hop2_all) - max_per_hop)
         hop1 = hop1_all[:max_per_hop]
-        hop2 = hop2_sorted[:max_per_hop]
+        hop2 = hop2_all[:max_per_hop]
 
         included = {entity_id, *hop1, *hop2}
-        edges = [
-            {"from_entity": str(s), "to_entity": str(o), "relation": pred}
-            for s, o, pred in relations
-            if s in included and o in included
-        ]
+        seen_edges: set[tuple[int, int, str]] = set()
+        edges = []
+        for s, o, pred in (*rel1, *rel2):
+            if s in included and o in included and (s, o, pred) not in seen_edges:
+                seen_edges.add((s, o, pred))
+                edges.append(
+                    {"from_entity": str(s), "to_entity": str(o), "relation": pred}
+                )
 
         def to_focus_entity(e: _Entity) -> dict:
             return {
@@ -311,7 +391,12 @@ class KGGraphService:
         # left over (singletons + clusters beyond the cap) folds into one
         # "loose ends" bucket so the scene stays legible.
         named = [c for c in components if len(c) >= 2]
-        named.sort(key=len, reverse=True)
+        # Deterministic order: size, then namesake importance, then id — so
+        # equal-size clusters keep a stable order (and stable color_seed)
+        # across requests, independent of DB row iteration order.
+        named.sort(
+            key=lambda c: (len(c), by_id[c[0]].mention_count, c[0]), reverse=True
+        )
         rendered = named[:MAX_NAMED_CLUSTERS]
         overflow_named = named[MAX_NAMED_CLUSTERS:]
 
@@ -372,6 +457,9 @@ class KGGraphService:
         return {
             "clusters": clusters,
             "total_entities": total_entities,
+            # Edges among the loaded (capped) entity slice — the rendered edge
+            # count, not an unbounded corpus-wide total. total_entities IS the
+            # unbounded count, so the two differ when the slice is truncated.
             "total_relations": len(relations),
             "truncated": truncated,
         }

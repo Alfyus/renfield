@@ -256,8 +256,8 @@ class TestCorpus:
 # ==========================================================================
 # Circle filtering — real Postgres
 # ==========================================================================
-
-pytestmark_pg = pytest.mark.postgres
+# Each PG test is individually decorated @pytest.mark.postgres (no module-wide
+# pytestmark — this file also holds sqlite tests that must run without PG).
 
 
 @pytest.fixture
