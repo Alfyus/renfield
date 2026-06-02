@@ -291,37 +291,51 @@ Neu anzulegen:    keine
 Passt das so? (ja / nein / was ändern willst du)
 ```
 
-**Known limitations of the free-text form:**
-- No per-field edit affordance (user has to type "ändere den Korrespondent auf Stadtwerke Köln")
-- No tree-picker for storage_path
-- All-or-nothing approval of new taxonomy proposals
+The free-text form is now the **fallback** — the interactive confirm card
+(below) is the primary affordance. Free-text still works (a typed `ja` /
+`nein` / `1: 2, 2: neu` reply is parsed by `_parse_user_choices`), but the
+per-field limitations it had (no edit affordance, all-or-nothing taxonomy
+approval, fragile separator syntax) no longer gate the user, who clicks
+instead of types.
 
-These only apply during the 10-upload cold-start window, so the pain is
-bounded. Mitigated further by the interactive card in PR 5 (below).
+#### interactive confirm card (SHIPPED)
 
-#### PR 5: interactive confirm card (still conditional, rationale shifts)
+> **Status: built.** The free-text mini-syntax (`1: 2, 2: neu`) proved
+> error-prone — a single stray `.` in a reply made the parser reject the
+> whole line, silently fall back to `ja`, and skip new tags the user had
+> agreed to create. Replaced with a clickable per-field picker modelled on
+> Claude Code's option cards.
 
-A chat-embedded card with per-field controls:
-- Inline-edit title
-- Tag chips with remove-X buttons
-- Storage-path tree picker (fed from Paperless's current tree)
-- Per-proposal accept/decline buttons for new taxonomy entries
-- One "Alles gut — ablegen" button
+A chat-embedded card attached to the assistant bubble that streamed the
+preview. Each ambiguous field shows its detected value plus options —
+**use an existing match / create new (editable text) / leave empty** — with
+safe defaults pre-selected (top near-match, never "create"). The user picks
+per field and hits **Ablegen** (or **Abbrechen**); the frontend submits a
+structured decision, no free-text parsing.
 
-Existing infrastructure: Renfield already has Adaptive Cards for the
-orchestrator ([#374](https://github.com/ebongard/renfield/pull/374)) —
-same rail. The card renders, the user clicks, the backend receives a
-structured payload instead of free text.
+**Data flow.** `forward_attachment_to_paperless` adds a structured
+`confirm` payload (`{summary, fields[{idx, field, label, extracted_value,
+options[], default}]}`) to its result `data` via
+`_build_confirm_payload` — `idx` is 1-based over the **full** proposals
+list so it maps straight to `pending.proposals[idx-1]` (same convention as
+`_parse_user_choices`; exact-match fields are hidden from the card without
+shifting indices). `agent_service` relays it as a `paperless_confirm` step →
+`paperless_confirm_request` WS message (deferred behind the preview bubble in
+both the single-agent and orchestrated paths, mirroring the `card` step). The
+card submits a `{type:"paperless_confirm", confirm_token, decisions:[{idx,
+action, value}], abort?}` WS frame, which `chat_handler` routes straight to
+`internal.paperless_commit_upload`; `_decisions_from_structured` maps the
+choices back onto the resolution-anchored `{resolution, action, value}` shape
+`_commit_approved` already consumed. No change to `_commit_approved`.
 
-**When to build.** Because confirm is cold-start-only, PR 5's priority
-is **improving the first 10 uploads**, not replacing permanent confirm.
-Build it if: (a) cold-start quality signal is noisy because users
-rubber-stamp free-text confirms they can't easily edit, or (b) first
-impressions matter enough that "type a German correction" is the wrong
-first experience for new users.
+**Components.** `PaperlessConfirmCard.tsx` (radio per field + editable create
+value), wired through `useChatWebSocket` (`paperless_confirm_request` type) →
+`ChatContext` (`submitPaperlessConfirm`, attaches to the latest assistant
+message) → `ChatMessages`. Reuses `.card` / `.btn-primary` / `.input` tokens;
+i18n under `chat.paperlessConfirm.*`.
 
-If the N = 10 window closes cleanly without much correction activity,
-PR 5 isn't needed.
+This only matters during the cold-start confirm window (first N uploads),
+after which uploads commit silently.
 
 ## Extraction stack (v1)
 

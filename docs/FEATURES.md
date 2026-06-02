@@ -33,6 +33,7 @@ Renfield ist ein vollständig offline-fähiger, selbst-gehosteter **digitaler As
 - **OCR-Text im Kontext**: Der Agent sieht den extrahierten Text per `document_context`-Prompt-Block inklusive `[attachment_id=N]`-Marker pro Datei
 - **Natürliche Weiterleitung nach Paperless**: „Lade diese Rechnung nach Paperless hoch" → Agent ruft `internal.forward_attachment_to_paperless(attachment_id=N)` auf; die Datei wird **direkt von Server-Storage** gelesen und als echte Bytes zum Paperless-MCP geleitet — der Agent handhabt nie Base64-Inhalte und kann daher nichts halluzinieren
 - **Session-Scope**: Die Attachment-Lookup ist auf die Chat-Session des Nutzers beschränkt — kein Cross-Session-Zugriff auf fremde Uploads
+- **Interaktive Bestätigungskarte**: Beim Cold-Start-Confirm (erste N Uploads) zeigt der Chat eine klickbare Karte statt einer getippten Syntax — pro unklarem Feld (Korrespondent / Typ / Tags / Speicherpfad) eine Auswahl „vorhandenen Treffer übernehmen / neu anlegen (editierbar) / leer lassen", Vorgaben vorausgewählt (nie „neu"). Der Nutzer klickt und bestätigt; das Frontend sendet eine strukturierte Entscheidung (`paperless_confirm`-WS-Frame) direkt an `internal.paperless_commit_upload`. Die getippte `ja` / `nein` / `1: 2, 2: neu`-Antwort bleibt als Fallback erhalten.
 - **HTTP-Fallback**: `POST /api/chat_upload/{id}/paperless` als direkter Endpoint für Frontend-Buttons (ohne LLM im Loop)
 
 ## Sprach-Interface
