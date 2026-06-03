@@ -74,6 +74,14 @@ class ActionExecutor:
             from services.knowledge_tool import knowledge_search
             return await knowledge_search(parameters)
 
+        # Platform-owned internal tool: enumerate the asker's own memories
+        # (no vector threshold) for broad self-knowledge queries. `user_id` is
+        # injected from the authenticated context — never from LLM params — so
+        # the tool only ever reads the current user's own memories.
+        if intent == "internal.list_my_memories":
+            from services.memory_list_tool import list_my_memories
+            return await list_my_memories(parameters, user_id=user_id)
+
         # Platform-owned internal tool: forward a chat attachment to Paperless.
         # The agent passes only the attachment_id; the tool reads real file
         # bytes from storage and calls mcp.paperless.upload_document under the
