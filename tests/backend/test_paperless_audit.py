@@ -17,6 +17,7 @@ Tests:
 - API route handler behavior
 """
 
+import base64
 import json
 from datetime import datetime, UTC
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -142,11 +143,18 @@ class TestCheckOcrQuality:
 
     @pytest.mark.unit
     def test_multiple_issues_lower_score(self):
-        """Multiple OCR issues should stack and lower the score."""
-        # Garbled: no spaces + special chars + repeated
+        """Multiple OCR issues should stack and lower the score.
+
+        All-symbol garbage trips both "garbled" (no spaces) and "high special
+        char ratio". It no longer also trips "Repeated characters": punctuation
+        runs are ordinary formatting and that rule now matches only alphanumeric
+        stuck-glyph runs (the false-positive fix). Two stacked issues => 3.
+        """
         text = "!!!!!!@@@@@$$$$$%%%%%^^^^^^" * 5
         score, issues = PaperlessAuditService._check_ocr_quality(text)
-        assert score <= 2
+        assert score <= 3
+        assert "special" in issues.lower()
+        assert "spaces" in issues.lower() or "garbled" in issues.lower()
 
     @pytest.mark.unit
     def test_score_never_below_one(self):
@@ -1191,49 +1199,155 @@ class TestSkipResults:
         assert mock_result.status == "skipped"
 
 
+def _make_audit_row(doc_id=42, result_id=7, ocr_quality=4):
+    row = MagicMock()
+    row.id = result_id
+    row.paperless_doc_id = doc_id
+    row.ocr_quality = ocr_quality
+    return row
+
+
+def _list_query_result(rows):
+    scalars = MagicMock()
+    scalars.all.return_value = rows
+    return MagicMock(scalars=MagicMock(return_value=scalars))
+
+
+def _mcp_router(mcp, responses, sink=None):
+    """Route ``execute_tool`` by tool name, recording calls into ``sink``.
+
+    Accepts extra args/kwargs (e.g. ``truncate=False`` on download_document).
+    """
+    async def _call(tool, params, *args, **kwargs):
+        if sink is not None:
+            sink.append((tool, params))
+        return responses.get(tool, {"success": True, "message": "{}"})
+    mcp.execute_tool.side_effect = _call
+
+
 class TestReprocessDocuments:
-    """Test reprocess_documents method."""
+    """Test reprocess_documents — now a local-OCR-then-write-back pipeline
+    with a Paperless-native reprocess fallback."""
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_reprocess_calls_mcp(self, service, mock_mcp_manager, mock_db_factory):
-        """Should call MCP reprocess_document for each result."""
-        mock_result = MagicMock()
-        mock_result.paperless_doc_id = 42
-
-        mock_session = mock_db_factory._mock_session
-        mock_scalars = MagicMock()
-        mock_scalars.all.return_value = [mock_result]
-        mock_session.execute.return_value = MagicMock(scalars=MagicMock(return_value=mock_scalars))
-
-        mock_mcp_manager.execute_tool.return_value = {"success": True}
+    async def test_fallback_to_paperless_when_download_unavailable(
+        self, service, mock_mcp_manager, mock_db_factory
+    ):
+        """No downloadable bytes => delegate to Paperless reprocess (fallback)."""
+        mock_db_factory._mock_session.execute.return_value = _list_query_result(
+            [_make_audit_row()]
+        )
+        _mcp_router(mock_mcp_manager, {
+            "mcp.paperless.download_document": {"success": True, "message": ""},
+            "mcp.paperless.reprocess_document": {"success": True},
+        })
 
         result = await service.reprocess_documents([1])
-        assert result["triggered"] == 1
+        assert result["fallback"] == 1
         assert result["failed"] == 0
+        assert result["triggered"] == 1  # legacy key = improved + fallback
 
         mock_mcp_manager.execute_tool.assert_called_with(
-            "mcp.paperless.reprocess_document",
-            {"document_id": 42},
+            "mcp.paperless.reprocess_document", {"document_id": 42},
         )
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_reprocess_failure(self, service, mock_mcp_manager, mock_db_factory):
-        """Should count failures when MCP call fails."""
-        mock_result = MagicMock()
-        mock_result.paperless_doc_id = 42
-
-        mock_session = mock_db_factory._mock_session
-        mock_scalars = MagicMock()
-        mock_scalars.all.return_value = [mock_result]
-        mock_session.execute.return_value = MagicMock(scalars=MagicMock(return_value=mock_scalars))
-
-        mock_mcp_manager.execute_tool.return_value = {"success": False}
+    async def test_failure_when_fallback_reprocess_fails(
+        self, service, mock_mcp_manager, mock_db_factory
+    ):
+        """Download unavailable AND Paperless reprocess fails => failed."""
+        mock_db_factory._mock_session.execute.return_value = _list_query_result(
+            [_make_audit_row()]
+        )
+        _mcp_router(mock_mcp_manager, {
+            "mcp.paperless.download_document": {"success": False},
+            "mcp.paperless.reprocess_document": {"success": False},
+        })
 
         result = await service.reprocess_documents([1])
         assert result["triggered"] == 0
         assert result["failed"] == 1
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_local_reocr_writes_back_when_improved(
+        self, service, mock_mcp_manager, mock_db_factory
+    ):
+        """Clean local OCR (better than stored) is PATCHed into Paperless content
+        and the audit row's quality is bumped."""
+        row = _make_audit_row(ocr_quality=4)
+        update_row = MagicMock()
+        mock_db_factory._mock_session.execute.side_effect = [
+            _list_query_result([row]),  # initial list query
+            MagicMock(scalar_one_or_none=MagicMock(return_value=update_row)),  # row bump
+        ]
+        b64 = base64.b64encode(b"%PDF-1.4 fake").decode()
+        calls = []
+        _mcp_router(mock_mcp_manager, {
+            "mcp.paperless.download_document": {
+                "success": True,
+                "message": json.dumps({"content_base64": b64, "filename": "doc_42.pdf"}),
+            },
+            "mcp.paperless.update_document": {"success": True, "message": "{}"},
+        }, sink=calls)
+        service._document_processor = MagicMock()
+        service._document_processor.extract_text_only = AsyncMock(
+            return_value="Sehr geehrte Damen und Herren, hier ist die saubere Rechnung."
+        )
+
+        result = await service.reprocess_documents([7])
+        assert result["improved"] == 1
+        assert result["fallback"] == 0
+        assert result["failed"] == 0
+
+        # download MUST bypass response truncation, or the base64 PDF is
+        # byte-cut into unparseable JSON for any real-sized scan.
+        dl_calls = [
+            c for c in mock_mcp_manager.execute_tool.call_args_list
+            if c.args[0] == "mcp.paperless.download_document"
+        ]
+        assert dl_calls and dl_calls[0].kwargs.get("truncate") is False
+
+        # extract was forced full-page OCR
+        _, kwargs = service._document_processor.extract_text_only.call_args
+        assert kwargs.get("force_ocr") is True
+        # content was written back
+        writes = [p for t, p in calls if t == "mcp.paperless.update_document"]
+        assert writes and "content" in writes[0]
+        # audit row quality bumped to the clean score
+        assert update_row.ocr_quality == 5
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_no_writeback_when_local_ocr_not_better(
+        self, service, mock_mcp_manager, mock_db_factory
+    ):
+        """If forced OCR yields worse text than the stored content, don't
+        overwrite — fall back to Paperless reprocess, never PATCH content."""
+        mock_db_factory._mock_session.execute.return_value = _list_query_result(
+            [_make_audit_row(ocr_quality=5)]
+        )
+        b64 = base64.b64encode(b"%PDF-1.4 fake").decode()
+        calls = []
+        _mcp_router(mock_mcp_manager, {
+            "mcp.paperless.download_document": {
+                "success": True,
+                "message": json.dumps({"content_base64": b64, "filename": "doc_42.pdf"}),
+            },
+            "mcp.paperless.reprocess_document": {"success": True},
+        }, sink=calls)
+        service._document_processor = MagicMock()
+        # No spaces => garbled => scores below the stored 5.
+        service._document_processor.extract_text_only = AsyncMock(
+            return_value="abcdefghij" * 40
+        )
+
+        result = await service.reprocess_documents([7])
+        assert result["fallback"] == 1
+        assert result["improved"] == 0
+        assert not [t for t, _ in calls if t == "mcp.paperless.update_document"]
 
 
 # ============================================================================

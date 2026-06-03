@@ -161,24 +161,14 @@ class DocumentProcessor:
 
     @staticmethod
     def _is_text_garbled(text: str) -> bool:
-        """Erkennt garbled/kaputten embedded Text (Leerzeichen-Verhältnis zu niedrig).
+        """Thin delegate to the shared ``utils.ocr_quality.is_text_garbled``.
 
-        PDFs mit kaputtem Text-Layer enthalten Wörter ohne Leerzeichen
-        (z.B. 'UmschauMarktplatz13Wiesbaden'). Normale Texte haben ~15-25%
-        Leerzeichen. Unter dem konfigurierten Schwellwert (Standard: 3%)
-        wird ein OCR-Re-Lauf empfohlen.
+        Kept as a method so existing call sites / tests are unchanged; the
+        heuristic itself lives in one place now (shared with the Paperless
+        audit's quality score so the two can't drift).
         """
-        if not text or len(text) < 50:
-            return False
-        space_ratio = text.count(' ') / len(text)
-        is_garbled = space_ratio < settings.rag_ocr_space_threshold
-        if is_garbled:
-            logger.warning(
-                f"Garbled embedded text detected (space ratio={space_ratio:.1%} "
-                f"< threshold={settings.rag_ocr_space_threshold:.1%}) — "
-                "re-running with force_full_page_ocr"
-            )
-        return is_garbled
+        from utils.ocr_quality import is_text_garbled
+        return is_text_garbled(text)
 
     async def process_document(
         self,
@@ -645,12 +635,21 @@ class DocumentProcessor:
 
         return chunks
 
-    async def extract_text_only(self, file_path: str, max_chars: int = 50000) -> str | None:
+    async def extract_text_only(
+        self, file_path: str, max_chars: int = 50000, force_ocr: bool = False
+    ) -> str | None:
         """
         Quick text extraction without chunking or embedding.
 
-        For TXT/MD files, reads directly via aiofiles.
-        For other formats, uses Docling conversion + export_to_text().
+        For TXT/MD files, reads directly via aiofiles. For other formats, uses
+        Docling conversion + export_to_text().
+
+        OCR quality recovery — same gates as ``process_document``: honors
+        ``rag_force_ocr`` / the ``force_ocr`` arg, and (for PDFs, when
+        ``rag_ocr_auto_detect`` is on) re-converts with full-page OCR if the
+        embedded text layer is garbled. Callers therefore get the same OCR
+        quality as a fresh KB ingest — they no longer silently keep a
+        mojibake'd text layer.
 
         Returns None on error.
         """
@@ -672,17 +671,33 @@ class DocumentProcessor:
             self._ensure_initialized()
 
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self._convert_document, file_path)
+            use_ocr = force_ocr or settings.rag_force_ocr
+            if use_ocr:
+                result = await loop.run_in_executor(None, self._convert_document_ocr, file_path)
+            else:
+                result = await loop.run_in_executor(None, self._convert_document, file_path)
 
             if result is None:
                 return None
 
             doc = result.document
-            if hasattr(doc, 'export_to_text'):
-                text = doc.export_to_text()
-                return text[:max_chars] if text else None
+            text = doc.export_to_text() if hasattr(doc, 'export_to_text') else ""
 
-            return None
+            # Auto-detect garbled embedded text and re-run with full-page OCR
+            # (PDF only) — the recovery path process_document uses, previously
+            # missing here despite the docstring's claim.
+            if (
+                not use_ocr
+                and settings.rag_ocr_auto_detect
+                and ext == "pdf"
+                and self._is_text_garbled(text)
+            ):
+                logger.info(f"extract_text_only: re-konvertiere mit force_full_page_ocr: {path.name}")
+                ocr_result = await loop.run_in_executor(None, self._convert_document_ocr, file_path)
+                if ocr_result is not None and hasattr(ocr_result.document, 'export_to_text'):
+                    text = ocr_result.document.export_to_text() or text
+
+            return text[:max_chars] if text else None
 
         except Exception as e:
             logger.error(f"extract_text_only Fehler für {file_path}: {e}")

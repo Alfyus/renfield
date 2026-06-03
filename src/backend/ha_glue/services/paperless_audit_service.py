@@ -10,12 +10,16 @@ calls MCP tools for all Paperless interactions.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -39,6 +43,8 @@ class PaperlessAuditService:
         self._running = False
         self._progress = {"current": 0, "total": 0, "current_doc_id": None}
         self._cancel_requested = False
+        # Lazily created on first local re-OCR (mirrors PaperlessMetadataExtractor).
+        self._document_processor = None
 
     async def start(self):
         """Start only if Paperless MCP server is available."""
@@ -613,10 +619,23 @@ class PaperlessAuditService:
         return {"skipped": count}
 
     async def reprocess_documents(self, result_ids: list[int]) -> dict:
-        """Trigger re-OCR for specific results via MCP."""
+        """Re-OCR documents with Renfield's local stack, writing the cleaned
+        text back into Paperless.
+
+        For each result: download the original via MCP, run the local
+        DocumentProcessor with forced full-page OCR (the same engine + garbled
+        recovery a KB ingest uses), and — if the result scores at least as well
+        as the stored content — PATCH Paperless's ``content``. When local OCR
+        can't beat the current text, or anything fails, fall back to
+        Paperless-NGX's own ``reprocess``.
+
+        Returns counts: ``improved`` (written back locally), ``fallback``
+        (delegated to Paperless), ``failed``.
+        """
         from models.database import PaperlessAuditResult
 
-        triggered = 0
+        improved = 0
+        fallback = 0
         failed = 0
 
         async with self._db_factory() as db:
@@ -626,16 +645,124 @@ class PaperlessAuditService:
             results = (await db.execute(stmt)).scalars().all()
 
         for result in results:
-            mcp_result = await self._mcp.execute_tool(
-                "mcp.paperless.reprocess_document",
-                {"document_id": result.paperless_doc_id},
-            )
-            if mcp_result.get("success"):
-                triggered += 1
+            outcome = await self._local_reocr(result)
+            if outcome == "improved":
+                improved += 1
+            elif outcome == "fallback":
+                fallback += 1
             else:
                 failed += 1
 
-        return {"triggered": triggered, "failed": failed}
+        # Keep the legacy "triggered" key (improved + fallback both kicked off
+        # a re-OCR) so existing callers/UI counters keep working.
+        return {
+            "triggered": improved + fallback,
+            "improved": improved,
+            "fallback": fallback,
+            "failed": failed,
+        }
+
+    async def _local_reocr(self, result) -> str:
+        """Re-OCR one audited document locally and write the text back.
+
+        Returns ``"improved"`` (local OCR written back to Paperless),
+        ``"fallback"`` (delegated to Paperless-native reprocess), or
+        ``"failed"``.
+        """
+        doc_id = result.paperless_doc_id
+
+        # 1. Download the original bytes via MCP. truncate=False is essential:
+        #    the base64 file payload is far larger than the LLM-oriented
+        #    response cap, and the generic truncator would byte-cut it
+        #    mid-payload into unparseable JSON (the download is for our OCR
+        #    pipeline, not the LLM context).
+        dl = await self._mcp.execute_tool(
+            "mcp.paperless.download_document",
+            {"document_id": doc_id},
+            truncate=False,
+        )
+        parsed = self._parse_mcp_result(dl) if dl.get("success") else None
+        b64 = (parsed or {}).get("content_base64")
+        if not b64:
+            logger.warning(
+                f"re-OCR: download failed for doc {doc_id} — "
+                "falling back to Paperless reprocess"
+            )
+            return await self._paperless_reprocess(doc_id)
+
+        # 2. Local quality-aware OCR on a temp file (forced full-page OCR:
+        #    the stored content is what the user flagged as suspect).
+        suffix = Path((parsed or {}).get("filename") or f"doc_{doc_id}.pdf").suffix or ".pdf"
+        tmp_path = None
+        new_text = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(base64.b64decode(b64))
+            if self._document_processor is None:
+                from services.document_processor import DocumentProcessor
+                self._document_processor = DocumentProcessor()
+            new_text = await self._document_processor.extract_text_only(
+                tmp_path, max_chars=1_000_000, force_ocr=True,
+            )
+        except Exception as e:
+            logger.error(f"re-OCR: local extraction failed for doc {doc_id}: {e}")
+            return await self._paperless_reprocess(doc_id)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        # 3. Only write back if the local OCR is non-empty and STRICTLY better
+        #    than the stored content. Forcing full-page OCR on an already-good
+        #    text layer re-rasterizes it and can regress quality without
+        #    lowering the coarse 1-5 score; requiring a strict improvement
+        #    means equal-score (incl. already-clean native text) is left
+        #    untouched and delegated to Paperless instead of being clobbered.
+        from utils.ocr_quality import score_ocr_quality
+
+        new_score, new_issues = score_ocr_quality(new_text) if new_text else (1, "No/minimal OCR text")
+        old_score = result.ocr_quality or 1
+        if not new_text or new_score <= old_score:
+            logger.info(
+                f"re-OCR: local result for doc {doc_id} not better "
+                f"(new={new_score} vs old={old_score}) — falling back to Paperless reprocess"
+            )
+            return await self._paperless_reprocess(doc_id)
+
+        upd = await self._mcp.execute_tool(
+            "mcp.paperless.update_document",
+            {"document_id": doc_id, "content": new_text},
+        )
+        if not upd.get("success"):
+            logger.error(
+                f"re-OCR: content write-back failed for doc {doc_id}: {upd.get('message')}"
+            )
+            return "failed"
+
+        # 4. Reflect the improved quality on the audit row.
+        async with self._db_factory() as db:
+            from models.database import PaperlessAuditResult
+
+            row = (await db.execute(
+                select(PaperlessAuditResult).where(PaperlessAuditResult.id == result.id)
+            )).scalar_one_or_none()
+            if row:
+                row.ocr_quality = new_score
+                row.ocr_issues = new_issues
+                await db.commit()
+
+        logger.info(f"re-OCR: wrote local OCR back to Paperless doc {doc_id} (quality {new_score})")
+        return "improved"
+
+    async def _paperless_reprocess(self, doc_id: int) -> str:
+        """Trigger Paperless-NGX's own OCR reprocess (fallback).
+
+        Returns ``"fallback"`` on success, ``"failed"`` otherwise.
+        """
+        res = await self._mcp.execute_tool(
+            "mcp.paperless.reprocess_document", {"document_id": doc_id}
+        )
+        return "fallback" if res.get("success") else "failed"
 
     # Columns allowed for sorting
     _SORTABLE_COLUMNS = {
@@ -1005,35 +1132,16 @@ class PaperlessAuditService:
 
     @staticmethod
     def _check_ocr_quality(content: str) -> tuple[int, str]:
-        """Rate OCR quality 1-5 based on heuristics."""
-        if not content or len(content.strip()) < 20:
-            return 1, "No/minimal OCR text"
+        """Thin delegate to the shared ``utils.ocr_quality.score_ocr_quality``.
 
-        issues = []
-
-        # Check space ratio (garbled text has very few spaces)
-        space_ratio = content.count(" ") / len(content)
-        if space_ratio < 0.03:
-            issues.append("Very few spaces (garbled)")
-
-        # Check for repeated characters
-        if re.search(r'(.)\1{5,}', content):
-            issues.append("Repeated characters")
-
-        # Check alphanumeric ratio
-        alnum = sum(c.isalnum() or c.isspace() for c in content)
-        if alnum / len(content) < 0.6:
-            issues.append("High special char ratio")
-
-        # Check for very short lines (fragmented OCR)
-        lines = [line for line in content.split('\n') if line.strip()]
-        if lines:
-            avg_line_len = sum(len(line) for line in lines) / len(lines)
-            if avg_line_len < 10 and len(lines) > 5:
-                issues.append("Fragmented text (very short lines)")
-
-        score = max(1, 5 - len(issues))
-        return score, "; ".join(issues) or "OK"
+        The heuristic moved into ``utils/ocr_quality.py`` (shared with the
+        ingest pipeline's garbled-layer gate). Notably the old naive
+        ``(.)\\1{5,}`` "Repeated characters" rule was dropped: it tripped on
+        ordinary column padding / dotted leaders and falsely docked clean
+        invoices. See that module for the calibrated replacement.
+        """
+        from utils.ocr_quality import score_ocr_quality
+        return score_ocr_quality(content)
 
     @staticmethod
     def _check_missing_fields(doc: dict) -> list[str]:
