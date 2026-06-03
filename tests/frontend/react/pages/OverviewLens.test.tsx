@@ -1,26 +1,24 @@
 /**
  * OverviewLens — the /wissen Übersicht dashboard.
  *
- * Editorial, list-led: a quiet corpus figure (incl. memories), the real Fristen
- * list with tier rings, real "Zu prüfen" preview rows that open the detail
- * drawer, and a gated "Bereiche" nav. Covers the populated path, the cold-start
- * empty-state, the memory-only corpus (the gating bug this redesign fixed), the
- * drawer-open click, and the tier-ring signal.
+ * A grid of uniform area cards: every area (Fristen, Prüfen, Dokumente, Graph,
+ * Erinnerungen) renders through AreaCard with the SAME shape — a count, preview
+ * rows, and one consistently-placed "Öffnen" link. Covers the populated grid,
+ * the memory-only corpus (the gating-bug regression), and the cold-start empty.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { http, HttpResponse } from 'msw';
-import { screen, fireEvent } from '@testing-library/react';
+import { screen } from '@testing-library/react';
 import { renderWithRouter } from '../test-utils';
 import { server } from '../mocks/server';
 import { TEST_CONFIG } from '../config';
 import { useAuth } from '../../../../src/frontend/src/context/AuthContext';
-import { useWissenDrawer } from '../../../../src/frontend/src/context/WissenDrawerContext';
 import OverviewLens from '../../../../src/frontend/src/pages/wissen/OverviewLens';
 
 const BASE_URL = TEST_CONFIG.API_BASE_URL;
 
-// OverviewLens gates stat queries + lens visibility via useAuth. authEnabled
-// false → all lenses visible (single-user), so the Bereiche nav lists every lens.
+// OverviewLens gates stat queries + per-card visibility via useAuth. authEnabled
+// false → all lenses visible (single-user), so every area card renders.
 vi.mock('../../../../src/frontend/src/context/AuthContext', () => ({
   useAuth: vi.fn(),
 }));
@@ -29,13 +27,6 @@ vi.mocked(useAuth).mockReturnValue({
   hasAnyPermission: () => true,
   authEnabled: false,
 } as unknown as ReturnType<typeof useAuth>);
-
-// Spy the drawer so the review-row click is observable.
-const openAtomSpy = vi.fn();
-vi.mock('../../../../src/frontend/src/context/WissenDrawerContext', () => ({
-  useWissenDrawer: vi.fn(),
-}));
-vi.mocked(useWissenDrawer).mockReturnValue({ openAtom: openAtomSpy });
 
 function isoInDays(days: number): string {
   const d = new Date();
@@ -47,9 +38,12 @@ function mockOverview(opts: {
   obligations?: unknown[];
   review?: unknown[];
   docs?: number;
+  documents?: unknown[];
   entities?: number;
   relations?: number;
+  topEntities?: unknown[];
   memories?: number;
+  memoryList?: unknown[];
 }) {
   server.use(
     http.get(`${BASE_URL}/api/atoms/obligations`, () => HttpResponse.json(opts.obligations ?? [])),
@@ -62,11 +56,16 @@ function mockOverview(opts: {
         knowledge_base_count: opts.docs ? 1 : 0,
       }),
     ),
+    http.get(`${BASE_URL}/api/knowledge/documents`, () => HttpResponse.json(opts.documents ?? [])),
     http.get(`${BASE_URL}/api/knowledge-graph/stats`, () =>
-      HttpResponse.json({ entity_count: opts.entities ?? 0, relation_count: opts.relations ?? 0 }),
+      HttpResponse.json({
+        entity_count: opts.entities ?? 0,
+        relation_count: opts.relations ?? 0,
+        top_entities: opts.topEntities ?? [],
+      }),
     ),
     http.get(`${BASE_URL}/api/memory`, () =>
-      HttpResponse.json({ memories: [], total: opts.memories ?? 0 }),
+      HttpResponse.json({ memories: opts.memoryList ?? [], total: opts.memories ?? 0 }),
     ),
   );
 }
@@ -90,55 +89,42 @@ const obligation = {
   circle_tier: 2,
 };
 
-const reviewAtom = {
-  atom_id: 'r1',
-  atom_type: 'conversation_memory',
-  tier: 1,
-  title: 'Lieblingsrestaurant',
-  preview: 'mag Sushi am Freitag',
-  created_at: new Date().toISOString(),
-};
-
 describe('OverviewLens', () => {
-  it('renders corpus figures (incl. memories), Fristen with tier ring, review previews, and lens nav', async () => {
+  it('renders every area as a uniform card with count, preview, and one Öffnen link', async () => {
     mockOverview({
       obligations: [obligation],
-      review: [reviewAtom, { atom_id: 'r2', atom_type: 'kb_document', tier: 2 }],
+      review: [
+        { atom_id: 'r1', atom_type: 'conversation_memory', tier: 1, title: 'Lieblingsrestaurant', created_at: new Date().toISOString() },
+      ],
       docs: 5,
+      documents: [{ id: 11, filename: 'vertrag.pdf', title: 'Stromvertrag', status: 'completed', created_at: new Date().toISOString() }],
       entities: 9,
       relations: 3,
+      topEntities: [{ id: 21, name: 'Jutta', entity_type: 'person' }],
       memories: 42,
+      memoryList: [{ id: 31, content: 'mag Mango', category: 'preference', importance: 0.8, created_at: new Date().toISOString() }],
     });
     const { container } = renderWithRouter(<OverviewLens />, { route: '/wissen' });
 
-    // Corpus line: memories are now counted (was the omitted figure). Each
-    // figure shows twice (corpus lead + the per-area Bereiche subline), so
-    // assert on all matches rather than a single one.
-    expect((await screen.findAllByText(/5 Dokumente/)).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/9 Entitäten/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/42 Erinnerungen/).length).toBeGreaterThan(0);
+    // Corpus lead counts memories (the gating-bug fix).
+    expect((await screen.findAllByText(/42 Erinnerungen/)).length).toBeGreaterThan(0);
 
-    // Fristen row carries the tier ring (the signal the old bare <li> dropped).
-    expect(container.querySelector('.tier-ring-2')).toBeTruthy();
-    expect(screen.queryByText(/Keine Fristen/)).not.toBeInTheDocument();
+    // All five area cards present.
+    expect(screen.getByRole('heading', { name: 'Nächste Fristen' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Zu prüfen' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Dokumente' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Graph' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Erinnerungen' })).toBeInTheDocument();
 
-    // Review section shows a real preview row, not just a count.
-    expect(await screen.findByText('Lieblingsrestaurant')).toBeInTheDocument();
-    expect(screen.getByText('mag Sushi am Freitag')).toBeInTheDocument();
+    // Each card carries exactly one consistently-placed "Öffnen" link.
+    expect(screen.getAllByRole('link', { name: /Öffnen/ })).toHaveLength(5);
 
-    // Bereiche nav deep-links into the lenses.
-    expect(screen.getByRole('link', { name: /Graph/ })).toHaveAttribute('href', '/wissen/graph');
-  });
-
-  it('opens the detail drawer when a review preview row is clicked', async () => {
-    openAtomSpy.mockClear();
-    mockOverview({ review: [reviewAtom], memories: 1 });
-    renderWithRouter(<OverviewLens />, { route: '/wissen' });
-
-    const row = await screen.findByText('Lieblingsrestaurant');
-    fireEvent.click(row);
-    expect(openAtomSpy).toHaveBeenCalledTimes(1);
-    expect(openAtomSpy.mock.calls[0][0].atom.atom_id).toBe('r1');
+    // Each card shows preview detail (the same level across areas).
+    expect(container.querySelector('.tier-ring-2')).toBeTruthy(); // Fristen obligation row
+    expect(screen.getByText('Lieblingsrestaurant')).toBeInTheDocument(); // review
+    expect(screen.getByText('Stromvertrag')).toBeInTheDocument(); // document
+    expect(screen.getByText('Jutta')).toBeInTheDocument(); // graph entity
+    expect(screen.getByText('mag Mango')).toBeInTheDocument(); // memory
   });
 
   it('does NOT show the empty-state when only memories exist (gating-bug regression)', async () => {

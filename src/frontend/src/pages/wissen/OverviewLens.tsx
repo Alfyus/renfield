@@ -1,22 +1,17 @@
-import { useMemo } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { BookOpen, ArrowRight, ChevronRight } from 'lucide-react';
+import { BookOpen } from 'lucide-react';
 import ObligationRow from '../../components/ObligationRow';
 import TierBadge from '../../components/TierBadge';
-import {
-  useObligationsQuery,
-  useAtomsForReviewQuery,
-  type AtomMatch,
-  type ReviewAtom,
-} from '../../api/resources/brain';
-import { useKnowledgeStatsQuery } from '../../api/resources/knowledge';
+import AreaCard from '../../components/wissen/AreaCard';
+import { useObligationsQuery, useAtomsForReviewQuery } from '../../api/resources/brain';
+import { useKnowledgeStatsQuery, useKnowledgeDocumentsQuery } from '../../api/resources/knowledge';
 import { useKgStatsQuery } from '../../api/resources/knowledgeGraph';
 import { useMemoriesQuery } from '../../api/resources/memories';
 import { urgencyGroup, relativeDays } from '../../utils/frist';
 import { useAuth } from '../../context/AuthContext';
-import { useWissenDrawer } from '../../context/WissenDrawerContext';
-import { LENSES, lensPath, isLensVisible } from './lenses';
+import { LENSES, isLensVisible } from './lenses';
 
 /** ISO yyyy-mm-dd `days` from today (matches ObligationsPage). */
 function isoInDays(days: number): string {
@@ -25,58 +20,86 @@ function isoInDays(days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-const OVERVIEW_FRIST_LIMIT = 5;
-const OVERVIEW_REVIEW_LIMIT = 3;
+const OVERVIEW_PREVIEW_LIMIT = 3;
 
-/**
- * Seed an `AtomMatch` from a review row so the detail drawer opens immediately
- * on click. The seed carries no `payload`; `WissenLayout`'s cold-fetch path
- * (`useAtomByIdQuery`) fills the full atom by id before the user reads it.
- */
-function reviewToAtomMatch(atom: ReviewAtom): AtomMatch {
-  return {
-    atom: { atom_id: atom.atom_id, atom_type: atom.atom_type, tier: atom.tier },
-    score: 0,
-    snippet: atom.preview ?? atom.title ?? '',
-    rank: 0,
-  };
+/** A uniform two-line preview row shared by every card (primary + muted detail,
+ *  optional tier badge where the source carries a tier). */
+function PreviewRow({
+  primary,
+  secondary,
+  tier,
+}: {
+  primary: string;
+  secondary?: string | null;
+  tier?: number;
+}) {
+  return (
+    <li className={tier != null ? `atom-row tier-ring-${tier}` : 'atom-row'}>
+      <div className="flex-1 min-w-0 space-y-0.5">
+        <p className="text-sm font-medium text-gray-900 dark:text-white truncate">{primary}</p>
+        {secondary && (
+          <p className="text-xs text-gray-500 dark:text-gray-400 truncate">{secondary}</p>
+        )}
+      </div>
+      {tier != null && <TierBadge tier={tier} className="shrink-0 ml-2" />}
+    </li>
+  );
+}
+
+/** Card body: loading / empty / the preview list — uniform across areas. */
+function CardBody({
+  loading,
+  empty,
+  emptyText,
+  children,
+}: {
+  loading: boolean;
+  empty: boolean;
+  emptyText: string;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  if (loading)
+    return <p className="text-sm text-gray-500 dark:text-gray-400">{t('common.loading')}</p>;
+  if (empty) return <p className="text-sm text-gray-500 dark:text-gray-400">{emptyText}</p>;
+  return <ul className="space-y-2">{children}</ul>;
 }
 
 /**
- * Übersicht — the `/wissen` index. Editorial, list-led (design DD3): a serif
- * lead with a quiet corpus figure, the real "Nächste Fristen" + "Zu prüfen"
- * lists as actual content (clickable into the detail drawer), and a gated
- * "Bereiche" nav into the other lenses. Pure composition of existing hooks —
- * no new endpoints. NOT a stat-card mosaic (AI-slop #2/#3); the LENSES nav is a
- * quiet vertical list, never an icon-circle grid.
+ * Übersicht — the `/wissen` index. A dashboard of uniform area cards (DD3 +
+ * user request): every area renders through `AreaCard` so each shows the SAME
+ * level of detail — a count, a few preview rows, and one consistently-placed
+ * "Öffnen →" link. Pure composition of existing hooks; no new endpoints.
  */
 export default function OverviewLens() {
   const { t, i18n } = useTranslation();
   const auth = useAuth();
   const { isFeatureEnabled } = auth;
-  const { openAtom } = useWissenDrawer();
   const now = useMemo(() => new Date(), []);
   const dueBefore = useMemo(() => isoInDays(7), []);
-  // Constructed once per language (above the early return so it isn't a
-  // conditional hook); Intl.RelativeTimeFormat construction isn't free.
   const rtf = useMemo(
     () => new Intl.RelativeTimeFormat(i18n.language, { numeric: 'auto' }),
     [i18n.language]
   );
 
   const schichtA = isFeatureEnabled('schicht_a_extraction_enabled');
+  const lensByKey = (k: string) => LENSES.find((l) => l.key === k);
+  const dokumenteLens = lensByKey('dokumente');
+  const graphLens = lensByKey('graph');
+  const docVisible = dokumenteLens ? isLensVisible(dokumenteLens, auth) : false;
+  const graphVisible = graphLens ? isLensVisible(graphLens, auth) : false;
 
-  // All hooks run unconditionally (rules of hooks). The knowledge + KG stat
-  // queries carry an `enabled` gate (feature off → no call); obligations,
-  // review and memories are always fetched — cheap, and ungated by design,
-  // same as the standalone pages.
+  // All hooks run unconditionally (rules of hooks). knowledge + KG queries carry
+  // an `enabled` gate; obligations/review/memories/docs are always fetched
+  // (cheap; ungated by design, same as the standalone pages).
   const obligationsQuery = useObligationsQuery({ dueBefore, limit: 200 });
   const reviewQuery = useAtomsForReviewQuery(7);
   const kbStats = useKnowledgeStatsQuery(isFeatureEnabled('knowledge'));
   const kgStats = useKgStatsQuery(isFeatureEnabled('knowledge_graph'));
   const memoriesQuery = useMemoriesQuery(null);
+  const docsQuery = useKnowledgeDocumentsQuery({ knowledgeBaseId: null, statusFilter: 'all' });
 
-  // Soonest-first already; keep only overdue + this-week for the glance.
+  // Fristen: soonest-first already; keep overdue + this-week for the glance.
   const upcoming = (obligationsQuery.data ?? []).filter((f) =>
     f.obligation_date ? urgencyGroup(f.obligation_date, now) !== 'later' : false
   );
@@ -89,6 +112,14 @@ export default function OverviewLens() {
   const entityCount = kgStats.data?.entity_count ?? 0;
   const relationCount = kgStats.data?.relation_count ?? 0;
   const memoryTotal = memoriesQuery.data?.total ?? 0;
+
+  const recentDocs = [...(docsQuery.data ?? [])]
+    .sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))
+    .slice(0, OVERVIEW_PREVIEW_LIMIT);
+  const topEntities = (kgStats.data?.top_entities ?? []).slice(0, OVERVIEW_PREVIEW_LIMIT);
+  const recentMemories = [...(memoriesQuery.data?.memories ?? [])]
+    .sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))
+    .slice(0, OVERVIEW_PREVIEW_LIMIT);
 
   const loading =
     obligationsQuery.isLoading ||
@@ -131,23 +162,10 @@ export default function OverviewLens() {
     memoryTotal > 0 ? t('lens.overview.figMemories', { count: memoryTotal }) : null,
   ].filter(Boolean) as string[];
 
-  // "Bereiche" nav: the segment lenses this user may see, same gate as the rail.
-  const bereiche = LENSES.filter((lens) => lens.segment && isLensVisible(lens, auth));
-  const lensSubline = (key: string): string | null => {
-    switch (key) {
-      case 'dokumente':
-        return docCount > 0 ? t('lens.overview.figDocs', { count: docCount }) : null;
-      case 'graph':
-        return entityCount > 0
-          ? `${t('lens.overview.figEntities', { count: entityCount })} · ${t('lens.overview.figRelations', { count: relationCount })}`
-          : null;
-      case 'erinnerungen':
-        return memoryTotal > 0 ? t('lens.overview.figMemories', { count: memoryTotal }) : null;
-      case 'pruefen':
-        return reviewCount > 0 ? t('lens.overview.reviewShort', { count: reviewCount }) : null;
-      default:
-        return null;
-    }
+  const relLabel = (iso?: string): string | null => {
+    if (!iso) return null;
+    const days = relativeDays(iso, now);
+    return Number.isFinite(days) ? rtf.format(days, 'day') : null;
   };
 
   return (
@@ -163,158 +181,131 @@ export default function OverviewLens() {
         )}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* Nächste Fristen — display-only rows with the tier ring (mirrors
-            ObligationsPage); "Alle Fristen" is the way into the lens. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Nächste Fristen */}
         {schichtA && (
-          <section className="space-y-3">
-            <div className="flex items-center justify-between gap-3">
-              <h2 className="text-2xl font-display font-medium text-gray-900 dark:text-white">
-                {t('lens.overview.fristen')}
-                {overdueCount > 0 && (
-                  <span className="ml-2 text-sm font-sans text-primary-700 dark:text-primary-400 tabular-nums">
-                    {t('lens.overview.overdueAccent', { count: overdueCount })}
-                  </span>
-                )}
-              </h2>
-              <Link
-                to="/wissen/fristen"
-                className="text-sm text-primary-600 dark:text-primary-400 inline-flex items-center gap-1 shrink-0 min-h-11"
-              >
-                {t('lens.overview.allFristen')}
-                <ArrowRight className="w-4 h-4" aria-hidden="true" />
-              </Link>
-            </div>
-            {obligationsQuery.isLoading ? (
-              <p className="text-sm text-gray-500 dark:text-gray-400">{t('common.loading')}</p>
-            ) : upcoming.length === 0 ? (
-              <p className="text-sm text-gray-500 dark:text-gray-400">
-                {t('lens.overview.noFristen')}
-              </p>
-            ) : (
-              <ul className="space-y-2">
-                {upcoming.slice(0, OVERVIEW_FRIST_LIMIT).map((fact) => (
-                  <li
-                    key={fact.id}
-                    className={`atom-row tier-ring-${fact.circle_tier} animate-fade-slide-in flex-col sm:flex-row`}
-                  >
-                    <ObligationRow fact={fact} now={now} />
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
+          <AreaCard
+            title={t('lens.overview.fristen')}
+            count={t('lens.overview.fristenSoon', { count: upcoming.length })}
+            accent={
+              overdueCount > 0 ? t('lens.overview.overdueAccent', { count: overdueCount }) : null
+            }
+            to="/wissen/fristen"
+          >
+            <CardBody
+              loading={obligationsQuery.isLoading}
+              empty={upcoming.length === 0}
+              emptyText={t('lens.overview.noFristen')}
+            >
+              {upcoming.slice(0, OVERVIEW_PREVIEW_LIMIT).map((fact) => (
+                <li
+                  key={fact.id}
+                  className={`atom-row tier-ring-${fact.circle_tier} flex-col sm:flex-row`}
+                >
+                  <ObligationRow fact={fact} now={now} />
+                </li>
+              ))}
+            </CardBody>
+          </AreaCard>
         )}
 
-        {/* Zu prüfen — real preview rows; click opens the detail drawer. */}
-        <section className="space-y-3">
-          <h2 className="text-2xl font-display font-medium text-gray-900 dark:text-white">
-            {t('lens.overview.review')}
-          </h2>
-          {reviewQuery.isLoading ? (
-            <p className="text-sm text-gray-500 dark:text-gray-400">{t('common.loading')}</p>
-          ) : reviewCount === 0 ? (
-            <p className="text-sm text-gray-500 dark:text-gray-400">
-              {t('lens.overview.reviewNone')}
-            </p>
-          ) : (
-            <>
-              <ul className="space-y-2">
-                {reviewAtoms.slice(0, OVERVIEW_REVIEW_LIMIT).map((atom) => (
-                  <li key={atom.atom_id}>
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => openAtom(reviewToAtomMatch(atom))}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          openAtom(reviewToAtomMatch(atom));
-                        }
-                      }}
-                      className={`atom-row tier-ring-${atom.tier ?? 0} animate-fade-slide-in cursor-pointer w-full text-left`}
-                    >
-                      <div className="flex-1 min-w-0 space-y-0.5">
-                        {atom.title && (
-                          <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
-                            {atom.title}
-                          </p>
-                        )}
-                        {atom.preview && (
-                          <p className="text-sm text-gray-600 dark:text-gray-300 line-clamp-2">
-                            {atom.preview}
-                          </p>
-                        )}
-                        <p className="text-xs text-gray-400 dark:text-gray-500">
-                          {t(`circles.atomType.${atom.atom_type}`, {
-                            defaultValue: atom.atom_type,
-                          })}
-                          {(() => {
-                            // Guard: Intl.RelativeTimeFormat throws on a non-finite
-                            // value, so a malformed created_at must not reach format().
-                            if (!atom.created_at) return null;
-                            const days = relativeDays(atom.created_at, now);
-                            return Number.isFinite(days) ? ` · ${rtf.format(days, 'day')}` : null;
-                          })()}
-                        </p>
-                      </div>
-                      <TierBadge tier={atom.tier ?? 0} className="shrink-0 ml-2" />
-                    </div>
-                  </li>
-                ))}
-              </ul>
-              {reviewCount > OVERVIEW_REVIEW_LIMIT && (
-                <Link
-                  to="/wissen/review"
-                  className="text-sm text-primary-600 dark:text-primary-400 inline-flex items-center gap-1 min-h-11"
-                >
-                  {t('lens.overview.reviewMore', { count: reviewCount - OVERVIEW_REVIEW_LIMIT })}
-                  <ArrowRight className="w-4 h-4" aria-hidden="true" />
-                </Link>
-              )}
-            </>
-          )}
-        </section>
-      </div>
-
-      {/* Bereiche — quiet nav into the other lenses (NOT an icon-circle grid). */}
-      {bereiche.length > 0 && (
-        <section className="space-y-3">
-          <h2 className="text-2xl font-display font-medium text-gray-900 dark:text-white">
-            {t('lens.overview.bereiche')}
-          </h2>
-          <ul className="space-y-2">
-            {bereiche.map((lens) => {
-              const Icon = lens.icon;
-              const sub = lensSubline(lens.key);
+        {/* Zu prüfen */}
+        <AreaCard
+          title={t('lens.overview.review')}
+          count={t('lens.overview.reviewShort', { count: reviewCount })}
+          to="/wissen/review"
+        >
+          <CardBody
+            loading={reviewQuery.isLoading}
+            empty={reviewCount === 0}
+            emptyText={t('lens.overview.reviewNone')}
+          >
+            {reviewAtoms.slice(0, OVERVIEW_PREVIEW_LIMIT).map((atom) => {
+              const rel = relLabel(atom.created_at);
+              const type = t(`circles.atomType.${atom.atom_type}`, {
+                defaultValue: atom.atom_type,
+              });
               return (
-                <li key={lens.key}>
-                  <Link
-                    to={lensPath(lens)}
-                    className="atom-row min-h-11 group hover:bg-gray-50 dark:hover:bg-gray-700/40"
-                  >
-                    <Icon className="w-5 h-5 shrink-0 text-gray-400" aria-hidden="true" />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-gray-900 dark:text-white">
-                        {t(lens.labelKey)}
-                      </p>
-                      {sub && (
-                        <p className="text-xs text-gray-500 dark:text-gray-400 tabular-nums">
-                          {sub}
-                        </p>
-                      )}
-                    </div>
-                    <ChevronRight
-                      className="w-4 h-4 shrink-0 text-gray-400 group-hover:text-gray-600 dark:group-hover:text-gray-200"
-                      aria-hidden="true"
-                    />
-                  </Link>
-                </li>
+                <PreviewRow
+                  key={atom.atom_id}
+                  primary={atom.title || atom.preview || type}
+                  secondary={rel ? `${type} · ${rel}` : type}
+                  tier={atom.tier ?? 0}
+                />
               );
             })}
-          </ul>
-        </section>
-      )}
+          </CardBody>
+        </AreaCard>
+
+        {/* Dokumente */}
+        {docVisible && (
+          <AreaCard
+            title={t('lens.dokumente')}
+            count={t('lens.overview.figDocs', { count: docCount })}
+            to="/wissen/dokumente"
+          >
+            <CardBody
+              loading={docsQuery.isLoading}
+              empty={recentDocs.length === 0}
+              emptyText={t('lens.overview.docsNone')}
+            >
+              {recentDocs.map((doc) => (
+                <PreviewRow
+                  key={doc.id}
+                  primary={doc.title || doc.filename}
+                  secondary={relLabel(doc.created_at)}
+                />
+              ))}
+            </CardBody>
+          </AreaCard>
+        )}
+
+        {/* Graph */}
+        {graphVisible && (
+          <AreaCard
+            title={t('lens.graph')}
+            count={`${t('lens.overview.figEntities', { count: entityCount })} · ${t('lens.overview.figRelations', { count: relationCount })}`}
+            to="/wissen/graph"
+          >
+            <CardBody
+              loading={kgStats.isLoading}
+              empty={topEntities.length === 0}
+              emptyText={t('lens.overview.graphNone')}
+            >
+              {topEntities.map((entity) => (
+                <PreviewRow
+                  key={entity.id}
+                  primary={entity.name}
+                  secondary={t(`knowledgeGraph.${entity.entity_type}`, {
+                    defaultValue: entity.entity_type,
+                  })}
+                />
+              ))}
+            </CardBody>
+          </AreaCard>
+        )}
+
+        {/* Erinnerungen */}
+        <AreaCard
+          title={t('lens.erinnerungen')}
+          count={t('lens.overview.figMemories', { count: memoryTotal })}
+          to="/wissen/erinnerungen"
+        >
+          <CardBody
+            loading={memoriesQuery.isLoading}
+            empty={recentMemories.length === 0}
+            emptyText={t('lens.overview.memoriesNone')}
+          >
+            {recentMemories.map((mem) => (
+              <PreviewRow
+                key={mem.id}
+                primary={mem.content}
+                secondary={t(`memory.categories.${mem.category}`, { defaultValue: mem.category })}
+              />
+            ))}
+          </CardBody>
+        </AreaCard>
+      </div>
     </div>
   );
 }
