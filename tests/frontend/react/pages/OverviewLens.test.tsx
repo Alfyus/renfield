@@ -61,8 +61,10 @@ function mockOverview(opts: {
       HttpResponse.json({
         entity_count: opts.entities ?? 0,
         relation_count: opts.relations ?? 0,
-        top_entities: opts.topEntities ?? [],
       }),
+    ),
+    http.get(`${BASE_URL}/api/knowledge-graph/entities`, () =>
+      HttpResponse.json({ entities: opts.topEntities ?? [], total: (opts.topEntities ?? []).length }),
     ),
     http.get(`${BASE_URL}/api/memory`, () =>
       HttpResponse.json({ memories: opts.memoryList ?? [], total: opts.memories ?? 0 }),

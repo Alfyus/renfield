@@ -7,7 +7,7 @@ import TierBadge from '../../components/TierBadge';
 import AreaCard from '../../components/wissen/AreaCard';
 import { useObligationsQuery, useAtomsForReviewQuery } from '../../api/resources/brain';
 import { useKnowledgeStatsQuery, useKnowledgeDocumentsQuery } from '../../api/resources/knowledge';
-import { useKgStatsQuery } from '../../api/resources/knowledgeGraph';
+import { useKgStatsQuery, useKgEntitiesQuery } from '../../api/resources/knowledgeGraph';
 import { useMemoriesQuery } from '../../api/resources/memories';
 import { urgencyGroup, relativeDays } from '../../utils/frist';
 import { useAuth } from '../../context/AuthContext';
@@ -102,6 +102,12 @@ export default function OverviewLens() {
     { knowledgeBaseId: null, statusFilter: 'all' },
     docVisible,
   );
+  // Graph preview: the stats endpoint doesn't return top_entities live, so pull
+  // the first few entities directly (gated on the card being visible).
+  const entitiesQuery = useKgEntitiesQuery(
+    { page: 1, size: OVERVIEW_PREVIEW_LIMIT },
+    graphVisible,
+  );
 
   // Fristen: soonest-first already; keep overdue + this-week for the glance.
   const upcoming = (obligationsQuery.data ?? []).filter((f) =>
@@ -120,7 +126,7 @@ export default function OverviewLens() {
   const recentDocs = [...(docsQuery.data ?? [])]
     .sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))
     .slice(0, OVERVIEW_PREVIEW_LIMIT);
-  const topEntities = (kgStats.data?.top_entities ?? []).slice(0, OVERVIEW_PREVIEW_LIMIT);
+  const topEntities = (entitiesQuery.data?.entities ?? []).slice(0, OVERVIEW_PREVIEW_LIMIT);
   const recentMemories = [...(memoriesQuery.data?.memories ?? [])]
     .sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))
     .slice(0, OVERVIEW_PREVIEW_LIMIT);
@@ -272,7 +278,7 @@ export default function OverviewLens() {
             to="/wissen/graph"
           >
             <CardBody
-              loading={kgStats.isLoading}
+              loading={entitiesQuery.isLoading}
               empty={topEntities.length === 0}
               emptyText={t('lens.overview.graphNone')}
             >
