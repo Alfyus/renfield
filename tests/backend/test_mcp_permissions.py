@@ -284,8 +284,14 @@ class TestExecuteToolPermissions:
     @pytest.mark.asyncio
     async def test_none_permissions_skips_check(self):
         """execute_tool() with user_permissions=None skips permission check."""
+        from unittest.mock import AsyncMock
+
         manager, _tool = _make_manager_with_tool()
-        # Will fail at execution (no session), but should pass permission check
+        # The fixture is "connected" with no real session; execute_tool now
+        # attempts an on-demand reconnect for a downed session, so stub it out
+        # to keep this permission-focused unit test hermetic (no network I/O).
+        manager._reconnect_server = AsyncMock(return_value=False)
+        # Will fail at execution (reconnect declined), but should pass permission check
         result = await manager.execute_tool(
             "mcp.weather.get_forecast",
             {"location": "Berlin"},

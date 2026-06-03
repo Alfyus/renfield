@@ -166,6 +166,158 @@ async def test_execute_tool_does_not_retry_on_application_error(manager_with_too
     assert state.session.call_tool.await_count == 1
 
 
+# ---------------------------------------------------------------------------
+# On-demand reconnect: a tool call against a server that went DOWN since the
+# last call (its pod/subprocess restarted → state.connected=False at call
+# time) must attempt one reconnect instead of bailing with "nicht verbunden".
+# This is the fix for the dlna-mcp regression where a `kubectl set image` on
+# an MCP-server deploy broke the agent's access until a manual backend restart.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_ensure_connected_short_circuits_when_connected():
+    """No needless reconnect when the session is already live."""
+    state = _make_state()
+    state.session = MagicMock()
+    mgr = _make_manager(state)
+    mgr._reconnect_server = AsyncMock(return_value=True)  # type: ignore[assignment]
+
+    assert await mgr._ensure_connected(state) is True
+    mgr._reconnect_server.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_ensure_connected_reconnects_when_down():
+    """Down session → exactly one reconnect attempt; returns its result."""
+    state = _make_state()
+    state.connected = False
+    state.session = None
+    mgr = _make_manager(state)
+    mgr._reconnect_server = AsyncMock(return_value=True)  # type: ignore[assignment]
+
+    assert await mgr._ensure_connected(state) is True
+    mgr._reconnect_server.assert_awaited_once()
+    assert await mgr._ensure_connected(None) is False  # unknown server
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_execute_tool_self_heals_when_down_at_call_time(manager_with_tool):
+    """Server marked disconnected at call time → reconnect → call proceeds.
+
+    Pre-fix, execute_tool short-circuited with "nicht verbunden" whenever
+    state.connected was False, so a restarted MCP server pod stayed unusable
+    until the background tick or a manual backend restart. Now the call
+    self-heals.
+    """
+    mgr, state = manager_with_tool
+    # Simulate the server's pod having restarted: session is gone.
+    state.connected = False
+    state.session = None
+    success_result = MagicMock(content=[MagicMock(type="text", text="ok")], isError=False)
+
+    async def _fake_reconnect(s):
+        s.connected = True
+        s.session = AsyncMock()
+        s.session.call_tool = AsyncMock(return_value=success_result)
+        return True
+
+    mgr._reconnect_server = _fake_reconnect  # type: ignore[assignment]
+
+    out = await mgr.execute_tool("mcp.srv.ping", {}, user_permissions=None)
+    assert out["success"] is True, out
+    assert out["message"] == "ok"
+    state.session.call_tool.assert_awaited_once()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_execute_tool_not_connected_when_reconnect_fails(manager_with_tool):
+    """If the on-demand reconnect can't restore the session, fail gracefully."""
+    mgr, state = manager_with_tool
+    state.connected = False
+    state.session = None
+    mgr._reconnect_server = AsyncMock(return_value=False)  # type: ignore[assignment]
+
+    out = await mgr.execute_tool("mcp.srv.ping", {}, user_permissions=None)
+    assert out["success"] is False
+    assert "nicht verbunden" in out["message"]
+    mgr._reconnect_server.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# "Session terminated": the streamable_http McpError raised after the server
+# restarts. It is NOT a transport exception type, so it must be recognised by
+# message and treated as session-death (reconnect + retry), while genuine
+# application McpErrors still fall through without a needless reconnect.
+# ---------------------------------------------------------------------------
+
+
+def _session_terminated_error():
+    """Build the real McpError the MCP SDK raises on a bounced session."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    return McpError(ErrorData(code=32600, message="Session terminated"))
+
+
+@pytest.mark.unit
+def test_is_session_dead_classification():
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    from services.mcp_client import _is_session_dead
+
+    # Transport death — typed exceptions + the SDK's "Session terminated" McpError.
+    assert _is_session_dead(_session_terminated_error()) is True
+    assert _is_session_dead(anyio.ClosedResourceError()) is True
+
+    # NOT session death — the classifier is gated on McpError + the exact
+    # "session terminated" signal, so none of these reconnect-and-retry
+    # (which could double-execute a mutating tool):
+    #   - a plain exception whose text mentions a session (not an McpError)
+    assert _is_session_dead(Exception("Session terminated")) is False
+    #   - an application McpError that merely mentions a session (e.g. IMAP)
+    assert _is_session_dead(McpError(ErrorData(code=-32000, message="session expired"))) is False
+    #   - ordinary application errors
+    assert _is_session_dead(McpError(ErrorData(code=-32602, message="Invalid params"))) is False
+    assert _is_session_dead(ValueError("bad argument")) is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_execute_tool_retries_on_session_terminated_mcperror(manager_with_tool):
+    """The bounced-server McpError must trigger reconnect + retry, not fail.
+
+    Reproduces the live dlna-mcp regression: the server pod restarts, the
+    next call raises McpError 'Session terminated', and the agent must recover
+    on the same turn (reconnect to the new pod) rather than reporting failure.
+    """
+    mgr, state = manager_with_tool
+    success_result = MagicMock(content=[MagicMock(type="text", text="ok")], isError=False)
+    state.session.call_tool.side_effect = [
+        _session_terminated_error(),
+        success_result,
+    ]
+    reconnect_calls = 0
+
+    async def _fake_reconnect(s):
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        s.connected = True
+        return True
+
+    mgr._reconnect_server = _fake_reconnect  # type: ignore[assignment]
+
+    out = await mgr.execute_tool("mcp.srv.ping", {}, user_permissions=None)
+    assert out["success"] is True, out
+    assert reconnect_calls == 1
+    assert state.session.call_tool.await_count == 2
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_execute_tool_retries_on_httpx_remote_protocol_error(manager_with_tool):
