@@ -89,15 +89,19 @@ export default function OverviewLens() {
   const docVisible = dokumenteLens ? isLensVisible(dokumenteLens, auth) : false;
   const graphVisible = graphLens ? isLensVisible(graphLens, auth) : false;
 
-  // All hooks run unconditionally (rules of hooks). knowledge + KG queries carry
-  // an `enabled` gate; obligations/review/memories/docs are always fetched
-  // (cheap; ungated by design, same as the standalone pages).
+  // All hooks run unconditionally (rules of hooks). The knowledge + KG queries
+  // carry an `enabled` gate so a hidden/ungranted area issues no request (the
+  // docs query is gated on `docVisible` → no 403 noise for non-kb users);
+  // obligations/review/memories are always fetched (cheap, ungated by design).
   const obligationsQuery = useObligationsQuery({ dueBefore, limit: 200 });
   const reviewQuery = useAtomsForReviewQuery(7);
   const kbStats = useKnowledgeStatsQuery(isFeatureEnabled('knowledge'));
   const kgStats = useKgStatsQuery(isFeatureEnabled('knowledge_graph'));
   const memoriesQuery = useMemoriesQuery(null);
-  const docsQuery = useKnowledgeDocumentsQuery({ knowledgeBaseId: null, statusFilter: 'all' });
+  const docsQuery = useKnowledgeDocumentsQuery(
+    { knowledgeBaseId: null, statusFilter: 'all' },
+    docVisible,
+  );
 
   // Fristen: soonest-first already; keep overdue + this-week for the glance.
   const upcoming = (obligationsQuery.data ?? []).filter((f) =>

@@ -133,12 +133,13 @@ async function moveDocumentsRequest({ documentIds, targetKbId }: MoveDocumentsIn
   return response.data;
 }
 
-export function useKnowledgeDocumentsQuery(filter: DocsFilter) {
+export function useKnowledgeDocumentsQuery(filter: DocsFilter, enabled = true) {
   return useApiQuery(
     {
       queryKey: [...keys.knowledge.list(), { filter }] as const,
       queryFn: () => fetchDocuments(filter),
       staleTime: STALE.DEFAULT,
+      enabled,
     },
     'common.error',
   );
