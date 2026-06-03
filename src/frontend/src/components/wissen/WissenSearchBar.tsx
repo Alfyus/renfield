@@ -58,11 +58,17 @@ export default function WissenSearchBar() {
   const searchQuery = useAtomSearchQuery(debouncedQ);
 
   const seg = activeSegment(location.pathname);
+  const activeLens = lensForSegment(seg);
+  // Lenses without atom types (Übersicht, Prüfen) can't meaningfully scope —
+  // scope=lens there behaves as everything, so the landing-page omnisearch
+  // doesn't render "nothing found" for real matches.
+  const lensOwnsAtoms = (activeLens?.atomTypes?.length ?? 0) > 0;
+  const filterToLens = scope === 'lens' && lensOwnsAtoms;
   const filtered = useMemo(() => {
     const results = searchQuery.data ?? [];
-    if (scope === 'everything') return results;
+    if (!filterToLens) return results;
     return results.filter((r) => ATOM_LENS_SEGMENT[r.atom.atom_type] === seg);
-  }, [searchQuery.data, scope, seg]);
+  }, [searchQuery.data, filterToLens, seg]);
 
   const onChange = (value: string) => {
     setInput(value);
@@ -83,7 +89,7 @@ export default function WissenSearchBar() {
   // At scope=lens on a lens that runs its own inline search (Documents chunk
   // search, Graph entity-table filter), the lens consumes `?q=` and renders
   // results inline — so suppress the cross-corpus overlay (D9 full-unify).
-  const lensConsumesInline = !!lensForSegment(seg)?.consumesQueryInline;
+  const lensConsumesInline = !!activeLens?.consumesQueryInline;
   const overlayActive = open && !(scope === 'lens' && lensConsumesInline);
   // The fetch lags the field by the debounce window; treat "field newer than
   // the fetched query, or fetch in flight" as pending so the empty-state does
@@ -164,7 +170,7 @@ export default function WissenSearchBar() {
           {!pending && filtered.length === 0 && (
             <div className="empty-state">
               <p>{t('lens.searchNoResults', { query: input })}</p>
-              {scope === 'lens' && (
+              {filterToLens && (
                 <p className="text-sm text-gray-500 dark:text-gray-400">{t('lens.searchWidenHint')}</p>
               )}
             </div>

@@ -283,6 +283,9 @@ export default function KnowledgePage() {
   // we clear our inline results and stay out of the way.
   const omniQ = searchParams.get('q') ?? '';
   const omniScope = searchParams.get('scope');
+  // Embedded with a non-empty query and not in cross-corpus mode → the
+  // Documents lens owns the query and renders inline results.
+  const embeddedActiveQuery = embedded && omniScope !== 'everything' && omniQ.trim().length > 0;
   const { mutateAsync: runChunkSearch } = searchMutation;
   useEffect(() => {
     if (!embedded) return;
@@ -292,12 +295,13 @@ export default function KnowledgePage() {
       setSearchResults([]);
       return;
     }
+    let cancelled = false; // ignore an out-of-order resolution after a newer query
     const id = setTimeout(() => {
       runChunkSearch({ query, knowledgeBaseId: selectedKnowledgeBase })
-        .then(setSearchResults)
+        .then((r) => { if (!cancelled) setSearchResults(r); })
         .catch(() => { /* surfaced via searchMutation.errorMessage */ });
     }, 300);
-    return () => clearTimeout(id);
+    return () => { cancelled = true; clearTimeout(id); };
   }, [embedded, omniQ, omniScope, selectedKnowledgeBase, runChunkSearch]);
 
   useEffect(() => {
@@ -618,8 +622,15 @@ export default function KnowledgePage() {
       {/* Search Section. Embedded as the Wissen Documents lens, the workspace
           omnisearch is the single input (D9) — hide our own box and only show
           the inline results it produces; standalone keeps the full search UI. */}
-      {(!embedded || searchResults.length > 0) && (
+      {(!embedded || embeddedActiveQuery || searchResults.length > 0) && (
       <div className="card">
+        {/* Embedded: the omnisearch drives this — show a loading/empty status
+            so a query without (yet) results isn't a silent void. */}
+        {embedded && embeddedActiveQuery && searchResults.length === 0 && (
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            {searching ? t('common.loading') : t('knowledge.noResults', { defaultValue: t('common.noResults', { defaultValue: 'Keine Ergebnisse' }) })}
+          </p>
+        )}
         {!embedded && (
           <>
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">

@@ -10,6 +10,7 @@ import {
 import { useKnowledgeStatsQuery } from '../../api/resources/knowledge';
 import { useKgStatsQuery } from '../../api/resources/knowledgeGraph';
 import { urgencyGroup } from '../../utils/frist';
+import { useAuth } from '../../context/AuthContext';
 
 /** ISO yyyy-mm-dd `days` from today (matches ObligationsPage). */
 function isoInDays(days: number): string {
@@ -28,13 +29,16 @@ const OVERVIEW_FRIST_LIMIT = 5;
  */
 export default function OverviewLens() {
   const { t } = useTranslation();
+  const { isFeatureEnabled } = useAuth();
   const now = useMemo(() => new Date(), []);
   const dueBefore = useMemo(() => isoInDays(7), []);
 
+  // Gate the per-feature stat queries so a deployment with a feature off
+  // doesn't fire a failing request from the dashboard on every load.
   const obligationsQuery = useObligationsQuery({ dueBefore, limit: 200 });
   const reviewQuery = useAtomsForReviewQuery(7);
-  const kbStats = useKnowledgeStatsQuery();
-  const kgStats = useKgStatsQuery();
+  const kbStats = useKnowledgeStatsQuery(isFeatureEnabled('knowledge'));
+  const kgStats = useKgStatsQuery(isFeatureEnabled('knowledge_graph'));
 
   // Soonest-first already; keep only overdue + this-week for the glance.
   const upcoming = (obligationsQuery.data ?? []).filter((f) =>

@@ -70,6 +70,19 @@ describe('WissenSearchBar', () => {
     expect(screen.queryByText('Graph entity Mueller')).not.toBeInTheDocument();
   });
 
+  it('on the index lens (no atom types) scope=lens still searches the whole corpus', async () => {
+    mockAtoms();
+    // Übersicht (/wissen, segment '') owns no atom types → must not filter to
+    // nothing at the default scope=lens (the landing-page omnisearch bug).
+    renderWithRouter(<WissenSearchBar />, { route: '/wissen' });
+
+    await userEvent.type(screen.getByRole('searchbox'), 'x');
+
+    expect(await screen.findByText('Graph entity Mueller')).toBeInTheDocument();
+    expect(screen.getByText('Rechnung 2024 document')).toBeInTheDocument();
+    expect(screen.queryByText(/Nichts gefunden/)).not.toBeInTheDocument();
+  });
+
   it('Escape clears the query and closes the overlay', async () => {
     mockAtoms();
     renderWithRouter(<WissenSearchBar />, { route: '/wissen/graph?scope=everything' });

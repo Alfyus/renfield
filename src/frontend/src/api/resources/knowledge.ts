@@ -155,12 +155,13 @@ export function useKnowledgeBasesQuery() {
   );
 }
 
-export function useKnowledgeStatsQuery() {
+export function useKnowledgeStatsQuery(enabled = true) {
   return useApiQuery(
     {
       queryKey: [...keys.knowledge.all, 'stats'] as const,
       queryFn: fetchStats,
       staleTime: STALE.DEFAULT,
+      enabled,
     },
     'common.error',
   );

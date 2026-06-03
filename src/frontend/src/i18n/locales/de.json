@@ -1534,10 +1534,11 @@
       "allFristen": "Alle Fristen",
       "noFristen": "Keine Fristen in den nächsten 7 Tagen.",
       "review": "Zu prüfen",
-      "reviewCount": "{{count}} Einträge warten auf Tier-Prüfung",
       "reviewNone": "Nichts zu prüfen.",
       "emptyTitle": "Dein zweites Gehirn ist noch leer.",
-      "emptyCta": "Dokument hochladen"
+      "emptyCta": "Dokument hochladen",
+      "reviewCount_one": "{{count}} Eintrag wartet auf Tier-Prüfung",
+      "reviewCount_other": "{{count}} Einträge warten auf Tier-Prüfung"
     }
   }
 }

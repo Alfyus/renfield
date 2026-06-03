@@ -2,7 +2,8 @@ import { useCallback } from 'react';
 import { useSearchParams } from 'react-router';
 
 /**
- * Merge-preserving access to the Wissen workspace URL params (`?q=`, `?detail=`).
+ * Merge-preserving access to the Wissen workspace URL params (`?q=`, `?scope=`,
+ * `?detail=`).
  *
  * The workspace shell and the embedded lenses BOTH write to the same query
  * string — the Graph lens owns `?focus=`, KnowledgePage owns `?doc=`. A naive

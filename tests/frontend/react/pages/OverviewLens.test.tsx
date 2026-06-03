@@ -5,15 +5,24 @@
  * composed from existing hooks. Covers the populated path and the cold-start
  * empty-state (the worst first impression the design review flagged).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { screen } from '@testing-library/react';
 import { renderWithRouter } from '../test-utils';
 import { server } from '../mocks/server';
 import { TEST_CONFIG } from '../config';
+import { useAuth } from '../../../../src/frontend/src/context/AuthContext';
 import OverviewLens from '../../../../src/frontend/src/pages/wissen/OverviewLens';
 
 const BASE_URL = TEST_CONFIG.API_BASE_URL;
+
+// OverviewLens gates its stat queries via useAuth().isFeatureEnabled.
+vi.mock('../../../../src/frontend/src/context/AuthContext', () => ({
+  useAuth: vi.fn(),
+}));
+vi.mocked(useAuth).mockReturnValue({
+  isFeatureEnabled: () => true,
+} as unknown as ReturnType<typeof useAuth>);
 
 function isoInDays(days: number): string {
   const d = new Date();

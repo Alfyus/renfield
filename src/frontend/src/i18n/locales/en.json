@@ -1534,10 +1534,11 @@
       "allFristen": "All deadlines",
       "noFristen": "No deadlines in the next 7 days.",
       "review": "To review",
-      "reviewCount": "{{count}} items awaiting tier review",
       "reviewNone": "Nothing to review.",
       "emptyTitle": "Your second brain is empty.",
-      "emptyCta": "Upload a document"
+      "emptyCta": "Upload a document",
+      "reviewCount_one": "{{count}} item awaiting tier review",
+      "reviewCount_other": "{{count}} items awaiting tier review"
     }
   }
 }
