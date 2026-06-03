@@ -86,6 +86,13 @@ async function fetchAtomSearch(query: string): Promise<AtomMatch[]> {
   return response.data ?? [];
 }
 
+async function fetchAtomById(atomId: string): Promise<AtomMatch> {
+  // GET /api/atoms/{id} → AtomResponse (atom + payload). 404 for not-found /
+  // not-authorized / synthetic non-table ids (kg_node:*, kg_edge:*).
+  const response = await apiClient.get<AtomMatch['atom']>(`/api/atoms/${encodeURIComponent(atomId)}`);
+  return { atom: response.data, snippet: '', score: 0, rank: 0 };
+}
+
 async function fetchAtomsForReview(days: number): Promise<ReviewAtom[]> {
   const response = await apiClient.get<ReviewAtom[]>('/api/circles/me/atoms-for-review', {
     params: { days, limit: 50 },
@@ -131,6 +138,24 @@ export function useAtomSearchQuery(query: string) {
       queryFn: () => fetchAtomSearch(query),
       staleTime: STALE.DEFAULT,
       enabled: query.trim().length > 0,
+    },
+    'circles.couldNotLoad',
+  );
+}
+
+/**
+ * A single atom by id — backs the detail drawer's cold-load (a `?detail=`
+ * deep-link opened without a clicked seed). 404s (incl. synthetic kg ids)
+ * surface as an error and the drawer degrades to closed.
+ */
+export function useAtomByIdQuery(atomId: string | null) {
+  return useApiQuery(
+    {
+      queryKey: keys.brain.atom(atomId ?? ''),
+      queryFn: () => fetchAtomById(atomId as string),
+      staleTime: STALE.DEFAULT,
+      enabled: !!atomId,
+      retry: false,
     },
     'circles.couldNotLoad',
   );

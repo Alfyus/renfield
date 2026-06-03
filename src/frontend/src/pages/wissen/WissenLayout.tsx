@@ -2,10 +2,11 @@ import { Suspense, useMemo, useState } from 'react';
 import { Outlet } from 'react-router';
 import { LensContextProvider } from '../../context/LensContext';
 import { WissenDrawerProvider } from '../../context/WissenDrawerContext';
+import { useWorkspaceParam } from '../../hooks/useWorkspaceParam';
 import LensRail from '../../components/wissen/LensRail';
 import WissenSearchBar from '../../components/wissen/WissenSearchBar';
 import WissenDetailDrawer from '../../components/wissen/WissenDetailDrawer';
-import type { AtomMatch } from '../../api/resources/brain';
+import { useAtomByIdQuery, type AtomMatch } from '../../api/resources/brain';
 
 // Stable object identity so the provider doesn't re-render consumers each pass.
 const EMBEDDED = { embedded: true } as const;
@@ -33,11 +34,27 @@ function LensSkeleton() {
  * outer max-width via `PageHeader` / `LensFrame` (D4).
  */
 export default function WissenLayout() {
-  // Drawer state lives here so it survives lens switches (the shell persists
-  // via D8; only the Outlet swaps). Seeded by the clicked atom — full payload
-  // in hand, no refetch needed.
-  const [detailAtom, setDetailAtom] = useState<AtomMatch | null>(null);
-  const drawer = useMemo(() => ({ openAtom: setDetailAtom }), []);
+  // The drawer's open state IS the `?detail=<atom_id>` param (deep-linkable,
+  // shareable, Back-closes, survives reload + lens switch). A click seeds the
+  // full atom in memory (rich, no fetch); a cold deep-link with no seed fetches
+  // the atom by id (real atoms resolve; synthetic kg ids 404 → drawer stays shut).
+  const { read, write } = useWorkspaceParam();
+  const detailParam = read('detail');
+  const [seed, setSeed] = useState<AtomMatch | null>(null);
+
+  const drawer = useMemo(
+    () => ({ openAtom: (m: AtomMatch) => { setSeed(m); write('detail', m.atom.atom_id); } }),
+    [write],
+  );
+
+  const seedMatches = !!detailParam && seed?.atom.atom_id === detailParam;
+  const coldQuery = useAtomByIdQuery(detailParam && !seedMatches ? detailParam : null);
+  const drawerAtom: AtomMatch | null = !detailParam
+    ? null
+    : seedMatches
+      ? seed
+      : coldQuery.data ?? null;
+  const closeDrawer = () => write('detail', null, { replace: true });
 
   return (
     <LensContextProvider value={EMBEDDED}>
@@ -51,7 +68,7 @@ export default function WissenLayout() {
             </Suspense>
           </div>
         </div>
-        <WissenDetailDrawer atom={detailAtom} onClose={() => setDetailAtom(null)} />
+        <WissenDetailDrawer atom={drawerAtom} onClose={closeDrawer} />
       </WissenDrawerProvider>
     </LensContextProvider>
   );
