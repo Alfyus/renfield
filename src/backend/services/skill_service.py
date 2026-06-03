@@ -442,13 +442,21 @@ class SkillService:
             WHERE status = ANY(:status_filter)
               AND embedding IS NOT NULL
               AND (
-                :asker IS NULL
-                OR user_id = :asker
+                -- :asker is cast to integer at every site. asyncpg renders
+                -- each named-param occurrence as a distinct positional
+                -- placeholder and asks Postgres to infer its type; the bare
+                -- ``$n IS NULL`` arm carries no type context, so the server
+                -- aborts the Parse with "could not determine data type of
+                -- parameter". An explicit CAST pins the type and is a no-op
+                -- for the column-compared arms (user_id / member_user_id are
+                -- both INTEGER).
+                CAST(:asker AS INTEGER) IS NULL
+                OR user_id = CAST(:asker AS INTEGER)
                 OR (user_id IS NULL AND source = :seed AND circle_tier = 4)
                 OR EXISTS (
                     SELECT 1 FROM circle_memberships cm
                     WHERE cm.circle_owner_id = procedural_skills.user_id
-                      AND cm.member_user_id = :asker
+                      AND cm.member_user_id = CAST(:asker AS INTEGER)
                       AND cm.dimension = 'tier'
                       AND (cm.value::text)::int <= procedural_skills.circle_tier
                 )
