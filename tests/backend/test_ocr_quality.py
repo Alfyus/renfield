@@ -98,12 +98,16 @@ class TestScoreOcrQuality:
         _, issues = score_ocr_quality(text)
         assert "repeated" not in issues.lower(), issues
 
-    def test_genuine_stuck_glyph_is_flagged(self):
-        """A long run of the SAME alphanumeric char IS a real OCR artifact."""
+    def test_repeated_char_run_not_flagged(self):
+        """There is no 'Repeated characters' rule: a long same-char run is not
+        a reliable OCR-quality signal (measured 0 true positives on the real
+        corpus — only redaction masks 'XXXX' and zero-padding '0000'). Such a
+        run in otherwise-clean text scores 5; genuine garbling is caught by the
+        space/special-char/fragmentation signals instead."""
         text = "Normal readable text here, and then llllllllll appears mid-sentence."
         score, issues = score_ocr_quality(text)
-        assert "repeated" in issues.lower()
-        assert score < 5
+        assert "repeated" not in issues.lower()
+        assert score == 5
 
     def test_garbled_no_spaces_flagged(self):
         text = "abcdefghijklmnopqrstuvwxyz" * 10

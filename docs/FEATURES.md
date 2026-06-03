@@ -514,7 +514,7 @@ Automatisierte Metadaten-Prüfung für Paperless-NGX Dokumente via LLM. Opt-in v
 ### Funktionsweise
 
 1. **Scan** — Alle Paperless-Dokumente werden per MCP abgerufen
-2. **OCR-Qualitätsprüfung** — Heuristische Bewertung (1-5) ohne LLM via `utils/ocr_quality.score_ocr_quality` (geteilt mit der Ingest-Pipeline, damit die „Zeichensalat"-Definition nicht auseinanderdriftet): erkennt fehlende Leerzeichen, echte Stuck-Glyph-Läufe (lange Wiederholung **desselben alphanumerischen** Zeichens — nicht mehr gewöhnliche Spalten-/Punkt-Formatierung) und hohe Sonderzeichen-Dichte
+2. **OCR-Qualitätsprüfung** — Heuristische Bewertung (1-5) ohne LLM via `utils/ocr_quality.score_ocr_quality` (geteilt mit der Ingest-Pipeline, damit die „Zeichensalat"-Definition nicht auseinanderdriftet): bewertet fehlende Leerzeichen (zusammengelaufene Wörter), hohe Sonderzeichen-Dichte und Fragmentierung (sehr kurze Zeilen). Eine „wiederholte Zeichen"-Regel gibt es bewusst **nicht** — am realen Korpus erzeugte sie nur Fehlalarme (Spalten-/Punkt-Formatierung, Schwärzungsmasken `XXXX`, Null-Auffüllung `0000`); echtes Garbling fangen die anderen Signale ab.
 3. **LLM-Analyse** — 8 Validierungsfelder: Titel, Korrespondent, Dokumenttyp, Tags, Speicherpfad, Datum, Sprache, Archivstatus
 4. **Fix-Modi**: `review` (manuelle Freigabe im Admin UI), `auto_threshold` (ab Konfidenz ≥ Schwellwert), `auto_all`
 

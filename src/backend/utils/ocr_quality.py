@@ -16,7 +16,6 @@ Both read the same ``rag_ocr_space_threshold``.
 from __future__ import annotations
 
 import logging
-import re
 
 from utils.config import settings
 
@@ -25,14 +24,14 @@ logger = logging.getLogger(__name__)
 # Below this we don't judge — too little signal either way.
 _MIN_JUDGEABLE_CHARS = 50
 
-# A genuine OCR stuck-glyph artifact is a long run of the SAME alphanumeric
-# character (e.g. "lllllllll", "00000000"). Runs of whitespace or punctuation
-# (column padding, dotted leaders "......", form underscores "____", "====="
-# rules) are ordinary document formatting and must NOT count: the old
-# ``(.)\1{5,}`` rule penalized exactly those and falsely docked 15/26 of the
-# real audit corpus (well-formatted invoices). Restrict to alphanumerics and
-# require a longer run.
-_OCR_STUCK_GLYPH = re.compile(r"([A-Za-z0-9äöüÄÖÜß])\1{7,}")
+# NB: there is intentionally NO "repeated characters" rule. The original
+# ``(.)\1{5,}`` heuristic was a net negative: measured against the real audit
+# corpus it produced ~19 flags and ZERO confirmed OCR defects — first on column
+# padding / dotted leaders, then (even restricted to long same-alphanumeric
+# runs) on legitimate content: redaction masks (``XXXXXXXX``) and zero-padded
+# numbers (``00000000``). Genuine garbled OCR is caught by the space-ratio,
+# special-char-ratio, and fragmentation signals below, which co-fire on real
+# failures; an isolated same-char run is not a reliable predictor on its own.
 
 
 def is_text_garbled(text: str) -> bool:
@@ -73,10 +72,6 @@ def score_ocr_quality(text: str) -> tuple[int, str]:
     # Garbled mojibake: words run together, almost no spaces.
     if text.count(" ") / n < settings.rag_ocr_space_threshold:
         issues.append("Very few spaces (garbled)")
-
-    # Stuck-glyph runs only (see _OCR_STUCK_GLYPH) — not whitespace/punctuation.
-    if _OCR_STUCK_GLYPH.search(text):
-        issues.append("Repeated characters")
 
     # Mostly non-text (symbols/control chars) => bad recognition.
     alnum_or_space = sum(c.isalnum() or c.isspace() for c in text)
