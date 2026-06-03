@@ -417,24 +417,32 @@ Eigenstaendiger MCP-Server der als UPnP/DLNA **Control Point** agiert. Nutzt `as
 
 Event-basiert via UPnP SUBSCRIBE (`LAST_CHANGE`) — kein Polling im Normalbetrieb.
 
-**Ausnahme: Event-stille Renderer (GetTransportInfo-Poll-Fallback, v2.12.5).**
-Manche Renderer (z. B. HiFiBerryOS) senden **nie** `LAST_CHANGE`-Events. Der
-gecachte `_transport_state` bleibt dann leer, und `get_status` konnte den
-Renderer-State nur als `unknown` melden — eine begonnene Wiedergabe ließ sich
-nicht positiv bestätigen. Deshalb pollt der DLNA-MCP für diese Renderer aktiv
-`GetTransportInfo`:
+**`LAST_CHANGE`-Parsing-Fix + GetTransportInfo-Poll-Backstop (v2.12.6).**
+`async-upnp-client` liefert den `LAST_CHANGE`-Callback eine **Liste** von
+`UpnpStateVariable`-Objekten (je `.name`/`.value`), keinen Dict. Der Handler rief
+`.get()` darauf auf und warf bei **jedem** Event `AttributeError` — der gecachte
+`_transport_state` wurde nie gesetzt. Folgen (vor v2.12.6 still kaputt):
 
-- `get_status` ruft vor dem Status-Mapping einen einmaligen, per
-  `asyncio.wait_for` auf 3 s budgetierten Poll auf (`async_update()` fächert in
-  mehrere sequenzielle SOAP-Calls auf — der erste Poll ist ein größerer Burst —
-  jeweils mit dem 5-s-Default der Library; ohne Budget könnte ein hängender
-  Renderer das Tool zehnersekundenlang blockieren).
-- Die Wiedergabe-Bestätigung in `start()` pollt als Fallback, wenn (noch) kein
-  Event vorliegt, und kann so weiterhin `PLAYING` bestätigen bzw. bei
-  `STOPPED`/`NO_MEDIA_PRESENT` (z. B. nicht erreichbarer Stream) sauber fehlschlagen.
+- `get_status` meldete dauerhaft `unknown` (z. B. am Arbeitszimmer-HiFiBerry — der
+  Renderer ist **nicht** event-still, der Handler ist nur immer abgestürzt).
+- Die Gapless-/Auto-Advance-Erkennung im Handler lief nie → Alben über mehrere
+  Tracks luden den übernächsten Track nicht vor bzw. sprangen auf Nicht-SetNext-
+  Renderern nicht weiter.
 
-Event-emittierende Renderer bleiben rein event-getrieben; der Poll greift nur,
-solange noch kein State aus einem Event vorliegt.
+Fix: Liste in eine `name→value`-Map falten. Zusätzlich abgesichert, weil der Fix
+die zuvor toten `STOPPED`-Zweige scharf schaltet — Track-Ende/Queue-Ende werden
+nur gewertet, wenn der Renderer **vorher tatsächlich `PLAYING`** erreicht hat
+(ein transientes `STOPPED`/`NO_MEDIA_PRESENT` in der Anlaufphase darf Track 1
+nicht überspringen oder eine Single-Track-Session vorzeitig abräumen); doppelte
+`STOPPED`-Events werden per `_advancing`-Flag entprellt.
+
+**GetTransportInfo-Poll als Backstop:** `get_status` ruft vor dem Status-Mapping
+einen per `asyncio.wait_for` auf 3 s budgetierten `GetTransportInfo`-Poll auf und
+liest danach den von der Library gepflegten `transport_state` (auch wenn der
+aktive Refresh scheitert — das Event-Abo hält den Wert frisch). So liefert
+`get_status` auch dann einen echten State, falls ein Renderer wider Erwarten keine
+Events schickt. Das Budget verhindert, dass ein hängender Renderer das Tool
+zehnersekundenlang blockiert.
 
 | | |
 |---|---|
