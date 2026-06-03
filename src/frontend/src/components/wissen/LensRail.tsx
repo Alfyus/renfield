@@ -1,7 +1,7 @@
 import { Link, useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../../context/AuthContext';
-import { LENSES, lensPath, type LensDef } from '../../pages/wissen/lenses';
+import { LENSES, lensPath, isLensVisible, type LensDef } from '../../pages/wissen/lenses';
 
 /**
  * Is this lens the active one for the current path? The index lens (`/wissen`)
@@ -28,12 +28,9 @@ export default function LensRail() {
   const navigate = useNavigate();
   const { isFeatureEnabled, hasAnyPermission, authEnabled } = useAuth();
 
-  const visibleLenses = LENSES.filter((lens) => {
-    if (lens.feature && !isFeatureEnabled(lens.feature)) return false;
-    if (!authEnabled) return true;
-    if (!lens.permission) return true;
-    return hasAnyPermission(lens.permission);
-  });
+  const visibleLenses = LENSES.filter((lens) =>
+    isLensVisible(lens, { isFeatureEnabled, hasAnyPermission, authEnabled }),
+  );
 
   if (visibleLenses.length === 0) return null;
 

@@ -87,6 +87,26 @@ export function lensPath(lens: LensDef): string {
   return lens.segment ? `/wissen/${lens.segment}` : '/wissen';
 }
 
+/** The auth surface lens gating reads — a structural subset of `useAuth()`. */
+export interface LensVisibilityAuth {
+  isFeatureEnabled: (feature: string) => boolean;
+  hasAnyPermission: (permissions: string[]) => boolean;
+  authEnabled: boolean;
+}
+
+/**
+ * Single gate for "may this user see this lens" (D2) — shared by `LensRail`
+ * and the Übersicht's "Bereiche" nav so visibility can never drift between the
+ * rail and the dashboard. Feature flag first (applies even when auth is off),
+ * then the any-of permission check (skipped in single-user mode).
+ */
+export function isLensVisible(lens: LensDef, auth: LensVisibilityAuth): boolean {
+  if (lens.feature && !auth.isFeatureEnabled(lens.feature)) return false;
+  if (!auth.authEnabled) return true;
+  if (!lens.permission) return true;
+  return auth.hasAnyPermission(lens.permission);
+}
+
 /** The lens owning a path segment (`''` = Übersicht index), or undefined. */
 export function lensForSegment(segment: string): LensDef | undefined {
   return LENSES.find((l) => l.segment === segment);
