@@ -57,11 +57,19 @@ export default function OverviewLens() {
   const { openAtom } = useWissenDrawer();
   const now = useMemo(() => new Date(), []);
   const dueBefore = useMemo(() => isoInDays(7), []);
+  // Constructed once per language (above the early return so it isn't a
+  // conditional hook); Intl.RelativeTimeFormat construction isn't free.
+  const rtf = useMemo(
+    () => new Intl.RelativeTimeFormat(i18n.language, { numeric: 'auto' }),
+    [i18n.language]
+  );
 
   const schichtA = isFeatureEnabled('schicht_a_extraction_enabled');
 
-  // All hooks run unconditionally (rules of hooks); per-feature queries carry
-  // their own `enabled` gate so a deployment with a feature off issues no call.
+  // All hooks run unconditionally (rules of hooks). The knowledge + KG stat
+  // queries carry an `enabled` gate (feature off → no call); obligations,
+  // review and memories are always fetched — cheap, and ungated by design,
+  // same as the standalone pages.
   const obligationsQuery = useObligationsQuery({ dueBefore, limit: 200 });
   const reviewQuery = useAtomsForReviewQuery(7);
   const kbStats = useKnowledgeStatsQuery(isFeatureEnabled('knowledge'));
@@ -70,10 +78,10 @@ export default function OverviewLens() {
 
   // Soonest-first already; keep only overdue + this-week for the glance.
   const upcoming = (obligationsQuery.data ?? []).filter((f) =>
-    f.obligation_date ? urgencyGroup(f.obligation_date, now) !== 'later' : false,
+    f.obligation_date ? urgencyGroup(f.obligation_date, now) !== 'later' : false
   );
   const overdueCount = upcoming.filter(
-    (f) => f.obligation_date && urgencyGroup(f.obligation_date, now) === 'overdue',
+    (f) => f.obligation_date && urgencyGroup(f.obligation_date, now) === 'overdue'
   ).length;
   const reviewAtoms = reviewQuery.data ?? [];
   const reviewCount = reviewAtoms.length;
@@ -122,8 +130,6 @@ export default function OverviewLens() {
     relationCount > 0 ? t('lens.overview.figRelations', { count: relationCount }) : null,
     memoryTotal > 0 ? t('lens.overview.figMemories', { count: memoryTotal }) : null,
   ].filter(Boolean) as string[];
-
-  const rtf = new Intl.RelativeTimeFormat(i18n.language, { numeric: 'auto' });
 
   // "Bereiche" nav: the segment lenses this user may see, same gate as the rail.
   const bereiche = LENSES.filter((lens) => lens.segment && isLensVisible(lens, auth));
@@ -182,7 +188,9 @@ export default function OverviewLens() {
             {obligationsQuery.isLoading ? (
               <p className="text-sm text-gray-500 dark:text-gray-400">{t('common.loading')}</p>
             ) : upcoming.length === 0 ? (
-              <p className="text-sm text-gray-500 dark:text-gray-400">{t('lens.overview.noFristen')}</p>
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                {t('lens.overview.noFristen')}
+              </p>
             ) : (
               <ul className="space-y-2">
                 {upcoming.slice(0, OVERVIEW_FRIST_LIMIT).map((fact) => (
@@ -206,41 +214,52 @@ export default function OverviewLens() {
           {reviewQuery.isLoading ? (
             <p className="text-sm text-gray-500 dark:text-gray-400">{t('common.loading')}</p>
           ) : reviewCount === 0 ? (
-            <p className="text-sm text-gray-500 dark:text-gray-400">{t('lens.overview.reviewNone')}</p>
+            <p className="text-sm text-gray-500 dark:text-gray-400">
+              {t('lens.overview.reviewNone')}
+            </p>
           ) : (
             <>
               <ul className="space-y-2">
                 {reviewAtoms.slice(0, OVERVIEW_REVIEW_LIMIT).map((atom) => (
-                  <li
-                    key={atom.atom_id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => openAtom(reviewToAtomMatch(atom))}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        openAtom(reviewToAtomMatch(atom));
-                      }
-                    }}
-                    className={`atom-row tier-ring-${atom.tier ?? 0} animate-fade-slide-in cursor-pointer`}
-                  >
-                    <div className="flex-1 min-w-0 space-y-0.5">
-                      {atom.title && (
-                        <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
-                          {atom.title}
+                  <li key={atom.atom_id}>
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => openAtom(reviewToAtomMatch(atom))}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          openAtom(reviewToAtomMatch(atom));
+                        }
+                      }}
+                      className={`atom-row tier-ring-${atom.tier ?? 0} animate-fade-slide-in cursor-pointer w-full text-left`}
+                    >
+                      <div className="flex-1 min-w-0 space-y-0.5">
+                        {atom.title && (
+                          <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
+                            {atom.title}
+                          </p>
+                        )}
+                        {atom.preview && (
+                          <p className="text-sm text-gray-600 dark:text-gray-300 line-clamp-2">
+                            {atom.preview}
+                          </p>
+                        )}
+                        <p className="text-xs text-gray-400 dark:text-gray-500">
+                          {t(`circles.atomType.${atom.atom_type}`, {
+                            defaultValue: atom.atom_type,
+                          })}
+                          {(() => {
+                            // Guard: Intl.RelativeTimeFormat throws on a non-finite
+                            // value, so a malformed created_at must not reach format().
+                            if (!atom.created_at) return null;
+                            const days = relativeDays(atom.created_at, now);
+                            return Number.isFinite(days) ? ` · ${rtf.format(days, 'day')}` : null;
+                          })()}
                         </p>
-                      )}
-                      {atom.preview && (
-                        <p className="text-sm text-gray-600 dark:text-gray-300 line-clamp-2">
-                          {atom.preview}
-                        </p>
-                      )}
-                      <p className="text-xs text-gray-400 dark:text-gray-500">
-                        {t(`circles.atomType.${atom.atom_type}`, { defaultValue: atom.atom_type })}
-                        {atom.created_at && ` · ${rtf.format(relativeDays(atom.created_at, now), 'day')}`}
-                      </p>
+                      </div>
+                      <TierBadge tier={atom.tier ?? 0} className="shrink-0 ml-2" />
                     </div>
-                    <TierBadge tier={atom.tier ?? 0} className="shrink-0 ml-2" />
                   </li>
                 ))}
               </ul>
@@ -279,7 +298,11 @@ export default function OverviewLens() {
                       <p className="text-sm font-medium text-gray-900 dark:text-white">
                         {t(lens.labelKey)}
                       </p>
-                      {sub && <p className="text-xs text-gray-500 dark:text-gray-400 tabular-nums">{sub}</p>}
+                      {sub && (
+                        <p className="text-xs text-gray-500 dark:text-gray-400 tabular-nums">
+                          {sub}
+                        </p>
+                      )}
                     </div>
                     <ChevronRight
                       className="w-4 h-4 shrink-0 text-gray-400 group-hover:text-gray-600 dark:group-hover:text-gray-200"
