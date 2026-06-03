@@ -136,6 +136,18 @@ Konsequenz: bei User-Löschung werden alle Atome des Nutzers kaskadierend gelös
 
 ---
 
+## Ein Ort für alles — der Wissens-Workspace
+
+Die vier Informationsarten haben historisch je eine eigene Seite (`/knowledge`, `/brain`, `/memory`, `/knowledge-graph`, plus die Fristen-Agenda und die Review-Queue). Hinter dem Flag `wissen_workspace_enabled` (standardmäßig aus) verschmelzen sie zu **einem** `/wissen`-Workspace — denn es ist *ein* Korpus, betrachtet durch verschiedene Linsen:
+
+- **Lens-Leiste** statt sechs Navigationspunkte: Übersicht · Dokumente · Graph · Erinnerungen · Fristen · Prüfen. Jede Linse ist die bestehende Seite, eingebettet (Doppel-Header/Breite entfallen via `LensFrame` + Kontext); Sichtbarkeit pro Linse über dieselben Permission-/Feature-Gates.
+- **Lens-bezogene Omnisuche** als Dreh- und Angelpunkt: `scope=lens` lässt die aktive Linse ihre *eigene* Inline-Suche fahren (Dokument-Chunk-Suche, Entity-Tabellenfilter), `scope=everything` legt ein Cross-Source-RRF-Overlay über die `/api/atoms`-Fusion (genau der Weg aus dem Retrieval-Abschnitt oben).
+- **Universeller Detail-Drawer**: Klick auf ein beliebiges Ergebnis öffnet typ-spezifischen Inhalt (Dokument→Fakten, Fakt→ObligationRow+Herkunft, Memory→Text, Entity→Name/Typ, Kante→Triple) samt Tier-Edit. Damit Graph-Entities einzeln adressierbar sind, liefert das Retrieval nun **pro-Entity-`kg_node`-/pro-Relation-`kg_edge`-Atome** (statt eines aggregierten Blocks); der String-Kontext für den Agenten bleibt unverändert.
+
+Alte URLs leiten (mit `?search`/`#hash`) in die Linsen um; ist das Flag aus, bleibt die flache Navigation unverändert. Code-Detail: Abschnitt „Unified Wissen workspace" in `CLAUDE.md`.
+
+---
+
 ## Siehe auch
 
 - [CIRCLES.md](CIRCLES.md) — Zugriffsebenen-Modell, Datentabellen und Retrieval-Filter im Detail

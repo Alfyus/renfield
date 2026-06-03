@@ -114,7 +114,7 @@ Jedes Subsystem, das Inhalte dem LLM präsentiert, wendet den Circle-Filter an:
 | `GET /api/atoms` | Unified Cross-Source-Search (`/brain` Frontend); `document_fact` ist eine fusionierte RRF-Quelle (Schicht-A-Fakten erscheinen mit grünem „Fakt"-Badge) |
 | `GET /api/atoms/documents/{id}/facts` | Alle Schicht-A-Fakten eines Dokuments; 404/403 am Eltern-Dokument circle-gated |
 | `GET /api/atoms/obligations` | Verpflichtungen (Rechnungen + Behörden-Fristen), nächste Frist zuerst; `due_before` + `limit` + `offset` (Offset-Paging für „Mehr laden") |
-| `GET /api/config/features` | Frontend-sichtbare Feature-Flags (Allowlist, derzeit `schicht_a_extraction_enabled`) — die eine bewusste Settings→Browser-Naht |
+| `GET /api/config/features` | Frontend-sichtbare Feature-Flags (Allowlist: `schicht_a_extraction_enabled`, `wissen_workspace_enabled`) — die eine bewusste Settings→Browser-Naht |
 | `PATCH /api/atoms/{id}` | Tier ändern; cascade auf incidente Relationen |
 | `GET /api/circles/me` | Eigene Circle-Konfiguration laden |
 | `GET /api/circles/me/members` | Mitgliederlisten pro Tier |
@@ -138,6 +138,8 @@ Jedes Subsystem, das Inhalte dem LLM präsentiert, wendet den Circle-Filter an:
 Die Dokument-Karten unter `/knowledge` tragen eine inline **Fakten**-Panel (`FaktenPanel`, lazy-Fetch beim Aufklappen) und verlinken bidirektional mit der Agenda (`?doc={id}#fakten` ↔ `#frist-{id}`).
 
 Shared Komponenten: `TierBadge` + `TierPicker` + `FactProvenance` (✓ deterministisch / ~ Modell-Vorschlag) + `ObligationRow` nutzen die `.tier-badge-{0..4}` / `.fact-group` / `.legal-flag`-Utilities aus `src/frontend/src/index.css` — farbliche Zuordnung *self* (warm) → *public* (kühl), siehe `DESIGN.md`.
+
+**Vereinheitlichter Wissens-Workspace (`wissen_workspace_enabled`, standardmäßig aus).** Ist das Flag an, bündeln sich die obigen Korpus-Seiten plus `/knowledge`, `/memory`, `/knowledge-graph` zu einem `/wissen`-Workspace: persistente Lens-Leiste (Übersicht · Dokumente · Graph · Erinnerungen · Fristen · Prüfen, per-Lens über dieselbe Permission/Feature-Metadaten gated), eine persistente **lens-bezogene Omnisuche** (`?scope=lens|everything`) und ein **universeller Detail-Drawer** (Klick auf ein beliebiges Atom → typ-spezifischer Inhalt + Tier-Edit über zwei ID-Räume: Atom-UUID via `usePatchAtomTier`, `kg_node` via KG-Integer-ID `useUpdateKgEntityTier`). Die alten Routen leiten dann (mit erhaltenem `?search`/`#hash`) nach `/wissen/*` um; aus = unveränderte flache Navigation. Skills (`/brain/skills`) + Föderations-Verlauf (`/brain/audit`) bleiben eigenständig. Details: Abschnitt im Haupt-`CLAUDE.md`.
 
 ---
 
