@@ -1270,6 +1270,7 @@ class MCPManager:
         user_permissions: list[str] | None = None,
         user_id: int | None = None,
         progress_sink: ProgressSink | None = None,
+        truncate: bool = True,
     ) -> dict:
         """
         Execute an MCP tool by its namespaced name.
@@ -1289,6 +1290,12 @@ class MCPManager:
                 federation ProgressChunk (enriched with peer identity). F4c
                 uses this to relay "asking Mom's brain…" status to the chat
                 WebSocket. Non-federation tools ignore the sink.
+            truncate: Cap the response at ``mcp_max_response_size`` (default
+                True). Truncation exists to protect the LLM context window; a
+                programmatic caller fetching binary payloads (e.g.
+                ``download_document``'s base64 file bytes) must pass
+                ``truncate=False`` or the JSON envelope is byte-cut mid-payload
+                and becomes unparseable for any non-trivial file.
 
         Returns:
             {"success": bool, "message": str, "data": Any}
@@ -1488,8 +1495,7 @@ class MCPManager:
             text = getattr(item, "text", None)
             if text:
                 # === Response Truncation ===
-                truncated_text = _truncate_response(text)
-                content_parts.append(truncated_text)
+                content_parts.append(_truncate_response(text) if truncate else text)
             raw_data.append(
                 {"type": getattr(item, "type", "unknown"), "text": text}
             )
@@ -1497,7 +1503,8 @@ class MCPManager:
         message = "\n".join(content_parts) if content_parts else "Tool executed"
 
         # Truncate final message if still too large
-        message = _truncate_response(message)
+        if truncate:
+            message = _truncate_response(message)
 
         # NOTE: Credential sanitization is NOT done here — the agent loop
         # needs real API keys in tool results (e.g. Jellyfin stream URLs

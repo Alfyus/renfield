@@ -514,9 +514,13 @@ Automatisierte Metadaten-Prüfung für Paperless-NGX Dokumente via LLM. Opt-in v
 ### Funktionsweise
 
 1. **Scan** — Alle Paperless-Dokumente werden per MCP abgerufen
-2. **OCR-Qualitätsprüfung** — Heuristische Bewertung (1-5) ohne LLM: erkennt Zeichensalat, wiederholte Zeichen, hohe Sonderzeichen-Dichte
+2. **OCR-Qualitätsprüfung** — Heuristische Bewertung (1-5) ohne LLM via `utils/ocr_quality.score_ocr_quality` (geteilt mit der Ingest-Pipeline, damit die „Zeichensalat"-Definition nicht auseinanderdriftet): erkennt fehlende Leerzeichen, echte Stuck-Glyph-Läufe (lange Wiederholung **desselben alphanumerischen** Zeichens — nicht mehr gewöhnliche Spalten-/Punkt-Formatierung) und hohe Sonderzeichen-Dichte
 3. **LLM-Analyse** — 8 Validierungsfelder: Titel, Korrespondent, Dokumenttyp, Tags, Speicherpfad, Datum, Sprache, Archivstatus
 4. **Fix-Modi**: `review` (manuelle Freigabe im Admin UI), `auto_threshold` (ab Konfidenz ≥ Schwellwert), `auto_all`
+
+### Re-OCR (lokaler Stack mit Paperless-Fallback)
+
+Die „Re-OCR"-Aktion läuft **nicht** mehr blind über Paperless' eigene OCR (die mit denselben Einstellungen scheitern würde). Stattdessen pro Dokument: Original-Bytes per MCP `download_document` laden (`truncate=False` — sonst wird das Base64 am LLM-Response-Limit abgeschnitten), lokal mit erzwungener Ganzseiten-OCR (Renfields Docling/EasyOCR-Stack inkl. Garbled-Layer-Recovery) neu erkennen, das Ergebnis bewerten und **nur bei striktem Qualitätsgewinn** den sauberen Text via `update_document(content=…)` zurück nach Paperless schreiben. Schlägt die lokale OCR fehl oder ist sie nicht besser, greift der Fallback auf Paperless' natives `reprocess`. Hinweis: Es wird nur der durchsuchbare Content aktualisiert, das archivierte PDF wird nicht neu erzeugt.
 
 ### Admin UI (`/admin/paperless-audit`)
 

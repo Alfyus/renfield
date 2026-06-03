@@ -887,9 +887,9 @@ class PaperlessMetadataExtractor:
         Vision-model path is deferred to PR 2b: it requires coordinating
         with the agent client to send image bytes + text, which the
         existing llm_client surface doesn't yet support cleanly. Docling
-        alone covers typed documents (the 80% case) and falls back to
-        EasyOCR for scans via the existing ``rag_ocr_auto_detect``
-        settings on ``DocumentProcessor``.
+        alone covers typed documents (the 80% case); ``extract_text_only``
+        re-runs full-page OCR when ``rag_ocr_auto_detect`` is on and the
+        embedded text layer is garbled (same recovery as a KB ingest).
         """
         if self._document_processor is None:
             from services.document_processor import DocumentProcessor
