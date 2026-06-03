@@ -31,6 +31,9 @@ class FeatureFlags(BaseModel):
     """Frontend-visible feature flags. Allowlist — add a field here only when
     the frontend must branch on it."""
     schicht_a_extraction_enabled: bool
+    # Gates the unified /wissen workspace nav + routing (frontend). Off => the
+    # legacy flat corpus nav. See utils/config.py::wissen_workspace_enabled.
+    wissen_workspace_enabled: bool
 
 
 @router.get("/features", response_model=FeatureFlags)
@@ -40,4 +43,5 @@ async def get_features(
     """Return the frontend-visible feature-flag allowlist."""
     return FeatureFlags(
         schicht_a_extraction_enabled=settings.schicht_a_extraction_enabled,
+        wissen_workspace_enabled=settings.wissen_workspace_enabled,
     )

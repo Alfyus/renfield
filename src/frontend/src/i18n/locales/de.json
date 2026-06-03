@@ -27,7 +27,8 @@
     "noResults": "Keine Ergebnisse gefunden",
     "continue": "Weiter",
     "back": "Zurück",
-    "done": "Fertig"
+    "done": "Fertig",
+    "clear": "Leeren"
   },
   "nav": {
     "chat": "Chat",
@@ -65,7 +66,8 @@
     "adminSkills": "Fähigkeiten-Inbox",
     "adminToolHealth": "Werkzeug-Gesundheit",
     "adminTrajectories": "Verlaufstrajektorien",
-    "adminCurator": "Kurator"
+    "adminCurator": "Kurator",
+    "wissen": "Wissen"
   },
   "auth": {
     "login": "Anmelden",
@@ -151,12 +153,11 @@
     "attachFile": "Datei anhängen",
     "uploading": "Wird hochgeladen...",
     "uploadSuccess": "Hochgeladen",
-    "uploadFailed": "Upload fehlgeschlagen",
+    "uploadFailed": "Verarbeitung fehlgeschlagen",
     "unsupportedFormat": "Dateiformat nicht unterstützt",
     "fileTooLarge": "Datei zu groß (max. {{size}}MB)",
     "removeAttachment": "Anhang entfernen",
     "uploadProcessing": "wird verarbeitet …",
-    "uploadFailed": "Verarbeitung fehlgeschlagen",
     "documentUploaded": "Dokument hochgeladen: {{filename}}",
     "documentAttached": "{{count}} Dokument(e) angehängt",
     "dropFileHere": "Datei ablegen zum Anhängen",
@@ -1509,6 +1510,55 @@
         "staleArchived": "Veraltete archiviert",
         "error": "Fehler"
       }
+    }
+  },
+  "lens": {
+    "uebersicht": "Übersicht",
+    "dokumente": "Dokumente",
+    "graph": "Graph",
+    "erinnerungen": "Erinnerungen",
+    "fristen": "Fristen",
+    "pruefen": "Prüfen",
+    "railLabel": "Wissens-Ansichten",
+    "pickerLabel": "Ansicht wählen",
+    "searchAllPlaceholder": "Alles durchsuchen…",
+    "scopeLabel": "Suchbereich",
+    "scopeThis": "Diese Ansicht",
+    "scopeAll": "Alles",
+    "searchNoResults": "Nichts gefunden für „{{query}}“",
+    "searchWidenHint": "Auf „Alles“ erweitern, um die gesamte Wissensbasis zu durchsuchen.",
+    "overview": {
+      "title": "Auf einen Blick",
+      "figDocs_one": "{{count}} Dokument",
+      "figDocs_other": "{{count}} Dokumente",
+      "figEntities_one": "{{count}} Entität",
+      "figEntities_other": "{{count}} Entitäten",
+      "figRelations_one": "{{count}} Beziehung",
+      "figRelations_other": "{{count}} Beziehungen",
+      "figMemories_one": "{{count}} Erinnerung",
+      "figMemories_other": "{{count}} Erinnerungen",
+      "open": "Öffnen",
+      "fristen": "Nächste Fristen",
+      "fristenSoon_one": "{{count}} in den nächsten 7 Tagen",
+      "fristenSoon_other": "{{count}} in den nächsten 7 Tagen",
+      "overdueAccent_one": "{{count}} überfällig",
+      "overdueAccent_other": "{{count}} überfällig",
+      "noFristen": "Keine Fristen in den nächsten 7 Tagen.",
+      "review": "Zu prüfen",
+      "reviewNone": "Nichts zu prüfen.",
+      "reviewShort_one": "{{count}} zu prüfen",
+      "reviewShort_other": "{{count}} zu prüfen",
+      "docsNone": "Noch keine Dokumente.",
+      "graphNone": "Noch keine Entitäten.",
+      "memoriesNone": "Noch keine Erinnerungen.",
+      "emptyTitle": "Dein zweites Gehirn ist noch leer.",
+      "emptyCta": "Dokument hochladen"
+    },
+    "detail": {
+      "title": "Detail",
+      "tier": "Sichtbarkeit",
+      "openInDocs": "In Dokumenten öffnen",
+      "openInGraph": "Im Graph öffnen"
     }
   }
 }

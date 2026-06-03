@@ -126,6 +126,7 @@ export const keys = {
     search: (query: string, filters?: Record<string, unknown>) =>
       ['brain', 'search', { query, ...(filters ?? {}) }] as const,
     review: () => ['brain', 'review'] as const,
+    atom: (atomId: string) => ['brain', 'atom', atomId] as const,
     facts: (documentId: number) => ['brain', 'facts', documentId] as const,
     obligations: (filters?: Record<string, unknown>) =>
       ['brain', 'obligations', filters ?? {}] as const,

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Inbox, Calendar } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
+import LensFrame from '../components/wissen/LensFrame';
 import Alert from '../components/Alert';
 import Badge from '../components/Badge';
 import type { BadgeColor } from '../components/Badge';
@@ -82,7 +83,7 @@ export default function BrainReviewPage() {
   };
 
   return (
-    <div className="max-w-5xl mx-auto p-6 space-y-6">
+    <LensFrame standaloneClassName="max-w-5xl mx-auto p-6 space-y-6">
       <PageHeader
         icon={Inbox}
         title={t('circles.reviewTitle')}
@@ -174,6 +175,6 @@ export default function BrainReviewPage() {
           })}
         </ul>
       )}
-    </div>
+    </LensFrame>
   );
 }

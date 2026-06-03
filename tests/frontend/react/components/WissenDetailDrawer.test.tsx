@@ -1,0 +1,79 @@
+/**
+ * WissenDetailDrawer — PR3 universal detail drawer.
+ *
+ * The CRITICAL guarantee (plan test #5): tier edits route to the right id-space.
+ * kg_node → useUpdateKgEntityTier by KG integer id; atom-backed types
+ * (conversation_memory/kb_document/document_fact) → usePatchAtomTier by atom
+ * UUID. Using the wrong one silently no-ops, so each path is asserted.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { fireEvent, screen } from '@testing-library/react';
+import { renderWithRouter, userEvent } from '../test-utils';
+import WissenDetailDrawer from '../../../../src/frontend/src/components/wissen/WissenDetailDrawer';
+import type { AtomMatch } from '../../../../src/frontend/src/api/resources/brain';
+import { usePatchAtomTier } from '../../../../src/frontend/src/api/resources/brain';
+import { useUpdateKgEntityTier } from '../../../../src/frontend/src/api/resources/knowledgeGraph';
+
+vi.mock('../../../../src/frontend/src/api/resources/brain', async (orig) => ({
+  ...(await orig<typeof import('../../../../src/frontend/src/api/resources/brain')>()),
+  usePatchAtomTier: vi.fn(),
+}));
+vi.mock('../../../../src/frontend/src/api/resources/knowledgeGraph', async (orig) => ({
+  ...(await orig<typeof import('../../../../src/frontend/src/api/resources/knowledgeGraph')>()),
+  useUpdateKgEntityTier: vi.fn(),
+}));
+
+const patchSpy = vi.fn();
+const kgSpy = vi.fn();
+
+beforeEach(() => {
+  patchSpy.mockReset();
+  kgSpy.mockReset();
+  vi.mocked(usePatchAtomTier).mockReturnValue({ mutate: patchSpy } as unknown as ReturnType<typeof usePatchAtomTier>);
+  vi.mocked(useUpdateKgEntityTier).mockReturnValue({ mutate: kgSpy } as unknown as ReturnType<typeof useUpdateKgEntityTier>);
+});
+
+const kgNode: AtomMatch = {
+  atom: { atom_id: 'kg_node:42', atom_type: 'kg_node', tier: 1, payload: { entity_id: 42, name: 'Müller GmbH', entity_type: 'organization' } },
+  score: 1, snippet: 'Müller GmbH', rank: 1,
+};
+const memory: AtomMatch = {
+  atom: { atom_id: 'mem-uuid', atom_type: 'conversation_memory', tier: 2, payload: { memory_id: 5, content: 'Mag Espresso', category: 'preference' } },
+  score: 1, snippet: 'Mag Espresso', rank: 1,
+};
+
+describe('WissenDetailDrawer', () => {
+  it('CRITICAL: kg_node tier edit uses the KG int-id endpoint, not the atom endpoint', async () => {
+    renderWithRouter(<WissenDetailDrawer atom={kgNode} onClose={() => {}} />);
+    expect(screen.getByText('Müller GmbH')).toBeInTheDocument();
+    // "open in Graph" carries the entity int id.
+    expect(screen.getByRole('link', { name: /Im Graph öffnen/ })).toHaveAttribute('href', '/wissen/graph?focus=42');
+
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: '3' } });
+
+    expect(kgSpy).toHaveBeenCalledWith({ id: 42, circleTier: 3 });
+    expect(patchSpy).not.toHaveBeenCalled();
+  });
+
+  it('CRITICAL: atom-backed (memory) tier edit uses the atom UUID endpoint', () => {
+    renderWithRouter(<WissenDetailDrawer atom={memory} onClose={() => {}} />);
+    expect(screen.getByText('Mag Espresso')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: '4' } });
+
+    expect(patchSpy).toHaveBeenCalledWith({ atomId: 'mem-uuid', policy: { tier: 4 } });
+    expect(kgSpy).not.toHaveBeenCalled();
+  });
+
+  it('Escape closes the drawer', async () => {
+    const onClose = vi.fn();
+    renderWithRouter(<WissenDetailDrawer atom={kgNode} onClose={onClose} />);
+    await userEvent.keyboard('{Escape}');
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('renders nothing when no atom is open', () => {
+    const { container } = renderWithRouter(<WissenDetailDrawer atom={null} onClose={() => {}} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+});

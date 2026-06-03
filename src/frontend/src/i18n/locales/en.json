@@ -27,7 +27,8 @@
     "noResults": "No results found",
     "continue": "Continue",
     "back": "Back",
-    "done": "Done"
+    "done": "Done",
+    "clear": "Clear"
   },
   "nav": {
     "chat": "Chat",
@@ -65,7 +66,8 @@
     "adminSkills": "Skills Inbox",
     "adminToolHealth": "Tool Health",
     "adminTrajectories": "Trajectories",
-    "adminCurator": "Curator"
+    "adminCurator": "Curator",
+    "wissen": "Knowledge"
   },
   "auth": {
     "login": "Login",
@@ -151,12 +153,11 @@
     "attachFile": "Attach file",
     "uploading": "Uploading...",
     "uploadSuccess": "Uploaded",
-    "uploadFailed": "Upload failed",
+    "uploadFailed": "Processing failed",
     "unsupportedFormat": "Unsupported file format",
     "fileTooLarge": "File too large (max. {{size}}MB)",
     "removeAttachment": "Remove attachment",
     "uploadProcessing": "processing …",
-    "uploadFailed": "Processing failed",
     "documentUploaded": "Document uploaded: {{filename}}",
     "documentAttached": "{{count}} document(s) attached",
     "dropFileHere": "Drop file to attach",
@@ -1509,6 +1510,55 @@
         "staleArchived": "Stale archived",
         "error": "Error"
       }
+    }
+  },
+  "lens": {
+    "uebersicht": "Overview",
+    "dokumente": "Documents",
+    "graph": "Graph",
+    "erinnerungen": "Memories",
+    "fristen": "Deadlines",
+    "pruefen": "Review",
+    "railLabel": "Knowledge views",
+    "pickerLabel": "Choose view",
+    "searchAllPlaceholder": "Search everything…",
+    "scopeLabel": "Search scope",
+    "scopeThis": "This view",
+    "scopeAll": "Everything",
+    "searchNoResults": "Nothing found for “{{query}}”",
+    "searchWidenHint": "Switch to “Everything” to search the whole knowledge base.",
+    "overview": {
+      "title": "At a glance",
+      "figDocs_one": "{{count}} document",
+      "figDocs_other": "{{count}} documents",
+      "figEntities_one": "{{count}} entity",
+      "figEntities_other": "{{count}} entities",
+      "figRelations_one": "{{count}} relation",
+      "figRelations_other": "{{count}} relations",
+      "figMemories_one": "{{count}} memory",
+      "figMemories_other": "{{count}} memories",
+      "open": "Open",
+      "fristen": "Upcoming deadlines",
+      "fristenSoon_one": "{{count}} in the next 7 days",
+      "fristenSoon_other": "{{count}} in the next 7 days",
+      "overdueAccent_one": "{{count}} overdue",
+      "overdueAccent_other": "{{count}} overdue",
+      "noFristen": "No deadlines in the next 7 days.",
+      "review": "To review",
+      "reviewNone": "Nothing to review.",
+      "reviewShort_one": "{{count}} to review",
+      "reviewShort_other": "{{count}} to review",
+      "docsNone": "No documents yet.",
+      "graphNone": "No entities yet.",
+      "memoriesNone": "No memories yet.",
+      "emptyTitle": "Your second brain is empty.",
+      "emptyCta": "Upload a document"
+    },
+    "detail": {
+      "title": "Detail",
+      "tier": "Visibility",
+      "openInDocs": "Open in Documents",
+      "openInGraph": "Open in Graph"
     }
   }
 }

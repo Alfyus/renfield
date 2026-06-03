@@ -35,4 +35,19 @@ export function urgencyGroup(iso: string, now: Date): UrgencyGroup {
   return 'later';
 }
 
+/**
+ * Signed whole calendar days from `now` to an ISO date/timestamp — negative
+ * when in the past. Feed straight to `Intl.RelativeTimeFormat.format(n, 'day')`
+ * for a locale-correct "vor 2 Tagen" / "2 days ago" without hardcoded strings.
+ * Same local-midnight pinning as `daysUntil`, so a `created_at` timestamp
+ * earlier today reads as 0 ("heute"), not -1.
+ */
+export function relativeDays(iso: string, now: Date): number {
+  const datePart = iso.slice(0, 10);
+  const [y, m, d] = datePart.split('-').map(Number);
+  if (!y || !m || !d) return NaN;
+  const then = new Date(y, m - 1, d).getTime();
+  return Math.round((then - localMidnight(now)) / 86_400_000);
+}
+
 export const URGENCY_ORDER: UrgencyGroup[] = ['overdue', 'thisWeek', 'later'];
