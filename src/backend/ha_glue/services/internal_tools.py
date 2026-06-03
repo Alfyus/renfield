@@ -367,9 +367,25 @@ class InternalToolService:
             else:
                 return resolve_result
 
-        entity_id = resolve_result["data"]["entity_id"]
-        resolved_room_name = resolve_result["data"]["room_name"]
-        device_name = resolve_result["data"]["device_name"]
+        data = resolve_result["data"]
+
+        # DLNA renderers have no HA entity_id and must be driven through the
+        # DLNA MCP path, not media_player.play_media. Without this branch the
+        # entity_id lookup below KeyErrors on every DLNA room (the agent's
+        # default playback tool was unusable for DLNA-only rooms).
+        if data.get("target_type") == "dlna":
+            return await self._play_url_on_dlna(
+                renderer_name=data.get("dlna_renderer_name"),
+                media_url=media_url,
+                title=title,
+                room_name=data.get("room_name", room_name),
+                device_name=data.get("device_name"),
+                params=params,
+            )
+
+        entity_id = data["entity_id"]
+        resolved_room_name = data["room_name"]
+        device_name = data["device_name"]
 
         # Step 2: Call HA media_player.play_media
         try:
@@ -500,6 +516,79 @@ class InternalToolService:
             return {
                 "success": False,
                 "message": f"Error playing media: {e!s}",
+                "action_taken": False,
+            }
+
+    async def _play_url_on_dlna(
+        self,
+        *,
+        renderer_name: str | None,
+        media_url: str,
+        title: str | None,
+        room_name: str,
+        device_name: str | None,
+        params: dict,
+    ) -> dict:
+        """Play a single already-resolved media URL on a DLNA renderer.
+
+        The DLNA counterpart of the HA `media_player.play_media` path in
+        `_play_in_room`: a room that resolves to a DLNA renderer is played via
+        `mcp.dlna.play_tracks` (a one-item queue), mirroring how
+        `_play_album_on_dlna` sends tracks. Avoids the entity_id assumption that
+        made `_play_in_room` crash on DLNA rooms.
+        """
+        if not renderer_name:
+            return {
+                "success": False,
+                "message": f"No DLNA renderer name for room '{room_name}'",
+                "action_taken": False,
+            }
+        try:
+            import json as _json
+
+            from main import app
+
+            mcp_manager = getattr(app.state, "mcp_manager", None)
+            if not mcp_manager:
+                return {
+                    "success": False,
+                    "message": "MCP manager not available",
+                    "action_taken": False,
+                }
+
+            tracks = [{"url": media_url, "title": title or "", "artist": "", "album": ""}]
+            result = await mcp_manager.execute_tool(
+                "mcp.dlna.play_tracks",
+                {"renderer_name": renderer_name, "tracks": _json.dumps(tracks)},
+            )
+            if not result.get("success"):
+                return {
+                    "success": False,
+                    "message": f"DLNA playback failed: {result.get('message', 'unknown error')}",
+                    "action_taken": False,
+                }
+
+            await self._register_media_follow(
+                params, room_name, "single_url",
+                media_url=media_url, title=title, thumb=None,
+            )
+            return {
+                "success": True,
+                "message": f"Playing on {device_name or renderer_name} in {room_name} (DLNA: {renderer_name})",
+                "action_taken": True,
+                "data": {
+                    "renderer_name": renderer_name,
+                    "room_name": room_name,
+                    "device_name": device_name,
+                    "media_url": media_url,
+                    "target_type": "dlna",
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error playing URL on DLNA renderer '{renderer_name}': {e}")
+            return {
+                "success": False,
+                "message": f"Error playing on DLNA: {e!s}",
                 "action_taken": False,
             }
 
