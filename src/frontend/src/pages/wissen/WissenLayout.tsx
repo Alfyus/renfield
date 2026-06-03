@@ -1,8 +1,11 @@
-import { Suspense } from 'react';
+import { Suspense, useMemo, useState } from 'react';
 import { Outlet } from 'react-router';
 import { LensContextProvider } from '../../context/LensContext';
+import { WissenDrawerProvider } from '../../context/WissenDrawerContext';
 import LensRail from '../../components/wissen/LensRail';
 import WissenSearchBar from '../../components/wissen/WissenSearchBar';
+import WissenDetailDrawer from '../../components/wissen/WissenDetailDrawer';
+import type { AtomMatch } from '../../api/resources/brain';
 
 // Stable object identity so the provider doesn't re-render consumers each pass.
 const EMBEDDED = { embedded: true } as const;
@@ -30,18 +33,26 @@ function LensSkeleton() {
  * outer max-width via `PageHeader` / `LensFrame` (D4).
  */
 export default function WissenLayout() {
+  // Drawer state lives here so it survives lens switches (the shell persists
+  // via D8; only the Outlet swaps). Seeded by the clicked atom — full payload
+  // in hand, no refetch needed.
+  const [detailAtom, setDetailAtom] = useState<AtomMatch | null>(null);
+  const drawer = useMemo(() => ({ openAtom: setDetailAtom }), []);
+
   return (
     <LensContextProvider value={EMBEDDED}>
-      <div className="flex gap-6">
-        <LensRail />
-        <div className="relative flex-1 min-w-0 space-y-4">
-          <WissenSearchBar />
-          <Suspense fallback={<LensSkeleton />}>
-            <Outlet />
-          </Suspense>
+      <WissenDrawerProvider value={drawer}>
+        <div className="flex gap-6">
+          <LensRail />
+          <div className="relative flex-1 min-w-0 space-y-4">
+            <WissenSearchBar />
+            <Suspense fallback={<LensSkeleton />}>
+              <Outlet />
+            </Suspense>
+          </div>
         </div>
-      </div>
-      {/* PR3: <WissenDetailDrawer /> mounts here (driven by ?detail=). */}
+        <WissenDetailDrawer atom={detailAtom} onClose={() => setDetailAtom(null)} />
+      </WissenDrawerProvider>
     </LensContextProvider>
   );
 }

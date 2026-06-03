@@ -92,7 +92,11 @@ class PolymorphicAtomStore:
         candidate_k = top_k * 3  # over-fetch for RRF fusion across sources
 
         rag_task = RAGRetrieval(self.db).search(query_text, top_k=candidate_k)
-        kg_task = KGRetrieval(self.db).get_relevant_context(query_text, user_id=asker_id)
+        # Structured per-entity/-relation KG atoms (not the aggregated string):
+        # each kg_node/kg_edge carries its source id so the detail drawer can
+        # render the entity + edit its tier. The agent path still uses the
+        # string form (get_relevant_context) elsewhere.
+        kg_task = KGRetrieval(self.db).get_relevant_atoms(query_text, user_id=asker_id)
         memory_task = MemoryRetrieval(self.db).retrieve(query_text, user_id=asker_id, limit=candidate_k)
         # Lexical retrievers — keyword / name fallback for queries the
         # vector path mis-ranks (single tokens like "Jutta", short
@@ -136,7 +140,7 @@ class PolymorphicAtomStore:
         # Removing the wrapper — exceptions in retrieval modules are converted to []
         # by the _wrap_* helpers, and any actual programmer error now bubbles to FastAPI.
         (
-            rag_results, kg_context, memory_results,
+            rag_results, kg_atoms, memory_results,
             lexical_chunks, lexical_memories, skill_results, document_fact_results,
         ) = await asyncio.gather(
             rag_task, kg_task, memory_task,
@@ -145,7 +149,7 @@ class PolymorphicAtomStore:
         )
 
         rag_matches = _wrap_rag_results(rag_results)
-        kg_matches = _wrap_kg_context(kg_context)
+        kg_matches = _wrap_kg_atoms(kg_atoms)
         memory_matches = _wrap_memory_results(memory_results)
         lexical_chunk_matches = _wrap_rag_results(lexical_chunks)
         lexical_memory_matches = _wrap_memory_results(lexical_memories)
@@ -247,33 +251,80 @@ def _wrap_rag_results(rag_results: Any) -> list[AtomMatch]:
     return list(seen_atoms.values())
 
 
-def _wrap_kg_context(kg_context: Any) -> list[AtomMatch]:
+def _wrap_kg_atoms(kg_atoms: Any) -> list[AtomMatch]:
     """
-    Convert KGRetrieval.get_relevant_context output (str or None) -> list[AtomMatch].
+    Convert KGRetrieval.get_relevant_atoms output -> list[AtomMatch].
 
-    KGRetrieval returns a formatted string today (per Lane A1). For PolymorphicAtomStore
-    we represent it as a single AtomMatch wrapping the formatted text. v2.5 KG retrieval
-    upgrade will return per-triple AtomMatch[] for proper RRF participation.
+    Emits ONE ``kg_node`` atom per matched entity and ONE ``kg_edge`` atom per
+    relation, each carrying its source id in the payload (``entity_id`` /
+    ``relation_id``) so the unified-search detail drawer can render the entity
+    and edit its circle tier via the KG int-id endpoint. Replaces the old single
+    ``kg_aggregated`` string blob (which had no id and couldn't be opened).
     """
-    if isinstance(kg_context, Exception) or not kg_context:
+    if isinstance(kg_atoms, Exception) or not kg_atoms:
         return []
+    entities = kg_atoms.get("entities") or []
+    relations = kg_atoms.get("relations") or []
+    if not entities and not relations:
+        return []
+
     now = _now()
-    return [
-        AtomMatch(
-            atom=Atom(
-                atom_id="kg_aggregated",  # placeholder; v2.5 returns per-triple atoms
-                atom_type="kg_node",
-                owner_user_id=0,
-                policy={"tier": 0},
-                created_at=now,
-                updated_at=now,
-                payload={"content": str(kg_context)},
-            ),
-            score=0.7,  # placeholder; v2.5 returns proper per-triple scores
-            snippet=str(kg_context)[:200],
-            rank=1,
+    matches: list[AtomMatch] = []
+    rank = 1
+    # Entities first (more relevant for a "tell me about X" search), then edges.
+    for e in entities:
+        eid = e.get("id")
+        matches.append(
+            AtomMatch(
+                atom=Atom(
+                    atom_id=f"kg_node:{eid}",
+                    atom_type="kg_node",
+                    owner_user_id=0,
+                    policy={"tier": int(e.get("circle_tier", 0) or 0)},
+                    created_at=now,
+                    updated_at=now,
+                    payload={
+                        "entity_id": eid,
+                        "name": e.get("name", ""),
+                        "entity_type": e.get("entity_type"),
+                    },
+                ),
+                score=float(e.get("similarity", 0.0) or 0.0),
+                snippet=str(e.get("name", ""))[:200],
+                rank=rank,
+            )
         )
-    ]
+        rank += 1
+    for r in relations:
+        rid = r.get("id")
+        subj = r.get("subject_name", "?")
+        pred = r.get("predicate", "")
+        obj = r.get("object_name", "?")
+        matches.append(
+            AtomMatch(
+                atom=Atom(
+                    atom_id=f"kg_edge:{rid}",
+                    atom_type="kg_edge",
+                    owner_user_id=0,
+                    policy={"tier": int(r.get("circle_tier", 0) or 0)},
+                    created_at=now,
+                    updated_at=now,
+                    payload={
+                        "relation_id": rid,
+                        "subject_id": r.get("subject_id"),
+                        "subject_name": subj,
+                        "predicate": pred,
+                        "object_id": r.get("object_id"),
+                        "object_name": obj,
+                    },
+                ),
+                score=0.5,  # relations rank below entities; RRF blends across sources
+                snippet=f"{subj} {pred} {obj}"[:200],
+                rank=rank,
+            )
+        )
+        rank += 1
+    return matches
 
 
 def _wrap_skill_results(skill_results: Any) -> list[AtomMatch]:

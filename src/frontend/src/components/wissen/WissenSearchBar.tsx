@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router';
+import { useLocation } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Search, X } from 'lucide-react';
 import { useWorkspaceParam } from '../../hooks/useWorkspaceParam';
-import { useAtomSearchQuery } from '../../api/resources/brain';
+import { useAtomSearchQuery, type AtomMatch } from '../../api/resources/brain';
 import { ATOM_LENS_SEGMENT, lensForSegment } from '../../pages/wissen/lenses';
+import { useWissenDrawer } from '../../context/WissenDrawerContext';
 import TierBadge from '../TierBadge';
 
 type Scope = 'lens' | 'everything';
@@ -33,8 +34,8 @@ function activeSegment(pathname: string): string {
 export default function WissenSearchBar() {
   const { t } = useTranslation();
   const location = useLocation();
-  const navigate = useNavigate();
   const { read, write } = useWorkspaceParam();
+  const { openAtom } = useWissenDrawer();
 
   const urlQ = read('q') ?? '';
   const [input, setInput] = useState(urlQ);
@@ -80,9 +81,11 @@ export default function WissenSearchBar() {
     write('q', null, { replace: true });
   };
 
-  const openResult = (segment: string) => {
+  // Clicking a result opens the detail drawer (seeded with the full atom);
+  // the drawer's per-type "open in lens" links handle navigation from there.
+  const openResult = (match: AtomMatch) => {
     clear();
-    navigate(`/wissen/${segment}`);
+    openAtom(match);
   };
 
   const open = input.trim().length > 0;
@@ -180,10 +183,7 @@ export default function WissenSearchBar() {
               <li key={r.atom.atom_id}>
                 <button
                   type="button"
-                  onClick={() => {
-                    const targetSeg = ATOM_LENS_SEGMENT[r.atom.atom_type];
-                    if (targetSeg) openResult(targetSeg);
-                  }}
+                  onClick={() => openResult(r)}
                   className="atom-row w-full text-left flex items-start gap-3 py-2"
                 >
                   {r.atom.tier !== undefined && <TierBadge tier={r.atom.tier} />}

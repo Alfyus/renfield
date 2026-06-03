@@ -1539,6 +1539,12 @@
       "emptyCta": "Upload a document",
       "reviewCount_one": "{{count}} item awaiting tier review",
       "reviewCount_other": "{{count}} items awaiting tier review"
+    },
+    "detail": {
+      "title": "Detail",
+      "tier": "Visibility",
+      "openInDocs": "Open in Documents",
+      "openInGraph": "Open in Graph"
     }
   }
 }

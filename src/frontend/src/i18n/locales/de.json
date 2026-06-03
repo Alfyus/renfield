@@ -1539,6 +1539,12 @@
       "emptyCta": "Dokument hochladen",
       "reviewCount_one": "{{count}} Eintrag wartet auf Tier-Prüfung",
       "reviewCount_other": "{{count}} Einträge warten auf Tier-Prüfung"
+    },
+    "detail": {
+      "title": "Detail",
+      "tier": "Sichtbarkeit",
+      "openInDocs": "In Dokumenten öffnen",
+      "openInGraph": "Im Graph öffnen"
     }
   }
 }

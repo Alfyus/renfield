@@ -17,6 +17,16 @@ export interface AtomMatch {
     atom_id: string;
     atom_type: AtomType;
     tier?: CircleTier | number;
+    /**
+     * Per-type source fields the detail drawer reads (already on the wire via
+     * AtomResponse.payload): kb_document → {document_id, document_title,
+     * document_filename}; document_fact → {fact_id, document_id, kind, value,
+     * obligation_date, amount_value, amount_currency, legal_gate, source};
+     * kg_node → {entity_id, name, entity_type}; kg_edge → {relation_id,
+     * subject_name, predicate, object_name}; conversation_memory → {memory_id,
+     * content, category}.
+     */
+    payload?: Record<string, unknown>;
   };
   score: number;
   snippet: string;
