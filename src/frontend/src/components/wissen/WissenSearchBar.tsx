@@ -3,21 +3,13 @@ import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Search, X } from 'lucide-react';
 import { useWorkspaceParam } from '../../hooks/useWorkspaceParam';
-import { useAtomSearchQuery, type AtomType } from '../../api/resources/brain';
+import { useAtomSearchQuery } from '../../api/resources/brain';
+import { ATOM_LENS_SEGMENT } from '../../pages/wissen/lenses';
 import TierBadge from '../TierBadge';
 
 type Scope = 'lens' | 'everything';
 
 const SEARCH_DEBOUNCE_MS = 300;
-
-/** Which lens segment owns each atom type — drives the scope filter + routing. */
-const ATOM_LENS_SEGMENT: Record<AtomType, string> = {
-  kb_document: 'dokumente',
-  document_fact: 'fristen',
-  kg_node: 'graph',
-  kg_edge: 'graph',
-  conversation_memory: 'erinnerungen',
-};
 
 function activeSegment(pathname: string): string {
   const m = pathname.match(/^\/wissen\/([^/?#]+)/);
@@ -33,8 +25,10 @@ function activeSegment(pathname: string): string {
  * - Scope toggle: "Diese Ansicht" filters results to the active lens's atom
  *   types; "Alles" searches the whole corpus.
  * - Results overlay LAYERS over the active lens (the parent content column is
- *   `relative`) — it never unmounts the lens, so the Graph WebGL scene behind
- *   it survives. Clicking a result routes to the owning lens.
+ *   `relative`) without unmounting it — toggling search does not tear down the
+ *   active lens (e.g. the Graph WebGL scene). Switching to a different lens
+ *   does remount that lens; only the shell (rail + this bar) persists.
+ *   Clicking a result routes to the owning lens.
  */
 export default function WissenSearchBar() {
   const { t } = useTranslation();
@@ -83,11 +77,15 @@ export default function WissenSearchBar() {
   };
 
   const open = input.trim().length > 0;
+  // The fetch lags the field by the debounce window; treat "field newer than
+  // the fetched query, or fetch in flight" as pending so the empty-state does
+  // NOT flash "no results" during the ~300ms gap on every keystroke.
+  const pending = input.trim() !== debouncedQ.trim() || searchQuery.isFetching;
 
   return (
     <div className="relative">
-      <div className="flex items-center gap-2">
-        <div className="relative flex-1">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-[12rem]">
           <Search
             className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
             aria-hidden="true"
@@ -96,27 +94,35 @@ export default function WissenSearchBar() {
             type="search"
             value={input}
             onChange={(e) => onChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape' && open) {
+                e.preventDefault();
+                clear();
+              }
+            }}
             placeholder={t('lens.searchAllPlaceholder')}
             aria-label={t('lens.searchAllPlaceholder')}
-            className="input min-h-11 w-full pl-9 pr-9"
+            aria-expanded={open}
+            aria-controls="wissen-search-results"
+            className="input min-h-11 w-full pl-9 pr-11"
           />
           {open && (
             <button
               type="button"
               onClick={clear}
               aria-label={t('common.clear')}
-              className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-md text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+              className="absolute right-1 top-1/2 -translate-y-1/2 min-w-11 min-h-11 flex items-center justify-center rounded-md text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
             >
               <X className="w-4 h-4" aria-hidden="true" />
             </button>
           )}
         </div>
 
-        {/* Scope toggle [Diese Ansicht | Alles] */}
+        {/* Scope toggle [Diese Ansicht | Alles] — visible on every viewport. */}
         <div
           role="group"
           aria-label={t('lens.scopeLabel')}
-          className="hidden sm:inline-flex shrink-0 rounded-sm border border-gray-200 dark:border-gray-700 overflow-hidden text-sm"
+          className="inline-flex shrink-0 rounded-sm border border-gray-200 dark:border-gray-700 overflow-hidden text-sm"
         >
           {(['lens', 'everything'] as const).map((s) => (
             <button
@@ -137,11 +143,17 @@ export default function WissenSearchBar() {
       </div>
 
       {open && (
-        <div className="absolute z-30 mt-2 left-0 right-0 card max-h-[60vh] overflow-y-auto shadow-lg">
-          {searchQuery.isLoading && (
+        <div
+          id="wissen-search-results"
+          role="region"
+          aria-live="polite"
+          aria-label={t('lens.searchAllPlaceholder')}
+          className="absolute z-30 mt-2 left-0 right-0 card max-h-[60vh] overflow-y-auto shadow-lg"
+        >
+          {pending && (
             <p className="text-sm text-gray-500 dark:text-gray-400 p-2">{t('common.loading')}</p>
           )}
-          {!searchQuery.isLoading && filtered.length === 0 && (
+          {!pending && filtered.length === 0 && (
             <div className="empty-state">
               <p>{t('lens.searchNoResults', { query: input })}</p>
               {scope === 'lens' && (
@@ -154,7 +166,10 @@ export default function WissenSearchBar() {
               <li key={r.atom.atom_id}>
                 <button
                   type="button"
-                  onClick={() => openResult(ATOM_LENS_SEGMENT[r.atom.atom_type])}
+                  onClick={() => {
+                    const targetSeg = ATOM_LENS_SEGMENT[r.atom.atom_type];
+                    if (targetSeg) openResult(targetSeg);
+                  }}
                   className="atom-row w-full text-left flex items-start gap-3 py-2"
                 >
                   {r.atom.tier !== undefined && <TierBadge tier={r.atom.tier} />}

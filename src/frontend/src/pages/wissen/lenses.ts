@@ -7,6 +7,7 @@ import {
   Inbox,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import type { AtomType } from '../../api/resources/brain';
 
 /**
  * A lens = one view over the knowledge corpus inside the Wissen workspace.
@@ -31,6 +32,8 @@ export interface LensDef {
   permission?: string[];
   /** Feature flag gating the lens (omitted = always on). */
   feature?: string;
+  /** Atom types this lens owns — drives search-result routing + scope filter. */
+  atomTypes?: AtomType[];
 }
 
 export const LENSES: LensDef[] = [
@@ -42,10 +45,30 @@ export const LENSES: LensDef[] = [
     icon: BookOpen,
     permission: ['kb.own', 'kb.shared', 'kb.all'],
     feature: 'knowledge',
+    atomTypes: ['kb_document'],
   },
-  { key: 'graph', segment: 'graph', labelKey: 'lens.graph', icon: Share2, feature: 'knowledge_graph' },
-  { key: 'erinnerungen', segment: 'erinnerungen', labelKey: 'lens.erinnerungen', icon: Brain },
-  { key: 'fristen', segment: 'fristen', labelKey: 'lens.fristen', icon: CalendarClock },
+  {
+    key: 'graph',
+    segment: 'graph',
+    labelKey: 'lens.graph',
+    icon: Share2,
+    feature: 'knowledge_graph',
+    atomTypes: ['kg_node', 'kg_edge'],
+  },
+  {
+    key: 'erinnerungen',
+    segment: 'erinnerungen',
+    labelKey: 'lens.erinnerungen',
+    icon: Brain,
+    atomTypes: ['conversation_memory'],
+  },
+  {
+    key: 'fristen',
+    segment: 'fristen',
+    labelKey: 'lens.fristen',
+    icon: CalendarClock,
+    atomTypes: ['document_fact'],
+  },
   { key: 'pruefen', segment: 'review', labelKey: 'lens.pruefen', icon: Inbox },
 ];
 
@@ -53,3 +76,9 @@ export const LENSES: LensDef[] = [
 export function lensPath(lens: LensDef): string {
   return lens.segment ? `/wissen/${lens.segment}` : '/wissen';
 }
+
+/** Owning lens segment per atom type, derived from `LENSES.atomTypes` — the
+ *  single source the search overlay uses to route + scope results. */
+export const ATOM_LENS_SEGMENT: Partial<Record<AtomType, string>> = Object.fromEntries(
+  LENSES.flatMap((lens) => (lens.atomTypes ?? []).map((at) => [at, lens.segment])),
+);

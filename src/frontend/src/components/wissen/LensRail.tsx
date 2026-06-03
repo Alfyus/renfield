@@ -65,7 +65,7 @@ export default function LensRail() {
         aria-label={t('lens.railLabel')}
         className="hidden md:flex md:flex-col md:gap-1 md:w-16 lg:w-56 shrink-0"
       >
-        <h2 className="hidden lg:block px-3 pb-2 text-xl font-display text-gray-900 dark:text-white">
+        <h2 className="hidden lg:block px-3 pb-2 text-2xl font-display text-gray-900 dark:text-white">
           {t('nav.wissen')}
         </h2>
         {visibleLenses.map((lens) => {
