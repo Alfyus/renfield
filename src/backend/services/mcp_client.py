@@ -637,6 +637,44 @@ _SESSION_DEAD_EXCEPTIONS: tuple[type[BaseException], ...] = (
     ConnectionError,
 )
 
+# Exact message the MCP streamable_http client returns once the server has
+# invalidated our session id — which is what happens when that server's
+# pod/process restarts (mcp/client/streamable_http.py raises this as an McpError
+# with JSON-RPC code 32600). It is NOT one of the transport exceptions above, so
+# without special-casing it the call is mistaken for an application error and
+# never retried.
+_SESSION_TERMINATED_MARKER = "session terminated"
+
+
+def _is_session_dead(exc: BaseException) -> bool:
+    """True if `exc` means the transport/session is dead (vs. an app error).
+
+    Two cases:
+    - the typed transport exceptions (stream closed / connection reset);
+    - the streamable_http "Session terminated" ``McpError`` raised after the
+      server restarts — the case that left the agent unable to reach a bounced
+      MCP server until a manual backend restart.
+
+    Deliberately NARROW: the message check is gated on the exception actually
+    being an ``McpError`` and matches only the SDK's exact "session terminated"
+    signal — NOT a free-text substring over arbitrary exceptions. A genuine
+    application error whose message merely mentions a "session" (e.g. an
+    email/IMAP or API tool surfacing an upstream "session expired") must NOT be
+    treated as transport death, because that would reconnect-and-retry and could
+    double-execute a mutating tool.
+    """
+    if isinstance(exc, _SESSION_DEAD_EXCEPTIONS):
+        return True
+    try:
+        from mcp.shared.exceptions import McpError
+    except Exception:  # noqa: BLE001 - SDK shape guard
+        return False
+    if not isinstance(exc, McpError):
+        return False
+    err = getattr(exc, "error", None)
+    msg = (getattr(err, "message", None) or str(exc) or "").lower()
+    return _SESSION_TERMINATED_MARKER in msg
+
 
 class MCPTransportType(str, Enum):
     STREAMABLE_HTTP = "streamable_http"
@@ -1087,6 +1125,32 @@ class MCPManager:
             await self._connect_server(state)
             return state.connected
 
+    async def _ensure_connected(self, state: "MCPServerState | None") -> bool:
+        """Best-effort on-demand reconnect immediately before a tool call.
+
+        Root-cause fix for "MCP Server X nicht verbunden" after that server's
+        pod/subprocess restarted: rather than bailing out and waiting for the
+        background refresh tick (or a manual backend restart) to heal the
+        session, a tool call attempts ONE reconnect right here. Mirrors
+        ``probe_server``'s reconnect-on-failure.
+
+        Transport-agnostic: ``_reconnect_server`` → ``_connect_server`` respawns
+        a stdio subprocess or re-establishes a streamable_http session as
+        appropriate, so this works for every configured MCP server. Federation
+        servers have no session and are dispatched before this is reached.
+
+        Returns True iff the server now has a live session.
+        """
+        if state is None:
+            return False
+        if state.connected and state.session is not None:
+            return True
+        logger.info(
+            f"MCP '{state.config.name}' not connected at call time; "
+            f"attempting on-demand reconnect"
+        )
+        return await self._reconnect_server(state)
+
     async def probe_server(self, server_name: str) -> dict:
         """Active probe for an MCP server's session via the universal
         ``tools/list`` method.
@@ -1316,7 +1380,9 @@ class MCPManager:
                 }
             return final_result
 
-        if not state or not state.connected or not state.session:
+        # Self-heal a session that went down since the last call (e.g. the
+        # server's pod restarted) instead of failing the call outright.
+        if not await self._ensure_connected(state):
             return {
                 "success": False,
                 "message": f"MCP Server '{tool_info.server_name}' nicht verbunden",
@@ -1359,10 +1425,12 @@ class MCPManager:
                 timeout=settings.mcp_call_timeout,
             )
 
-        # Try once; on a session-shape exception (transport-layer death —
-        # see _SESSION_DEAD_EXCEPTIONS) reconnect and retry once. Application
-        # errors (McpError, validation) and timeouts fall through immediately:
-        # reconnecting wouldn't help and would tear down a healthy session.
+        # Try once; on a session-death signal (transport exception OR the
+        # streamable_http "Session terminated" McpError after a server bounce —
+        # see _is_session_dead) reconnect and retry once. Genuine application
+        # errors (other McpError, validation) and timeouts fall through
+        # immediately: reconnecting wouldn't help and would tear down a healthy
+        # session over a malformed argument.
         result = None
         last_exc: BaseException | None = None
         for attempt in range(2):
@@ -1377,8 +1445,14 @@ class MCPManager:
                     "message": f"Tool-Aufruf Timeout: {namespaced_name}",
                     "data": None,
                 }
-            except _SESSION_DEAD_EXCEPTIONS as e:
+            except Exception as e:  # noqa: BLE001 - bubble in last_exc
                 last_exc = e
+                if not _is_session_dead(e):
+                    # Application-level error (McpError, schema, etc.). The
+                    # session is fine; just surface the failure.
+                    logger.error(f"MCP tool call failed: {namespaced_name}: {e}")
+                    state.last_error = str(e)
+                    break
                 if attempt == 0:
                     logger.warning(
                         f"MCP session died on {namespaced_name}: {type(e).__name__}: {e}; "
@@ -1395,13 +1469,6 @@ class MCPManager:
                 )
                 state.connected = False
                 state.last_error = str(e)
-            except Exception as e:  # noqa: BLE001 - bubble in last_exc
-                # Application-level error (McpError, schema, etc.). The
-                # session is fine; just surface the failure.
-                last_exc = e
-                logger.error(f"MCP tool call failed: {namespaced_name}: {e}")
-                state.last_error = str(e)
-                break
 
         if result is None:
             return {
@@ -1740,7 +1807,9 @@ class MCPManager:
             yield {"success": False, "message": perm_error, "data": None}
             return
 
-        if not state.connected or not state.session:
+        # Self-heal a session that went down since the last call (e.g. the
+        # server's pod restarted) instead of failing the call outright.
+        if not await self._ensure_connected(state):
             yield {
                 "success": False,
                 "message": f"MCP Server '{tool_info.server_name}' nicht verbunden",
