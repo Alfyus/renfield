@@ -335,6 +335,11 @@ class Settings(BaseSettings):
     # Opt-in: the LLM obligation pass costs one classification call per ingest, and
     # the obligation/alert layer that consumes these facts isn't wired yet.
     schicht_a_extraction_enabled: bool = False
+    # Unified "Wissen" workspace (frontend). When on, the 6 corpus nav entries
+    # (knowledge/brain/review/fristen/memory/knowledge-graph) collapse into one
+    # /wissen workspace and the old routes redirect in. Off => legacy flat nav.
+    # Runtime flag (exposed via /api/config/features) so it flips without a rebuild.
+    wissen_workspace_enabled: bool = False
     schicht_a_extraction_model: str = ""             # empty => ollama_chat_model || ollama_model
     # Output-token cap for the obligation/universal LLM pass. The old fixed 1200
     # cap (→ OpenAI max_tokens) silently truncated rich docs' JSON → unparseable

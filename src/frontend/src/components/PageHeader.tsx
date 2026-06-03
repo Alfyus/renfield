@@ -1,5 +1,6 @@
 import type { LucideIcon } from 'lucide-react';
 import type { ReactNode } from 'react';
+import { useLensContext } from '../context/LensContext';
 
 interface PageHeaderProps {
   icon: LucideIcon;
@@ -9,6 +10,17 @@ interface PageHeaderProps {
 }
 
 export default function PageHeader({ icon: Icon, title, subtitle, children }: PageHeaderProps) {
+  const { embedded } = useLensContext();
+
+  // Embedded as a Wissen lens: the lens-rail already names the section, so the
+  // title card would double the chrome. Keep the action buttons (upload,
+  // add-memory, …) in a slim right-aligned bar so capability isn't lost (D4);
+  // render nothing when there are no actions.
+  if (embedded) {
+    if (!children) return null;
+    return <div className="flex items-center justify-end gap-2">{children}</div>;
+  }
+
   return (
     <div className="card">
       <div className="flex flex-col sm:flex-row sm:items-center gap-4">

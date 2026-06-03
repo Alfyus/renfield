@@ -351,6 +351,13 @@ const mockPermissions: MockPermission[] = [
 ];
 
 export const handlers: HttpHandler[] = [
+  // Frontend-visible feature-flag allowlist (api/routes/config.py).
+  http.get(`${BASE_URL}/api/config/features`, () => {
+    return HttpResponse.json({
+      schicht_a_extraction_enabled: false,
+      wissen_workspace_enabled: false,
+    });
+  }),
   // MCP API
   http.get(`${BASE_URL}/api/mcp/status`, () => {
     return HttpResponse.json(mockMcpStatus);

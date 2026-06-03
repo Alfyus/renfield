@@ -65,6 +65,8 @@ export interface ObligationsFilter {
 /** Frontend-visible backend feature flags (allowlist — see api/routes/config.py). */
 export interface FeatureFlags {
   schicht_a_extraction_enabled: boolean;
+  /** Gates the unified /wissen workspace nav + routing (D10). */
+  wissen_workspace_enabled: boolean;
 }
 
 async function fetchAtomSearch(query: string): Promise<AtomMatch[]> {

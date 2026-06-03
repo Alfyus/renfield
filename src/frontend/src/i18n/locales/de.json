@@ -27,7 +27,8 @@
     "noResults": "Keine Ergebnisse gefunden",
     "continue": "Weiter",
     "back": "Zurück",
-    "done": "Fertig"
+    "done": "Fertig",
+    "clear": "Leeren"
   },
   "nav": {
     "chat": "Chat",
@@ -65,7 +66,8 @@
     "adminSkills": "Fähigkeiten-Inbox",
     "adminToolHealth": "Werkzeug-Gesundheit",
     "adminTrajectories": "Verlaufstrajektorien",
-    "adminCurator": "Kurator"
+    "adminCurator": "Kurator",
+    "wissen": "Wissen"
   },
   "auth": {
     "login": "Anmelden",
@@ -151,12 +153,11 @@
     "attachFile": "Datei anhängen",
     "uploading": "Wird hochgeladen...",
     "uploadSuccess": "Hochgeladen",
-    "uploadFailed": "Upload fehlgeschlagen",
+    "uploadFailed": "Verarbeitung fehlgeschlagen",
     "unsupportedFormat": "Dateiformat nicht unterstützt",
     "fileTooLarge": "Datei zu groß (max. {{size}}MB)",
     "removeAttachment": "Anhang entfernen",
     "uploadProcessing": "wird verarbeitet …",
-    "uploadFailed": "Verarbeitung fehlgeschlagen",
     "documentUploaded": "Dokument hochgeladen: {{filename}}",
     "documentAttached": "{{count}} Dokument(e) angehängt",
     "dropFileHere": "Datei ablegen zum Anhängen",
@@ -1510,5 +1511,21 @@
         "error": "Fehler"
       }
     }
+  },
+  "lens": {
+    "uebersicht": "Übersicht",
+    "dokumente": "Dokumente",
+    "graph": "Graph",
+    "erinnerungen": "Erinnerungen",
+    "fristen": "Fristen",
+    "pruefen": "Prüfen",
+    "railLabel": "Wissens-Ansichten",
+    "pickerLabel": "Ansicht wählen",
+    "searchAllPlaceholder": "Alles durchsuchen…",
+    "scopeLabel": "Suchbereich",
+    "scopeThis": "Diese Ansicht",
+    "scopeAll": "Alles",
+    "searchNoResults": "Nichts gefunden für „{{query}}“",
+    "searchWidenHint": "Auf „Alles“ erweitern, um die gesamte Wissensbasis zu durchsuchen."
   }
 }

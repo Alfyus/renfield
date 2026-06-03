@@ -27,7 +27,8 @@
     "noResults": "No results found",
     "continue": "Continue",
     "back": "Back",
-    "done": "Done"
+    "done": "Done",
+    "clear": "Clear"
   },
   "nav": {
     "chat": "Chat",
@@ -65,7 +66,8 @@
     "adminSkills": "Skills Inbox",
     "adminToolHealth": "Tool Health",
     "adminTrajectories": "Trajectories",
-    "adminCurator": "Curator"
+    "adminCurator": "Curator",
+    "wissen": "Knowledge"
   },
   "auth": {
     "login": "Login",
@@ -151,12 +153,11 @@
     "attachFile": "Attach file",
     "uploading": "Uploading...",
     "uploadSuccess": "Uploaded",
-    "uploadFailed": "Upload failed",
+    "uploadFailed": "Processing failed",
     "unsupportedFormat": "Unsupported file format",
     "fileTooLarge": "File too large (max. {{size}}MB)",
     "removeAttachment": "Remove attachment",
     "uploadProcessing": "processing …",
-    "uploadFailed": "Processing failed",
     "documentUploaded": "Document uploaded: {{filename}}",
     "documentAttached": "{{count}} document(s) attached",
     "dropFileHere": "Drop file to attach",
@@ -1510,5 +1511,21 @@
         "error": "Error"
       }
     }
+  },
+  "lens": {
+    "uebersicht": "Overview",
+    "dokumente": "Documents",
+    "graph": "Graph",
+    "erinnerungen": "Memories",
+    "fristen": "Deadlines",
+    "pruefen": "Review",
+    "railLabel": "Knowledge views",
+    "pickerLabel": "Choose view",
+    "searchAllPlaceholder": "Search everything…",
+    "scopeLabel": "Search scope",
+    "scopeThis": "This view",
+    "scopeAll": "Everything",
+    "searchNoResults": "Nothing found for “{{query}}”",
+    "searchWidenHint": "Switch to “Everything” to search the whole knowledge base."
   }
 }

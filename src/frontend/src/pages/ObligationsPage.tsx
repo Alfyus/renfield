@@ -4,6 +4,7 @@ import { Link, useLocation } from 'react-router';
 import { CalendarClock } from 'lucide-react';
 
 import PageHeader from '../components/PageHeader';
+import LensFrame from '../components/wissen/LensFrame';
 import Alert from '../components/Alert';
 import ObligationRow from '../components/ObligationRow';
 import BestaetigenButton from '../components/obligations/BestaetigenButton';
@@ -95,7 +96,7 @@ export default function ObligationsPage() {
   const isEmpty = !query.isLoading && accumulated.length === 0;
 
   return (
-    <div className="max-w-5xl mx-auto p-6 space-y-6">
+    <LensFrame standaloneClassName="max-w-5xl mx-auto p-6 space-y-6">
       <PageHeader icon={CalendarClock} title={t('obligations.title')} subtitle={t('obligations.subtitle')} />
 
       {query.errorMessage && <Alert variant="error">{query.errorMessage}</Alert>}
@@ -200,6 +201,6 @@ export default function ObligationsPage() {
       )}
 
       {pending !== null && <BestaetigtToast onUndo={() => undo(pending)} />}
-    </div>
+    </LensFrame>
   );
 }

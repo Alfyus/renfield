@@ -46,7 +46,19 @@ import NotificationToast from './NotificationToast';
 import NavBadge from './NavBadge';
 import { useWissensbasisAvailable } from '../api/resources/wissensbasis';
 import { useDraftCountQuery } from '../api/resources/skills';
+import { useFeatureFlags } from '../api/resources/brain';
 import { useAuth } from '../context/AuthContext';
+
+// The six corpus nav entries the Wissen workspace collapses into one (D10).
+// Skills + Federation Audit are NOT corpus and stay standalone.
+const WISSEN_CORPUS_HREFS = new Set([
+  '/knowledge',
+  '/brain',
+  '/brain/review',
+  '/brain/fristen',
+  '/memory',
+  '/knowledge-graph',
+]);
 
 interface NavItemConfig {
   nameKey: string;
@@ -161,7 +173,31 @@ export default function Layout({ children }: LayoutProps) {
   // permanently empty page.
   const wissensbasisAvailable = useWissensbasisAvailable();
 
-  const mainNavigation: NavItem[] = mainNavigationConfig.map((item) => ({
+  // D10: when the workspace flag is on, collapse the six corpus entries into a
+  // single "Wissen" entry (inserted where the first corpus entry was). Off =>
+  // legacy flat nav. The flag resolving late just reveals the collapse once.
+  const { data: featureFlags } = useFeatureFlags();
+  const wissenWorkspace = featureFlags?.wissen_workspace_enabled ?? false;
+
+  const mainNavSource: NavItemConfig[] = wissenWorkspace
+    ? (() => {
+        const out: NavItemConfig[] = [];
+        let inserted = false;
+        for (const item of mainNavigationConfig) {
+          if (WISSEN_CORPUS_HREFS.has(item.href)) {
+            if (!inserted) {
+              out.push({ nameKey: 'nav.wissen', href: '/wissen', icon: BookOpen });
+              inserted = true;
+            }
+            continue; // drop the individual corpus entry
+          }
+          out.push(item);
+        }
+        return out;
+      })()
+    : mainNavigationConfig;
+
+  const mainNavigation: NavItem[] = mainNavSource.map((item) => ({
     ...item,
     name: t(item.nameKey),
   }));
@@ -280,7 +316,12 @@ export default function Layout({ children }: LayoutProps) {
 
   const NavLink = ({ item, onClick }: NavLinkProps) => {
     const Icon = item.icon;
-    const isActive = location.pathname === item.href;
+    // The Wissen entry lights for any lens path (/wissen/dokumente, …), so a
+    // deep lens link still shows the section as active (D8 risk #6).
+    const isActive =
+      item.href === '/wissen'
+        ? location.pathname === '/wissen' || location.pathname.startsWith('/wissen/')
+        : location.pathname === item.href;
     // Sidebar Skills Inbox draft count. Only fetched when the user can
     // see the entry (the badge component itself hides at 0, so even on
     // non-admin views nothing visible escapes — but we gate the query
@@ -539,7 +580,14 @@ export default function Layout({ children }: LayoutProps) {
         tabIndex={-1}
       >
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          <div key={location.pathname} className="animate-fade-slide-in">
+          {/* The Wissen workspace is a persistent shell: all /wissen/* paths
+              share ONE content key so switching lenses reconciles the shell
+              (rail + search + Graph WebGL) instead of remounting it (D8).
+              Every other section keeps its per-pathname entrance animation. */}
+          <div
+            key={location.pathname.startsWith('/wissen') ? 'wissen' : location.pathname}
+            className="animate-fade-slide-in"
+          >
             {children}
           </div>
         </div>
