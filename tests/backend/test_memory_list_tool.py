@@ -13,10 +13,22 @@ import pytest
 
 from services.memory_list_tool import (
     MEMORY_LIST_MAX_LIMIT,
+    _VALID_CATEGORIES,
     list_my_memories,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_valid_categories_match_canonical_set():
+    """Guard against drift: the allowlist must equal the canonical category set.
+
+    A hardcoded subset previously omitted 'procedural', silently turning a
+    `category=procedural` filter into an unfiltered all-memories read.
+    """
+    from models.database import MEMORY_CATEGORIES
+
+    assert _VALID_CATEGORIES == set(MEMORY_CATEGORIES)
 
 
 def _patches(memories, total, owner=1):
@@ -87,6 +99,15 @@ async def test_invalid_category_is_ignored_not_errored():
         await list_my_memories({"category": "bogus"}, user_id=1)
     # invalid category dropped → list_for_user called with category=None
     assert svc.list_for_user.await_args.kwargs["category"] is None
+
+
+@pytest.mark.asyncio
+async def test_procedural_category_reaches_service():
+    """A valid non-default category ('procedural') must reach the service."""
+    svc, p_sess, p_svc = _patches([], total=0)
+    with p_sess, p_svc:
+        await list_my_memories({"category": "procedural"}, user_id=1)
+    assert svc.list_for_user.await_args.kwargs["category"] == "procedural"
 
 
 @pytest.mark.asyncio

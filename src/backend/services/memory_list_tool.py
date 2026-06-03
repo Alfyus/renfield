@@ -21,9 +21,16 @@ from __future__ import annotations
 
 from loguru import logger
 
+from models.database import MEMORY_CATEGORIES
+
 MEMORY_LIST_DEFAULT_LIMIT = 100
 MEMORY_LIST_MAX_LIMIT = 200
-_VALID_CATEGORIES = {"preference", "fact", "instruction", "context"}
+# Derive the valid-category allowlist from the canonical constant rather than
+# hardcoding it — a hardcoded subset silently drops a real category (it omitted
+# "procedural"), turning a `category=procedural` filter into an unfiltered
+# "all memories" read. Importing the source of truth makes any future category
+# work automatically.
+_VALID_CATEGORIES = set(MEMORY_CATEGORIES)
 
 # Registered with the agent tool registry by
 # `services/agent_tools.py::_register_internal_tools()`.
@@ -36,10 +43,10 @@ MEMORY_LIST_TOOL: dict = {
             "'list everything you remember about me', 'what are my preferences?') "
             "where the small auto-injected memory snapshot is not enough. Returns "
             "the user's memories newest-first with their category. Optional "
-            "'category' filter (preference|fact|instruction|context)."
+            "'category' filter (preference|fact|context|instruction|procedural)."
         ),
         "parameters": {
-            "category": "Optional category filter: preference, fact, instruction, or context (optional)",
+            "category": "Optional category filter: preference, fact, context, instruction, or procedural (optional)",
             "limit": "Max memories to return (optional; default 100, max 200)",
         },
     },
