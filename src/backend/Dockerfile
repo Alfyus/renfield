@@ -69,7 +69,14 @@ RUN pip install --no-cache-dir \
       -r requirements-pypi.txt
 
 # Layer 5: github archive deps (small, slow to resolve — kept in its own layer).
-RUN if [ -s requirements-github.txt ]; then pip install --no-cache-dir --force-reinstall --no-deps -r requirements-github.txt; fi
+# GITHUB_DEPS_REV busts ONLY this layer so a satellite MCP package pinned to a
+# moving ref (e.g. `renfield-mcp-dlna @ .../main.tar.gz`) can be re-fetched
+# without invalidating the heavy ML layers above (which 504 on Harbor). Pass
+# the upstream commit SHA as the value to make the build reproducible:
+#   docker build --build-arg GITHUB_DEPS_REV=<sha> …
+ARG GITHUB_DEPS_REV=0
+RUN echo "github deps rev: ${GITHUB_DEPS_REV}" \
+    && if [ -s requirements-github.txt ]; then pip install --no-cache-dir --force-reinstall --no-deps -r requirements-github.txt; fi
 
 # Stage the heaviest packages OUTSIDE /opt/venv so the runtime stage can COPY
 # them individually. A single `COPY --from=builder /opt/venv /opt/venv` would
