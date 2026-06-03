@@ -378,6 +378,7 @@ class InternalToolService:
                 renderer_name=data.get("dlna_renderer_name"),
                 media_url=media_url,
                 title=title,
+                thumb=thumb,
                 room_name=data.get("room_name", room_name),
                 device_name=data.get("device_name"),
                 params=params,
@@ -525,6 +526,7 @@ class InternalToolService:
         renderer_name: str | None,
         media_url: str,
         title: str | None,
+        thumb: str | None,
         room_name: str,
         device_name: str | None,
         params: dict,
@@ -556,10 +558,15 @@ class InternalToolService:
                     "action_taken": False,
                 }
 
-            tracks = [{"url": media_url, "title": title or "", "artist": "", "album": ""}]
+            track = {"url": media_url, "title": title or "", "artist": "", "album": ""}
+            if thumb:
+                # play_tracks renders cover art from `art_url` (same field the
+                # video path uses); forward it so DLNA single-URL playback shows
+                # the thumbnail instead of a blank tile.
+                track["art_url"] = thumb
             result = await mcp_manager.execute_tool(
                 "mcp.dlna.play_tracks",
-                {"renderer_name": renderer_name, "tracks": _json.dumps(tracks)},
+                {"renderer_name": renderer_name, "tracks": _json.dumps([track])},
             )
             if not result.get("success"):
                 return {
@@ -570,7 +577,7 @@ class InternalToolService:
 
             await self._register_media_follow(
                 params, room_name, "single_url",
-                media_url=media_url, title=title, thumb=None,
+                media_url=media_url, title=title, thumb=thumb,
             )
             return {
                 "success": True,

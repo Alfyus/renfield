@@ -394,6 +394,7 @@ class TestPlayInRoom:
             result = await internal_tools._play_in_room({
                 "media_url": "http://jellyfin:8096/Audio/abc/universal",
                 "room_name": "Arbeitszimmer",
+                "thumb": "http://jellyfin:8096/Items/abc/Images/Primary",
             })
 
         assert result["success"] is True, result
@@ -406,6 +407,8 @@ class TestPlayInRoom:
         tracks = _json.loads(tool_params["tracks"])
         assert len(tracks) == 1
         assert tracks[0]["url"] == "http://jellyfin:8096/Audio/abc/universal"
+        # Cover art is forwarded as `art_url` (same field the video path uses).
+        assert tracks[0]["art_url"] == "http://jellyfin:8096/Items/abc/Images/Primary"
 
     @pytest.mark.unit
     async def test_play_in_room_room_not_found(self, internal_tools):
