@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { X, ArrowRight } from 'lucide-react';
@@ -211,12 +211,20 @@ function DocContent({ payload }: { payload: Record<string, unknown> }) {
   const title = str(payload.document_title) || str(payload.document_filename);
   const docId = num(payload.document_id);
   const { t } = useTranslation();
+  // Real toggle so the FaktenPanel's expander isn't a dead control for screen
+  // readers; defaults open (the drawer's purpose is to show the facts).
+  const [factsOpen, setFactsOpen] = useState(true);
   return (
     <div className="space-y-2">
       {title && <p className="text-lg text-gray-900 dark:text-white break-words">{title}</p>}
       {docId != null && (
         <>
-          <FaktenPanel documentId={docId} status="completed" open onToggle={() => {}} />
+          <FaktenPanel
+            documentId={docId}
+            status="completed"
+            open={factsOpen}
+            onToggle={() => setFactsOpen((o) => !o)}
+          />
           <LensLink to={`/wissen/dokumente?doc=${docId}`} label={t('lens.detail.openInDocs')} />
         </>
       )}

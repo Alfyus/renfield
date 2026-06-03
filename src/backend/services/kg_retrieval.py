@@ -446,8 +446,15 @@ class KGRetrieval:
         relation_rows = rel_result.fetchall()
 
         # Resolve subject/object names (may reference entities outside the match set).
+        # TODO(circle-leak): this fetch is NOT circle-filtered, so a relation the
+        # asker may see can disclose the NAME of an endpoint entity in a circle
+        # they can't. Pre-existing — get_relevant_context does the identical
+        # unfiltered fetch into LLM context — so fix BOTH methods together (route
+        # the name lookup through kg_entities_circles_filter, "?" on miss) in a
+        # dedicated follow-up verified on .159; not introduced by this PR.
         needed_ids = {r.subject_id for r in relation_rows} | {r.object_id for r in relation_rows}
-        name_map = dict(entities and {eid: e["name"] for eid, e in entities.items()})
+        # `entities` is non-empty here (early-returned above otherwise).
+        name_map = {eid: e["name"] for eid, e in entities.items()}
         missing = [i for i in needed_ids if i not in name_map]
         if missing:
             res = await self.db.execute(select(KGEntity).where(KGEntity.id.in_(missing)))

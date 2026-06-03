@@ -81,10 +81,12 @@ export default function WissenSearchBar() {
     write('q', null, { replace: true });
   };
 
-  // Clicking a result opens the detail drawer (seeded with the full atom);
-  // the drawer's per-type "open in lens" links handle navigation from there.
+  // Clicking a result opens the detail drawer (seeded with the full atom).
+  // We deliberately do NOT clear the query: the overlay stays mounted behind
+  // the drawer's backdrop, so closing the drawer returns the user to their
+  // results AND focus restores to the clicked row (clearing here would unmount
+  // the opener before the drawer captures it → focus stranded on <body>).
   const openResult = (match: AtomMatch) => {
-    clear();
     openAtom(match);
   };
 
