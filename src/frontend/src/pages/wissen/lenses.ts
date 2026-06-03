@@ -34,6 +34,14 @@ export interface LensDef {
   feature?: string;
   /** Atom types this lens owns — drives search-result routing + scope filter. */
   atomTypes?: AtomType[];
+  /**
+   * True when the lens has its own inline search that should consume the
+   * workspace `?q=` (D9 full-unify): Documents runs a chunk-semantic search,
+   * Graph filters its entity table. For these the omnisearch is the single
+   * input and the cross-corpus overlay is suppressed at `scope=lens` — the
+   * lens renders results inline. Lenses without this fall back to the overlay.
+   */
+  consumesQueryInline?: boolean;
 }
 
 export const LENSES: LensDef[] = [
@@ -46,6 +54,7 @@ export const LENSES: LensDef[] = [
     permission: ['kb.own', 'kb.shared', 'kb.all'],
     feature: 'knowledge',
     atomTypes: ['kb_document'],
+    consumesQueryInline: true,
   },
   {
     key: 'graph',
@@ -54,6 +63,7 @@ export const LENSES: LensDef[] = [
     icon: Share2,
     feature: 'knowledge_graph',
     atomTypes: ['kg_node', 'kg_edge'],
+    consumesQueryInline: true,
   },
   {
     key: 'erinnerungen',
@@ -75,6 +85,11 @@ export const LENSES: LensDef[] = [
 /** Absolute path for a lens (`/wissen` for the index, `/wissen/<segment>` else). */
 export function lensPath(lens: LensDef): string {
   return lens.segment ? `/wissen/${lens.segment}` : '/wissen';
+}
+
+/** The lens owning a path segment (`''` = Übersicht index), or undefined. */
+export function lensForSegment(segment: string): LensDef | undefined {
+  return LENSES.find((l) => l.segment === segment);
 }
 
 /** Owning lens segment per atom type, derived from `LENSES.atomTypes` — the

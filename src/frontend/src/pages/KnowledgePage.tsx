@@ -50,6 +50,7 @@ import {
   type DocumentRow,
 } from '../api/resources/knowledge';
 import { keys } from '../api/keys';
+import { useLensContext } from '../context/LensContext';
 
 interface DuplicateErrorPayload {
   existing_document?: ExistingDocument;
@@ -62,6 +63,9 @@ export default function KnowledgePage() {
   const { t } = useTranslation();
   const { confirm, ConfirmDialogComponent } = useConfirmDialog();
   const queryClient = useQueryClient();
+  // Embedded as the Documents lens: the workspace omnisearch (?q=) is the single
+  // search input (D9). We hide our own input and run the chunk search off ?q=.
+  const { embedded } = useLensContext();
 
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{ text: string; variant: AlertVariant } | null>(null);
@@ -273,6 +277,28 @@ export default function KnowledgePage() {
   const [searchParams] = useSearchParams();
   const deepLinkDoc = searchParams.get('doc');
   const deepLinkHandled = useRef(false);
+
+  // D9 (embedded): drive the chunk search from the workspace omnisearch `?q=`,
+  // debounced. At scope=everything the cross-corpus overlay owns the query, so
+  // we clear our inline results and stay out of the way.
+  const omniQ = searchParams.get('q') ?? '';
+  const omniScope = searchParams.get('scope');
+  const { mutateAsync: runChunkSearch } = searchMutation;
+  useEffect(() => {
+    if (!embedded) return;
+    const query = omniQ.trim();
+    setSearchQuery(query);
+    if (omniScope === 'everything' || !query) {
+      setSearchResults([]);
+      return;
+    }
+    const id = setTimeout(() => {
+      runChunkSearch({ query, knowledgeBaseId: selectedKnowledgeBase })
+        .then(setSearchResults)
+        .catch(() => { /* surfaced via searchMutation.errorMessage */ });
+    }, 300);
+    return () => clearTimeout(id);
+  }, [embedded, omniQ, omniScope, selectedKnowledgeBase, runChunkSearch]);
 
   useEffect(() => {
     // New target id → allow handling again (e.g. agenda → doc A, back, → doc B).
@@ -589,8 +615,13 @@ export default function KnowledgePage() {
         )}
       </div>
 
-      {/* Search Section */}
+      {/* Search Section. Embedded as the Wissen Documents lens, the workspace
+          omnisearch is the single input (D9) — hide our own box and only show
+          the inline results it produces; standalone keeps the full search UI. */}
+      {(!embedded || searchResults.length > 0) && (
       <div className="card">
+        {!embedded && (
+          <>
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
           <Search className="w-5 h-5 text-primary-400" />
           {t('knowledge.searchInDocuments')}
@@ -617,6 +648,8 @@ export default function KnowledgePage() {
             {t('common.search')}
           </button>
         </div>
+          </>
+        )}
 
         {/* Search Results */}
         {searchResults.length > 0 && (
@@ -656,6 +689,7 @@ export default function KnowledgePage() {
           </div>
         )}
       </div>
+      )}
 
       {/* Status Filters */}
       <div className="flex space-x-2 overflow-x-auto">

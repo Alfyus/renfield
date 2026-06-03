@@ -1,13 +1,13 @@
 /**
- * WissenSearchBar — lens-scoped omnisearch (plan-eng-review D9 + /review follow-up).
+ * WissenSearchBar — lens-scoped omnisearch (D7 + D9 full-unify).
  *
- * Covers the logic-dense bits the review flagged as untested: the scope filter
- * (Diese Ansicht vs Alles), Escape-to-clear, and that results render after the
- * debounce without the empty-state flashing first.
+ * Covers: cross-corpus overlay (scope=everything), scope=lens filtering on a
+ * non-consuming lens, overlay suppression on a consuming lens (Documents/Graph
+ * run their own inline search off ?q=), and Escape-to-clear.
  */
 import { describe, it, expect } from 'vitest';
 import { http, HttpResponse } from 'msw';
-import { screen, waitFor } from '@testing-library/react';
+import { screen } from '@testing-library/react';
 import { renderWithRouter, userEvent } from '../test-utils';
 import { server } from '../mocks/server';
 import { TEST_CONFIG } from '../config';
@@ -28,51 +28,59 @@ function mockAtoms() {
       HttpResponse.json([
         atom('a1', 'kg_node', 'Graph entity Mueller'),
         atom('a2', 'kb_document', 'Rechnung 2024 document'),
+        atom('a3', 'document_fact', 'Frist 31.12. Steuer'),
       ]),
     ),
   );
 }
 
 describe('WissenSearchBar', () => {
-  it('shows corpus results after the debounce (scope = Alles)', async () => {
+  it('scope=everything shows the whole-corpus overlay', async () => {
     mockAtoms();
-    renderWithRouter(<WissenSearchBar />, { route: '/wissen/graph' });
+    renderWithRouter(<WissenSearchBar />, { route: '/wissen/graph?scope=everything' });
 
-    await userEvent.type(screen.getByRole('searchbox'), 'rechnung');
+    await userEvent.type(screen.getByRole('searchbox'), 'x');
 
     expect(await screen.findByText('Graph entity Mueller')).toBeInTheDocument();
     expect(screen.getByText('Rechnung 2024 document')).toBeInTheDocument();
-    // The empty-state must NOT be present once results arrive (debounce-flash fix).
     expect(screen.queryByText(/Nichts gefunden/)).not.toBeInTheDocument();
   });
 
-  it('scope "Diese Ansicht" filters results to the active lens atom types', async () => {
+  it('scope=lens filters the overlay to the active lens atom types (non-consuming lens)', async () => {
     mockAtoms();
-    renderWithRouter(<WissenSearchBar />, { route: '/wissen/graph' });
+    // Fristen owns document_fact and has no inline search → overlay, filtered.
+    renderWithRouter(<WissenSearchBar />, { route: '/wissen/fristen' });
 
     await userEvent.type(screen.getByRole('searchbox'), 'x');
-    await screen.findByText('Graph entity Mueller');
 
-    await userEvent.click(screen.getByRole('button', { name: 'Diese Ansicht' }));
-
-    // graph lens owns kg_node/kg_edge → kb_document is filtered out.
-    expect(screen.getByText('Graph entity Mueller')).toBeInTheDocument();
+    expect(await screen.findByText('Frist 31.12. Steuer')).toBeInTheDocument();
+    expect(screen.queryByText('Graph entity Mueller')).not.toBeInTheDocument();
     expect(screen.queryByText('Rechnung 2024 document')).not.toBeInTheDocument();
   });
 
-  it('Escape clears the query and closes the results overlay', async () => {
+  it('D9: suppresses the overlay on a consuming lens at scope=lens (lens searches inline)', async () => {
     mockAtoms();
+    // Graph consumes ?q= inline (entity-table filter) → no cross-corpus overlay.
     renderWithRouter(<WissenSearchBar />, { route: '/wissen/graph' });
 
+    await userEvent.type(screen.getByRole('searchbox'), 'mueller');
+
+    // Give any (incorrect) overlay fetch a chance to render, then assert absence.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(screen.queryByText('Graph entity Mueller')).not.toBeInTheDocument();
+  });
+
+  it('Escape clears the query and closes the overlay', async () => {
+    mockAtoms();
+    renderWithRouter(<WissenSearchBar />, { route: '/wissen/graph?scope=everything' });
+
     const box = screen.getByRole('searchbox');
-    await userEvent.type(box, 'rechnung');
+    await userEvent.type(box, 'x');
     await screen.findByText('Graph entity Mueller');
 
     await userEvent.type(box, '{Escape}');
 
     expect(box).toHaveValue('');
-    await waitFor(() =>
-      expect(screen.queryByText('Graph entity Mueller')).not.toBeInTheDocument(),
-    );
+    expect(screen.queryByText('Graph entity Mueller')).not.toBeInTheDocument();
   });
 });

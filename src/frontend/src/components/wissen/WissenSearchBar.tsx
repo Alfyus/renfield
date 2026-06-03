@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { Search, X } from 'lucide-react';
 import { useWorkspaceParam } from '../../hooks/useWorkspaceParam';
 import { useAtomSearchQuery } from '../../api/resources/brain';
-import { ATOM_LENS_SEGMENT } from '../../pages/wissen/lenses';
+import { ATOM_LENS_SEGMENT, lensForSegment } from '../../pages/wissen/lenses';
 import TierBadge from '../TierBadge';
 
 type Scope = 'lens' | 'everything';
@@ -38,7 +38,10 @@ export default function WissenSearchBar() {
 
   const urlQ = read('q') ?? '';
   const [input, setInput] = useState(urlQ);
-  const [scope, setScope] = useState<Scope>('everything');
+  // Scope lives in the URL so the consuming lenses (Documents/Graph) can read it
+  // too. Default 'lens' — the single box searches the current view first.
+  const scope: Scope = read('scope') === 'everything' ? 'everything' : 'lens';
+  const setScope = (s: Scope) => write('scope', s, { replace: true });
   const [debouncedQ, setDebouncedQ] = useState(urlQ);
 
   // Keep the field in sync if `?q=` changes from the outside (deep-link, back).
@@ -77,6 +80,11 @@ export default function WissenSearchBar() {
   };
 
   const open = input.trim().length > 0;
+  // At scope=lens on a lens that runs its own inline search (Documents chunk
+  // search, Graph entity-table filter), the lens consumes `?q=` and renders
+  // results inline — so suppress the cross-corpus overlay (D9 full-unify).
+  const lensConsumesInline = !!lensForSegment(seg)?.consumesQueryInline;
+  const overlayActive = open && !(scope === 'lens' && lensConsumesInline);
   // The fetch lags the field by the debounce window; treat "field newer than
   // the fetched query, or fetch in flight" as pending so the empty-state does
   // NOT flash "no results" during the ~300ms gap on every keystroke.
@@ -102,7 +110,7 @@ export default function WissenSearchBar() {
             }}
             placeholder={t('lens.searchAllPlaceholder')}
             aria-label={t('lens.searchAllPlaceholder')}
-            aria-expanded={open}
+            aria-expanded={overlayActive}
             aria-controls="wissen-search-results"
             className="input min-h-11 w-full pl-9 pr-11"
           />
@@ -142,7 +150,7 @@ export default function WissenSearchBar() {
         </div>
       </div>
 
-      {open && (
+      {overlayActive && (
         <div
           id="wissen-search-results"
           role="region"
