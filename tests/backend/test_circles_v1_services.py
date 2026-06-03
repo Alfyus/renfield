@@ -39,7 +39,7 @@ from services.circle_resolver import PolicyEvaluator
 from services.polymorphic_atom_store import (
     _rrf_merge,
     _wrap_document_fact_results,
-    _wrap_kg_context,
+    _wrap_kg_atoms,
     _wrap_memory_results,
     _wrap_rag_results,
 )
@@ -472,21 +472,24 @@ class TestSourceWrapping:
 
     @pytest.mark.unit
     def test_kg_wrapper_handles_exception_input(self):
-        assert _wrap_kg_context(RuntimeError("KG down")) == []
+        assert _wrap_kg_atoms(RuntimeError("KG down")) == []
 
     @pytest.mark.unit
     def test_kg_wrapper_handles_none_input(self):
-        assert _wrap_kg_context(None) == []
-        assert _wrap_kg_context("") == []
+        assert _wrap_kg_atoms(None) == []
+        assert _wrap_kg_atoms({"entities": [], "relations": []}) == []
 
     @pytest.mark.unit
-    def test_kg_wrapper_returns_one_aggregated_match(self):
-        kg_context = "WISSENSGRAPH:\n- Anna lives_in Hamburg\n- Anna born_in 1985"
-        result = _wrap_kg_context(kg_context)
-        assert len(result) == 1
-        assert result[0].atom.atom_type == "kg_node"
-        assert result[0].atom.atom_id == "kg_aggregated"
-        assert "Anna" in result[0].atom.payload["content"]
+    def test_kg_wrapper_emits_per_entity_atoms(self):
+        # PR3: per-entity kg_node + per-relation kg_edge (was one aggregated blob).
+        result = _wrap_kg_atoms({
+            "entities": [{"id": 3, "name": "Anna", "entity_type": "person", "circle_tier": 1, "similarity": 0.8}],
+            "relations": [{"id": 9, "subject_id": 3, "subject_name": "Anna", "predicate": "lives_in", "object_id": 4, "object_name": "Hamburg", "circle_tier": 1}],
+        })
+        assert [m.atom.atom_type for m in result] == ["kg_node", "kg_edge"]
+        assert result[0].atom.atom_id == "kg_node:3"
+        assert result[0].atom.payload["entity_id"] == 3
+        assert result[1].atom.payload["relation_id"] == 9
 
     @pytest.mark.unit
     def test_memory_wrapper_handles_exception_input(self):
