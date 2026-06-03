@@ -80,14 +80,15 @@ For architecture questions, use the `architecture-guide` agent.
 
 ### Platform-owned internal agent tools
 
-The agent loop sees a mix of MCP tools (`mcp.<server>.<tool>`) and `internal.*` tools. Internal tools are platform-level wrappers that bundle multi-step workflows or chain MCP calls with real server-side state. Two live on the platform core (rest live in `ha_glue`):
+The agent loop sees a mix of MCP tools (`mcp.<server>.<tool>`) and `internal.*` tools. Internal tools are platform-level wrappers that bundle multi-step workflows or chain MCP calls with real server-side state. Three live on the platform core (rest live in `ha_glue`):
 
 | Tool | Purpose | Source |
 |---|---|---|
 | `internal.knowledge_search` | Semantic RAG search over the user's knowledge base | `services/knowledge_tool.py` |
+| `internal.list_my_memories` | Enumerate the asker's own conversation memories (preferences/facts/instructions) WITHOUT the per-turn `{memory_context}` vector threshold — backs broad self-knowledge queries ("Was weißt du über mich?") the small auto-injected snapshot can't answer. Reads only the authenticated user's own memories. | `services/memory_list_tool.py` |
 | `internal.forward_attachment_to_paperless` | Forward a chat-attached file to Paperless using real server-stored bytes — prevents the LLM from handling base64 payloads it can't actually see | `services/chat_upload_tool.py` |
 
-Dispatch for both is a special case in `services/action_executor.py` that injects dependencies the generic `intent.startswith("internal.")` hook path cannot provide (`mcp_manager`, `session_id`).
+Dispatch for these is a special case in `services/action_executor.py` that injects dependencies the generic `intent.startswith("internal.")` hook path cannot provide (`mcp_manager`, `session_id`, and the authenticated `user_id` for `list_my_memories`).
 
 ### Agent stale-error marker
 

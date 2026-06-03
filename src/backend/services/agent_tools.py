@@ -183,8 +183,9 @@ class AgentToolRegistry:
         """
         from services.chat_upload_tool import CHAT_UPLOAD_TOOLS
         from services.knowledge_tool import KNOWLEDGE_TOOL
+        from services.memory_list_tool import MEMORY_LIST_TOOL
 
-        platform_tools: dict = {**KNOWLEDGE_TOOL, **CHAT_UPLOAD_TOOLS}
+        platform_tools: dict = {**KNOWLEDGE_TOOL, **MEMORY_LIST_TOOL, **CHAT_UPLOAD_TOOLS}
 
         for name, definition in platform_tools.items():
             if internal_filter is not None and name not in internal_filter:

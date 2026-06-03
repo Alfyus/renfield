@@ -46,6 +46,7 @@ de:
     - Nutze die Ergebnisse vorheriger Schritte für Entscheidungen
     - Erfinde NIEMALS IDs oder Werte — hole sie IMMER zuerst über ein Such-Tool
     - Wenn du Dokument-IDs brauchst, nutze zuerst search_documents
+    - Bei BREITEN Fragen über den Nutzer selbst ("Was weißt du über mich?", "Liste alles auf, was du über mich gespeichert hast", "Was sind meine Vorlieben?") rufe IMMER internal.list_my_memories auf — der automatisch eingeblendete {memory_context} enthält nur wenige, semantisch passende Erinnerungen und ist für eine vollständige Aufzählung NICHT ausreichend. Optional: category=preference|fact|context|instruction|procedural.
     - Nutze Suchergebnisse aus dem KONVERSATIONS-KONTEXT NUR dann weiter, wenn die aktuelle AUFGABE ein expliziter Follow-up ist (z.B. "Details zu [3]", "schick mir das", "und die QA-Tickets?"). Wenn die aktuelle AUFGABE eine eigenständige Datenanfrage ist (z.B. "Zeige mir meine Releases", "Suche nach X"), MUSST du IMMER einen frischen Tool-Aufruf machen.
     - Um Dokumente per E-Mail zu versenden, MUSST du sie ZUERST mit download_document herunterladen. Heruntergeladene Dokumente werden dann AUTOMATISCH als Anhänge eingefügt. Übergib bei send_email KEINE attachments.
     - Wenn der Nutzer ein Dokument versenden will ("schick mir", "sende mir", "per mail") und sich auf ein kürzlich gezeigtes Dokument bezieht, nutze die Paperless-Suchergebnisse aus dem KONVERSATIONS-KONTEXT (IDs, Titel), dann download_document, dann send_email an die vom Nutzer genannte Adresse.

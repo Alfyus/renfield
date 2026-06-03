@@ -104,6 +104,10 @@ Renfield kann sich Dinge über Nutzer langfristig merken — Präferenzen, Fakte
 4. **Context Injection** — Relevante Memories werden in den LLM-Prompt eingefügt
 5. **Decay** — Context-Kategorie Memories verfallen nach konfigurierbarer Zeit (default: 30 Tage)
 
+### Vollständige Aufzählung (Self-Knowledge)
+
+Die automatische Context Injection (Schritt 3) blendet nur die wenigen semantisch zur aktuellen Nachricht passenden Memories ein (max `MEMORY_RETRIEVAL_LIMIT`). Für **breite Fragen über den Nutzer selbst** ("Was weißt du über mich?", "Liste alle meine Vorlieben auf") reicht das nicht — eine vage Meta-Frage matcht die spezifischen Fakten schlecht. Dafür gibt es das Agent-Tool **`internal.list_my_memories`** (`services/memory_list_tool.py`): Es zählt die **eigenen** Memories des authentifizierten Nutzers ohne Vektor-Schwellwert auf, optional gefiltert nach Kategorie (`preference|fact|context|instruction|procedural`). Die `user_id` wird serverseitig aus dem authentifizierten Kontext injiziert — nie aus LLM-Parametern — sodass das Tool ausschließlich die Memories des fragenden Nutzers liest.
+
 ### Widerspruchserkennung
 
 Opt-in Feature (`MEMORY_CONTRADICTION_RESOLUTION=true`): Beim Speichern neuer Memories werden bestehende auf semantische Ähnlichkeit geprüft. Memories im Threshold-Bereich (0.6–0.89) werden dem LLM zur Widerspruchsprüfung vorgelegt. Bei Widerspruch wird die alte Memory aktualisiert oder archiviert.
