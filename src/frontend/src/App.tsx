@@ -50,6 +50,7 @@ const AdminToolHealthPage = lazy(() => import('./pages/AdminToolHealthPage'));
 const AdminTrajectoriesPage = lazy(() => import('./pages/AdminTrajectoriesPage'));
 const AdminCuratorPage = lazy(() => import('./pages/AdminCuratorPage'));
 const WissenLayout = lazy(() => import('./pages/wissen/WissenLayout'));
+const OverviewLens = lazy(() => import('./pages/wissen/OverviewLens'));
 
 function AppRoutes() {
   const { isFeatureEnabled } = useAuth();
@@ -109,8 +110,8 @@ function AppRoutes() {
                     <WissenLayout />
                   </ProtectedRoute>
                 }>
-                  {/* PR1: index bounces to Dokumente; PR2 swaps in OverviewLens. */}
-                  <Route index element={<RedirectPreserving to="/wissen/dokumente" />} />
+                  {/* Übersicht dashboard (PR2). */}
+                  <Route index element={<OverviewLens />} />
                   <Route path="dokumente" element={
                     <ProtectedRoute permission={['kb.own', 'kb.shared', 'kb.all']} requireAny>
                       <KnowledgePage />

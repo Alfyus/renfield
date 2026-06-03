@@ -1526,6 +1526,18 @@
     "scopeThis": "This view",
     "scopeAll": "Everything",
     "searchNoResults": "Nothing found for “{{query}}”",
-    "searchWidenHint": "Switch to “Everything” to search the whole knowledge base."
+    "searchWidenHint": "Switch to “Everything” to search the whole knowledge base.",
+    "overview": {
+      "title": "At a glance",
+      "corpus": "{{docs}} documents · {{entities}} entities · {{relations}} relations",
+      "fristen": "Upcoming deadlines",
+      "allFristen": "All deadlines",
+      "noFristen": "No deadlines in the next 7 days.",
+      "review": "To review",
+      "reviewCount": "{{count}} items awaiting tier review",
+      "reviewNone": "Nothing to review.",
+      "emptyTitle": "Your second brain is empty.",
+      "emptyCta": "Upload a document"
+    }
   }
 }

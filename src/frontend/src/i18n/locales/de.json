@@ -1526,6 +1526,18 @@
     "scopeThis": "Diese Ansicht",
     "scopeAll": "Alles",
     "searchNoResults": "Nichts gefunden für „{{query}}“",
-    "searchWidenHint": "Auf „Alles“ erweitern, um die gesamte Wissensbasis zu durchsuchen."
+    "searchWidenHint": "Auf „Alles“ erweitern, um die gesamte Wissensbasis zu durchsuchen.",
+    "overview": {
+      "title": "Auf einen Blick",
+      "corpus": "{{docs}} Dokumente · {{entities}} Entitäten · {{relations}} Beziehungen",
+      "fristen": "Nächste Fristen",
+      "allFristen": "Alle Fristen",
+      "noFristen": "Keine Fristen in den nächsten 7 Tagen.",
+      "review": "Zu prüfen",
+      "reviewCount": "{{count}} Einträge warten auf Tier-Prüfung",
+      "reviewNone": "Nichts zu prüfen.",
+      "emptyTitle": "Dein zweites Gehirn ist noch leer.",
+      "emptyCta": "Dokument hochladen"
+    }
   }
 }
