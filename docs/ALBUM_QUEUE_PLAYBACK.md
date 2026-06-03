@@ -8,6 +8,8 @@
 
 Wenn ein Benutzer "Spiel das Album X im Arbeitszimmer" sagt, spielt Renfield nur den ersten Track. Der Agent-Loop erkennt das Album korrekt, ruft `get_album_tracks` auf, erhaelt alle Tracks — aber `internal.play_in_room` kann nur **eine einzelne URL** an Home Assistant senden.
 
+> **Update (v2.12.2):** `internal.play_in_room` ist nicht mehr HA-only — es verzweigt jetzt bei `target_type == "dlna"` auf `_play_url_on_dlna()` (`mcp.dlna.play_tracks`, Ein-Track-Queue) statt auf `media_player.play_media`. Vorher führte ein DLNA-Raum dort zu `KeyError: 'entity_id'`. Mehrere Tracks (Album-Queue) laufen weiterhin über `internal.play_album_on_dlna` (Option H unten).
+
 Ziel: Alle Tracks eines Albums sequentiell abspielen, ueber beliebige Wiedergabegeraete.
 
 ## Architektur-Kontext

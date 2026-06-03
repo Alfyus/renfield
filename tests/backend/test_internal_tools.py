@@ -362,6 +362,52 @@ class TestPlayInRoom:
         )
 
     @pytest.mark.unit
+    async def test_play_in_room_dlna_routes_to_dlna_not_ha(self, internal_tools):
+        """A room resolving to a DLNA renderer plays via mcp.dlna.play_tracks
+        (one-item queue) instead of HA media_player — and must NOT KeyError on
+        the absent entity_id (the regression that crashed DLNA-room playback)."""
+        import json as _json
+        from types import ModuleType
+
+        resolve_result = {
+            "success": True,
+            "message": "Found DLNA renderer",
+            "action_taken": True,
+            "data": {
+                "target_type": "dlna",
+                "dlna_renderer_name": '55" Interactive Signage Flip',
+                "room_name": "Arbeitszimmer",
+                "device_name": "Flip",
+                # note: no entity_id — exactly the shape that used to KeyError
+            },
+        }
+        mock_mgr = MagicMock()
+        mock_mgr.execute_tool = AsyncMock(return_value={"success": True, "message": "ok"})
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=resolve_result), \
+             patch.object(internal_tools, "_register_media_follow", new_callable=AsyncMock), \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_in_room({
+                "media_url": "http://jellyfin:8096/Audio/abc/universal",
+                "room_name": "Arbeitszimmer",
+            })
+
+        assert result["success"] is True, result
+        assert result["data"]["target_type"] == "dlna"
+        assert result["data"]["renderer_name"] == '55" Interactive Signage Flip'
+        # Routed to the DLNA path with a single-track queue — NOT HA play_media.
+        tool_name, tool_params = mock_mgr.execute_tool.await_args.args
+        assert tool_name == "mcp.dlna.play_tracks"
+        assert tool_params["renderer_name"] == '55" Interactive Signage Flip'
+        tracks = _json.loads(tool_params["tracks"])
+        assert len(tracks) == 1
+        assert tracks[0]["url"] == "http://jellyfin:8096/Audio/abc/universal"
+
+    @pytest.mark.unit
     async def test_play_in_room_room_not_found(self, internal_tools):
         """Unknown room returns error without calling HA."""
         resolve_result = {
