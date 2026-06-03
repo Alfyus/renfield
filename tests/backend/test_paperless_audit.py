@@ -118,12 +118,14 @@ class TestCheckOcrQuality:
         assert "spaces" in issues.lower() or "garbled" in issues.lower()
 
     @pytest.mark.unit
-    def test_repeated_characters(self):
-        """Text with repeated characters should be detected."""
+    def test_repeated_characters_not_flagged(self):
+        """The 'Repeated characters' rule was removed (0 true positives on the
+        real corpus — only redaction masks and zero-padding). A same-char run
+        in otherwise-clean text now scores 5."""
         text = "Normal text here. Then aaaaaaaaa and more normal text follows after that section."
         score, issues = PaperlessAuditService._check_ocr_quality(text)
-        assert score < 5
-        assert "repeated" in issues.lower()
+        assert score == 5
+        assert "repeated" not in issues.lower()
 
     @pytest.mark.unit
     def test_high_special_chars(self):
@@ -146,9 +148,8 @@ class TestCheckOcrQuality:
         """Multiple OCR issues should stack and lower the score.
 
         All-symbol garbage trips both "garbled" (no spaces) and "high special
-        char ratio". It no longer also trips "Repeated characters": punctuation
-        runs are ordinary formatting and that rule now matches only alphanumeric
-        stuck-glyph runs (the false-positive fix). Two stacked issues => 3.
+        char ratio" => two stacked issues => 3. There is no "Repeated
+        characters" rule (removed: 0 true positives on the real corpus).
         """
         text = "!!!!!!@@@@@$$$$$%%%%%^^^^^^" * 5
         score, issues = PaperlessAuditService._check_ocr_quality(text)

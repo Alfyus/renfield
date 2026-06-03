@@ -1135,10 +1135,11 @@ class PaperlessAuditService:
         """Thin delegate to the shared ``utils.ocr_quality.score_ocr_quality``.
 
         The heuristic moved into ``utils/ocr_quality.py`` (shared with the
-        ingest pipeline's garbled-layer gate). Notably the old naive
-        ``(.)\\1{5,}`` "Repeated characters" rule was dropped: it tripped on
-        ordinary column padding / dotted leaders and falsely docked clean
-        invoices. See that module for the calibrated replacement.
+        ingest pipeline's garbled-layer gate). The old ``(.)\\1{5,}``
+        "Repeated characters" rule was dropped entirely — measured 0 true
+        positives on the real corpus (only formatting, redaction masks, and
+        zero-padding). Garbling is caught by the space/special-char/
+        fragmentation signals instead.
         """
         from utils.ocr_quality import score_ocr_quality
         return score_ocr_quality(content)
