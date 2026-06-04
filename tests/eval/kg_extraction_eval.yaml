@@ -1,0 +1,64 @@
+# KG Extraction CI Eval — Structured Memory Phase 2 (D6).
+#
+# Hard per-case gates for the conversation KG-extraction prompt. The headline
+# is the SUBJECT-BINDING gold case: a fact about one person must never attach
+# to another (the conflation the whole effort exists to kill). Plus
+# tastes-as-relation (no generic "Musik" node) and multi-type presence.
+#
+# All names are generic placeholders (no real household names).
+#
+# Runner: bin/run_kg_extraction_eval.py (needs Ollama; on-demand).
+# Logic + schema are unit-tested in tests/eval/test_kg_extraction_eval_runner.py.
+#
+# expect-block keys:
+#   entities_must_include / entities_must_not_include
+#   relations_must_include / relations_must_not_include
+#   entity_count_at_most / relations_count_at_least
+
+cases:
+
+  # ==============================================================
+  # 1. subject-binding gold case — the anti-conflation gate
+  # ==============================================================
+  - id: case-subject-binding-gold
+    description: "Two people in one turn; a preference must bind to the right one only."
+    lang: de
+    speaker: Max
+    user_message: "Alice mag Jazz. Carol ist meine Mutter."
+    assistant_response: "Notiert."
+    expect:
+      entities_must_include:
+        - {name: Alice, type: person}
+        - {name: Carol, type: person}
+      # the conflation guard: Carol must NOT inherit Alice's music preference
+      relations_must_not_include:
+        - {subject: Carol, predicate: mag}
+
+  # ==============================================================
+  # 2. taste-as-relation — no generic concept node
+  # ==============================================================
+  - id: case-taste-as-relation
+    description: "A music taste is a relation Person->Artist, not a generic 'Musik' node."
+    lang: de
+    speaker: Max
+    user_message: "Alice mag Musik von Sam Star."
+    assistant_response: "Okay."
+    expect:
+      entities_must_include:
+        - {name: Sam Star, type: person}
+      relations_must_include:
+        - {subject: Alice, predicate: mag, object: Sam Star}
+      entities_must_not_include: ["Musik"]
+
+  # ==============================================================
+  # 3. multi-type — a person who is also an artist
+  # ==============================================================
+  - id: case-multi-type
+    description: "An entity with several roles surfaces as a person (multi-type aspirational)."
+    lang: de
+    speaker: Max
+    user_message: "Sam Star ist ein bekannter Saenger."
+    assistant_response: "Verstanden."
+    expect:
+      entities_must_include:
+        - {name: Sam Star, types_include: [person]}

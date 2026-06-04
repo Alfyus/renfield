@@ -1,0 +1,83 @@
+/**
+ * MergeProposalCard — the /brain/review merge-proposal card (T10, D2/D4/D6).
+ * Presentational: comparison + survivor toggle + cross-tier visibility warning
+ * + stakes-adjusted button emphasis. German default.
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { screen, fireEvent } from '@testing-library/react';
+import MergeProposalCard from '../../../../src/frontend/src/components/MergeProposalCard';
+import { renderWithRouter } from '../test-utils';
+import type {
+  MergeProposal,
+  MergeProposalEntityBrief,
+} from '../../../../src/frontend/src/api/resources/knowledgeGraph';
+
+function brief(o: Partial<MergeProposalEntityBrief> = {}): MergeProposalEntityBrief {
+  return {
+    id: 0, name: '', entity_type: 'person', circle_tier: 0, mention_count: 1,
+    surface_forms: [], ...o,
+  };
+}
+
+function proposal(o: Partial<MergeProposal> = {}): MergeProposal {
+  return {
+    id: 1, similarity: 0.9, reason: 'cross_tier', status: 'pending', created_at: '',
+    loser: brief({ id: 10, name: 'Alice', circle_tier: 0, mention_count: 2 }),
+    winner: brief({ id: 20, name: 'Alice Brown', circle_tier: 2, mention_count: 9, surface_forms: ['A.B.'] }),
+    ...o,
+  };
+}
+
+describe('MergeProposalCard', () => {
+  it('renders both entities + surface-form pill (de)', () => {
+    renderWithRouter(<MergeProposalCard proposal={proposal()} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByText('Alice')).toBeInTheDocument();
+    expect(screen.getByText('Alice Brown')).toBeInTheDocument();
+    expect(screen.getByText('A.B.')).toBeInTheDocument(); // surface form chip
+  });
+
+  it('cross_tier proposal shows the visibility-change warning', () => {
+    renderWithRouter(<MergeProposalCard proposal={proposal({ reason: 'cross_tier' })} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByText(/Sichtbarkeit ändert sich/)).toBeInTheDocument();
+  });
+
+  it('same-tier gray_zone hides the warning and uses a primary merge button', () => {
+    const p = proposal({
+      reason: 'gray_zone',
+      loser: brief({ id: 10, name: 'Alice', circle_tier: 0 }),
+      winner: brief({ id: 20, name: 'Alice Brown', circle_tier: 0, mention_count: 9 }),
+    });
+    renderWithRouter(<MergeProposalCard proposal={p} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByText(/Sichtbarkeit/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Zusammenführen' }).className).toContain('btn-primary');
+  });
+
+  it('cross_tier merge button is de-emphasised (secondary, no primary nudge)', () => {
+    renderWithRouter(<MergeProposalCard proposal={proposal({ reason: 'cross_tier' })} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const merge = screen.getByRole('button', { name: 'Zusammenführen' });
+    expect(merge.className).toContain('btn-secondary');
+    expect(merge.className).not.toContain('btn-primary');
+  });
+
+  it('approves with the default winner', () => {
+    const onApprove = vi.fn();
+    renderWithRouter(<MergeProposalCard proposal={proposal()} onApprove={onApprove} onReject={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Zusammenführen' }));
+    expect(onApprove).toHaveBeenCalledWith(20); // stored winner
+  });
+
+  it('survivor toggle: keeping the other entity approves with its id', () => {
+    const onApprove = vi.fn();
+    renderWithRouter(<MergeProposalCard proposal={proposal()} onApprove={onApprove} onReject={vi.fn()} />);
+    fireEvent.click(screen.getByLabelText('Alice behalten')); // pick the loser as survivor
+    fireEvent.click(screen.getByRole('button', { name: 'Zusammenführen' }));
+    expect(onApprove).toHaveBeenCalledWith(10);
+  });
+
+  it('reject fires onReject', () => {
+    const onReject = vi.fn();
+    renderWithRouter(<MergeProposalCard proposal={proposal()} onApprove={vi.fn()} onReject={onReject} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Ablehnen' }));
+    expect(onReject).toHaveBeenCalledTimes(1);
+  });
+});

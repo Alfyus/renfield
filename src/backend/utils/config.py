@@ -462,6 +462,17 @@ class Settings(BaseSettings):
     skill_curator_min_uses_to_consider_stale: int = Field(default=3, ge=1, le=100)  # Avoid archiving rarely-tested skills
     skill_curator_max_merges_per_run: int = Field(default=20, ge=1, le=200)   # Safety cap
 
+    # KG entity reconciler (Structured Memory Phase 1, T5). Periodic per-user
+    # self-join over kg_entities embeddings: same-tier high-confidence dupes are
+    # auto-merged; cross-tier / gray-zone dupes become kg_merge_proposals for
+    # owner review (D3). Opt-in.
+    kg_reconciler_enabled: bool = False                                          # Master switch
+    kg_reconciler_interval: int = Field(default=86400, ge=300, le=604800)        # Seconds between runs (default 1d)
+    kg_reconciler_candidate_threshold: float = Field(default=0.85, ge=0.5, le=1.0)   # Cosine to consider a pair at all
+    kg_reconciler_auto_merge_threshold: float = Field(default=0.95, ge=0.5, le=1.0)  # Same-tier auto-merge bar (>= candidate)
+    kg_reconciler_max_per_run: int = Field(default=50, ge=1, le=500)             # Safety cap per user per run
+    kg_reconciler_embed_backfill_per_run: int = Field(default=50, ge=0, le=500)  # Re-embed up to N null-embedding entities per pass (#6); 0 disables
+
     # Skill draft-gate shadow log (v2.10 admin console rollout). When True,
     # SkillService.find_similar runs a parallel "would-have-injected" query
     # that relaxes the status='approved' filter, so we can measure how much

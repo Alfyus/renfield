@@ -774,23 +774,13 @@ class TestCRUD:
 
     @pytest.mark.unit
     async def test_merge_entities(self, kg_service, db_session):
-        source = await _create_entity(db_session, name="Ed", entity_type="person", mention_count=3)
-        target = await _create_entity(db_session, name="Edi", entity_type="person", mention_count=5)
-        e3 = await _create_entity(db_session, name="Berlin", entity_type="place")
-
-        await _create_relation(db_session, source.id, "lives_in", e3.id)
-
-        result = await kg_service.merge_entities(source.id, target.id)
-
-        assert result is not None
-        assert result.id == target.id
-        assert result.mention_count == 8  # 3 + 5
-
-        # Source should be inactive
-        src_result = await db_session.execute(
-            select(KGEntity).where(KGEntity.id == source.id)
-        )
-        assert src_result.scalar_one().is_active is False
+        # merge_entities was rewritten for Phase 1 (canonical_id tombstone,
+        # surface-form/multi-type absorb, kg_relations FK reparent + re-dedup,
+        # tier=MIN cascade, memory-subject follow). It now uses PG-only SQL
+        # (jsonb / LEAST / json_build_object) and can't run on the sqlite shim.
+        # Comprehensive coverage lives in tests/backend/test_kg_merge_pg.py
+        # (real Postgres). Same positional contract (loser, winner) -> winner.
+        pytest.skip("merge_entities is PG-only — see test_kg_merge_pg.py")
 
     @pytest.mark.unit
     async def test_delete_relation(self, kg_service, db_session):

@@ -58,6 +58,10 @@ Die Quell-Tabellen tragen **denormalisiert** eine `circle_tier`- und `atom_id`-S
 
 Wenn der Eigentümer eine Tier-Änderung an einem Atom vornimmt (`PATCH /api/atoms/{id}`), kaskadiert die Änderung auf alle incidenten Relationen (bei `kg_entity`-Atoms) und aktualisiert die denormalisierten `circle_tier`-Spalten in einem Transaktions-Schritt. Konsistenz zwischen `atoms.policy` und Quell-Tabelle ist ein ACID-Commit.
 
+### Merge-Invariante (Structured Memory)
+
+Werden zwei KG-Entitäten zusammengeführt (`merge_entities`, z. B. durch den Reconciler), gilt: **eine Verschmelzung darf die Sichtbarkeit nie erhöhen.** Der überlebende Knoten erhält `circle_tier = MIN(beide)`, und alle inzidenten Relationen rechnen auf `LEAST(subject, object)` neu (gleiche Kaskade wie oben). Deshalb werden **nur same-tier** Paare automatisch gemergt; **Cross-Tier-Paare gehen in die Owner-Review** (`/brain/review`, `kg_merge_proposals`) statt still verschmolzen zu werden. Der Loser bleibt als Tombstone (`is_active=False`, `canonical_id=<winner>`) für den Audit-Trail.
+
 ---
 
 ## Datenmodell

@@ -99,6 +99,7 @@ export const keys = {
     entities: (filters?: Record<string, unknown>) => ['knowledgeGraph', 'entities', filters ?? {}] as const,
     relations: (filters?: Record<string, unknown>) => ['knowledgeGraph', 'relations', filters ?? {}] as const,
     circleTiers: () => ['knowledgeGraph', 'circle-tiers'] as const,
+    mergeProposals: () => ['knowledgeGraph', 'merge-proposals'] as const,
   },
   circles: {
     all: ['circles'] as const,

@@ -174,6 +174,12 @@ Both items below were surfaced by outside voice during the 2026-05-26 `/plan-eng
   - **DEPENDS ON:** Evidence that household-tier auto-extracted skills happen with non-trivial frequency post-v2.10 — measurable via `procedural_skills.circle_tier=2 AND source='auto_extracted'` count.
   - **TRIGGER:** ≥10 household-tier auto-extracted skills observed across the user-base, OR explicit user feedback "I can't get to my partner's drafts."
 
+### ~~Structured-memory reconciler — residual race hardening~~ ✅ FIXED (2026-06-04, `feature/structured-memory-kg`)
+Surfaced by `/review` of the branch; all three fixed in the same branch (commit follows the review-fixes commit) with PG tests in `tests/backend/test_kg_reconciler_pg.py`. Kept here as an audit trail.
+- **#3 — Concurrent approve of two overlapping proposals.** ✅ `approve_proposal` now closes a no-op merge (survivor `None`, counterpart already tombstoned) as `KG_MERGE_PROPOSAL_SUPERSEDED` instead of a misleading `approved`, and only resolves a still-PENDING proposal. Test: `test_overlapping_approve_marks_superseded`.
+- **#4 — `run_reconciler` overlap.** ✅ `run_for_user` wraps each pass in a non-blocking per-user advisory lock (`pg_try_advisory_lock(_RECONCILER_LOCK_NS, user_id)`) on a dedicated connection (`self.db.bind.engine`) so it survives `merge_entities`' mid-pass commits; an overlapping run returns a no-op report. Test: `test_concurrent_run_skips_when_locked`. (Used a session-level lock on a side connection rather than the `pg_advisory_xact_lock` first sketched, because merge_entities commits mid-pass.)
+- **#6 — Embedding-null entities never reconciled.** ✅ `backfill_missing_embeddings` re-embeds up to `KG_RECONCILER_EMBED_BACKFILL_PER_RUN` active null-embedding entities at the top of each pass, so they become reconcilable the same run. Test: `test_backfill_embeds_null_entities_then_reconciles`.
+
 ### Paperless PR 5 — Interactive confirm card
 In-chat card with per-field controls, tag chips, storage-path tree; structured-payload callback instead of free-text.
 - **Primary source:** `docs/design/paperless-llm-metadata.md` §Implementation plan → PR 5, §302-324

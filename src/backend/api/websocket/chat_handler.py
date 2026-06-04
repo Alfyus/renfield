@@ -433,6 +433,20 @@ async def _fetch_document_context(attachment_ids: list[int], lang: str) -> str:
         return ""
 
 
+def _format_memory_line(m: dict) -> str:
+    """Render one retrieved memory as a context line, surfacing its subject.
+
+    The subject tag is the D9 fix for the cross-person conflation: each fact
+    carries WHO it is about (``- [FACT · Alice] ...``) so the LLM never merges
+    facts about different people. Falls back to the bare category when the
+    memory has no subject (speaker-self / general facts).
+    """
+    cat_label = (m.get("category") or "").upper()
+    subject = m.get("subject_name")
+    tag = f"{cat_label} · {subject}" if subject else cat_label
+    return f"- [{tag}] {m.get('content', '')}"
+
+
 async def _retrieve_memory_context(content: str, user_id: int | None, lang: str) -> str:
     """Retrieve relevant memories and format as prompt section."""
     from utils.hooks import run_hooks
@@ -459,10 +473,7 @@ async def _retrieve_memory_context(content: str, user_id: int | None, lang: str)
                         combined.append(m)
 
                 if combined:
-                    lines = []
-                    for m in combined:
-                        cat_label = m["category"].upper()
-                        lines.append(f"- [{cat_label}] {m['content']}")
+                    lines = [_format_memory_line(m) for m in combined]
                     memories_str = "\n".join(lines)
 
                     sections.append(prompt_manager.get(

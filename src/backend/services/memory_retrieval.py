@@ -147,7 +147,7 @@ class MemoryRetrieval:
                 WITH candidates AS (
                     SELECT
                         id, content, category, importance, confidence, access_count,
-                        created_at, last_accessed_at,
+                        created_at, last_accessed_at, subject_name,
                         (1 - (embedding <=> CAST(:embedding AS vector))) AS similarity
                     FROM conversation_memories m
                     WHERE is_active = true
@@ -158,7 +158,7 @@ class MemoryRetrieval:
                 )
                 SELECT
                     id, content, category, importance, confidence,
-                    access_count, created_at, similarity
+                    access_count, created_at, subject_name, similarity
                 FROM candidates
                 ORDER BY (
                     similarity * importance * confidence
@@ -189,6 +189,7 @@ class MemoryRetrieval:
                     confidence,
                     access_count,
                     created_at,
+                    subject_name,
                     1 - (embedding <=> CAST(:embedding AS vector)) as similarity
                 FROM conversation_memories m
                 WHERE is_active = true
@@ -216,6 +217,7 @@ class MemoryRetrieval:
                     "importance": row.importance,
                     "access_count": row.access_count,
                     "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "subject_name": row.subject_name,
                     "similarity": round(sim, 3),
                 })
                 memory_ids.append(row.id)
@@ -267,7 +269,7 @@ class MemoryRetrieval:
         circles_clause, circles_params = self._memory_circles_filter(user_id)
 
         sql = text(f"""
-            SELECT id, content, category, importance, access_count, created_at
+            SELECT id, content, category, importance, access_count, created_at, subject_name
             FROM conversation_memories m
             WHERE is_active = true
               AND importance >= :threshold
@@ -294,6 +296,7 @@ class MemoryRetrieval:
                 "importance": row.importance,
                 "access_count": row.access_count,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
+                "subject_name": row.subject_name,
                 "similarity": 1.0,
             })
             memory_ids.append(row.id)

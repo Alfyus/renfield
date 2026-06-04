@@ -16,9 +16,17 @@ from loguru import logger
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.database import KG_ENTITY_TYPES, TIER_PUBLIC, KGEntity, KGRelation
+from models.database import (
+    ATOM_TYPE_KG_EDGE,
+    EMBEDDING_DIMENSION,
+    KG_ENTITY_TYPES,
+    TIER_PUBLIC,
+    KGEntity,
+    KGRelation,
+)
 from services.kg_validator import load_heuristics as load_kg_heuristics
 from services.kg_validator import validate_relation as validate_kg_relation
+from services.merge_guard import is_already_merged
 from utils.config import settings
 from utils.llm_client import get_default_client, get_embed_client
 
@@ -245,6 +253,17 @@ class KnowledgeGraphService:
         )
         return response.embedding
 
+    @staticmethod
+    def _embed_input(name: str, description: str | None) -> str:
+        """Embedding input for an entity: name plus description when present.
+
+        Name+description is a stronger identity signal than the bare name (it
+        shrinks the ambiguous near-duplicate band — D10). resolve_entity AND
+        merge_entities both embed via this helper so a freshly-resolved entity
+        and its later re-embed during a merge stay in the same vector space.
+        """
+        return f"{name}: {description}" if description else name
+
     async def _extract_query_entities(self, query: str, lang: str = "de") -> list[str]:
         """
         Extract entity names from a natural-language query via LLM.
@@ -415,62 +434,111 @@ class KnowledgeGraphService:
         user_id: int | None,
         user_role: str | None = None,  # kept for back-compat; ignored under circles
         description: str | None = None,
+        extra_types: list[str] | None = None,
     ) -> KGEntity:
         """
         Resolve an entity by name, creating or merging as needed.
 
-        Lane C rewrite: scope-based steps 2 and 4 (accessible custom scopes
-        from kg_scope_loader) are removed because the scope column was
-        DROPPED by pc20260420_circles_v1_schema. New resolution order:
+        Structured-Memory Phase 1 cascade (rules -> alias -> embedding -> new):
 
-        1. Exact name match in user's own entities (user_id + unowned)
-        2. Embedding similarity in user's own entities
-        3. Create new entity owned by this user (circle_tier defaults to
-           the user's default_capture_policy.tier; AtomService.upsert_atom
-           creates the corresponding atoms row)
+        1. Exact name match (own + unowned, live, canonical_id IS NULL).
+        2. Surface-form match — the name is a known alias absorbed onto a
+           canonical entity (GIN jsonb_path_ops). PG-only.
+        3. Embedding similarity, but SAME-TIER ONLY (D11) and high-threshold
+           ONLY (D10), embedded from name+description. We never inline-merge on
+           a weak or cross-tier match — those fall through to "create new" and
+           the background reconciler proposes the real, review-gated merge.
+        4. Create a new canonical entity (canonical_id NULL, circle_tier 0).
 
-        Cross-user entity dedup (the old "accessible scopes" behavior) is
-        deferred to v2 — household-shared knowledge graph entities will
-        come back via the named-circles work then. For v1 dogfooding,
-        per-user entity isolation is acceptable + simpler.
+        Cross-user entity dedup stays deferred to the named-circles work; v1 is
+        per-user (own + unowned only).
         """
-        # Step 1: Exact name match in user's own entities (include unowned)
-        query = select(KGEntity).where(
-            func.lower(KGEntity.name) == name.lower(),
-            KGEntity.is_active == True,  # noqa: E712
-            or_(KGEntity.user_id == user_id, KGEntity.user_id.is_(None)),
-        )
-        result = await self.db.execute(query)
-        existing = result.scalar_one_or_none()
+        resolved_type = entity_type if entity_type in KG_ENTITY_TYPES else "thing"
+        now = datetime.now(UTC).replace(tzinfo=None)
+        # Multi-type superset (D4): scalar entity_type stays the closed-enum
+        # primary; entity_types may carry free-form extras (e.g. "musician").
+        extra = [t.strip() for t in (extra_types or []) if t and t.strip()]
+        seed_types = list(dict.fromkeys([resolved_type, *extra]))
 
+        def _bump(ent: KGEntity) -> KGEntity:
+            ent.mention_count = (ent.mention_count or 1) + 1
+            ent.last_seen_at = now
+            if description and not ent.description:
+                ent.description = description
+            if extra:  # fold any newly-observed types into the existing entity
+                ent.entity_types = list(dict.fromkeys(
+                    list(ent.entity_types or [ent.entity_type]) + extra
+                ))
+            return ent
+
+        # Step 1: exact name match (own + unowned, live, canonical only).
+        # Names are no longer unique (the embedding step is same-tier-guarded,
+        # so the same name can exist at different tiers), so order
+        # deterministically and take first instead of scalar_one.
+        q = (
+            select(KGEntity)
+            .where(
+                func.lower(KGEntity.name) == name.lower(),
+                KGEntity.is_active == True,  # noqa: E712
+                KGEntity.canonical_id.is_(None),
+                or_(KGEntity.user_id == user_id, KGEntity.user_id.is_(None)),
+            )
+            .order_by(KGEntity.circle_tier.asc(), KGEntity.mention_count.desc())
+        )
+        existing = (await self.db.execute(q)).scalars().first()
         if existing:
-            existing.mention_count = (existing.mention_count or 1) + 1
-            existing.last_seen_at = datetime.now(UTC).replace(tzinfo=None)
-            if description and not existing.description:
-                existing.description = description
+            _bump(existing)
             await self.db.flush()
             return existing
 
-        # Step 2: Embedding similarity check (user's own entities only)
+        # Step 2: surface-form match — the incoming name is a known alias absorbed
+        # onto a canonical entity. PG-only (jsonb @> + GIN jsonb_path_ops); the
+        # sqlite shim has no @> operator, so it skips straight to embedding/create.
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        if dialect == "postgresql":
+            sf_user = "AND (user_id = :uid OR user_id IS NULL)" if user_id is not None else ""
+            sf_sql = text(f"""
+                SELECT id FROM kg_entities
+                WHERE is_active = true AND canonical_id IS NULL
+                  AND surface_forms @> CAST(:sf AS jsonb)
+                  {sf_user}
+                ORDER BY circle_tier ASC, mention_count DESC
+                LIMIT 1
+            """)
+            sf_params: dict = {"sf": json.dumps([name])}
+            if user_id is not None:
+                sf_params["uid"] = user_id
+            sf_row = (await self.db.execute(sf_sql, sf_params)).fetchone()
+            if sf_row:
+                ent = (await self.db.execute(
+                    select(KGEntity).where(KGEntity.id == sf_row.id)
+                )).scalar_one_or_none()
+                if ent:
+                    _bump(ent)
+                    await self.db.flush()
+                    return ent
+
+        # Step 3: embedding similarity — SAME-TIER ONLY (D11), high-threshold ONLY
+        # (D10), embedded from name+description. A cross-tier or sub-threshold
+        # near-duplicate is NOT folded in here; it falls through to "create new"
+        # and the background reconciler proposes the review-gated merge.
+        default_tier = 0
         embedding = None
         try:
-            embedding = await self._get_embedding(name)
+            embedding = await self._get_embedding(self._embed_input(name, description))
         except Exception as e:
             logger.warning(f"KG: Could not generate embedding for entity '{name}': {e}")
 
         if embedding:
             similar = await self._find_similar_entity(
-                embedding, user_id=user_id, accessible_scopes=None
+                embedding, user_id=user_id, tier=default_tier,
             )
-            if similar:
-                similar.mention_count = (similar.mention_count or 1) + 1
-                similar.last_seen_at = datetime.now(UTC).replace(tzinfo=None)
-                if description and not similar.description:
-                    similar.description = description
+            if similar is not None:
+                _bump(similar)
                 await self.db.flush()
                 return similar
 
-        # Step 3: Per-user entity limit check (no scope filter; just count user's entities)
+        # Step 4: Per-user entity limit check (no scope filter; just count user's entities)
         if user_id is not None:
             count_result = await self.db.execute(
                 select(func.count(KGEntity.id)).where(
@@ -495,7 +563,6 @@ class KnowledgeGraphService:
         # carrying the just-minted atom_id, then patch the atoms row's
         # source_id once entity.id is known.
         owner_id = await self._resolve_owner_user_id(user_id)
-        default_tier = 0
         # owner_id is None only in dev/test setups with an empty users table;
         # in that path we skip atom registration and write the entity with
         # atom_id=None (the source-row ORM column is nullable). Production
@@ -529,7 +596,8 @@ class KnowledgeGraphService:
                 entity = KGEntity(
                     user_id=owner_id,
                     name=name,
-                    entity_type=entity_type if entity_type in KG_ENTITY_TYPES else "thing",
+                    entity_type=resolved_type,
+                    entity_types=list(seed_types),
                     description=description,
                     embedding=embedding,
                     atom_id=atom_id,
@@ -542,7 +610,8 @@ class KnowledgeGraphService:
             entity = KGEntity(
                 user_id=owner_id,
                 name=name,
-                entity_type=entity_type if entity_type in KG_ENTITY_TYPES else "thing",
+                entity_type=resolved_type,
+                entity_types=list(seed_types),
                 description=description,
                 embedding=embedding,
                 atom_id=None,
@@ -557,38 +626,49 @@ class KnowledgeGraphService:
         self,
         embedding: list[float],
         user_id: int | None,
-        accessible_scopes: list[str] | None = None,
+        tier: int | None = None,
     ) -> KGEntity | None:
         """
-        Find an existing entity above the similarity threshold.
+        Find the nearest existing entity above the similarity threshold.
 
         Args:
             embedding: Entity embedding vector
-            user_id: User ID for personal scope filtering (None = no personal filtering)
-            accessible_scopes: List of custom scope names accessible to the user (None = skip)
+            user_id: personal scope filter (None = no personal filtering); matches
+                the user's own entities plus unowned (user_id IS NULL) rows.
+            tier: when set, restrict to same-tier candidates (D11) — never fold a
+                fresh extraction into an entity at a DIFFERENT circle_tier; that
+                cross-tier consolidation is review-gated via the reconciler.
         """
         threshold = settings.kg_similarity_threshold
         embedding_str = f"[{','.join(map(str, embedding))}]"
 
-        # Lane C rewrite: scope column was DROPPED. Filter by user_id only;
-        # the accessible_scopes parameter is kept in the signature for back-compat
-        # with existing callers but is now ignored. Cross-user dedup returns
-        # via v2 named-circles work.
+        params: dict = {"embedding": embedding_str}
+        user_filter = ""
         if user_id is not None:
             user_filter = "AND (user_id = :user_id OR user_id IS NULL)"
-            params: dict = {"embedding": embedding_str, "user_id": user_id}
-        else:
-            user_filter = ""
-            params = {"embedding": embedding_str}
+            params["user_id"] = user_id
+        tier_filter = ""
+        if tier is not None:
+            tier_filter = "AND circle_tier = :tier"
+            params["tier"] = tier
 
+        # halfvec cast on BOTH sides is mandatory to use idx_kg_entities_embedding_hnsw
+        # (built with halfvec_cosine_ops; regular `vector` caps at 2000 dims, prod
+        # runs 2560-dim qwen3-embedding:4b). Without the cast the planner falls back
+        # to a seq-scan + per-row cosine on the raw vectors. Same pattern as
+        # skill_curator.find_duplicate_pairs / skill_service.find_similar.
+        # canonical_id IS NULL: never match a merge tombstone (pointer-chase).
+        dim = EMBEDDING_DIMENSION
         sql = text(f"""
             SELECT id,
-                   1 - (embedding <=> CAST(:embedding AS vector)) as similarity
+                   1 - (embedding::halfvec({dim}) <=> CAST(:embedding AS halfvec({dim}))) as similarity
             FROM kg_entities
             WHERE is_active = true
               AND embedding IS NOT NULL
+              AND canonical_id IS NULL
               {user_filter}
-            ORDER BY embedding <=> CAST(:embedding AS vector)
+              {tier_filter}
+            ORDER BY embedding::halfvec({dim}) <=> CAST(:embedding AS halfvec({dim}))
             LIMIT 1
         """)
 
@@ -629,8 +709,14 @@ class KnowledgeGraphService:
         user_id: int | None = None,
         confidence: float = 0.8,
         source_session_id: str | None = None,
+        stated_by_user_id: int | None = None,
+        source_message_id: int | None = None,
     ) -> KGRelation:
-        """Save a relation, deduplicating same subject+predicate+object."""
+        """Save a relation, deduplicating same subject+predicate+object.
+
+        ``stated_by_user_id`` is the speaker who asserted the fact (provenance),
+        distinct from ``user_id`` (the graph owner) — enables "who told me X".
+        """
         # Check for existing relation
         query = select(KGRelation).where(
             KGRelation.subject_id == subject_id,
@@ -673,6 +759,8 @@ class KnowledgeGraphService:
             object_id=object_id,
             confidence=confidence,
             source_session_id=source_session_id,
+            stated_by_user_id=stated_by_user_id,
+            source_message_id=source_message_id,
             atom_id=atom_id,
             circle_tier=relation_tier,
         )
@@ -685,6 +773,176 @@ class KnowledgeGraphService:
             f"atom_id={atom_id} tier={relation_tier}"
         )
         return relation
+
+    # =========================================================================
+    # Canonicalization / Merge (Structured Memory Phase 1)
+    # =========================================================================
+
+    async def merge_entities(self, loser_id: int, winner_id: int) -> KGEntity | None:
+        """Merge ``loser`` into ``winner``: absorb, reparent edges, tombstone.
+
+        Ports the skill-curator merge pattern (embedding-before-lock, FOR UPDATE
+        both rows, shared already-merged guard) and adds the entity-specific
+        machinery skills don't need: reparenting ``kg_relations`` integer FKs
+        loser->winner, re-deduping the resulting relations, recomputing each
+        touched relation's ``circle_tier`` (and its atom policy), and following
+        ``conversation_memories.subject_entity_id`` to the survivor.
+
+        Invariants:
+          - A merge MUST NEVER raise visibility: the survivor's tier becomes
+            ``MIN(winner, loser)`` and incident relations recompute to
+            ``LEAST(subject, object)``.
+          - Per-user only for v1: a cross-user pair is refused (cross-user /
+            household canonicalization is deferred to the named-circles work).
+          - Concurrency-safe: a second pass that lost the FOR UPDATE race finds
+            the loser already tombstoned (``canonical_id`` set / inactive) via
+            ``is_already_merged`` and bails without double-applying.
+
+        Returns the surviving (winner) entity if the merge was applied, or None
+        if skipped (no-op id pair, missing row, already merged, or cross-user).
+        """
+        if loser_id == winner_id:
+            return None
+
+        # Preview-load (no lock) just to build the survivor's embedding input;
+        # recompute the embedding OUTSIDE any row lock so a slow embed endpoint
+        # doesn't hold kg_entities locks (same rationale as merge_pair).
+        winner_preview = (await self.db.execute(
+            select(KGEntity).where(KGEntity.id == winner_id)
+        )).scalar_one_or_none()
+        loser_preview = (await self.db.execute(
+            select(KGEntity).where(KGEntity.id == loser_id)
+        )).scalar_one_or_none()
+        if winner_preview is None or loser_preview is None:
+            return None
+
+        emb_input = self._embed_input(winner_preview.name, winner_preview.description)
+        new_emb: list[float] | None = None
+        try:
+            new_emb = await self._get_embedding(emb_input)
+        except Exception as e:  # best-effort — keep the old embedding on failure
+            logger.warning(f"KG merge: embedding recompute failed for {winner_preview.name!r}: {e}")
+
+        # Re-load both rows WITH locks; bail if a concurrent pass already merged.
+        winner = (await self.db.execute(
+            select(KGEntity).where(KGEntity.id == winner_id).with_for_update()
+        )).scalar_one_or_none()
+        loser = (await self.db.execute(
+            select(KGEntity).where(KGEntity.id == loser_id).with_for_update()
+        )).scalar_one_or_none()
+        if winner is None or loser is None:
+            await self.db.rollback()
+            return None
+        if is_already_merged(canonical_pointer=loser.canonical_id, is_live=loser.is_active) or \
+           is_already_merged(canonical_pointer=winner.canonical_id, is_live=winner.is_active):
+            await self.db.rollback()
+            return None
+        if loser.user_id != winner.user_id:
+            await self.db.rollback()
+            logger.warning(
+                f"KG merge refused: cross-user pair #{loser.id}(u={loser.user_id}) "
+                f"-> #{winner.id}(u={winner.user_id}); per-user canonicalization only (v1)"
+            )
+            return None
+
+        # --- absorb loser into winner ---
+        # surface_forms = winner ∪ loser ∪ {loser.name}, order-preserving dedup,
+        # excluding the winner's own canonical name (that lives in `name`).
+        merged_forms = list(dict.fromkeys(
+            list(winner.surface_forms or [])
+            + list(loser.surface_forms or [])
+            + [loser.name]
+        ))
+        winner.surface_forms = [f for f in merged_forms if f and f != winner.name]
+        # multi-type union; fall back to the scalar type when an array is empty.
+        w_types = list(winner.entity_types or [winner.entity_type])
+        l_types = list(loser.entity_types or [loser.entity_type])
+        winner.entity_types = list(dict.fromkeys([t for t in (w_types + l_types) if t]))
+        winner.mention_count = (winner.mention_count or 1) + (loser.mention_count or 1)
+        if loser.first_seen_at and (winner.first_seen_at is None or loser.first_seen_at < winner.first_seen_at):
+            winner.first_seen_at = loser.first_seen_at
+        if loser.last_seen_at and (winner.last_seen_at is None or loser.last_seen_at > winner.last_seen_at):
+            winner.last_seen_at = loser.last_seen_at
+        if not winner.description and loser.description:
+            winner.description = loser.description
+        if new_emb is not None:
+            winner.embedding = new_emb
+        # NEVER raise visibility — survivor tier is the more-restrictive of the two.
+        merged_tier = min(int(winner.circle_tier or 0), int(loser.circle_tier or 0))
+        winner.circle_tier = merged_tier
+
+        # tombstone loser (kept for audit; its kg_node atom stays too)
+        loser.is_active = False
+        loser.canonical_id = winner.id
+        loser.last_seen_at = datetime.now(UTC).replace(tzinfo=None)
+        await self.db.flush()
+
+        wid, lid = winner.id, loser.id
+
+        # --- reparent kg_relations FKs loser -> winner ---
+        await self.db.execute(text(
+            "UPDATE kg_relations SET subject_id = :w WHERE subject_id = :l"
+        ), {"w": wid, "l": lid})
+        await self.db.execute(text(
+            "UPDATE kg_relations SET object_id = :w WHERE object_id = :l"
+        ), {"w": wid, "l": lid})
+        # self-loops created by the merge (a former loser<->winner edge) are noise.
+        await self.db.execute(text(
+            "UPDATE kg_relations SET is_active = false "
+            "WHERE subject_id = :w AND object_id = :w AND is_active = true"
+        ), {"w": wid})
+        # carry max(confidence) onto the survivor of each now-duplicate triple ...
+        await self.db.execute(text(
+            "UPDATE kg_relations surv SET confidence = agg.maxc "
+            "FROM (SELECT subject_id, predicate, object_id, max(confidence) AS maxc "
+            "      FROM kg_relations WHERE is_active = true "
+            "      GROUP BY subject_id, predicate, object_id HAVING count(*) > 1) agg "
+            "WHERE surv.subject_id = agg.subject_id AND surv.predicate = agg.predicate "
+            "  AND surv.object_id = agg.object_id AND surv.is_active = true "
+            "  AND surv.id = (SELECT min(k.id) FROM kg_relations k "
+            "                 WHERE k.is_active = true AND k.subject_id = agg.subject_id "
+            "                   AND k.predicate = agg.predicate AND k.object_id = agg.object_id)"
+        ))
+        # ... then deactivate the duplicates, keeping the lowest id per triple.
+        await self.db.execute(text(
+            "UPDATE kg_relations r SET is_active = false "
+            "WHERE r.is_active = true AND EXISTS ("
+            "  SELECT 1 FROM kg_relations k WHERE k.is_active = true AND k.id < r.id "
+            "    AND k.subject_id = r.subject_id AND k.predicate = r.predicate "
+            "    AND k.object_id = r.object_id)"
+        ))
+        # recompute tier on every winner-incident active relation + sync atom policy
+        await self.db.execute(text(
+            "UPDATE kg_relations r SET circle_tier = LEAST(s.circle_tier, o.circle_tier) "
+            "FROM kg_entities s, kg_entities o "
+            "WHERE r.subject_id = s.id AND r.object_id = o.id "
+            "  AND (r.subject_id = :w OR r.object_id = :w)"
+        ), {"w": wid})
+        await self.db.execute(text(
+            "UPDATE atoms SET policy = json_build_object('tier', r.circle_tier), updated_at = NOW() "
+            "FROM kg_relations r "
+            "WHERE atoms.atom_type = :edge AND atoms.source_id = r.id::text "
+            "  AND (r.subject_id = :w OR r.object_id = :w)"
+        ), {"edge": ATOM_TYPE_KG_EDGE, "w": wid})
+        # keep the survivor's own kg_node atom policy in lockstep with merged_tier
+        if winner.atom_id:
+            await self.db.execute(text(
+                "UPDATE atoms SET policy = json_build_object('tier', :t), updated_at = NOW() "
+                "WHERE atom_id = :a"
+            ), {"t": merged_tier, "a": winner.atom_id})
+
+        # --- follow memory subject links to the survivor (D9) ---
+        await self.db.execute(text(
+            "UPDATE conversation_memories SET subject_entity_id = :w WHERE subject_entity_id = :l"
+        ), {"w": wid, "l": lid})
+
+        await self.db.commit()
+        await self.db.refresh(winner)  # reload post-commit (expire_on_commit safety)
+        logger.info(
+            f"🔗 KG merge: entity #{lid} {loser.name!r} -> #{wid} {winner.name!r} "
+            f"(tier={merged_tier}, {len(winner.surface_forms)} surface forms)"
+        )
+        return winner
 
     # =========================================================================
     # Extract from Conversation
@@ -765,8 +1023,17 @@ class KnowledgeGraphService:
         rejected_count = 0
         for ent in entities_data:
             name = ent.get("name", "").strip()
-            etype = ent.get("type", "thing").strip().lower()
             desc = ent.get("description", "").strip() or None
+            # Accept single `type` or multi `types` (D4 multi-type). Primary =
+            # first closed-enum type; the rest become free-form entity_types
+            # extras (e.g. "musician") carried on the entity.
+            raw_types = ent.get("types") or ([ent.get("type")] if ent.get("type") else [])
+            raw_types = [str(t).strip().lower() for t in raw_types if t and str(t).strip()]
+            etype = next(
+                (t for t in raw_types if t in KG_ENTITY_TYPES),
+                raw_types[0] if raw_types else "thing",
+            )
+            extra_types = [t for t in raw_types if t != etype]
             if not name:
                 continue
 
@@ -775,7 +1042,9 @@ class KnowledgeGraphService:
                 rejected_count += 1
                 continue
 
-            entity = await self.resolve_entity(name, etype, user_id, user_role, desc)
+            entity = await self.resolve_entity(
+                name, etype, user_id, user_role, desc, extra_types=extra_types or None,
+            )
             entity_map[name.lower()] = entity
             saved_entities.append(entity)
 
@@ -831,6 +1100,7 @@ class KnowledgeGraphService:
                 user_id=user_id,
                 confidence=conf,
                 source_session_id=session_id,
+                stated_by_user_id=user_id,  # the authenticated speaker asserted it
             )
             saved_relations.append(relation)
 
@@ -937,8 +1207,17 @@ class KnowledgeGraphService:
         rejected_count = 0
         for ent in entities_data:
             name = ent.get("name", "").strip()
-            etype = ent.get("type", "thing").strip().lower()
             desc = ent.get("description", "").strip() or None
+            # Accept single `type` or multi `types` (D4 multi-type). Primary =
+            # first closed-enum type; the rest become free-form entity_types
+            # extras (e.g. "musician") carried on the entity.
+            raw_types = ent.get("types") or ([ent.get("type")] if ent.get("type") else [])
+            raw_types = [str(t).strip().lower() for t in raw_types if t and str(t).strip()]
+            etype = next(
+                (t for t in raw_types if t in KG_ENTITY_TYPES),
+                raw_types[0] if raw_types else "thing",
+            )
+            extra_types = [t for t in raw_types if t != etype]
             if not name:
                 continue
 
@@ -947,7 +1226,9 @@ class KnowledgeGraphService:
                 rejected_count += 1
                 continue
 
-            entity = await self.resolve_entity(name, etype, user_id, user_role, desc)
+            entity = await self.resolve_entity(
+                name, etype, user_id, user_role, desc, extra_types=extra_types or None,
+            )
             entity_map[name.lower()] = entity
             saved_entities.append(entity)
 
@@ -1288,41 +1569,6 @@ class KnowledgeGraphService:
 
         await self.db.commit()
         return True
-
-    async def merge_entities(
-        self,
-        source_id: int,
-        target_id: int,
-    ) -> KGEntity | None:
-        """Merge source entity into target. Moves relations, deactivates source."""
-        source = await self.get_entity(source_id)
-        target = await self.get_entity(target_id)
-        if not source or not target:
-            return None
-
-        # Move source's relations to target
-        await self.db.execute(
-            update(KGRelation)
-            .where(KGRelation.subject_id == source_id, KGRelation.is_active == True)  # noqa: E712
-            .values(subject_id=target_id)
-        )
-        await self.db.execute(
-            update(KGRelation)
-            .where(KGRelation.object_id == source_id, KGRelation.is_active == True)  # noqa: E712
-            .values(object_id=target_id)
-        )
-
-        # Accumulate mention count
-        target.mention_count = (target.mention_count or 1) + (source.mention_count or 1)
-        if source.description and not target.description:
-            target.description = source.description
-
-        # Deactivate source
-        source.is_active = False
-
-        await self.db.commit()
-        await self.db.refresh(target)
-        return target
 
     async def list_relations(
         self,
