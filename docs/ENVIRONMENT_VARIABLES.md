@@ -667,7 +667,24 @@ KG_RECONCILER_CANDIDATE_THRESHOLD=0.85        # Cosine ab wann ein Paar ueberhau
 KG_RECONCILER_AUTO_MERGE_THRESHOLD=0.95       # Same-Tier-Auto-Merge-Schwelle (>= candidate)
 KG_RECONCILER_MAX_PER_RUN=50                  # Safety-Cap pro User pro Lauf
 KG_RECONCILER_EMBED_BACKFILL_PER_RUN=50       # Null-Embedding-Entitaeten pro Lauf nach-einbetten (0 deaktiviert)
+
+# Graph-Expansion-Retrieval (Phase 4, post-RRF) — opt-in, aus = byte-identisch
+GRAPH_EXPANSION_ENABLED=false                 # Nach RRF 1-2 Hops von den fused kg_node-Pivots laufen (PolymorphicAtomStore)
+GRAPH_EXPANSION_MAX_PIVOTS=8                   # Max fused kg_node-Pivots zum Expandieren
+GRAPH_EXPANSION_MAX_HOPS=2                     # Traversal-Tiefe (1-3)
+GRAPH_EXPANSION_MAX_EXPANDED=15               # Cap auf zusaetzliche Nachbar-Atome (Hub-Flood-Schutz)
 ```
+
+**Graph-Expansion (Phase 4):** Wenn `GRAPH_EXPANSION_ENABLED=true`, expandiert
+`PolymorphicAtomStore.query` **nach** der RRF-Fusion die obersten `kg_node`-Pivots
+1-`GRAPH_EXPANSION_MAX_HOPS` Hops ueber `kg_relations` (level-synchrone BFS →
+korrekte Min-Hop-Distanz; Circle-Filter pro Hop; Frontier-Cap; **leak-sichere
+Kanten** nur wenn beide Endpunkte sichtbar; Decay = pivot/(1+hop); Cap
+`GRAPH_EXPANSION_MAX_EXPANDED`). Die zusaetzlichen Nachbar-Atome tragen
+`payload.expanded=true`+`hop`. Einzelner Insertion-Point (kein Doppel-Work), Decay
+ueberlebt. Aus (default) = `query` byte-identisch. (Der Agent-String-Pfad
+`get_relevant_context` profitiert erst, wenn er auf den fused-Pfad umgestellt wird
+— offener Follow-up in `TODOS.md`.)
 
 **Verhalten:**
 Wenn `KG_RECONCILER_ENABLED=true`, iteriert ein Background-Scheduler pro

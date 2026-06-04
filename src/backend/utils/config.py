@@ -493,6 +493,11 @@ class Settings(BaseSettings):
     kg_retrieval_threshold: float = Field(default=0.70, ge=0.0, le=1.0)         # Context retrieval threshold
     kg_max_entities_per_user: int = Field(default=5000, ge=10, le=50000)         # Max active entities per user
     kg_max_context_triples: int = Field(default=15, ge=1, le=50)                 # Max triples injected into prompt
+    # Graph-expansion retrieval (Phase 4, post-RRF) — opt-in, off = byte-identical
+    graph_expansion_enabled: bool = False                                       # Walk 1-2 hops from fused kg_node pivots (post-RRF in PolymorphicAtomStore)
+    graph_expansion_max_pivots: int = Field(default=8, ge=1, le=50)             # Max fused kg_node pivots to expand from
+    graph_expansion_max_hops: int = Field(default=2, ge=1, le=3)               # Traversal depth
+    graph_expansion_max_expanded: int = Field(default=15, ge=1, le=100)        # Cap on added neighbour atoms (hub-flood guard)
 
     # Document Upload
     upload_dir: str = "/app/data/uploads"
