@@ -172,7 +172,11 @@ class KgReconcilerService:
                     kg = KnowledgeGraphService(self.db)
                     res = await kg.merge_entities(c.loser_id, c.winner_id)
                     if res is not None:
+                        # track BOTH sides: a survivor must not be re-merged into
+                        # a third node later in this batch on stale (pre-merge)
+                        # pair data (transitive-cluster guard).
                         touched.add(c.loser_id)
+                        touched.add(c.winner_id)
                         report.auto_merged += 1
                 elif await self._propose(user_id, c):
                     touched.add(c.loser_id)

@@ -549,10 +549,14 @@ async def approve_merge_proposal(
     proposal_id: int,
     body: ApproveMergeRequest | None = None,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(Permission.KG_MANAGE)),
+    user: User = Depends(require_permission(Permission.KG_VIEW)),
 ):
     """Approve a pending proposal: merge into the survivor (tier=MIN), mark
-    approved. Optional body.winner_id overrides which entity survives (D2)."""
+    approved. Optional body.winner_id overrides which entity survives (D2).
+
+    KG_VIEW (not KG_MANAGE): proposals are the caller's OWN duplicates surfaced
+    in their /brain/review queue; ownership is enforced by _owned_pending_proposal.
+    KG_MANAGE (admin) would dead-end the queue for the household owners it serves."""
     await _owned_pending_proposal(db, proposal_id, user)
     survivor = await KgReconcilerService(db).approve_proposal(
         proposal_id, resolved_by=user.id,
@@ -567,9 +571,10 @@ async def approve_merge_proposal(
 async def reject_merge_proposal(
     proposal_id: int,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(Permission.KG_MANAGE)),
+    user: User = Depends(require_permission(Permission.KG_VIEW)),
 ):
-    """Reject a pending proposal (no merge; keeps both entities)."""
+    """Reject a pending proposal (no merge; keeps both entities). KG_VIEW +
+    ownership (see approve) — the owner resolves their own review queue."""
     await _owned_pending_proposal(db, proposal_id, user)
     ok = await KgReconcilerService(db).reject_proposal(proposal_id, resolved_by=user.id)
     if not ok:
@@ -580,10 +585,11 @@ async def reject_merge_proposal(
 @router.post("/reconciler/run", response_model=ReconcilerRunResponse)
 async def run_reconciler(
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(Permission.KG_MANAGE)),
+    user: User = Depends(require_permission(Permission.KG_VIEW)),
 ):
     """Trigger a reconciler pass over the caller's own entities (auto-merge
-    same-tier high-confidence dupes; queue cross-tier/gray-zone for review)."""
+    same-tier high-confidence dupes; queue cross-tier/gray-zone for review).
+    KG_VIEW: acts only on run_for_user(user.id) — the caller's own graph."""
     report = await KgReconcilerService(db).run_for_user(user.id)
     return ReconcilerRunResponse(
         candidates=report.candidates,
