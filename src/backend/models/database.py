@@ -948,8 +948,8 @@ class ConversationMemory(Base):
     circle_tier = Column(Integer, nullable=False, default=0)
 
     # --- Structured Memory (Phase 0/D9): subject attribution ---
-    # WHO the fact is ABOUT ("Jutta mag X" -> subject = the Jutta entity),
-    # distinct from user_id (the OWNER) and from the speaker. Closes the
+    # WHO the fact is ABOUT (a named person -> their entity), distinct from
+    # user_id (the OWNER) and from the speaker. Closes the
     # flat-memory conflation bug: retrieval can subject-filter instead of
     # relying on embedding neighborhood. subject_entity_id links to the
     # canonical KG entity when one resolves; subject_name carries the raw

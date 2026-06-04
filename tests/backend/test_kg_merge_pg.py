@@ -72,9 +72,9 @@ async def _active_relations(db, **where) -> list:
 class TestAbsorbAndTombstone:
     async def test_basic_absorb(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_a")
-        winner = await _entity(pg_db_session, owner, "Jutta", mention_count=12)
-        loser = await _entity(pg_db_session, owner, "Jutta Müller",
-                              surface_forms=["J.M."], entity_types=["person"], mention_count=3)
+        winner = await _entity(pg_db_session, owner, "Alice", mention_count=12)
+        loser = await _entity(pg_db_session, owner, "Alice Brown",
+                              surface_forms=["A.B."], entity_types=["person"], mention_count=3)
         svc = _svc(pg_db_session, monkeypatch)
 
         assert await svc.merge_entities(loser.id, winner.id) is not None
@@ -82,15 +82,15 @@ class TestAbsorbAndTombstone:
         assert loser.is_active is False
         assert loser.canonical_id == winner.id
         # loser.name + loser's surface forms folded into the survivor
-        assert "Jutta Müller" in winner.surface_forms
-        assert "J.M." in winner.surface_forms
-        assert "Jutta" not in winner.surface_forms  # own canonical name excluded
+        assert "Alice Brown" in winner.surface_forms
+        assert "A.B." in winner.surface_forms
+        assert "Alice" not in winner.surface_forms  # own canonical name excluded
         assert winner.entity_types == ["person"]
         assert winner.mention_count == 15
 
     async def test_idpair_noop(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_noop")
-        e = await _entity(pg_db_session, owner, "Jutta")
+        e = await _entity(pg_db_session, owner, "Alice")
         svc = _svc(pg_db_session, monkeypatch)
         assert await svc.merge_entities(e.id, e.id) is None
 
@@ -98,9 +98,9 @@ class TestAbsorbAndTombstone:
 class TestReparentRelations:
     async def test_relation_follows_to_winner(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_rel")
-        winner = await _entity(pg_db_session, owner, "Jutta")
-        loser = await _entity(pg_db_session, owner, "Jutta M.")
-        mj = await _entity(pg_db_session, owner, "Michael Jackson")
+        winner = await _entity(pg_db_session, owner, "Alice")
+        loser = await _entity(pg_db_session, owner, "Alice B.")
+        mj = await _entity(pg_db_session, owner, "Sam Star")
         await _relation(pg_db_session, owner, loser, "mag_musik_von", mj)
         svc = _svc(pg_db_session, monkeypatch)
 
@@ -112,9 +112,9 @@ class TestReparentRelations:
 
     async def test_duplicate_relations_deduped(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_dup")
-        winner = await _entity(pg_db_session, owner, "Jutta")
-        loser = await _entity(pg_db_session, owner, "Jutta M.")
-        mj = await _entity(pg_db_session, owner, "Michael Jackson")
+        winner = await _entity(pg_db_session, owner, "Alice")
+        loser = await _entity(pg_db_session, owner, "Alice B.")
+        mj = await _entity(pg_db_session, owner, "Sam Star")
         await _relation(pg_db_session, owner, winner, "mag_musik_von", mj)
         await _relation(pg_db_session, owner, loser, "mag_musik_von", mj)
         svc = _svc(pg_db_session, monkeypatch)
@@ -126,8 +126,8 @@ class TestReparentRelations:
 
     async def test_self_loop_removed(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_loop")
-        winner = await _entity(pg_db_session, owner, "Jutta")
-        loser = await _entity(pg_db_session, owner, "Jutta M.")
+        winner = await _entity(pg_db_session, owner, "Alice")
+        loser = await _entity(pg_db_session, owner, "Alice B.")
         # an edge winner -> loser becomes a self-loop after the merge
         await _relation(pg_db_session, owner, winner, "ist", loser)
         svc = _svc(pg_db_session, monkeypatch)
@@ -141,8 +141,8 @@ class TestReparentRelations:
 class TestTierInvariant:
     async def test_survivor_tier_is_min_and_cascades(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_tier")
-        winner = await _entity(pg_db_session, owner, "Jutta", tier=2)   # household
-        loser = await _entity(pg_db_session, owner, "Jutta M.", tier=0)  # self
+        winner = await _entity(pg_db_session, owner, "Alice", tier=2)   # household
+        loser = await _entity(pg_db_session, owner, "Alice B.", tier=0)  # self
         other = await _entity(pg_db_session, owner, "Bonn", tier=2, etype="place")
         await _relation(pg_db_session, owner, loser, "wohnt_in", other, tier=0)
         svc = _svc(pg_db_session, monkeypatch)
@@ -159,9 +159,9 @@ class TestTierInvariant:
 class TestMemorySubjectFollows:
     async def test_subject_entity_repointed(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_mem")
-        winner = await _entity(pg_db_session, owner, "Jutta")
-        loser = await _entity(pg_db_session, owner, "Jutta M.")
-        mem = ConversationMemory(user_id=owner.id, content="Jutta mag X",
+        winner = await _entity(pg_db_session, owner, "Alice")
+        loser = await _entity(pg_db_session, owner, "Alice B.")
+        mem = ConversationMemory(user_id=owner.id, content="Alice mag X",
                                  category="fact", circle_tier=0, subject_entity_id=loser.id)
         pg_db_session.add(mem)
         await pg_db_session.flush()
@@ -178,8 +178,8 @@ class TestMemorySubjectFollows:
 class TestGuardsAndIsolation:
     async def test_second_merge_is_skipped(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_guard")
-        winner = await _entity(pg_db_session, owner, "Jutta", mention_count=10)
-        loser = await _entity(pg_db_session, owner, "Jutta M.", mention_count=5)
+        winner = await _entity(pg_db_session, owner, "Alice", mention_count=10)
+        loser = await _entity(pg_db_session, owner, "Alice B.", mention_count=5)
         svc = _svc(pg_db_session, monkeypatch)
 
         assert await svc.merge_entities(loser.id, winner.id) is not None
@@ -191,8 +191,8 @@ class TestGuardsAndIsolation:
     async def test_cross_user_refused(self, pg_db_session, monkeypatch):
         a = await _make_user(pg_db_session, "mg_u_a")
         b = await _make_user(pg_db_session, "mg_u_b")
-        winner = await _entity(pg_db_session, a, "Jutta")
-        loser = await _entity(pg_db_session, b, "Jutta")
+        winner = await _entity(pg_db_session, a, "Alice")
+        loser = await _entity(pg_db_session, b, "Alice")
         svc = _svc(pg_db_session, monkeypatch)
 
         assert await svc.merge_entities(loser.id, winner.id) is None

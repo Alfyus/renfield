@@ -53,35 +53,35 @@ def _svc(db, monkeypatch, *, embed=None) -> KnowledgeGraphService:
 class TestExactAndSurfaceForm:
     async def test_exact_name_bumps_existing(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rc_exact")
-        ent = await _entity(pg_db_session, owner, "Jutta", mention_count=1)
+        ent = await _entity(pg_db_session, owner, "Alice", mention_count=1)
         svc = _svc(pg_db_session, monkeypatch)
 
-        got = await svc.resolve_entity("Jutta", "person", owner.id)
+        got = await svc.resolve_entity("Alice", "person", owner.id)
 
         assert got.id == ent.id
         assert got.mention_count == 2  # bumped, no new row
 
     async def test_surface_form_match(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rc_sf")
-        canon = await _entity(pg_db_session, owner, "Jutta",
-                              surface_forms=["Jutta Müller"], mention_count=4)
+        canon = await _entity(pg_db_session, owner, "Alice",
+                              surface_forms=["Alice Brown"], mention_count=4)
         svc = _svc(pg_db_session, monkeypatch)
 
-        # "Jutta Müller" has no exact-name row, but it's a known surface form.
-        got = await svc.resolve_entity("Jutta Müller", "person", owner.id)
+        # "Alice Brown" has no exact-name row, but it's a known surface form.
+        got = await svc.resolve_entity("Alice Brown", "person", owner.id)
 
         assert got.id == canon.id
         assert got.mention_count == 5
 
     async def test_pointer_chase_skips_tombstone(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rc_ptr")
-        live = await _entity(pg_db_session, owner, "Jutta", mention_count=2)
+        live = await _entity(pg_db_session, owner, "Alice", mention_count=2)
         # a merge tombstone with the SAME name must never be returned
-        await _entity(pg_db_session, owner, "Jutta", mention_count=9,
+        await _entity(pg_db_session, owner, "Alice", mention_count=9,
                       is_active=False, canonical_id=live.id)
         svc = _svc(pg_db_session, monkeypatch)
 
-        got = await svc.resolve_entity("Jutta", "person", owner.id)
+        got = await svc.resolve_entity("Alice", "person", owner.id)
         assert got.id == live.id
 
 

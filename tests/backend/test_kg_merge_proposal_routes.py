@@ -21,7 +21,7 @@ pytestmark = pytest.mark.unit
 
 class TestMergeProposalSchemas:
     def test_entity_brief_defaults(self):
-        b = MergeProposalEntityBrief(id=1, name="Jutta", entity_type="person")
+        b = MergeProposalEntityBrief(id=1, name="Alice", entity_type="person")
         assert b.circle_tier == 0
         assert b.mention_count == 1
         assert b.surface_forms == []
@@ -30,10 +30,10 @@ class TestMergeProposalSchemas:
         r = MergeProposalResponse(
             id=7, similarity=0.91, reason="cross_tier", status="pending",
             created_at="2026-06-04T00:00:00",
-            loser=MergeProposalEntityBrief(id=1, name="Jutta", entity_type="person",
+            loser=MergeProposalEntityBrief(id=1, name="Alice", entity_type="person",
                                            circle_tier=0, mention_count=2,
                                            surface_forms=["J."]),
-            winner=MergeProposalEntityBrief(id=2, name="Jutta Müller", entity_type="person",
+            winner=MergeProposalEntityBrief(id=2, name="Alice Brown", entity_type="person",
                                             circle_tier=2, mention_count=9),
         )
         assert r.reason == "cross_tier"

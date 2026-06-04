@@ -81,8 +81,8 @@ class TestFindPairs:
     async def test_finds_similar_pair_and_picks_winner(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_find")
         # identical embeddings -> cosine ~1.0; b has more mentions -> winner
-        await _entity(pg_db_session, owner, "Jutta", mention=2, emb=_unit(5))
-        big = await _entity(pg_db_session, owner, "Jutta M.", mention=9, emb=_unit(5))
+        await _entity(pg_db_session, owner, "Alice", mention=2, emb=_unit(5))
+        big = await _entity(pg_db_session, owner, "Alice B.", mention=9, emb=_unit(5))
         rec = _recon(pg_db_session, monkeypatch)
 
         pairs = await rec.find_duplicate_pairs(owner.id)
@@ -93,8 +93,8 @@ class TestFindPairs:
 class TestRunForUser:
     async def test_same_tier_high_sim_auto_merges(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_auto")
-        a = await _entity(pg_db_session, owner, "Jutta", tier=0, mention=2, emb=_unit(6))
-        b = await _entity(pg_db_session, owner, "Jutta M.", tier=0, mention=9, emb=_unit(6))
+        a = await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
+        b = await _entity(pg_db_session, owner, "Alice B.", tier=0, mention=9, emb=_unit(6))
         rec = _recon(pg_db_session, monkeypatch)
 
         report = await rec.run_for_user(owner.id)
@@ -109,8 +109,8 @@ class TestRunForUser:
 
     async def test_cross_tier_proposes_not_merges(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_cross")
-        a = await _entity(pg_db_session, owner, "Jutta", tier=0, mention=2, emb=_unit(6))
-        b = await _entity(pg_db_session, owner, "Jutta M.", tier=2, mention=9, emb=_unit(6))
+        a = await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
+        b = await _entity(pg_db_session, owner, "Alice B.", tier=2, mention=9, emb=_unit(6))
         rec = _recon(pg_db_session, monkeypatch)
 
         report = await rec.run_for_user(owner.id)
@@ -126,8 +126,8 @@ class TestRunForUser:
 
     async def test_gray_zone_same_tier_proposes(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_gray")
-        await _entity(pg_db_session, owner, "Jutta", tier=0, mention=2, emb=_unit(0))
-        await _entity(pg_db_session, owner, "Jutta M.", tier=0, mention=9, emb=_gray())
+        await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(0))
+        await _entity(pg_db_session, owner, "Alice B.", tier=0, mention=9, emb=_gray())
         rec = _recon(pg_db_session, monkeypatch)
 
         report = await rec.run_for_user(owner.id)
@@ -137,8 +137,8 @@ class TestRunForUser:
 
     async def test_idempotent_second_run_no_new_proposals(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_idem")
-        await _entity(pg_db_session, owner, "Jutta", tier=0, mention=2, emb=_unit(6))
-        await _entity(pg_db_session, owner, "Jutta M.", tier=2, mention=9, emb=_unit(6))
+        await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
+        await _entity(pg_db_session, owner, "Alice B.", tier=2, mention=9, emb=_unit(6))
         rec = _recon(pg_db_session, monkeypatch)
 
         r1 = await rec.run_for_user(owner.id)
@@ -151,8 +151,8 @@ class TestRunForUser:
 class TestApproveReject:
     async def test_approve_merges_and_marks(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_appr")
-        a = await _entity(pg_db_session, owner, "Jutta", tier=0, mention=2, emb=_unit(6))
-        b = await _entity(pg_db_session, owner, "Jutta M.", tier=2, mention=9, emb=_unit(6))
+        a = await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
+        b = await _entity(pg_db_session, owner, "Alice B.", tier=2, mention=9, emb=_unit(6))
         rec = _recon(pg_db_session, monkeypatch)
         await rec.run_for_user(owner.id)
         pid = (await pg_db_session.execute(
@@ -172,8 +172,8 @@ class TestApproveReject:
 
     async def test_reject_marks_no_merge(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_rej")
-        a = await _entity(pg_db_session, owner, "Jutta", tier=0, mention=2, emb=_unit(6))
-        await _entity(pg_db_session, owner, "Jutta M.", tier=2, mention=9, emb=_unit(6))
+        a = await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
+        await _entity(pg_db_session, owner, "Alice B.", tier=2, mention=9, emb=_unit(6))
         rec = _recon(pg_db_session, monkeypatch)
         await rec.run_for_user(owner.id)
         pid = (await pg_db_session.execute(
