@@ -573,6 +573,17 @@ class ConversationMemoryService:
                 logger.debug(f"Skipping extracted memory with invalid category: {category}")
                 continue
 
+            # Phase 3-subsume (opt-in): a decomposable fact about a named subject
+            # lives in the KG (entities + relations, extracted by the KG hook on
+            # the SAME turn), so don't also store a flat duplicate. Preferences/
+            # instructions/context/procedural stay flat (their object is often not
+            # a named entity). Off (default) => unchanged. Aggressive: enable only
+            # once KG capture of facts is validated, else a fact whose object is
+            # not a named entity is lost.
+            if settings.memory_subsume_to_kg and category == MEMORY_CATEGORY_FACT and subject:
+                logger.debug(f"📥 Subsuming fact to KG (skip flat memory): subject={subject!r}")
+                continue
+
             # Clamp importance to valid range
             try:
                 importance = max(0.1, min(1.0, float(importance)))
