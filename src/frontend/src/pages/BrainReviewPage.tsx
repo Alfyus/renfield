@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Inbox, Calendar } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import LensFrame from '../components/wissen/LensFrame';
+import MergeProposalsSection from '../components/MergeProposalsSection';
 import Alert from '../components/Alert';
 import Badge from '../components/Badge';
 import type { BadgeColor } from '../components/Badge';
@@ -92,6 +93,9 @@ export default function BrainReviewPage() {
 
       {displayError && <Alert variant="error" onClose={() => setError(null)}>{displayError}</Alert>}
       {success && <Alert variant="success">{success}</Alert>}
+
+      {/* D7: merge-proposal review queue, above the per-atom tier review list */}
+      <MergeProposalsSection />
 
       <div className="flex items-center gap-3">
         <Calendar className="w-4 h-4 text-gray-500" aria-hidden="true" />

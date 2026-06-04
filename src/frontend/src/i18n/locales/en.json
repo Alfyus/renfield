@@ -1203,6 +1203,24 @@
     "reviewDaysLabel": "Window",
     "reviewEmpty": "No new atoms to review.",
     "reviewTierChanged": "Tier updated.",
+    "mergeProposals": {
+      "sectionTitle": "Merge suggestions",
+      "whySuggested": "Possible duplicate · {{pct}}% similarity",
+      "reason": {
+        "cross_tier": "different visibility",
+        "gray_zone": "similar but uncertain"
+      },
+      "survivorLegend": "Which entity should remain?",
+      "keepThis": "Keep {{name}}",
+      "mentions_one": "{{count}} mention",
+      "mentions_other": "{{count}} mentions",
+      "willMerge": "merges into",
+      "visibilityWarning": "Note: visibility changes from {{from}} to {{to}}",
+      "merge": "Merge",
+      "reject": "Reject",
+      "merged": "Merged",
+      "undo": "Undo"
+    },
     "settingsTitle": "Circles & Members",
     "settingsSubtitle": "Manage your tiers and who is invited into each.",
     "defaultCaptureTier": "Default capture tier",

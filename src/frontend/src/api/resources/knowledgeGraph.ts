@@ -272,3 +272,91 @@ export function useUpdateKgRelation() {
     'common.error',
   );
 }
+
+// ---------------------------------------------------------------------------
+// Merge-proposal review queue (Structured Memory Phase 1/2, T5/T9-12, D3)
+// ---------------------------------------------------------------------------
+
+export interface MergeProposalEntityBrief {
+  id: number;
+  name: string;
+  entity_type: string;
+  circle_tier: number;
+  mention_count: number;
+  surface_forms: string[];
+}
+
+export interface MergeProposal {
+  id: number;
+  similarity: number;
+  reason: string; // 'cross_tier' | 'gray_zone'
+  status: string;
+  created_at: string;
+  loser: MergeProposalEntityBrief;
+  winner: MergeProposalEntityBrief;
+}
+
+async function fetchMergeProposals(): Promise<MergeProposal[]> {
+  const response = await apiClient.get<{ proposals: MergeProposal[]; total: number }>(
+    '/api/knowledge-graph/merge-proposals',
+  );
+  return response.data.proposals;
+}
+
+async function approveMergeProposalRequest(input: { id: number; winnerId?: number }): Promise<void> {
+  await apiClient.post(
+    `/api/knowledge-graph/merge-proposals/${input.id}/approve`,
+    input.winnerId != null ? { winner_id: input.winnerId } : {},
+  );
+}
+
+async function rejectMergeProposalRequest(id: number): Promise<void> {
+  await apiClient.post(`/api/knowledge-graph/merge-proposals/${id}/reject`, {});
+}
+
+export interface ReconcilerRunResult {
+  candidates: number;
+  auto_merged: number;
+  proposed: number;
+}
+
+async function runReconcilerRequest(): Promise<ReconcilerRunResult> {
+  const response = await apiClient.post<ReconcilerRunResult>('/api/knowledge-graph/reconciler/run', {});
+  return response.data;
+}
+
+export function useMergeProposalsQuery(enabled = true) {
+  return useApiQuery(
+    {
+      queryKey: keys.knowledgeGraph.mergeProposals(),
+      queryFn: fetchMergeProposals,
+      staleTime: STALE.DEFAULT,
+      enabled,
+    },
+    'knowledgeGraph.couldNotLoad',
+  );
+}
+
+export function useApproveMergeProposal() {
+  const queryClient = useQueryClient();
+  return useApiMutation(
+    { mutationFn: approveMergeProposalRequest, onSuccess: () => invalidateKg(queryClient) },
+    'common.error',
+  );
+}
+
+export function useRejectMergeProposal() {
+  const queryClient = useQueryClient();
+  return useApiMutation(
+    { mutationFn: rejectMergeProposalRequest, onSuccess: () => invalidateKg(queryClient) },
+    'common.error',
+  );
+}
+
+export function useRunReconciler() {
+  const queryClient = useQueryClient();
+  return useApiMutation(
+    { mutationFn: runReconcilerRequest, onSuccess: () => invalidateKg(queryClient) },
+    'common.error',
+  );
+}
