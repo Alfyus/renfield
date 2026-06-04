@@ -41,6 +41,28 @@ from utils.config import settings
 _RECONCILER_LOCK_NS = 0x4B47  # "KG"
 
 
+def _norm(s: str | None) -> str:
+    return (s or "").strip().lower()
+
+
+def _name_collision_low_signal(
+    name_a: str | None, name_b: str | None,
+    desc_a: str | None, desc_b: str | None,
+) -> bool:
+    """True when a candidate pair shares a name but lacks signal to tell them apart.
+
+    Same normalized name + (either description empty OR identical descriptions) =>
+    the embedding match is essentially a name match, which cannot distinguish two
+    different real entities that happen to share a name. Such pairs must go to
+    owner review, never auto-merge (Phase 3 P3-T2). When BOTH sides carry distinct
+    non-empty descriptions the similarity is meaningful, so auto-merge stays allowed.
+    """
+    if _norm(name_a) != _norm(name_b):
+        return False
+    da, db = _norm(desc_a), _norm(desc_b)
+    return (not da) or (not db) or (da == db)
+
+
 @dataclass
 class MergeCandidate:
     loser_id: int
@@ -48,6 +70,13 @@ class MergeCandidate:
     similarity: float
     loser_tier: int
     winner_tier: int
+    # Same canonical name + weak disambiguating signal (a missing or identical
+    # description on either side). The embedding similarity is then driven almost
+    # entirely by the shared name, so two genuinely different people ("Anna" the
+    # mother vs "Anna" the friend) look like a dupe. Never auto-merge these —
+    # route to owner review — else the memory↔entity bridge's backfill would feed
+    # the Jutta/Anna conflation back through the reconciler (Phase 3 P3-T2).
+    block_auto_merge: bool = False
 
 
 @dataclass
@@ -88,6 +117,8 @@ class KgReconcilerService:
                    a.circle_tier AS tier_a, b.circle_tier AS tier_b,
                    a.mention_count AS mc_a, b.mention_count AS mc_b,
                    a.first_seen_at AS fs_a, b.first_seen_at AS fs_b,
+                   a.name AS name_a, b.name AS name_b,
+                   a.description AS desc_a, b.description AS desc_b,
                    1 - (a.embedding::halfvec({dim}) <=> b.embedding::halfvec({dim})) AS similarity
             FROM kg_entities a
             JOIN kg_entities b
@@ -130,6 +161,9 @@ class KgReconcilerService:
                 loser_id=loser_id, winner_id=winner_id,
                 similarity=float(r.similarity),
                 loser_tier=loser_tier, winner_tier=winner_tier,
+                block_auto_merge=_name_collision_low_signal(
+                    r.name_a, r.name_b, r.desc_a, r.desc_b,
+                ),
             ))
         return out
 
@@ -255,7 +289,7 @@ class KgReconcilerService:
             if c.loser_id in touched or c.winner_id in touched:
                 continue  # transitive-cluster guard
             try:
-                if c.loser_tier == c.winner_tier and c.similarity >= auto_t:
+                if c.loser_tier == c.winner_tier and c.similarity >= auto_t and not c.block_auto_merge:
                     kg = KnowledgeGraphService(self.db)
                     res = await kg.merge_entities(c.loser_id, c.winner_id)
                     if res is not None:

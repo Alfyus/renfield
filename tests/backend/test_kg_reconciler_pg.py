@@ -57,9 +57,9 @@ async def _make_user(db: AsyncSession, name: str) -> User:
     return u
 
 
-async def _entity(db, owner, name, *, tier=0, mention=1, emb=None, etype="person") -> KGEntity:
+async def _entity(db, owner, name, *, tier=0, mention=1, emb=None, etype="person", desc=None) -> KGEntity:
     e = KGEntity(user_id=owner.id, name=name, entity_type=etype, circle_tier=tier,
-                 mention_count=mention, embedding=emb)
+                 mention_count=mention, embedding=emb, description=desc)
     db.add(e)
     await db.flush()
     return e
@@ -108,6 +108,35 @@ class TestRunForUser:
             select(KGEntity).where(KGEntity.id == loser.id)
         )).scalar_one()
         assert tomb.is_active is False and tomb.canonical_id is not None
+
+    async def test_same_name_low_signal_proposes_not_merges(self, pg_db_session, monkeypatch):
+        # P3-T2: two same-tier entities sharing a name with empty descriptions are
+        # high-similarity but indistinguishable (could be two different people).
+        # They must NOT auto-merge — route to review — else the memory bridge's
+        # backfill would feed the Jutta/Anna conflation back through the reconciler.
+        owner = await _make_user(pg_db_session, "rec_namecol")
+        await _entity(pg_db_session, owner, "Anna", tier=0, mention=2, emb=_unit(6))
+        await _entity(pg_db_session, owner, "Anna", tier=0, mention=9, emb=_unit(6))
+        rec = _recon(pg_db_session, monkeypatch)
+
+        report = await rec.run_for_user(owner.id)
+        assert report.auto_merged == 0   # blocked
+        assert report.proposed == 1      # routed to owner review instead
+        assert await _count_pending(pg_db_session, owner.id) == 1
+
+    async def test_same_name_distinct_descriptions_still_auto_merges(self, pg_db_session, monkeypatch):
+        # Control: same name BUT both sides carry distinct non-empty descriptions,
+        # so the embedding similarity is meaningful — auto-merge stays allowed.
+        owner = await _make_user(pg_db_session, "rec_namedesc")
+        await _entity(pg_db_session, owner, "Anna", tier=0, mention=2, emb=_unit(6),
+                      desc="meine Mutter, wohnt in Bonn")
+        await _entity(pg_db_session, owner, "Anna", tier=0, mention=9, emb=_unit(6),
+                      desc="Kollegin im Büro")
+        rec = _recon(pg_db_session, monkeypatch)
+
+        report = await rec.run_for_user(owner.id)
+        assert report.auto_merged == 1
+        assert report.proposed == 0
 
     async def test_cross_tier_proposes_not_merges(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_cross")

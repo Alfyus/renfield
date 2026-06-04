@@ -130,3 +130,65 @@ class TestCreateNew:
         got = await svc.resolve_entity("Quux", "spaceship", owner.id)
         assert got.entity_type == "thing"
         assert got.entity_types == ["thing"]
+
+
+class TestPhase3CreateTier:
+    async def test_create_tier_honored(self, pg_db_session, monkeypatch):
+        # Phase 3: a backfilled household (tier 2) fact must mint a tier-2 entity,
+        # not the legacy hardcoded tier-0.
+        owner = await _make_user(pg_db_session, "rc_ct")
+        svc = _svc(pg_db_session, monkeypatch, embed=_vec(40))
+        got = await svc.resolve_entity("Hausmeister", "person", owner.id, create_tier=2)
+        assert got.id is not None and got.circle_tier == 2
+
+    async def test_create_tier_clamped(self, pg_db_session, monkeypatch):
+        owner = await _make_user(pg_db_session, "rc_clamp")
+        svc = _svc(pg_db_session, monkeypatch, embed=_vec(41))
+        got = await svc.resolve_entity("Out", "person", owner.id, create_tier=99)
+        assert got.circle_tier == 4  # clamped to the top of the 0..4 ladder
+
+    async def test_create_tier_scopes_embedding_search(self, pg_db_session, monkeypatch):
+        # An identical-embedding candidate at tier 0 must NOT be folded into when
+        # create_tier=2 (same-tier guard now keyed on create_tier) -> new tier-2 row.
+        owner = await _make_user(pg_db_session, "rc_ct_emb")
+        t0 = await _entity(pg_db_session, owner, "Bonn", tier=0, etype="place", embedding=_vec(42))
+        svc = _svc(pg_db_session, monkeypatch, embed=_vec(42))  # cosine 1.0
+        got = await svc.resolve_entity("Bnn", "place", owner.id, create_tier=2)
+        assert got.id != t0.id and got.circle_tier == 2
+
+
+class TestPhase3MatchEntityType:
+    async def test_exact_name_wrong_type_skipped_when_scoped(self, pg_db_session, monkeypatch):
+        # A "Bella" PLACE must not absorb a "Bella" PERSON resolve when type-scoped.
+        owner = await _make_user(pg_db_session, "rc_mt_exact")
+        place = await _entity(pg_db_session, owner, "Bella", tier=0, etype="place")
+        svc = _svc(pg_db_session, monkeypatch, embed=_vec(50))
+
+        scoped = await svc.resolve_entity("Bella", "person", owner.id, match_entity_type=True)
+        assert scoped.id != place.id and scoped.entity_type == "person"
+
+    async def test_exact_name_matches_cross_type_by_default(self, pg_db_session, monkeypatch):
+        # Control: without the flag, resolution stays type-blind (legacy behavior).
+        owner = await _make_user(pg_db_session, "rc_mt_default")
+        place = await _entity(pg_db_session, owner, "Bella", tier=0, etype="place")
+        svc = _svc(pg_db_session, monkeypatch, embed=_vec(51))
+
+        got = await svc.resolve_entity("Bella", "person", owner.id)  # no flag
+        assert got.id == place.id and got.entity_type == "place"  # matched the place
+
+    async def test_surface_form_wrong_type_skipped_when_scoped(self, pg_db_session, monkeypatch):
+        owner = await _make_user(pg_db_session, "rc_mt_sf")
+        place = await _entity(pg_db_session, owner, "Bonn", tier=0, etype="place",
+                              surface_forms=["Beuel"])
+        svc = _svc(pg_db_session, monkeypatch, embed=_vec(52))
+
+        scoped = await svc.resolve_entity("Beuel", "person", owner.id, match_entity_type=True)
+        assert scoped.id != place.id and scoped.entity_type == "person"
+
+    async def test_embedding_wrong_type_skipped_when_scoped(self, pg_db_session, monkeypatch):
+        owner = await _make_user(pg_db_session, "rc_mt_emb")
+        place = await _entity(pg_db_session, owner, "Bella", tier=0, etype="place", embedding=_vec(53))
+        svc = _svc(pg_db_session, monkeypatch, embed=_vec(53))  # cosine 1.0, same tier
+
+        scoped = await svc.resolve_entity("Bella2", "person", owner.id, match_entity_type=True)
+        assert scoped.id != place.id and scoped.entity_type == "person"
