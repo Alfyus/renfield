@@ -189,3 +189,23 @@ class TestApproveReject:
             select(KGEntity).where(KGEntity.id == a.id)
         )).scalar_one()
         assert loser.is_active is True  # rejection does not merge
+
+    async def test_approve_override_winner(self, pg_db_session, monkeypatch):
+        # D2 survivor toggle: owner keeps the LESS-mentioned entity instead of
+        # the reconciler's default (more-mentioned) winner.
+        owner = await _make_user(pg_db_session, "rec_swap")
+        a = await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
+        b = await _entity(pg_db_session, owner, "Alice B.", tier=2, mention=9, emb=_unit(6))
+        rec = _recon(pg_db_session, monkeypatch)
+        await rec.run_for_user(owner.id)
+        pid = (await pg_db_session.execute(
+            select(KgMergeProposal.id).where(KgMergeProposal.user_id == owner.id)
+        )).scalar_one()
+
+        # default winner is b (more mentions); override to keep a
+        survivor = await rec.approve_proposal(pid, resolved_by=owner.id, winner_id=a.id)
+        assert survivor is not None and survivor.id == a.id
+        b_row = (await pg_db_session.execute(
+            select(KGEntity).where(KGEntity.id == b.id)
+        )).scalar_one()
+        assert b_row.is_active is False  # b became the loser

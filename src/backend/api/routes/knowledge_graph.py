@@ -24,6 +24,7 @@ from api.routes.knowledge_graph_schemas import (
     MergeEntitiesRequest,
     MergeProposalEntityBrief,
     MergeProposalResponse,
+    ApproveMergeRequest,
     MergeProposalsListResponse,
     ReconcilerRunResponse,
     RelationCreate,
@@ -546,12 +547,17 @@ async def list_merge_proposals(
 @router.post("/merge-proposals/{proposal_id}/approve", response_model=EntityResponse)
 async def approve_merge_proposal(
     proposal_id: int,
+    body: ApproveMergeRequest | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_permission(Permission.KG_MANAGE)),
 ):
-    """Approve a pending proposal: merge loser -> winner (tier=MIN), mark approved."""
+    """Approve a pending proposal: merge into the survivor (tier=MIN), mark
+    approved. Optional body.winner_id overrides which entity survives (D2)."""
     await _owned_pending_proposal(db, proposal_id, user)
-    survivor = await KgReconcilerService(db).approve_proposal(proposal_id, resolved_by=user.id)
+    survivor = await KgReconcilerService(db).approve_proposal(
+        proposal_id, resolved_by=user.id,
+        winner_id=body.winner_id if body else None,
+    )
     if survivor is None:
         raise HTTPException(status_code=409, detail="Proposal already resolved or merge was a no-op")
     return _entity_to_response(survivor)

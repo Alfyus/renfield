@@ -191,8 +191,17 @@ class KgReconcilerService:
             )
         return report
 
-    async def approve_proposal(self, proposal_id: int, resolved_by: int | None = None) -> KGEntity | None:
+    async def approve_proposal(
+        self,
+        proposal_id: int,
+        resolved_by: int | None = None,
+        winner_id: int | None = None,
+    ) -> KGEntity | None:
         """Apply a pending proposal: merge loser -> winner, mark approved.
+
+        ``winner_id`` lets the owner override which side survives (D2 survivor
+        toggle): pass the entity id to keep. It must be one of the proposal's two
+        entities; the other becomes the loser. Defaults to the stored winner.
 
         Returns the surviving entity, or None if the proposal is missing/already
         resolved or the merge was a no-op.
@@ -202,9 +211,13 @@ class KgReconcilerService:
         )).scalar_one_or_none()
         if p is None or p.status != KG_MERGE_PROPOSAL_PENDING:
             return None
-        survivor = await KnowledgeGraphService(self.db).merge_entities(
-            p.loser_entity_id, p.winner_entity_id
-        )
+        pair = {p.loser_entity_id, p.winner_entity_id}
+        if winner_id is not None and winner_id in pair:
+            keep = winner_id
+        else:
+            keep = p.winner_entity_id  # default / invalid override -> stored winner
+        drop = (pair - {keep}).pop()
+        survivor = await KnowledgeGraphService(self.db).merge_entities(drop, keep)
         # merge_entities commits; re-load the proposal in the fresh txn to mark it.
         p = (await self.db.execute(
             select(KgMergeProposal).where(KgMergeProposal.id == proposal_id)

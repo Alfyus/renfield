@@ -171,3 +171,9 @@ class ReconcilerRunResponse(BaseModel):
     auto_merged: int
     proposed: int
     notes: list[str] = Field(default_factory=list)
+
+
+class ApproveMergeRequest(BaseModel):
+    # Optional owner override of which entity survives (D2 survivor toggle).
+    # Must be one of the proposal's two entity ids; None = stored winner.
+    winner_id: int | None = None
