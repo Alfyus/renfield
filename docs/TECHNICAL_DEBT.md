@@ -206,7 +206,7 @@ Optional: Eine kurze Notiz im neuen `CONTRIBUTING.md`-Abschnitt zu Alembic-Best-
 
 **Aufwand:** ~1–2 h für run-at-boot inkl. Tests; ~halber Tag für die persistierte Catch-up-Variante.
 
-**Tracking:** Eigenes Issue; betrifft alle `_spawn_periodic_task`-Aufrufer mit Intervall ≳ erwarteter Pod-Lebensdauer.
+**Tracking:** [#678](https://github.com/ebongard/renfield/issues/678); betrifft alle `_spawn_periodic_task`-Aufrufer mit Intervall ≳ erwarteter Pod-Lebensdauer.
 
 ---
 
