@@ -5,6 +5,7 @@ import { X, ArrowRight } from 'lucide-react';
 import type { AtomMatch, DocumentFact, FactSource } from '../../api/resources/brain';
 import { usePatchAtomTier } from '../../api/resources/brain';
 import { useUpdateKgEntityTier } from '../../api/resources/knowledgeGraph';
+import { useMemoriesBySubjectQuery } from '../../api/resources/memories';
 import TierPicker from '../TierPicker';
 import type { CircleTier } from '../TierBadge';
 import FaktenPanel from '../knowledge/FaktenPanel';
@@ -170,6 +171,11 @@ export default function WissenDetailDrawer({ atom, onClose }: WissenDetailDrawer
         {atom_type === 'conversation_memory' && (
           <div className="space-y-1">
             <p className="text-gray-700 dark:text-gray-200">{str(payload.content) || atom.snippet}</p>
+            {payload.subject_name != null && (
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                {t('memory.subjectLabel', { name: str(payload.subject_name) })}
+              </p>
+            )}
             {payload.category != null && (
               <p className="text-xs text-gray-500 dark:text-gray-400">{str(payload.category)}</p>
             )}
@@ -183,6 +189,9 @@ export default function WissenDetailDrawer({ atom, onClose }: WissenDetailDrawer
             )}
             {num(payload.entity_id) != null && (
               <LensLink to={`/wissen/graph?focus=${num(payload.entity_id)}`} label={t('lens.detail.openInGraph')} />
+            )}
+            {num(payload.entity_id) != null && (
+              <EntityMemories entityId={num(payload.entity_id) as number} />
             )}
           </div>
         )}
@@ -228,6 +237,28 @@ function DocContent({ payload }: { payload: Record<string, unknown> }) {
           <LensLink to={`/wissen/dokumente?doc=${docId}`} label={t('lens.detail.openInDocs')} />
         </>
       )}
+    </div>
+  );
+}
+
+/** Phase 3c: "Erinnerungen über diesen Knoten" — memories linked to a KG entity. */
+function EntityMemories({ entityId }: { entityId: number }) {
+  const { t } = useTranslation();
+  const { data, isLoading } = useMemoriesBySubjectQuery(entityId);
+  const memories = data?.memories ?? [];
+  if (isLoading || memories.length === 0) return null;
+  return (
+    <div className="pt-2 mt-2 border-t border-gray-100 dark:border-gray-700/60">
+      <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">
+        {t('memory.aboutThisEntity')}
+      </p>
+      <ul className="space-y-1">
+        {memories.map((m) => (
+          <li key={m.id} className="text-sm text-gray-700 dark:text-gray-200 line-clamp-2">
+            {m.content}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

@@ -7,6 +7,7 @@ import {
   Edit3,
   Eye,
   Calendar,
+  User,
 } from 'lucide-react';
 import Modal from '../components/Modal';
 import PageHeader from '../components/PageHeader';
@@ -205,9 +206,20 @@ export default function MemoryPage() {
               className="group card hover:shadow-md transition-shadow"
             >
               <div className="flex items-start justify-between mb-2">
-                <Badge color={CATEGORY_BADGE_COLORS[memory.category] || 'gray'}>
-                  {t(`memory.categories.${memory.category}`)}
-                </Badge>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Badge color={CATEGORY_BADGE_COLORS[memory.category] || 'gray'}>
+                    {t(`memory.categories.${memory.category}`)}
+                  </Badge>
+                  {memory.subject_name && (
+                    <span
+                      className="inline-flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400"
+                      title={t('memory.subjectLabel', { name: memory.subject_name })}
+                    >
+                      <User className="w-3 h-3" />
+                      <span className="truncate max-w-[8rem]">{memory.subject_name}</span>
+                    </span>
+                  )}
+                </div>
                 <div className="flex items-center space-x-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
                   <button
                     onClick={() => openEditModal(memory)}

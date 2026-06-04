@@ -531,6 +531,8 @@
     "noMemories": "Noch keine Erinnerungen vorhanden",
     "count": "{{count}} Erinnerungen",
     "couldNotLoad": "Erinnerungen konnten nicht geladen werden",
+    "subjectLabel": "Über: {{name}}",
+    "aboutThisEntity": "Erinnerungen über diesen Knoten",
     "content": "Inhalt",
     "importance": "Wichtigkeit",
     "accessCount": "Zugriffe",
