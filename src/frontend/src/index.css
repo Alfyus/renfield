@@ -269,10 +269,10 @@
 
 @utility merge-proposal-card {
   /* Owner review card for a proposed entity merge — warm card holding the
-     two-column compare. Entrance via the existing motion token (reduced-motion
-     already wired for it). */
+     two-column compare. Entrance animation is applied via the plain
+     `animate-fade-slide-in` class on the element (see MergeProposalCard.tsx) —
+     it is a CSS class, not a Tailwind utility, so it can't go through @apply. */
   @apply rounded-lg border border-gray-200 bg-white p-4 shadow-sm
-         animate-fade-slide-in
          dark:bg-gray-800 dark:border-gray-700;
 }
 

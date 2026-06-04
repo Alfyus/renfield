@@ -81,7 +81,7 @@ export default function MergeProposalCard({ proposal, onApprove, onReject, busy 
   };
 
   return (
-    <li className="merge-proposal-card flex flex-col gap-3">
+    <li className="merge-proposal-card animate-fade-slide-in flex flex-col gap-3">
       <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
         <GitMerge className="w-4 h-4" aria-hidden="true" />
         <span>{t('circles.mergeProposals.whySuggested', { pct })}</span>
