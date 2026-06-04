@@ -165,6 +165,25 @@ class PolymorphicAtomStore:
             top_k=top_k,
             k=settings.rag_hybrid_rrf_k,
         )
+
+        # Phase 4: graph expansion (post-RRF). Walk 1-2 hops out from the fused
+        # kg_node pivots so the agent/UI sees the neighbourhood, not just the
+        # matched nodes. Circle-filtered per hop, leak-safe edges, decay-scored,
+        # provenance-marked. Flag-gated (off => merged unchanged). Single seam so
+        # the decay survives and it runs once.
+        if settings.graph_expansion_enabled:
+            from services.graph_expansion import expand_fused
+            extra = await expand_fused(
+                list(merged), asker_id, self.db,
+                max_pivots=settings.graph_expansion_max_pivots,
+                max_hops=settings.graph_expansion_max_hops,
+                max_expanded=settings.graph_expansion_max_expanded,
+            )
+            if extra:
+                have = {m.atom.atom_id for m in merged}
+                merged = list(merged) + [m for m in extra if m.atom.atom_id not in have]
+                merged.sort(key=lambda m: m.score, reverse=True)
+                merged = merged[: top_k + settings.graph_expansion_max_expanded]
         return merged
 
     async def get_atom(self, atom_id: str, *, asker_id: int) -> Atom | None:
