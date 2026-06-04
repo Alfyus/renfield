@@ -309,7 +309,9 @@ class AtomService:
             )
             await self.db.execute(
                 text(
-                    "UPDATE atoms SET policy = json_build_object('tier', :tier), "
+                    # CAST(:tier AS INTEGER): json_build_object is VARIADIC "any",
+                    # so asyncpg can't infer a bare param's type ($1) -> 500.
+                    "UPDATE atoms SET policy = json_build_object('tier', CAST(:tier AS INTEGER)), "
                     "updated_at = NOW() "
                     "FROM document_facts f "
                     "WHERE atoms.atom_type = :fact_type "

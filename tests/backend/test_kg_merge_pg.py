@@ -156,6 +156,40 @@ class TestTierInvariant:
         assert rel.circle_tier == 0
 
 
+class TestAtomPolicySync:
+    async def test_winner_atom_policy_follows_merged_tier(self, pg_db_session, monkeypatch):
+        # Regression: the survivor's kg_node atom policy is updated via
+        # json_build_object('tier', CAST(:t AS INTEGER)). Without the cast asyncpg
+        # raised IndeterminateDatatypeError ($1) → 500 on POST /entities/merge.
+        # The other fixtures create bare entities (no atom_id), so this branch
+        # never ran and the bug shipped. Here the winner HAS an atom.
+        from models.database import ATOM_TYPE_KG_NODE, Atom
+        owner = await _make_user(pg_db_session, "mg_atom")
+        # entity first (no atom_id), then the atom it points at — the
+        # kg_entities.atom_id FK requires the atoms row to exist before linking.
+        winner = await _entity(pg_db_session, owner, "Alice", tier=2)
+        loser = await _entity(pg_db_session, owner, "Alice B.", tier=0)
+        aid = "11111111-1111-1111-1111-111111111111"
+        pg_db_session.add(Atom(
+            atom_id=aid, atom_type=ATOM_TYPE_KG_NODE,
+            source_table="kg_entities", source_id=str(winner.id),
+            owner_user_id=owner.id, policy={"tier": 2},
+        ))
+        await pg_db_session.flush()
+        winner.atom_id = aid
+        await pg_db_session.flush()
+        svc = _svc(pg_db_session, monkeypatch)
+
+        # would raise asyncpg IndeterminateDatatypeError before the CAST fix
+        assert await svc.merge_entities(loser.id, winner.id) is not None
+
+        assert winner.circle_tier == 0  # MIN(2, 0)
+        pol = (await pg_db_session.execute(
+            select(Atom.policy).where(Atom.atom_id == winner.atom_id)
+        )).scalar_one()
+        assert pol == {"tier": 0}  # atom policy followed the merged tier
+
+
 class TestMemorySubjectFollows:
     async def test_subject_entity_repointed(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "mg_mem")
