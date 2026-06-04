@@ -32,6 +32,7 @@ def _spawn_periodic_task(
     interval: int,
     work: Callable[[], Awaitable[None]],
     started_msg: str,
+    run_at_boot: bool = False,
 ) -> None:
     """Spawn a fire-and-forget background task that runs ``work`` every
     ``interval`` seconds.
@@ -46,12 +47,32 @@ def _spawn_periodic_task(
       - ``started_msg`` is logged at INFO on spawn so log aggregation
         sees the same "X scheduler started" line as before this helper
         existed.
+      - ``run_at_boot`` (opt-in): run one tick promptly after spawn,
+        BEFORE the first ``sleep(interval)``, then fall into the normal
+        cadence. Required for schedulers whose ``interval`` is on the
+        order of (or longer than) the pod's lifetime: the plain
+        sleep-then-work loop fires its first tick ``interval`` seconds
+        after boot and the timer resets on every restart, so a pod that
+        recycles more often than ``interval`` NEVER runs the work (#678).
+        Leave False for short-interval schedulers — they reach their
+        first real tick well within a normal pod lifetime.
 
     Gates (``settings.X_enabled``) are the caller's responsibility — they
     decide whether the scheduler runs AT ALL, distinct from the loop
     body which decides what work happens per tick.
     """
     async def _loop() -> None:
+        if run_at_boot:
+            try:
+                await work()
+            # CancelledError (BaseException, not Exception) is intentionally
+            # NOT caught here: a shutdown cancel during the boot tick should
+            # propagate so the task settles as cancelled, same as the loop
+            # below. Only a genuine work() failure is logged and swallowed,
+            # so a transient boot-run error still falls into the interval
+            # loop instead of disabling the scheduler.
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{name} failed (boot run): {e}")
         while True:
             try:
                 await asyncio.sleep(interval)
@@ -195,6 +216,7 @@ def _schedule_speaker_vocab_rebuild():
         interval=interval,
         work=_tick,
         started_msg=f"✅ Speaker vocab rebuild scheduled (interval={interval}s)",
+        run_at_boot=True,  # daily interval — see #678
     )
 
 
@@ -320,6 +342,7 @@ def _schedule_trajectory_cleanup():
             f"(interval={settings.trajectory_cleanup_interval}s, "
             f"retention={settings.trajectory_retention_days}d)"
         ),
+        run_at_boot=True,  # daily interval — see #678
     )
 
 
@@ -367,6 +390,7 @@ def _schedule_skill_curator():
             f"duplicate_threshold={settings.skill_curator_duplicate_threshold}, "
             f"stale_days={settings.skill_curator_stale_days})"
         ),
+        run_at_boot=True,  # daily interval — see #678
     )
 
 
@@ -417,6 +441,7 @@ def _schedule_skill_shadow_log_cleanup():
             f"(interval={settings.skill_shadow_log_cleanup_interval}s, "
             f"retention={settings.skill_shadow_log_retention_days}d)"
         ),
+        run_at_boot=True,  # daily interval — see #678
     )
 
 
