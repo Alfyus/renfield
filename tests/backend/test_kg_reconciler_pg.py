@@ -275,6 +275,41 @@ class TestApproveReject:
         )).scalar_one()
         assert c_row.is_active is True and c_row.canonical_id is None
 
+    async def test_single_user_mode_routes_user_none(self, pg_db_session, monkeypatch):
+        # AUTH_ENABLED=false → require_permission yields user=None. The routes
+        # must not crash on user.id and the operator sees/acts on everything.
+        from api.routes.knowledge_graph import (
+            list_merge_proposals,
+            reject_merge_proposal,
+            run_reconciler,
+        )
+        owner = await _make_user(pg_db_session, "rt_single")
+        a = await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
+        b = await _entity(pg_db_session, owner, "Alice B.", tier=2, mention=9, emb=_unit(6))
+        p = KgMergeProposal(
+            user_id=owner.id, loser_entity_id=a.id, winner_entity_id=b.id,
+            similarity=0.9, loser_tier=0, winner_tier=2, reason=KG_MERGE_REASON_CROSS_TIER,
+        )
+        pg_db_session.add(p)
+        await pg_db_session.flush()
+        _recon(pg_db_session, monkeypatch)  # patch commit/rollback + embedding
+
+        # list: user=None sees the pending proposal (no AttributeError on user.id)
+        listed = await list_merge_proposals(db=pg_db_session, user=None)
+        assert listed.total == 1
+        assert listed.proposals[0].winner.id == b.id
+
+        # reject: user=None resolves the owner's own queue
+        rejected = await reject_merge_proposal(p.id, db=pg_db_session, user=None)
+        assert rejected["status"] == "rejected"
+        assert (await list_merge_proposals(db=pg_db_session, user=None)).total == 0
+
+        # run: user=None aggregates over all active users (here: just `owner`).
+        # The cross-tier (a,b) pair is found again (rejection doesn't suppress
+        # re-discovery) and proposed — proving the aggregation path executed.
+        report = await run_reconciler(db=pg_db_session, user=None)
+        assert report.candidates == 1 and report.proposed == 1
+
     async def test_approve_override_winner(self, pg_db_session, monkeypatch):
         # D2 survivor toggle: owner keeps the LESS-mentioned entity instead of
         # the reconciler's default (more-mentioned) winner.
