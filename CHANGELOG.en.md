@@ -8,6 +8,16 @@ For earlier history (v1.2.0 - v2.5.0), see [CHANGELOG.md](CHANGELOG.md) (German 
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+Three latent bugs that silently disabled the self-learning system in production — found during end-to-end validation, each fixed, deployed, and verified live:
+
+- **Skill injection threw on every agent turn** (`v2.12.10`) — `SkillService.find_similar` bound `:asker` in a bare `:asker IS NULL` arm; asyncpg aborted the Parse with "could not determine data type of parameter $3". The error was caught as a warning, so no skill (not even a seed) was ever injected into the agent prompt despite `SKILLS_ENABLED=true`. `:asker` is now cast to `INTEGER` at every site; a Postgres-only regression test was added (the sqlite harness runs no server-side Parse, so the bug was invisible there). PR [#676](https://github.com/ebongard/renfield/pull/676).
+- **Daily background schedulers never ran on short-lived pods** (`v2.12.11`) — `_spawn_periodic_task` slept one interval before the first `work()`, so a daily scheduler (`interval=86400s`) fired its first tick 24h after boot and the timer reset on every pod restart. Skill Curator, Trajectory Cleanup, Shadow-Log Cleanup, and Speaker Vocab rebuild therefore effectively never ran. An opt-in `run_at_boot` runs one tick right after spawn. PR [#680](https://github.com/ebongard/renfield/pull/680).
+- **`agent_trajectories` was always empty and skill auto-extraction never fired** (`v2.12.12`) — the agent loop did not append the terminal `final_answer` step to `context.steps` (only `tool_call`/`tool_result`/`error`). Because the post-turn bookkeeping classifies the turn from `context.steps`, every turn read as `ABORT`: the trajectory was dropped (the default capture-set `success,tool_fail` excludes `abort`) and `turn_success` was always `False` — so no skill auto-extraction, and every injected skill was mis-recorded as a failure (auto-demote risk). The terminal step is now recorded in the `run()` wrapper. PR [#682](https://github.com/ebongard/renfield/pull/682).
+
 ## [v2.8.1] — 2026-05-22
 
 ### Changed
