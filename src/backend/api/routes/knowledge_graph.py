@@ -4,7 +4,9 @@ Knowledge Graph API Routes — CRUD for entities and relations.
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from api.routes.knowledge_graph_schemas import (
     CircleTierInfo,
@@ -20,16 +22,26 @@ from api.routes.knowledge_graph_schemas import (
     KGStatsResponse,
     MergeDuplicatesResponse,
     MergeEntitiesRequest,
+    MergeProposalEntityBrief,
+    MergeProposalResponse,
+    MergeProposalsListResponse,
+    ReconcilerRunResponse,
     RelationCreate,
     RelationListResponse,
     RelationResponse,
     RelationUpdate,
 )
-from models.database import TIER_PUBLIC, User
+from models.database import (
+    KG_MERGE_PROPOSAL_PENDING,
+    TIER_PUBLIC,
+    KgMergeProposal,
+    User,
+)
 from models.permissions import Permission
 from services.api_rate_limiter import limiter
 from services.auth_service import require_permission
 from services.database import get_db
+from services.kg_reconciler_service import KgReconcilerService
 from services.knowledge_graph_service import KnowledgeGraphService
 from utils.config import settings
 
@@ -470,3 +482,106 @@ async def merge_duplicate_clusters(
     except Exception as e:
         logger.error(f"KG merge duplicates error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================================================================
+# Merge-proposal review queue (Structured Memory Phase 1, T5/D3)
+# =========================================================================
+
+def _merge_brief(e) -> MergeProposalEntityBrief:
+    return MergeProposalEntityBrief(
+        id=e.id,
+        name=e.name,
+        entity_type=e.entity_type,
+        circle_tier=e.circle_tier or 0,
+        mention_count=e.mention_count or 1,
+        surface_forms=list(e.surface_forms or []),
+    )
+
+
+def _proposal_to_response(p: KgMergeProposal) -> MergeProposalResponse:
+    return MergeProposalResponse(
+        id=p.id,
+        similarity=p.similarity,
+        reason=p.reason,
+        status=p.status,
+        created_at=p.created_at.isoformat() if p.created_at else "",
+        loser=_merge_brief(p.loser),
+        winner=_merge_brief(p.winner),
+    )
+
+
+async def _owned_pending_proposal(db: AsyncSession, proposal_id: int, user: User) -> KgMergeProposal:
+    p = (await db.execute(
+        select(KgMergeProposal).where(KgMergeProposal.id == proposal_id)
+    )).scalar_one_or_none()
+    # uniform 404 for not-found AND not-owned (don't leak existence cross-user)
+    if p is None or (p.user_id is not None and p.user_id != user.id):
+        raise HTTPException(status_code=404, detail="Merge proposal not found")
+    return p
+
+
+@router.get("/merge-proposals", response_model=MergeProposalsListResponse)
+async def list_merge_proposals(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.KG_VIEW)),
+):
+    """Pending entity-merge proposals owned by the caller (D3 review queue)."""
+    rows = (await db.execute(
+        select(KgMergeProposal)
+        .options(
+            selectinload(KgMergeProposal.loser),
+            selectinload(KgMergeProposal.winner),
+        )
+        .where(
+            KgMergeProposal.user_id == user.id,
+            KgMergeProposal.status == KG_MERGE_PROPOSAL_PENDING,
+        )
+        .order_by(KgMergeProposal.similarity.desc(), KgMergeProposal.created_at.desc())
+    )).scalars().all()
+    proposals = [_proposal_to_response(p) for p in rows]
+    return MergeProposalsListResponse(proposals=proposals, total=len(proposals))
+
+
+@router.post("/merge-proposals/{proposal_id}/approve", response_model=EntityResponse)
+async def approve_merge_proposal(
+    proposal_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.KG_MANAGE)),
+):
+    """Approve a pending proposal: merge loser -> winner (tier=MIN), mark approved."""
+    await _owned_pending_proposal(db, proposal_id, user)
+    survivor = await KgReconcilerService(db).approve_proposal(proposal_id, resolved_by=user.id)
+    if survivor is None:
+        raise HTTPException(status_code=409, detail="Proposal already resolved or merge was a no-op")
+    return _entity_to_response(survivor)
+
+
+@router.post("/merge-proposals/{proposal_id}/reject")
+async def reject_merge_proposal(
+    proposal_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.KG_MANAGE)),
+):
+    """Reject a pending proposal (no merge; keeps both entities)."""
+    await _owned_pending_proposal(db, proposal_id, user)
+    ok = await KgReconcilerService(db).reject_proposal(proposal_id, resolved_by=user.id)
+    if not ok:
+        raise HTTPException(status_code=409, detail="Proposal already resolved")
+    return {"status": "rejected", "proposal_id": proposal_id}
+
+
+@router.post("/reconciler/run", response_model=ReconcilerRunResponse)
+async def run_reconciler(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.KG_MANAGE)),
+):
+    """Trigger a reconciler pass over the caller's own entities (auto-merge
+    same-tier high-confidence dupes; queue cross-tier/gray-zone for review)."""
+    report = await KgReconcilerService(db).run_for_user(user.id)
+    return ReconcilerRunResponse(
+        candidates=report.candidates,
+        auto_merged=report.auto_merged,
+        proposed=report.proposed,
+        notes=report.notes,
+    )

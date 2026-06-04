@@ -396,6 +396,44 @@ def _schedule_skill_curator():
     )
 
 
+def _schedule_kg_reconciler():
+    """Periodic KG entity reconciler (Structured Memory Phase 1, T5).
+
+    Per user: auto-merge same-tier high-confidence duplicate entities and queue
+    cross-tier / gray-zone pairs as kg_merge_proposals for owner review (D3).
+    Gated on ``kg_reconciler_enabled`` (opt-in).
+    """
+    if not settings.kg_reconciler_enabled:
+        return
+
+    async def _tick():
+        from services.kg_reconciler_service import KgReconcilerService
+
+        async with AsyncSessionLocal() as enum_session:
+            user_ids = await KgReconcilerService(enum_session).list_active_user_ids()
+
+        # Per-user session so a failure / aborted txn doesn't leak between users.
+        for uid in user_ids:
+            try:
+                async with AsyncSessionLocal() as per_user_db:
+                    await KgReconcilerService(per_user_db).run_for_user(uid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"KG reconciler failed for user {uid}: {e}")
+
+    _spawn_periodic_task(
+        name="KG reconciler",
+        interval=settings.kg_reconciler_interval,
+        work=_tick,
+        started_msg=(
+            f"KG Reconciler gestartet "
+            f"(interval={settings.kg_reconciler_interval}s, "
+            f"candidate>={settings.kg_reconciler_candidate_threshold}, "
+            f"auto>={settings.kg_reconciler_auto_merge_threshold})"
+        ),
+        run_at_boot=True,  # daily interval — see #678
+    )
+
+
 def _schedule_skill_shadow_log_cleanup():
     """Prune `skill_would_have_injected_log` rows older than the
     configured retention.
@@ -792,6 +830,7 @@ async def lifespan(app: "FastAPI"):
     _schedule_federation_audit_cleanup()
     _schedule_trajectory_cleanup()
     _schedule_skill_curator()
+    _schedule_kg_reconciler()
     _schedule_skill_shadow_log_cleanup()
     _schedule_paperless_sweepers(app)
 

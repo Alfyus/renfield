@@ -137,3 +137,37 @@ class MergeDuplicatesResponse(BaseModel):
     clusters_found: int
     entities_merged: int
     clusters: list[dict] = Field(default_factory=list)
+
+
+# --- Merge-proposal review queue (Structured Memory Phase 1, T5/D3) ---
+
+class MergeProposalEntityBrief(BaseModel):
+    """One side of a proposed merge, with the fields the owner needs to judge."""
+    id: int
+    name: str
+    entity_type: str
+    circle_tier: int = 0
+    mention_count: int = 1
+    surface_forms: list[str] = Field(default_factory=list)
+
+
+class MergeProposalResponse(BaseModel):
+    id: int
+    similarity: float
+    reason: str            # cross_tier | gray_zone
+    status: str            # pending | approved | rejected
+    created_at: str = ""
+    loser: MergeProposalEntityBrief
+    winner: MergeProposalEntityBrief
+
+
+class MergeProposalsListResponse(BaseModel):
+    proposals: list[MergeProposalResponse]
+    total: int
+
+
+class ReconcilerRunResponse(BaseModel):
+    candidates: int
+    auto_merged: int
+    proposed: int
+    notes: list[str] = Field(default_factory=list)
