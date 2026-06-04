@@ -170,6 +170,7 @@ class ReconcilerRunResponse(BaseModel):
     candidates: int
     auto_merged: int
     proposed: int
+    embedded_backfilled: int = 0
     notes: list[str] = Field(default_factory=list)
 
 

@@ -1516,6 +1516,10 @@ class KGRelation(Base):
 KG_MERGE_PROPOSAL_PENDING = "pending"
 KG_MERGE_PROPOSAL_APPROVED = "approved"
 KG_MERGE_PROPOSAL_REJECTED = "rejected"
+# A concurrent approve already merged one side before this one applied (#3):
+# the merge was a no-op, so the proposal is closed as superseded rather than
+# flipped to a misleading "approved" (owner sees nothing changed).
+KG_MERGE_PROPOSAL_SUPERSEDED = "superseded"
 # Why a proposal exists instead of an auto-merge:
 KG_MERGE_REASON_CROSS_TIER = "cross_tier"  # endpoints at different tiers — needs owner sign-off (D3)
 KG_MERGE_REASON_GRAY_ZONE = "gray_zone"    # similar but below the auto-merge threshold (D10)

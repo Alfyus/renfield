@@ -19,13 +19,15 @@ from models.database import (
     KG_MERGE_PROPOSAL_APPROVED,
     KG_MERGE_PROPOSAL_PENDING,
     KG_MERGE_PROPOSAL_REJECTED,
+    KG_MERGE_PROPOSAL_SUPERSEDED,
+    KG_MERGE_REASON_CROSS_TIER,
     KGEntity,
     KgMergeProposal,
     Role,
     User,
 )
 from services.knowledge_graph_service import KnowledgeGraphService
-from services.kg_reconciler_service import KgReconcilerService
+from services.kg_reconciler_service import _RECONCILER_LOCK_NS, KgReconcilerService
 
 pytestmark = [pytest.mark.postgres, pytest.mark.asyncio]
 
@@ -135,6 +137,53 @@ class TestRunForUser:
         assert report.auto_merged == 0
         assert report.proposed == 1
 
+    async def test_backfill_embeds_null_entities_then_reconciles(self, pg_db_session, monkeypatch):
+        # #6: entities born without an embedding are invisible to the self-join;
+        # the pass backfills them first, so they become reconcilable same run.
+        owner = await _make_user(pg_db_session, "rec_backfill")
+        a = await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=None)
+        b = await _entity(pg_db_session, owner, "Alice B.", tier=0, mention=9, emb=None)
+        rec = _recon(pg_db_session, monkeypatch)  # _get_embedding -> _unit(3) for both
+
+        # before backfill: NULL embeddings -> no candidate pairs at all
+        assert await rec.find_duplicate_pairs(owner.id) == []
+
+        report = await rec.run_for_user(owner.id)
+        assert report.embedded_backfilled == 2
+        # identical backfilled embedding -> same-tier high-sim pair -> auto-merge
+        assert report.auto_merged == 1
+        for e in (a, b):
+            row = (await pg_db_session.execute(
+                select(KGEntity).where(KGEntity.id == e.id)
+            )).scalar_one()
+            assert row.embedding is not None
+
+    async def test_concurrent_run_skips_when_locked(self, pg_db_session, pg_async_engine, monkeypatch):
+        # #4: a second overlapping run for the same user finds the per-user
+        # advisory lock held and returns a no-op report instead of redoing work.
+        owner = await _make_user(pg_db_session, "rec_lock")
+        await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
+        await _entity(pg_db_session, owner, "Alice B.", tier=0, mention=9, emb=_unit(6))
+        rec = _recon(pg_db_session, monkeypatch)
+
+        async with pg_async_engine.connect() as holder:
+            got = (await holder.execute(
+                text("SELECT pg_try_advisory_lock(:ns, :uid)"),
+                {"ns": _RECONCILER_LOCK_NS, "uid": owner.id},
+            )).scalar()
+            assert got is True
+            try:
+                report = await rec.run_for_user(owner.id)
+                # lock held -> skipped despite an obvious same-tier dup pair
+                assert report.candidates == 0
+                assert report.auto_merged == 0
+                assert any("skipped" in n for n in report.notes)
+            finally:
+                await holder.execute(
+                    text("SELECT pg_advisory_unlock(:ns, :uid)"),
+                    {"ns": _RECONCILER_LOCK_NS, "uid": owner.id},
+                )
+
     async def test_idempotent_second_run_no_new_proposals(self, pg_db_session, monkeypatch):
         owner = await _make_user(pg_db_session, "rec_idem")
         await _entity(pg_db_session, owner, "Alice", tier=0, mention=2, emb=_unit(6))
@@ -189,6 +238,42 @@ class TestApproveReject:
             select(KGEntity).where(KGEntity.id == a.id)
         )).scalar_one()
         assert loser.is_active is True  # rejection does not merge
+
+    async def test_overlapping_approve_marks_superseded(self, pg_db_session, monkeypatch):
+        # #3: two pending proposals share entity b (b->a and c->b). Approving
+        # the first tombstones b; approving the second is a no-op merge, so it
+        # closes as SUPERSEDED rather than a misleading APPROVED.
+        owner = await _make_user(pg_db_session, "rec_super")
+        a = await _entity(pg_db_session, owner, "Alice", tier=0, mention=9, emb=_unit(6))
+        b = await _entity(pg_db_session, owner, "Alice B.", tier=2, mention=2, emb=_unit(6))
+        c = await _entity(pg_db_session, owner, "Alice C.", tier=2, mention=5, emb=_unit(6))
+        p1 = KgMergeProposal(
+            user_id=owner.id, loser_entity_id=b.id, winner_entity_id=a.id,
+            similarity=0.9, loser_tier=2, winner_tier=0, reason=KG_MERGE_REASON_CROSS_TIER,
+        )
+        p2 = KgMergeProposal(
+            user_id=owner.id, loser_entity_id=c.id, winner_entity_id=b.id,
+            similarity=0.9, loser_tier=2, winner_tier=2, reason=KG_MERGE_REASON_CROSS_TIER,
+        )
+        pg_db_session.add_all([p1, p2])
+        await pg_db_session.flush()
+        rec = _recon(pg_db_session, monkeypatch)
+
+        s1 = await rec.approve_proposal(p1.id, resolved_by=owner.id)
+        assert s1 is not None and s1.id == a.id  # b merged into a
+
+        s2 = await rec.approve_proposal(p2.id, resolved_by=owner.id)
+        assert s2 is None  # winner b already tombstoned -> no-op
+
+        prop2 = (await pg_db_session.execute(
+            select(KgMergeProposal).where(KgMergeProposal.id == p2.id)
+        )).scalar_one()
+        assert prop2.status == KG_MERGE_PROPOSAL_SUPERSEDED
+        # c was never touched by the no-op merge
+        c_row = (await pg_db_session.execute(
+            select(KGEntity).where(KGEntity.id == c.id)
+        )).scalar_one()
+        assert c_row.is_active is True and c_row.canonical_id is None
 
     async def test_approve_override_winner(self, pg_db_session, monkeypatch):
         # D2 survivor toggle: owner keeps the LESS-mentioned entity instead of

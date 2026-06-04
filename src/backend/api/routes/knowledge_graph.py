@@ -595,5 +595,6 @@ async def run_reconciler(
         candidates=report.candidates,
         auto_merged=report.auto_merged,
         proposed=report.proposed,
+        embedded_backfilled=report.embedded_backfilled,
         notes=report.notes,
     )

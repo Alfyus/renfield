@@ -36,6 +36,10 @@ from models.database import (
 from services.knowledge_graph_service import KnowledgeGraphService
 from utils.config import settings
 
+# Fixed namespace key (classid) for the per-user reconciler advisory lock (#4).
+# pg_advisory_lock keys are int4; the objid is the user_id.
+_RECONCILER_LOCK_NS = 0x4B47  # "KG"
+
 
 @dataclass
 class MergeCandidate:
@@ -52,6 +56,7 @@ class ReconcileReport:
     candidates: int = 0
     auto_merged: int = 0
     proposed: int = 0
+    embedded_backfilled: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -155,9 +160,91 @@ class KgReconcilerService:
         await self.db.flush()
         return True
 
+    async def backfill_missing_embeddings(self, user_id: int) -> int:
+        """Embed live entities that have no vector yet (#6).
+
+        ``find_duplicate_pairs`` requires ``embedding IS NOT NULL`` on both
+        sides, so an entity created before its embedding was computed (or whose
+        embed call failed) is invisible to the self-join forever. Re-embed a
+        bounded batch at the top of each pass so those entities become
+        reconcilable. Best-effort: a failed embed leaves the row NULL for the
+        next pass. Postgres-only (the sqlite shim has no vector column).
+        """
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        if dialect != "postgresql":
+            return 0
+        cap = settings.kg_reconciler_embed_backfill_per_run
+        if cap <= 0:
+            return 0
+        rows = (await self.db.execute(
+            select(KGEntity).where(
+                KGEntity.user_id == user_id,
+                KGEntity.is_active.is_(True),
+                KGEntity.canonical_id.is_(None),
+                KGEntity.embedding.is_(None),
+            ).limit(cap)
+        )).scalars().all()
+        if not rows:
+            return 0
+        kg = KnowledgeGraphService(self.db)
+        n = 0
+        for ent in rows:
+            try:
+                emb = await kg._get_embedding(
+                    KnowledgeGraphService._embed_input(ent.name, ent.description)
+                )
+                if emb:
+                    ent.embedding = emb
+                    n += 1
+            except Exception as e:  # noqa: BLE001 — leave NULL, retry next pass
+                logger.warning(
+                    f"KG reconciler: embed backfill failed for #{ent.id} {ent.name!r}: {e}"
+                )
+        if n:
+            await self.db.commit()
+        return n
+
     async def run_for_user(self, user_id: int) -> ReconcileReport:
-        """One reconciler pass for a user. Idempotent."""
+        """One reconciler pass for a user, serialized per-user (idempotent).
+
+        Wrapped in a non-blocking per-user advisory lock (#4): two overlapping
+        runs for the same user must not redo each other's work — the second
+        caller finds the lock held and returns a no-op report. The lock lives on
+        a DEDICATED connection (``self.db.bind.engine``) because merge_entities
+        commits mid-pass, which can return self.db's own connection to the pool;
+        a session-level lock taken on self.db would not survive that.
+        """
         report = ReconcileReport(user_id=user_id)
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        if dialect != "postgresql":
+            return await self._reconcile_pass(user_id, report)
+
+        try:
+            lock_engine = self.db.bind.engine
+        except AttributeError:  # no standalone connectable — run unlocked
+            return await self._reconcile_pass(user_id, report)
+
+        async with lock_engine.connect() as lock_conn:
+            got = (await lock_conn.execute(
+                text("SELECT pg_try_advisory_lock(:ns, :uid)"),
+                {"ns": _RECONCILER_LOCK_NS, "uid": user_id},
+            )).scalar()
+            if not got:
+                report.notes.append(
+                    "skipped: another reconciler run holds this user's lock"
+                )
+                return report
+            try:
+                return await self._reconcile_pass(user_id, report)
+            finally:
+                await lock_conn.execute(
+                    text("SELECT pg_advisory_unlock(:ns, :uid)"),
+                    {"ns": _RECONCILER_LOCK_NS, "uid": user_id},
+                )
+
+    async def _reconcile_pass(self, user_id: int, report: ReconcileReport) -> ReconcileReport:
+        """The actual work of one pass: embed-backfill, find, auto-merge/propose."""
+        report.embedded_backfilled = await self.backfill_missing_embeddings(user_id)
         pairs = await self.find_duplicate_pairs(user_id)
         report.candidates = len(pairs)
 
@@ -188,10 +275,11 @@ class KgReconcilerService:
                 )
 
         await self.db.commit()
-        if report.auto_merged or report.proposed:
+        if report.auto_merged or report.proposed or report.embedded_backfilled:
             logger.info(
                 f"🔗 KG reconciler user={user_id}: auto_merged={report.auto_merged}, "
-                f"proposed={report.proposed}, candidates={report.candidates}"
+                f"proposed={report.proposed}, candidates={report.candidates}, "
+                f"embedded_backfilled={report.embedded_backfilled}"
             )
         return report
 
@@ -226,9 +314,20 @@ class KgReconcilerService:
         p = (await self.db.execute(
             select(KgMergeProposal).where(KgMergeProposal.id == proposal_id)
         )).scalar_one_or_none()
-        if p is not None:
-            from models.database import KG_MERGE_PROPOSAL_APPROVED
-            p.status = KG_MERGE_PROPOSAL_APPROVED
+        # Only this caller may resolve a still-PENDING proposal; if a concurrent
+        # approve already resolved it, leave its verdict intact (#3).
+        if p is not None and p.status == KG_MERGE_PROPOSAL_PENDING:
+            from models.database import (
+                KG_MERGE_PROPOSAL_APPROVED,
+                KG_MERGE_PROPOSAL_SUPERSEDED,
+            )
+            # survivor is None => one side was already merged/tombstoned by an
+            # overlapping approve; the merge was a no-op. Close as superseded
+            # rather than a misleading "approved" (owner sees nothing changed).
+            p.status = (
+                KG_MERGE_PROPOSAL_APPROVED if survivor is not None
+                else KG_MERGE_PROPOSAL_SUPERSEDED
+            )
             p.resolved_at = datetime.now(UTC).replace(tzinfo=None)
             p.resolved_by_user_id = resolved_by
             await self.db.commit()
