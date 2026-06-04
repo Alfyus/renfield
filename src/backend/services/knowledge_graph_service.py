@@ -253,6 +253,17 @@ class KnowledgeGraphService:
         )
         return response.embedding
 
+    @staticmethod
+    def _embed_input(name: str, description: str | None) -> str:
+        """Embedding input for an entity: name plus description when present.
+
+        Name+description is a stronger identity signal than the bare name (it
+        shrinks the ambiguous near-duplicate band — D10). resolve_entity AND
+        merge_entities both embed via this helper so a freshly-resolved entity
+        and its later re-embed during a merge stay in the same vector space.
+        """
+        return f"{name}: {description}" if description else name
+
     async def _extract_query_entities(self, query: str, lang: str = "de") -> list[str]:
         """
         Extract entity names from a natural-language query via LLM.
@@ -427,58 +438,98 @@ class KnowledgeGraphService:
         """
         Resolve an entity by name, creating or merging as needed.
 
-        Lane C rewrite: scope-based steps 2 and 4 (accessible custom scopes
-        from kg_scope_loader) are removed because the scope column was
-        DROPPED by pc20260420_circles_v1_schema. New resolution order:
+        Structured-Memory Phase 1 cascade (rules -> alias -> embedding -> new):
 
-        1. Exact name match in user's own entities (user_id + unowned)
-        2. Embedding similarity in user's own entities
-        3. Create new entity owned by this user (circle_tier defaults to
-           the user's default_capture_policy.tier; AtomService.upsert_atom
-           creates the corresponding atoms row)
+        1. Exact name match (own + unowned, live, canonical_id IS NULL).
+        2. Surface-form match — the name is a known alias absorbed onto a
+           canonical entity (GIN jsonb_path_ops). PG-only.
+        3. Embedding similarity, but SAME-TIER ONLY (D11) and high-threshold
+           ONLY (D10), embedded from name+description. We never inline-merge on
+           a weak or cross-tier match — those fall through to "create new" and
+           the background reconciler proposes the real, review-gated merge.
+        4. Create a new canonical entity (canonical_id NULL, circle_tier 0).
 
-        Cross-user entity dedup (the old "accessible scopes" behavior) is
-        deferred to v2 — household-shared knowledge graph entities will
-        come back via the named-circles work then. For v1 dogfooding,
-        per-user entity isolation is acceptable + simpler.
+        Cross-user entity dedup stays deferred to the named-circles work; v1 is
+        per-user (own + unowned only).
         """
-        # Step 1: Exact name match in user's own entities (include unowned)
-        query = select(KGEntity).where(
-            func.lower(KGEntity.name) == name.lower(),
-            KGEntity.is_active == True,  # noqa: E712
-            or_(KGEntity.user_id == user_id, KGEntity.user_id.is_(None)),
-        )
-        result = await self.db.execute(query)
-        existing = result.scalar_one_or_none()
+        resolved_type = entity_type if entity_type in KG_ENTITY_TYPES else "thing"
+        now = datetime.now(UTC).replace(tzinfo=None)
 
+        def _bump(ent: KGEntity) -> KGEntity:
+            ent.mention_count = (ent.mention_count or 1) + 1
+            ent.last_seen_at = now
+            if description and not ent.description:
+                ent.description = description
+            return ent
+
+        # Step 1: exact name match (own + unowned, live, canonical only).
+        # Names are no longer unique (the embedding step is same-tier-guarded,
+        # so the same name can exist at different tiers), so order
+        # deterministically and take first instead of scalar_one.
+        q = (
+            select(KGEntity)
+            .where(
+                func.lower(KGEntity.name) == name.lower(),
+                KGEntity.is_active == True,  # noqa: E712
+                KGEntity.canonical_id.is_(None),
+                or_(KGEntity.user_id == user_id, KGEntity.user_id.is_(None)),
+            )
+            .order_by(KGEntity.circle_tier.asc(), KGEntity.mention_count.desc())
+        )
+        existing = (await self.db.execute(q)).scalars().first()
         if existing:
-            existing.mention_count = (existing.mention_count or 1) + 1
-            existing.last_seen_at = datetime.now(UTC).replace(tzinfo=None)
-            if description and not existing.description:
-                existing.description = description
+            _bump(existing)
             await self.db.flush()
             return existing
 
-        # Step 2: Embedding similarity check (user's own entities only)
+        # Step 2: surface-form match — the incoming name is a known alias absorbed
+        # onto a canonical entity. PG-only (jsonb @> + GIN jsonb_path_ops); the
+        # sqlite shim has no @> operator, so it skips straight to embedding/create.
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        if dialect == "postgresql":
+            sf_user = "AND (user_id = :uid OR user_id IS NULL)" if user_id is not None else ""
+            sf_sql = text(f"""
+                SELECT id FROM kg_entities
+                WHERE is_active = true AND canonical_id IS NULL
+                  AND surface_forms @> CAST(:sf AS jsonb)
+                  {sf_user}
+                ORDER BY circle_tier ASC, mention_count DESC
+                LIMIT 1
+            """)
+            sf_params: dict = {"sf": json.dumps([name])}
+            if user_id is not None:
+                sf_params["uid"] = user_id
+            sf_row = (await self.db.execute(sf_sql, sf_params)).fetchone()
+            if sf_row:
+                ent = (await self.db.execute(
+                    select(KGEntity).where(KGEntity.id == sf_row.id)
+                )).scalar_one_or_none()
+                if ent:
+                    _bump(ent)
+                    await self.db.flush()
+                    return ent
+
+        # Step 3: embedding similarity — SAME-TIER ONLY (D11), high-threshold ONLY
+        # (D10), embedded from name+description. A cross-tier or sub-threshold
+        # near-duplicate is NOT folded in here; it falls through to "create new"
+        # and the background reconciler proposes the review-gated merge.
+        default_tier = 0
         embedding = None
         try:
-            embedding = await self._get_embedding(name)
+            embedding = await self._get_embedding(self._embed_input(name, description))
         except Exception as e:
             logger.warning(f"KG: Could not generate embedding for entity '{name}': {e}")
 
         if embedding:
             similar = await self._find_similar_entity(
-                embedding, user_id=user_id, accessible_scopes=None
+                embedding, user_id=user_id, tier=default_tier,
             )
-            if similar:
-                similar.mention_count = (similar.mention_count or 1) + 1
-                similar.last_seen_at = datetime.now(UTC).replace(tzinfo=None)
-                if description and not similar.description:
-                    similar.description = description
+            if similar is not None:
+                _bump(similar)
                 await self.db.flush()
                 return similar
 
-        # Step 3: Per-user entity limit check (no scope filter; just count user's entities)
+        # Step 4: Per-user entity limit check (no scope filter; just count user's entities)
         if user_id is not None:
             count_result = await self.db.execute(
                 select(func.count(KGEntity.id)).where(
@@ -503,7 +554,6 @@ class KnowledgeGraphService:
         # carrying the just-minted atom_id, then patch the atoms row's
         # source_id once entity.id is known.
         owner_id = await self._resolve_owner_user_id(user_id)
-        default_tier = 0
         # owner_id is None only in dev/test setups with an empty users table;
         # in that path we skip atom registration and write the entity with
         # atom_id=None (the source-row ORM column is nullable). Production
@@ -537,7 +587,8 @@ class KnowledgeGraphService:
                 entity = KGEntity(
                     user_id=owner_id,
                     name=name,
-                    entity_type=entity_type if entity_type in KG_ENTITY_TYPES else "thing",
+                    entity_type=resolved_type,
+                    entity_types=[resolved_type],
                     description=description,
                     embedding=embedding,
                     atom_id=atom_id,
@@ -550,7 +601,8 @@ class KnowledgeGraphService:
             entity = KGEntity(
                 user_id=owner_id,
                 name=name,
-                entity_type=entity_type if entity_type in KG_ENTITY_TYPES else "thing",
+                entity_type=resolved_type,
+                entity_types=[resolved_type],
                 description=description,
                 embedding=embedding,
                 atom_id=None,
@@ -565,29 +617,31 @@ class KnowledgeGraphService:
         self,
         embedding: list[float],
         user_id: int | None,
-        accessible_scopes: list[str] | None = None,
+        tier: int | None = None,
     ) -> KGEntity | None:
         """
-        Find an existing entity above the similarity threshold.
+        Find the nearest existing entity above the similarity threshold.
 
         Args:
             embedding: Entity embedding vector
-            user_id: User ID for personal scope filtering (None = no personal filtering)
-            accessible_scopes: List of custom scope names accessible to the user (None = skip)
+            user_id: personal scope filter (None = no personal filtering); matches
+                the user's own entities plus unowned (user_id IS NULL) rows.
+            tier: when set, restrict to same-tier candidates (D11) — never fold a
+                fresh extraction into an entity at a DIFFERENT circle_tier; that
+                cross-tier consolidation is review-gated via the reconciler.
         """
         threshold = settings.kg_similarity_threshold
         embedding_str = f"[{','.join(map(str, embedding))}]"
 
-        # Lane C rewrite: scope column was DROPPED. Filter by user_id only;
-        # the accessible_scopes parameter is kept in the signature for back-compat
-        # with existing callers but is now ignored. Cross-user dedup returns
-        # via v2 named-circles work.
+        params: dict = {"embedding": embedding_str}
+        user_filter = ""
         if user_id is not None:
             user_filter = "AND (user_id = :user_id OR user_id IS NULL)"
-            params: dict = {"embedding": embedding_str, "user_id": user_id}
-        else:
-            user_filter = ""
-            params = {"embedding": embedding_str}
+            params["user_id"] = user_id
+        tier_filter = ""
+        if tier is not None:
+            tier_filter = "AND circle_tier = :tier"
+            params["tier"] = tier
 
         # halfvec cast on BOTH sides is mandatory to use idx_kg_entities_embedding_hnsw
         # (built with halfvec_cosine_ops; regular `vector` caps at 2000 dims, prod
@@ -604,6 +658,7 @@ class KnowledgeGraphService:
               AND embedding IS NOT NULL
               AND canonical_id IS NULL
               {user_filter}
+              {tier_filter}
             ORDER BY embedding::halfvec({dim}) <=> CAST(:embedding AS halfvec({dim}))
             LIMIT 1
         """)
@@ -744,9 +799,7 @@ class KnowledgeGraphService:
         if winner_preview is None or loser_preview is None:
             return None
 
-        emb_input = winner_preview.name
-        if winner_preview.description:
-            emb_input = f"{winner_preview.name}: {winner_preview.description}"
+        emb_input = self._embed_input(winner_preview.name, winner_preview.description)
         new_emb: list[float] | None = None
         try:
             new_emb = await self._get_embedding(emb_input)
