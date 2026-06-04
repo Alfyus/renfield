@@ -1512,6 +1512,51 @@ class KGRelation(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
+# KG merge-proposal review queue (Structured Memory Phase 1, T5)
+KG_MERGE_PROPOSAL_PENDING = "pending"
+KG_MERGE_PROPOSAL_APPROVED = "approved"
+KG_MERGE_PROPOSAL_REJECTED = "rejected"
+# Why a proposal exists instead of an auto-merge:
+KG_MERGE_REASON_CROSS_TIER = "cross_tier"  # endpoints at different tiers — needs owner sign-off (D3)
+KG_MERGE_REASON_GRAY_ZONE = "gray_zone"    # similar but below the auto-merge threshold (D10)
+
+
+class KgMergeProposal(Base):
+    """A reconciler-proposed entity merge awaiting owner review (D3).
+
+    The background reconciler auto-merges only same-tier, high-confidence
+    duplicates. Cross-tier pairs (which could change who can see the merged
+    node) and gray-zone pairs (similar but below the auto threshold) are NOT
+    merged silently — they land here for the owner to approve/reject on
+    /brain/review. Approval routes through KnowledgeGraphService.merge_entities
+    (loser -> winner), which keeps the merge invariants (tier=MIN, never raise
+    visibility).
+    """
+    __tablename__ = "kg_merge_proposals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    loser_entity_id = Column(Integer, ForeignKey("kg_entities.id", ondelete="CASCADE"), nullable=False)
+    winner_entity_id = Column(Integer, ForeignKey("kg_entities.id", ondelete="CASCADE"), nullable=False)
+    similarity = Column(Float, nullable=False, default=0.0)
+    loser_tier = Column(Integer, nullable=False, default=0)
+    winner_tier = Column(Integer, nullable=False, default=0)
+    reason = Column(String(30), nullable=False, default=KG_MERGE_REASON_CROSS_TIER)
+    status = Column(String(20), nullable=False, default=KG_MERGE_PROPOSAL_PENDING, index=True)
+    created_at = Column(DateTime, default=_utcnow)
+    resolved_at = Column(DateTime, nullable=True)
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    __table_args__ = (
+        Index("ix_kg_merge_proposals_user_status", "user_id", "status"),
+        # one pending proposal per ordered pair (partial unique) is created in
+        # the migration (PG WHERE-predicate index — not expressible portably here).
+    )
+
+    loser = relationship("KGEntity", foreign_keys=[loser_entity_id])
+    winner = relationship("KGEntity", foreign_keys=[winner_entity_id])
+
+
 class MemoryHistory(Base):
     """Audit trail for memory modifications (create/update/delete)."""
     __tablename__ = "memory_history"
