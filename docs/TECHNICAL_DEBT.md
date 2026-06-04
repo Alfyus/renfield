@@ -2,7 +2,7 @@
 
 Dieses Dokument enthält eine umfassende Analyse der technischen Schulden im gesamten Renfield-System.
 
-**Letzte Aktualisierung:** 2026-06-04 (Backend #14 ergänzt: periodische Scheduler verlieren tägliche Ticks bei Pod-Neustart — Befund aus der Self-Learning-Validierung)
+**Letzte Aktualisierung:** 2026-06-04 (Backend #14 behoben: `run_at_boot` für die täglichen Scheduler, #678)
 
 ---
 
@@ -10,11 +10,11 @@ Dieses Dokument enthält eine umfassende Analyse der technischen Schulden im ges
 
 | Bereich | Kritisch | Mittel | Niedrig | Gesamt | Behoben |
 |---------|----------|--------|---------|--------|---------|
-| Backend | 0 | 4 | 4 | 10 | 10 |
+| Backend | 0 | 3 | 4 | 9 | 11 |
 | Frontend | 0 | 0 | 2 | 4 | 7 |
 | Satellite | 0 | 3 | 2 | 5 | 5 |
 | Infrastruktur | 0 | 3 | 2 | 6 | 6 |
-| **Gesamt** | **0** | **10** | **10** | **25** | **28** |
+| **Gesamt** | **0** | **9** | **10** | **24** | **29** |
 
 ---
 
@@ -191,9 +191,11 @@ Optional: Eine kurze Notiz im neuen `CONTRIBUTING.md`-Abschnitt zu Alembic-Best-
 
 ---
 
-#### 14. Periodische Scheduler verlieren tägliche Ticks bei Pod-Neustart
+#### ~~14. Periodische Scheduler verlieren tägliche Ticks bei Pod-Neustart~~ ✅ Behoben
 
-**Status:** Offen — Befund bei Self-Learning-Validierung (2026-06-04).
+**Status:** ✅ Behoben (2026-06-04, #678) — opt-in `run_at_boot` in `_spawn_periodic_task`: ein Tick direkt nach Spawn, vor dem ersten `sleep(interval)`. Aktiviert für die vier täglichen Scheduler (Skill Curator, Trajectory Cleanup, Skill Shadow-Log Cleanup, Speaker-Vocab-Rebuild). Kurz-Intervall-Scheduler behalten den Default (ihr erster Tick fällt ohnehin in eine normale Pod-Lebensdauer). Boot-Run-Fehler werden geloggt und geschluckt (fällt in die Intervall-Schleife durch); `CancelledError` während des Boot-Ticks propagiert sauber (Shutdown). Unit-Tests in `tests/backend/test_lifecycle_scheduler.py`. Die persistierte `last_run_at`-Catch-up-Variante bleibt für ein etwaiges Multi-Replica-Deployment offen, ist aber für den aktuellen Single-Replica-Betrieb nicht nötig.
+
+**Ursprünglicher Befund (2026-06-04):**
 
 **Problem:** `_spawn_periodic_task` (`api/lifecycle.py`) implementiert seine Schleife als `sleep(interval)` → `work()` (sleep-then-run). Der erste Tick erfolgt also erst `interval` Sekunden _nach_ dem Pod-Boot, und der Timer startet bei jedem Neustart bei null. Für die täglichen Scheduler (`interval=86400s`) heißt das: startet der Backend-Pod häufiger als alle 24 h neu (Rollout, OOM, k8s-Reschedule), feuert der Tick **nie**. Betroffen v. a. **Skill Curator** und **Trajectory Cleanup** (beide 86400s), sekundär Skill-Shadow-Log-Cleanup und Speaker-Vocab-Rebuild.
 
