@@ -158,7 +158,7 @@ class TestConversationMemoryConfig:
         defaults = Settings.model_fields
         assert defaults["memory_enabled"].default is False
         assert defaults["memory_retrieval_limit"].default == 3
-        assert defaults["memory_retrieval_threshold"].default == 0.7
+        assert defaults["memory_retrieval_threshold"].default == 0.5
         assert defaults["memory_max_per_user"].default == 500
         assert defaults["memory_context_decay_days"].default == 30
         assert defaults["memory_dedup_threshold"].default == 0.9

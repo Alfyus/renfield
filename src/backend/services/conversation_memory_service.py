@@ -145,9 +145,16 @@ class ConversationMemoryService:
         team_id: str | None = None,
         confidence: float = 1.0,
         trigger_pattern: str | None = None,
+        subject: str | None = None,
     ) -> ConversationMemory | None:
         """
         Save a memory with deduplication.
+
+        ``subject`` is the person/entity the fact is ABOUT (a named person), stored
+        in ``subject_name`` so retrieval can disambiguate per-subject instead of
+        relying on embedding neighborhood — this is the structural fix for the
+        cross-person conflation bug (D9). The KG-entity link (subject_entity_id)
+        is populated by the Phase-3 bridge, not here.
 
         If a semantically similar memory already exists (above dedup threshold),
         updates access_count and last_accessed_at instead of creating a duplicate.
@@ -214,6 +221,7 @@ class ConversationMemoryService:
             team_id=team_id,
             confidence=confidence,
             trigger_pattern=trigger_pattern,
+            subject_name=(subject.strip() or None) if subject else None,
             atom_id=atom_id,
             circle_tier=default_tier,
         )
@@ -555,6 +563,7 @@ class ConversationMemoryService:
             category = item.get("category", "").strip().lower()
             importance = item.get("importance", 0.5)
             trigger_pattern = item.get("trigger_pattern")
+            subject = (item.get("subject") or "").strip() or None
 
             if not content:
                 continue
@@ -592,6 +601,7 @@ class ConversationMemoryService:
                     importance=importance,
                     source_session_id=session_id,
                     trigger_pattern=trigger_pattern if category == "procedural" else None,
+                    subject=subject,
                 )
             if memory:
                 saved.append(memory)

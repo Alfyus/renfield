@@ -22,8 +22,13 @@ de:
     User: {user_message}
     Assistent: {assistant_response}
 
+    WICHTIG — SUBJEKT: Gib pro Fakt ein "subject" an: die Person/Entitaet, UEBER
+    die der Fakt handelt (der im Dialog genannte Name). Bei Fakten ueber den
+    Sprecher selbst oder allgemeine/aufgabenbezogene Fakten: null. Vermische NIE
+    Fakten ueber verschiedene Personen in einem Eintrag — ein Fakt, ein Subjekt.
+
     Antwort als JSON-Array (leeres Array [] wenn nichts erinnerungswuerdig):
-    [{{"content": "...", "category": "preference|fact|instruction|context", "importance": 0.1-1.0}}]
+    [{{"content": "...", "subject": "<Name> oder null", "category": "preference|fact|instruction|context", "importance": 0.1-1.0}}]
 
   extraction_system: "Du extrahierst Fakten aus Dialogen. Antworte NUR mit einem JSON-Array."
 
@@ -193,8 +198,13 @@ en:
     User: {user_message}
     Assistant: {assistant_response}
 
+    IMPORTANT — SUBJECT: for each fact, give a "subject": the person/entity the
+    fact is ABOUT (the name mentioned in the dialog). Use null for facts about the
+    speaker themselves or general/task facts. NEVER mix facts about different
+    people in one entry — one fact, one subject.
+
     Reply as JSON array (empty array [] if nothing memorable):
-    [{{"content": "...", "category": "preference|fact|instruction|context", "importance": 0.1-1.0}}]
+    [{{"content": "...", "subject": "<name> or null", "category": "preference|fact|instruction|context", "importance": 0.1-1.0}}]
 
   extraction_system: "You extract facts from dialogs. Reply ONLY with a JSON array."
 
