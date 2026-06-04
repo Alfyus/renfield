@@ -197,9 +197,11 @@ def _schedule_reminder_checker():
 def _schedule_speaker_vocab_rebuild():
     """Periodically rebuild the per-user STT vocabulary table (Phase B-3 follow-up).
 
-    Sleep-first cadence — a freshly-restarted pod doesn't hammer the DB on
-    every boot. First rebuild happens after one interval; cold-start
-    callers see the platform default until then.
+    Runs at boot (``run_at_boot=True`` below), then every interval. The
+    daily interval is longer than a typical pod lifetime, so a sleep-first
+    cadence would mean the rebuild never runs on a pod that recycles
+    sooner (#678); the boot tick guarantees cold-start callers get a fresh
+    vocabulary instead of the platform default.
     """
     if not settings.speaker_vocab_capture_enabled:
         return
