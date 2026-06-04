@@ -16,9 +16,17 @@ from loguru import logger
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.database import KG_ENTITY_TYPES, TIER_PUBLIC, KGEntity, KGRelation
+from models.database import (
+    ATOM_TYPE_KG_EDGE,
+    EMBEDDING_DIMENSION,
+    KG_ENTITY_TYPES,
+    TIER_PUBLIC,
+    KGEntity,
+    KGRelation,
+)
 from services.kg_validator import load_heuristics as load_kg_heuristics
 from services.kg_validator import validate_relation as validate_kg_relation
+from services.merge_guard import is_already_merged
 from utils.config import settings
 from utils.llm_client import get_default_client, get_embed_client
 
@@ -581,14 +589,22 @@ class KnowledgeGraphService:
             user_filter = ""
             params = {"embedding": embedding_str}
 
+        # halfvec cast on BOTH sides is mandatory to use idx_kg_entities_embedding_hnsw
+        # (built with halfvec_cosine_ops; regular `vector` caps at 2000 dims, prod
+        # runs 2560-dim qwen3-embedding:4b). Without the cast the planner falls back
+        # to a seq-scan + per-row cosine on the raw vectors. Same pattern as
+        # skill_curator.find_duplicate_pairs / skill_service.find_similar.
+        # canonical_id IS NULL: never match a merge tombstone (pointer-chase).
+        dim = EMBEDDING_DIMENSION
         sql = text(f"""
             SELECT id,
-                   1 - (embedding <=> CAST(:embedding AS vector)) as similarity
+                   1 - (embedding::halfvec({dim}) <=> CAST(:embedding AS halfvec({dim}))) as similarity
             FROM kg_entities
             WHERE is_active = true
               AND embedding IS NOT NULL
+              AND canonical_id IS NULL
               {user_filter}
-            ORDER BY embedding <=> CAST(:embedding AS vector)
+            ORDER BY embedding::halfvec({dim}) <=> CAST(:embedding AS halfvec({dim}))
             LIMIT 1
         """)
 
@@ -685,6 +701,178 @@ class KnowledgeGraphService:
             f"atom_id={atom_id} tier={relation_tier}"
         )
         return relation
+
+    # =========================================================================
+    # Canonicalization / Merge (Structured Memory Phase 1)
+    # =========================================================================
+
+    async def merge_entities(self, loser_id: int, winner_id: int) -> KGEntity | None:
+        """Merge ``loser`` into ``winner``: absorb, reparent edges, tombstone.
+
+        Ports the skill-curator merge pattern (embedding-before-lock, FOR UPDATE
+        both rows, shared already-merged guard) and adds the entity-specific
+        machinery skills don't need: reparenting ``kg_relations`` integer FKs
+        loser->winner, re-deduping the resulting relations, recomputing each
+        touched relation's ``circle_tier`` (and its atom policy), and following
+        ``conversation_memories.subject_entity_id`` to the survivor.
+
+        Invariants:
+          - A merge MUST NEVER raise visibility: the survivor's tier becomes
+            ``MIN(winner, loser)`` and incident relations recompute to
+            ``LEAST(subject, object)``.
+          - Per-user only for v1: a cross-user pair is refused (cross-user /
+            household canonicalization is deferred to the named-circles work).
+          - Concurrency-safe: a second pass that lost the FOR UPDATE race finds
+            the loser already tombstoned (``canonical_id`` set / inactive) via
+            ``is_already_merged`` and bails without double-applying.
+
+        Returns the surviving (winner) entity if the merge was applied, or None
+        if skipped (no-op id pair, missing row, already merged, or cross-user).
+        """
+        if loser_id == winner_id:
+            return None
+
+        # Preview-load (no lock) just to build the survivor's embedding input;
+        # recompute the embedding OUTSIDE any row lock so a slow embed endpoint
+        # doesn't hold kg_entities locks (same rationale as merge_pair).
+        winner_preview = (await self.db.execute(
+            select(KGEntity).where(KGEntity.id == winner_id)
+        )).scalar_one_or_none()
+        loser_preview = (await self.db.execute(
+            select(KGEntity).where(KGEntity.id == loser_id)
+        )).scalar_one_or_none()
+        if winner_preview is None or loser_preview is None:
+            return None
+
+        emb_input = winner_preview.name
+        if winner_preview.description:
+            emb_input = f"{winner_preview.name}: {winner_preview.description}"
+        new_emb: list[float] | None = None
+        try:
+            new_emb = await self._get_embedding(emb_input)
+        except Exception as e:  # best-effort — keep the old embedding on failure
+            logger.warning(f"KG merge: embedding recompute failed for {winner_preview.name!r}: {e}")
+
+        # Re-load both rows WITH locks; bail if a concurrent pass already merged.
+        winner = (await self.db.execute(
+            select(KGEntity).where(KGEntity.id == winner_id).with_for_update()
+        )).scalar_one_or_none()
+        loser = (await self.db.execute(
+            select(KGEntity).where(KGEntity.id == loser_id).with_for_update()
+        )).scalar_one_or_none()
+        if winner is None or loser is None:
+            await self.db.rollback()
+            return None
+        if is_already_merged(canonical_pointer=loser.canonical_id, is_live=loser.is_active) or \
+           is_already_merged(canonical_pointer=winner.canonical_id, is_live=winner.is_active):
+            await self.db.rollback()
+            return None
+        if loser.user_id != winner.user_id:
+            await self.db.rollback()
+            logger.warning(
+                f"KG merge refused: cross-user pair #{loser.id}(u={loser.user_id}) "
+                f"-> #{winner.id}(u={winner.user_id}); per-user canonicalization only (v1)"
+            )
+            return None
+
+        # --- absorb loser into winner ---
+        # surface_forms = winner ∪ loser ∪ {loser.name}, order-preserving dedup,
+        # excluding the winner's own canonical name (that lives in `name`).
+        merged_forms = list(dict.fromkeys(
+            list(winner.surface_forms or [])
+            + list(loser.surface_forms or [])
+            + [loser.name]
+        ))
+        winner.surface_forms = [f for f in merged_forms if f and f != winner.name]
+        # multi-type union; fall back to the scalar type when an array is empty.
+        w_types = list(winner.entity_types or [winner.entity_type])
+        l_types = list(loser.entity_types or [loser.entity_type])
+        winner.entity_types = list(dict.fromkeys([t for t in (w_types + l_types) if t]))
+        winner.mention_count = (winner.mention_count or 1) + (loser.mention_count or 1)
+        if loser.first_seen_at and (winner.first_seen_at is None or loser.first_seen_at < winner.first_seen_at):
+            winner.first_seen_at = loser.first_seen_at
+        if loser.last_seen_at and (winner.last_seen_at is None or loser.last_seen_at > winner.last_seen_at):
+            winner.last_seen_at = loser.last_seen_at
+        if not winner.description and loser.description:
+            winner.description = loser.description
+        if new_emb is not None:
+            winner.embedding = new_emb
+        # NEVER raise visibility — survivor tier is the more-restrictive of the two.
+        merged_tier = min(int(winner.circle_tier or 0), int(loser.circle_tier or 0))
+        winner.circle_tier = merged_tier
+
+        # tombstone loser (kept for audit; its kg_node atom stays too)
+        loser.is_active = False
+        loser.canonical_id = winner.id
+        loser.last_seen_at = datetime.now(UTC).replace(tzinfo=None)
+        await self.db.flush()
+
+        wid, lid = winner.id, loser.id
+
+        # --- reparent kg_relations FKs loser -> winner ---
+        await self.db.execute(text(
+            "UPDATE kg_relations SET subject_id = :w WHERE subject_id = :l"
+        ), {"w": wid, "l": lid})
+        await self.db.execute(text(
+            "UPDATE kg_relations SET object_id = :w WHERE object_id = :l"
+        ), {"w": wid, "l": lid})
+        # self-loops created by the merge (a former loser<->winner edge) are noise.
+        await self.db.execute(text(
+            "UPDATE kg_relations SET is_active = false "
+            "WHERE subject_id = :w AND object_id = :w AND is_active = true"
+        ), {"w": wid})
+        # carry max(confidence) onto the survivor of each now-duplicate triple ...
+        await self.db.execute(text(
+            "UPDATE kg_relations surv SET confidence = agg.maxc "
+            "FROM (SELECT subject_id, predicate, object_id, max(confidence) AS maxc "
+            "      FROM kg_relations WHERE is_active = true "
+            "      GROUP BY subject_id, predicate, object_id HAVING count(*) > 1) agg "
+            "WHERE surv.subject_id = agg.subject_id AND surv.predicate = agg.predicate "
+            "  AND surv.object_id = agg.object_id AND surv.is_active = true "
+            "  AND surv.id = (SELECT min(k.id) FROM kg_relations k "
+            "                 WHERE k.is_active = true AND k.subject_id = agg.subject_id "
+            "                   AND k.predicate = agg.predicate AND k.object_id = agg.object_id)"
+        ))
+        # ... then deactivate the duplicates, keeping the lowest id per triple.
+        await self.db.execute(text(
+            "UPDATE kg_relations r SET is_active = false "
+            "WHERE r.is_active = true AND EXISTS ("
+            "  SELECT 1 FROM kg_relations k WHERE k.is_active = true AND k.id < r.id "
+            "    AND k.subject_id = r.subject_id AND k.predicate = r.predicate "
+            "    AND k.object_id = r.object_id)"
+        ))
+        # recompute tier on every winner-incident active relation + sync atom policy
+        await self.db.execute(text(
+            "UPDATE kg_relations r SET circle_tier = LEAST(s.circle_tier, o.circle_tier) "
+            "FROM kg_entities s, kg_entities o "
+            "WHERE r.subject_id = s.id AND r.object_id = o.id "
+            "  AND (r.subject_id = :w OR r.object_id = :w)"
+        ), {"w": wid})
+        await self.db.execute(text(
+            "UPDATE atoms SET policy = json_build_object('tier', r.circle_tier), updated_at = NOW() "
+            "FROM kg_relations r "
+            "WHERE atoms.atom_type = :edge AND atoms.source_id = r.id::text "
+            "  AND (r.subject_id = :w OR r.object_id = :w)"
+        ), {"edge": ATOM_TYPE_KG_EDGE, "w": wid})
+        # keep the survivor's own kg_node atom policy in lockstep with merged_tier
+        if winner.atom_id:
+            await self.db.execute(text(
+                "UPDATE atoms SET policy = json_build_object('tier', :t), updated_at = NOW() "
+                "WHERE atom_id = :a"
+            ), {"t": merged_tier, "a": winner.atom_id})
+
+        # --- follow memory subject links to the survivor (D9) ---
+        await self.db.execute(text(
+            "UPDATE conversation_memories SET subject_entity_id = :w WHERE subject_entity_id = :l"
+        ), {"w": wid, "l": lid})
+
+        await self.db.commit()
+        await self.db.refresh(winner)  # reload post-commit (expire_on_commit safety)
+        logger.info(
+            f"🔗 KG merge: entity #{lid} {loser.name!r} -> #{wid} {winner.name!r} "
+            f"(tier={merged_tier}, {len(winner.surface_forms)} surface forms)"
+        )
+        return winner
 
     # =========================================================================
     # Extract from Conversation
@@ -1288,41 +1476,6 @@ class KnowledgeGraphService:
 
         await self.db.commit()
         return True
-
-    async def merge_entities(
-        self,
-        source_id: int,
-        target_id: int,
-    ) -> KGEntity | None:
-        """Merge source entity into target. Moves relations, deactivates source."""
-        source = await self.get_entity(source_id)
-        target = await self.get_entity(target_id)
-        if not source or not target:
-            return None
-
-        # Move source's relations to target
-        await self.db.execute(
-            update(KGRelation)
-            .where(KGRelation.subject_id == source_id, KGRelation.is_active == True)  # noqa: E712
-            .values(subject_id=target_id)
-        )
-        await self.db.execute(
-            update(KGRelation)
-            .where(KGRelation.object_id == source_id, KGRelation.is_active == True)  # noqa: E712
-            .values(object_id=target_id)
-        )
-
-        # Accumulate mention count
-        target.mention_count = (target.mention_count or 1) + (source.mention_count or 1)
-        if source.description and not target.description:
-            target.description = source.description
-
-        # Deactivate source
-        source.is_active = False
-
-        await self.db.commit()
-        await self.db.refresh(target)
-        return target
 
     async def list_relations(
         self,
