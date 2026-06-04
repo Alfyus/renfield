@@ -480,7 +480,22 @@ MEMORY_EXTRACTION_ENABLED=false     # Fakten automatisch aus Dialogen extrahiere
 MEMORY_CONTRADICTION_RESOLUTION=false   # LLM-basierte Widerspruchserkennung aktivieren
 MEMORY_CONTRADICTION_THRESHOLD=0.6      # Similarity-Untergrenze fuer Vergleich (0.3-0.89)
 MEMORY_CONTRADICTION_TOP_K=5            # Max bestehende Erinnerungen zum Vergleich (1-10)
+
+# Memory→KG Bridge (Structured Memory Phase 3) — opt-in, dark by default
+MEMORY_KG_BRIDGE_ENABLED=false              # Memory-Subjekte an kanonische KG-Entitaeten binden (save-time + entity-augmentiertes Retrieval)
+MEMORY_RETRIEVAL_SUBJECT_UNION_LIMIT=5      # Max deterministische subjekt-verlinkte Memories pro Turn (1-50)
 ```
+
+**Memory→KG Bridge (Phase 3):** Wenn `MEMORY_KG_BRIDGE_ENABLED=true`, verlinkt der
+Hintergrund-Extraktionspfad zerlegbare Memories (`fact`/`preference`) mit ihrer
+kanonischen KG-Entitaet (`conversation_memories.subject_entity_id`) — typ- und
+tier-bewusst (`resolve_entity(create_tier=memory.tier, match_entity_type=True)`),
+nie im synchronen Turn. Retrieval wird entity-augmentiert: im Query genannte
+Entitaeten (Exact+Surface-Form, kein LLM) ziehen ihre subjekt-verlinkten Memories
+deterministisch in die Embedding-Treffer (similarity-Floor, eigenes Limit,
+canonical_id-Tombstone-Chase) — **immer durch denselben `circle_sql`-Filter**.
+Bestandsdaten: `python bin/backfill_subject_entity_ids.py --dry-run` (Schaetzung,
+keine Writes) → `--commit`. Aus = Retrieval/Extraktion byte-identisch zu vorher.
 
 **Defaults:**
 - `MEMORY_ENABLED`: `false`
