@@ -120,6 +120,12 @@ Neue Atome erhalten einen **Default-Tier** — aktuell `2` (household) bei Dokum
 
 `/brain/review` listet Atome, die der Eigentümer neu klassifizieren sollte — neue Uploads, Entities mit Tier-Konflikten zwischen Relationen, Memories die ein Gate knapp passiert haben. Der Eigentümer kann dort batch-weise Tiers setzen; die Tier-Cascade propagiert auf incidente Relationen.
 
+## Strukturiertes Memory — Kanonisierung & Subjekt
+
+Damit das Gedächtnis nicht nur „flacher Text" ist, traegt jeder konversationelle Fakt ein **Subjekt** (`subject_name` / `subject_entity_id`): über WEN er handelt. Das Retrieval reicht das Subjekt mit und taggt den injizierten Kontext (`- [FACT · <Name>] …`), sodass Fakten über verschiedene Personen strukturell nicht mehr vermischt werden.
+
+Auf der KG-Seite werden Entitäten **kanonisiert**: Schreibvarianten sammeln sich als `surface_forms` auf der kanonischen Zeile, eine Entität kann mehrere Rollen tragen (`entity_types`, z. B. Person + Musiker), und Relationen halten die Provenienz (`stated_by_user_id` — wer hat es gesagt). Ein periodischer **Reconciler** führt nachträglich entstandene Dubletten zusammen: same-tier mit hoher Ähnlichkeit automatisch, Cross-Tier/Grauzone als **Merge-Vorschlag** zur Owner-Review (`/brain/review`). Eine Verschmelzung erhöht nie die Sichtbarkeit (Tier = MIN) — Details in [`CIRCLES.md`](CIRCLES.md#merge-invariante-structured-memory).
+
 ---
 
 ## Federation — Zweite Gehirne, die sich begegnen

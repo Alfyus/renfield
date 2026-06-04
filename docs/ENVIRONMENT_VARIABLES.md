@@ -626,6 +626,49 @@ Manueller Trigger: `POST /api/skills/curator/run` (admin-only). Optional `{"user
 
 ---
 
+### KG Entity Reconciler (Structured Memory)
+
+Periodischer Per-User-Lauf, der near-duplicate KG-Entitaeten zusammenfuehrt
+(das Pendant zum Skill-Curator, fuer den Knowledge Graph). Opt-in.
+
+```bash
+# Master-Schalter
+KG_RECONCILER_ENABLED=false
+
+# Scheduler
+KG_RECONCILER_INTERVAL=86400                  # Sekunden zwischen Laeufen (default 1d)
+
+# Kandidaten + Auto-Merge
+KG_RECONCILER_CANDIDATE_THRESHOLD=0.85        # Cosine ab wann ein Paar ueberhaupt betrachtet wird
+KG_RECONCILER_AUTO_MERGE_THRESHOLD=0.95       # Same-Tier-Auto-Merge-Schwelle (>= candidate)
+KG_RECONCILER_MAX_PER_RUN=50                  # Safety-Cap pro User pro Lauf
+```
+
+**Verhalten:**
+Wenn `KG_RECONCILER_ENABLED=true`, iteriert ein Background-Scheduler pro
+`KG_RECONCILER_INTERVAL` Sekunden ueber alle User mit aktiven, kanonischen
+Entitaeten und ruft `KgReconcilerService.run_for_user(user_id)`. Ein
+halfvec-Embedding-Self-Join findet Duplikat-Paare desselben Users (Cosine
+>= `KG_RECONCILER_CANDIDATE_THRESHOLD`); Winner = mehr Erwaehnungen, tie-break
+aelteres `first_seen_at`. Dann:
+
+1. **Same-Tier + Cosine >= `KG_RECONCILER_AUTO_MERGE_THRESHOLD`** → automatischer
+   Merge via `merge_entities` (absorbiert surface_forms/Multi-Typ, reparentiert
+   Relationen, Tier = MIN, tombstoned den Loser mit `canonical_id`).
+2. **Cross-Tier ODER Grauzone** (aehnlich, aber unter der Auto-Schwelle) →
+   ein `kg_merge_proposals`-Eintrag fuer die Owner-Review (`/brain/review`).
+   Wird NIE still gemergt — eine Verschmelzung darf Sichtbarkeit nie erhoehen.
+
+Idempotent: Paare mit bereits offenem Proposal werden ausgeschlossen
+(Partial-Unique auf `(loser, winner) WHERE status='pending'`).
+
+Manueller Trigger: `POST /api/knowledge-graph/reconciler/run` (KG_MANAGE).
+Review-Routen: `GET /api/knowledge-graph/merge-proposals`,
+`POST …/{id}/approve` (optional `{"winner_id": <id>}` als Survivor-Override),
+`POST …/{id}/reject`.
+
+---
+
 ### Satellite System
 
 ```bash

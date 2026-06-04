@@ -154,6 +154,18 @@ Frontend pages: `/brain` (search), `/brain/review` (owner review queue), `/brain
 
 For memory-retrieval callers: pass `user_id=asker_id`. For RAG search: pass `user_id=asker_id` in every `rag.search()` call — `None` reduces to public-tier-only in auth-enabled mode.
 
+### Structured Memory (KG canonicalization + subject attribution)
+
+Lifts personal memory from flat text onto the typed KG substrate.
+
+**Schema (additive on the circles tables).** `kg_entities`: `canonical_id` self-FK (NULL = canonical/live; non-NULL = merge tombstone → survivor, mirrors `procedural_skills.merged_into_id`), `surface_forms` JSONB (absorbed aliases, GIN `jsonb_path_ops`), `entity_types` JSONB (multi-type superset; scalar `entity_type` stays the closed-enum primary), `external_id` (column only). `kg_relations`: `stated_by_user_id` (who asserted the fact, ≠ owner) + `source_message_id`. `conversation_memories`: `subject_entity_id` + `subject_name` (WHO the fact is about). Migrations `pc20260604_struct_mem` + `pc20260604b_kgmp`.
+
+**Entity resolution cascade** (`KnowledgeGraphService.resolve_entity`): exact name → surface-form (jsonb `@>`) → embedding (SAME-TIER only + high threshold, `::halfvec`, name+description) → create new. It never folds across tiers or on a weak signal inline; those become reconciler proposals. **`merge_entities(loser, winner)`** ports the skill-curator merge (FOR UPDATE + shared `services/merge_guard.is_already_merged`) and adds entity-specific work: reparent `kg_relations` FKs, re-dedup, recompute `circle_tier=LEAST(subject,object)` + atom policy, follow `conversation_memories.subject_entity_id`, tombstone the loser. **Invariant: a merge never raises visibility** (survivor tier = MIN).
+
+**Reconciler** (`services/kg_reconciler_service.py`, `KG_RECONCILER_ENABLED`, opt-in): periodic per-user halfvec self-join → same-tier high-confidence dupes auto-merge; cross-tier / gray-zone become `kg_merge_proposals` for owner review (never silently merged). Scheduler `_schedule_kg_reconciler` (run_at_boot). Routes: `/api/knowledge-graph/merge-proposals` (GET), `…/{id}/approve` (optional `winner_id` survivor override), `…/{id}/reject`, `/reconciler/run`. Frontend: `MergeProposalsSection` + `MergeProposalCard` at the top of `/brain/review` (comparison + survivor toggle + cross-tier warning + 5s undo toast).
+
+**The conflation fix (D9):** memory extraction now binds each fact to a `subject_name`, retrieval carries it, and the injected context is subject-tagged (`- [FACT · <name>] …`) so the LLM cannot conflate facts about different people. Extraction also emits multi-type entities + tastes-as-relations and records `stated_by`. KG-extraction eval: `bin/run_kg_extraction_eval.py` + `tests/eval/kg_extraction_eval.yaml`.
+
 ## Testing
 
 Tests in `tests/` at project root. Backend: 3,400+ tests.
