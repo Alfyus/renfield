@@ -22,6 +22,7 @@ export const keys = {
   memories: {
     all: ['memories'] as const,
     list: (category: string | null) => ['memories', 'list', { category }] as const,
+    bySubject: (entityId: number | null) => ['memories', 'bySubject', { entityId }] as const,
   },
   users: {
     all: ['users'] as const,

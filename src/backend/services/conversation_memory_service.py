@@ -23,6 +23,8 @@ from models.database import (
     MEMORY_ACTION_DELETED,
     MEMORY_ACTION_UPDATED,
     MEMORY_CATEGORIES,
+    MEMORY_CATEGORY_FACT,
+    MEMORY_CATEGORY_PREFERENCE,
     MEMORY_CHANGED_BY_RESOLUTION,
     MEMORY_CHANGED_BY_SYSTEM,
     MEMORY_CHANGED_BY_USER,
@@ -604,9 +606,57 @@ class ConversationMemoryService:
                     subject=subject,
                 )
             if memory:
+                await self._bridge_subject_entity(memory, subject, category)
                 saved.append(memory)
 
         return saved
+
+    async def _bridge_subject_entity(
+        self,
+        memory: ConversationMemory,
+        subject: str | None,
+        category: str,
+    ) -> None:
+        """Phase 3 bridge: link a decomposable memory's subject to a canonical KG entity.
+
+        Runs only here, in the background extraction path (never the synchronous
+        turn). Decomposable facts/preferences are about a named subject (a person);
+        resolve that subject to the canonical entity — reusing whatever the turn's
+        KG extraction already created, since resolve_entity is name-idempotent — and
+        store its id in subject_entity_id so "Was weiß ich über X" becomes
+        deterministic. Non-decomposable categories (procedural/instruction/context)
+        stay flat.
+
+        Gated behind MEMORY_KG_BRIDGE_ENABLED (opt-in, dark by default). Best-effort:
+        a resolve failure leaves subject_entity_id NULL (backfill or the next mention
+        links it later). type-scoped + tier-pinned resolution (Phase 3a) prevents
+        wrong-type links and self-tier leaks.
+        """
+        if not settings.memory_kg_bridge_enabled:
+            return
+        if memory is None or memory.user_id is None:
+            return
+        if not subject or category not in (MEMORY_CATEGORY_FACT, MEMORY_CATEGORY_PREFERENCE):
+            return
+        if memory.subject_entity_id is not None:
+            return
+        try:
+            from services.knowledge_graph_service import KnowledgeGraphService
+            ent = await KnowledgeGraphService(self.db).resolve_entity(
+                subject, "person", memory.user_id,
+                create_tier=memory.circle_tier,
+                match_entity_type=True,
+            )
+            memory.subject_entity_id = ent.id
+            if not memory.subject_name:
+                memory.subject_name = subject
+            await self.db.commit()
+        except Exception as e:  # noqa: BLE001 — bridge is best-effort; never break extraction
+            await self.db.rollback()
+            logger.warning(
+                f"Memory KG bridge failed for memory #{getattr(memory, 'id', '?')} "
+                f"subject={subject!r}: {e}"
+            )
 
     @staticmethod
     def _parse_extraction_response(raw_text: str) -> list[dict]:
@@ -1395,6 +1445,8 @@ class ConversationMemoryService:
                 "access_count": m.access_count,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "last_accessed_at": m.last_accessed_at.isoformat() if m.last_accessed_at else None,
+                "subject_name": m.subject_name,
+                "subject_entity_id": m.subject_entity_id,
             }
             for m in memories
         ]

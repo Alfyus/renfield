@@ -59,6 +59,11 @@ from services.circle_sql import conversation_memories_circles_filter
 from utils.config import settings
 from utils.llm_client import get_embed_client
 
+# Similarity score assigned to deterministic subject-linked memories (Phase 3c).
+# High floor so a fact about a query-named subject is never ranked below a fuzzy
+# embedding hit — but < 1.0 so retrieve_essential's always-injected rows still lead.
+_SUBJECT_MATCH_SIMILARITY = 0.99
+
 
 class MemoryRetrieval:
     """
@@ -222,6 +227,22 @@ class MemoryRetrieval:
                 })
                 memory_ids.append(row.id)
 
+        # Phase 3c: entity-augmented union. Resolve subjects named in the query
+        # and prepend their deterministic memories (circle-filtered) so a fact
+        # about a named person isn't dropped just because its wording is far
+        # from the query embedding. Subject hits are prioritized but capped
+        # within `limit` so they can't flood a generic query. Opt-in flag.
+        if settings.memory_kg_bridge_enabled:
+            union_limit = min(max(int(settings.memory_retrieval_subject_union_limit), 1), limit)
+            existing_ids = {m["id"] for m in memories}
+            subject_hits = [
+                h for h in await self._subject_linked_memories(message, user_id, union_limit)
+                if h["id"] not in existing_ids
+            ]
+            if subject_hits:
+                memories = (subject_hits + memories)[:limit]
+                memory_ids = [m["id"] for m in memories]
+
         # Update access tracking. flush() not commit() — the caller's
         # outer transaction decides when to persist. Previously this
         # committed unconditionally, which broke the v2-shadow savepoint
@@ -329,6 +350,122 @@ class MemoryRetrieval:
         now = datetime.now(UTC).replace(tzinfo=None)
         age_days = max((now - created_at).total_seconds() / 86400, 0)
         return math.exp(-0.693 * age_days / half_life_days)
+
+    async def _find_query_entities(self, message: str, user_id: int | None) -> list[int]:
+        """Resolve LIVE canonical entity ids named in the query (Phase 3c).
+
+        Exact word-token match on name/surface-form (+ multi-word phrase
+        substring) — cheap SQL, NO LLM. Word-token match avoids the
+        substring false positive ("Anna" inside "Annahme"). Scoped to the
+        asker's own + unowned entities so we never resolve to another user's
+        private entity. Returns canonical (canonical_id IS NULL) ids only;
+        the caller expands to tombstones via COALESCE(canonical_id, id).
+        """
+        tokens = sorted({t.lower() for t in re.findall(r"\w{3,}", message or "")})
+        if not tokens:
+            return []
+        params: dict[str, Any] = {
+            "tokens": tokens,
+            "msg": (message or "").lower(),
+            "cap": max(int(settings.memory_retrieval_subject_union_limit), 1) * 4,
+        }
+        user_filter = ""
+        if user_id is not None and settings.auth_enabled:
+            user_filter = "AND (user_id = :uid OR user_id IS NULL)"
+            params["uid"] = user_id
+        sql = text(f"""
+            SELECT id FROM kg_entities
+            WHERE is_active = true AND canonical_id IS NULL
+              {user_filter}
+              AND (
+                lower(name) = ANY(:tokens)
+                OR (position(' ' in name) > 0 AND :msg LIKE '%' || lower(name) || '%')
+                OR EXISTS (
+                    SELECT 1 FROM jsonb_array_elements_text(surface_forms) sf
+                    WHERE lower(sf) = ANY(:tokens)
+                )
+              )
+            LIMIT :cap
+        """)
+        rows = (await self.db.execute(sql, params)).fetchall()
+        return [int(r.id) for r in rows]
+
+    async def _subject_linked_memories(
+        self, message: str, user_id: int | None, limit: int,
+    ) -> list[dict]:
+        """Deterministic memories whose subject entity is named in the query (Phase 3c).
+
+        Closes the embedding-recall tail: a fact about a named subject is
+        returned even when its wording is far from the query. Tombstone-safe
+        (COALESCE(canonical_id, id) chase) and circle-filtered via the SAME
+        clause as the embedding path — the union must never bypass circle access.
+        """
+        eids = await self._find_query_entities(message, user_id)
+        if not eids:
+            return []
+        clause, cparams = self._memory_circles_filter(user_id)
+        sql = text(f"""
+            SELECT id, content, category, importance, access_count, created_at, subject_name
+            FROM conversation_memories m
+            WHERE is_active = true
+              AND subject_entity_id IS NOT NULL
+              AND subject_entity_id IN (
+                  SELECT e.id FROM kg_entities e
+                  WHERE COALESCE(e.canonical_id, e.id) = ANY(:eids)
+              )
+              AND {clause}
+            ORDER BY importance * confidence DESC
+            LIMIT :union_limit
+        """)
+        rows = (await self.db.execute(
+            sql, {"eids": eids, "union_limit": limit, **cparams}
+        )).fetchall()
+        return [{
+            "id": row.id,
+            "content": row.content,
+            "category": row.category,
+            "importance": row.importance,
+            "access_count": row.access_count,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "subject_name": row.subject_name,
+            "similarity": _SUBJECT_MATCH_SIMILARITY,
+        } for row in rows]
+
+    async def list_by_subject_entity(
+        self, entity_id: int, user_id: int | None, limit: int = 50,
+    ) -> list[dict]:
+        """All memories whose subject entity is `entity_id` (canonical-chased),
+        circle-filtered for the asker. Backs the /wissen entity drawer
+        "Erinnerungen über diesen Knoten" (Phase 3c)."""
+        clause, params = self._memory_circles_filter(user_id)
+        sql = text(f"""
+            SELECT id, content, category, importance, access_count,
+                   created_at, last_accessed_at, subject_name, subject_entity_id
+            FROM conversation_memories m
+            WHERE is_active = true
+              AND subject_entity_id IS NOT NULL
+              AND subject_entity_id IN (
+                  SELECT e.id FROM kg_entities e
+                  WHERE COALESCE(e.canonical_id, e.id) = :eid
+              )
+              AND {clause}
+            ORDER BY importance * confidence DESC
+            LIMIT :limit
+        """)
+        rows = (await self.db.execute(
+            sql, {"eid": entity_id, "limit": limit, **params}
+        )).fetchall()
+        return [{
+            "id": row.id,
+            "content": row.content,
+            "category": row.category,
+            "importance": row.importance,
+            "access_count": row.access_count,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "last_accessed_at": row.last_accessed_at.isoformat() if row.last_accessed_at else None,
+            "subject_name": row.subject_name,
+            "subject_entity_id": row.subject_entity_id,
+        } for row in rows]
 
     @staticmethod
     def _memory_circles_filter(user_id: int | None) -> tuple[str, dict[str, Any]]:

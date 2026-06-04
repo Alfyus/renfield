@@ -53,6 +53,8 @@ def _memory_to_response(memory) -> MemoryResponse:
         access_count=memory.access_count,
         created_at=memory.created_at.isoformat() if memory.created_at else "",
         last_accessed_at=memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
+        subject_name=memory.subject_name,
+        subject_entity_id=memory.subject_entity_id,
     )
 
 
@@ -94,6 +96,8 @@ async def list_memories(
                     access_count=m["access_count"],
                     created_at=m["created_at"] or "",
                     last_accessed_at=m.get("last_accessed_at"),
+                    subject_name=m.get("subject_name"),
+                    subject_entity_id=m.get("subject_entity_id"),
                 )
                 for m in memories
             ],
@@ -103,6 +107,44 @@ async def list_memories(
         )
     except Exception as e:
         logger.error(f"List memories error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/by-subject/{entity_id}", response_model=MemoryListResponse)
+@limiter.limit(settings.api_rate_limit_chat)
+async def list_memories_by_subject(
+    request: Request,
+    entity_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_user_or_default),
+):
+    """Memories whose subject is the given KG entity (Phase 3c), circle-filtered.
+
+    Backs the /wissen entity drawer's "Erinnerungen über diesen Knoten". Tombstone-
+    safe (canonical_id chase) so a pre-merge link still resolves to the survivor.
+    """
+    try:
+        from services.memory_retrieval import MemoryRetrieval
+        rows = await MemoryRetrieval(db).list_by_subject_entity(
+            entity_id, current_user.id if current_user else None, limit,
+        )
+        return MemoryListResponse(
+            memories=[
+                MemoryResponse(
+                    id=m["id"], content=m["content"], category=m["category"],
+                    importance=m["importance"], access_count=m["access_count"],
+                    created_at=m["created_at"] or "",
+                    last_accessed_at=m.get("last_accessed_at"),
+                    subject_name=m.get("subject_name"),
+                    subject_entity_id=m.get("subject_entity_id"),
+                )
+                for m in rows
+            ],
+            total=len(rows), limit=limit, offset=0,
+        )
+    except Exception as e:
+        logger.error(f"List memories by subject error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

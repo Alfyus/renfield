@@ -13,6 +13,7 @@ import WissenDetailDrawer from '../../../../src/frontend/src/components/wissen/W
 import type { AtomMatch } from '../../../../src/frontend/src/api/resources/brain';
 import { usePatchAtomTier } from '../../../../src/frontend/src/api/resources/brain';
 import { useUpdateKgEntityTier } from '../../../../src/frontend/src/api/resources/knowledgeGraph';
+import { useMemoriesBySubjectQuery } from '../../../../src/frontend/src/api/resources/memories';
 
 vi.mock('../../../../src/frontend/src/api/resources/brain', async (orig) => ({
   ...(await orig<typeof import('../../../../src/frontend/src/api/resources/brain')>()),
@@ -21,6 +22,10 @@ vi.mock('../../../../src/frontend/src/api/resources/brain', async (orig) => ({
 vi.mock('../../../../src/frontend/src/api/resources/knowledgeGraph', async (orig) => ({
   ...(await orig<typeof import('../../../../src/frontend/src/api/resources/knowledgeGraph')>()),
   useUpdateKgEntityTier: vi.fn(),
+}));
+vi.mock('../../../../src/frontend/src/api/resources/memories', async (orig) => ({
+  ...(await orig<typeof import('../../../../src/frontend/src/api/resources/memories')>()),
+  useMemoriesBySubjectQuery: vi.fn(),
 }));
 
 const patchSpy = vi.fn();
@@ -31,6 +36,11 @@ beforeEach(() => {
   kgSpy.mockReset();
   vi.mocked(usePatchAtomTier).mockReturnValue({ mutate: patchSpy } as unknown as ReturnType<typeof usePatchAtomTier>);
   vi.mocked(useUpdateKgEntityTier).mockReturnValue({ mutate: kgSpy } as unknown as ReturnType<typeof useUpdateKgEntityTier>);
+  // default: no linked memories (EntityMemories renders nothing) — keeps the
+  // pre-existing kg_node tests unaffected.
+  vi.mocked(useMemoriesBySubjectQuery).mockReturnValue(
+    { data: { memories: [], total: 0 }, isLoading: false } as unknown as ReturnType<typeof useMemoriesBySubjectQuery>,
+  );
 });
 
 const kgNode: AtomMatch = {
@@ -75,5 +85,29 @@ describe('WissenDetailDrawer', () => {
   it('renders nothing when no atom is open', () => {
     const { container } = renderWithRouter(<WissenDetailDrawer atom={null} onClose={() => {}} />);
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it('Phase 3c: memory drawer surfaces the subject (de)', () => {
+    const memWithSubject: AtomMatch = {
+      atom: {
+        atom_id: 'mem-uuid-2', atom_type: 'conversation_memory', tier: 0,
+        payload: { memory_id: 7, content: 'mag Tee', category: 'preference', subject_name: 'Jutta' },
+      },
+      score: 1, snippet: 'mag Tee', rank: 1,
+    };
+    renderWithRouter(<WissenDetailDrawer atom={memWithSubject} onClose={() => {}} />);
+    expect(screen.getByText(/Über: Jutta/)).toBeInTheDocument();
+  });
+
+  it('Phase 3c: kg_node drawer lists memories about the entity', () => {
+    vi.mocked(useMemoriesBySubjectQuery).mockReturnValue(
+      {
+        data: { memories: [{ id: 1, content: 'Jutta mag Tee', category: 'preference', importance: 0.6, access_count: 0, created_at: '' }], total: 1 },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useMemoriesBySubjectQuery>,
+    );
+    renderWithRouter(<WissenDetailDrawer atom={kgNode} onClose={() => {}} />);
+    expect(screen.getByText('Erinnerungen über diesen Knoten')).toBeInTheDocument();
+    expect(screen.getByText('Jutta mag Tee')).toBeInTheDocument();
   });
 });

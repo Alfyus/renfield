@@ -531,6 +531,8 @@
     "noMemories": "No memories yet",
     "count": "{{count}} memories",
     "couldNotLoad": "Could not load memories",
+    "subjectLabel": "About: {{name}}",
+    "aboutThisEntity": "Memories about this entity",
     "content": "Content",
     "importance": "Importance",
     "accessCount": "Access count",

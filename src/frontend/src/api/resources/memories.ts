@@ -13,6 +13,9 @@ export interface Memory {
   importance: number;
   access_count: number;
   created_at: string;
+  // Phase 3 bridge: WHO the memory is about + its canonical KG entity link.
+  subject_name?: string | null;
+  subject_entity_id?: number | null;
 }
 
 export interface MemoryListResponse {
@@ -54,6 +57,24 @@ export function useMemoriesQuery(category: MemoryCategory | null) {
       queryKey: keys.memories.list(category),
       queryFn: () => fetchMemories(category),
       staleTime: STALE.DEFAULT,
+    },
+    'memory.couldNotLoad',
+  );
+}
+
+async function fetchMemoriesBySubject(entityId: number): Promise<MemoryListResponse> {
+  const response = await apiClient.get<MemoryListResponse>(`/api/memory/by-subject/${entityId}`);
+  return response.data;
+}
+
+/** Phase 3c: memories whose subject is a given KG entity — backs the entity drawer. */
+export function useMemoriesBySubjectQuery(entityId: number | null | undefined) {
+  return useApiQuery(
+    {
+      queryKey: keys.memories.bySubject(entityId ?? null),
+      queryFn: () => fetchMemoriesBySubject(entityId as number),
+      staleTime: STALE.DEFAULT,
+      enabled: entityId != null,
     },
     'memory.couldNotLoad',
   );
