@@ -435,6 +435,8 @@ class KnowledgeGraphService:
         user_role: str | None = None,  # kept for back-compat; ignored under circles
         description: str | None = None,
         extra_types: list[str] | None = None,
+        create_tier: int | None = None,
+        match_entity_type: bool = False,
     ) -> KGEntity:
         """
         Resolve an entity by name, creating or merging as needed.
@@ -452,6 +454,17 @@ class KnowledgeGraphService:
 
         Cross-user entity dedup stays deferred to the named-circles work; v1 is
         per-user (own + unowned only).
+
+        Phase 3 additive params (default = legacy behavior, byte-identical):
+        - ``create_tier``: tier for the create path AND the same-tier embedding
+          search. ``None`` => 0 (self), today's behavior. The memory→entity
+          bridge passes the source memory's ``circle_tier`` so a backfilled
+          household fact doesn't mint a self-tier entity.
+        - ``match_entity_type``: when True, the exact-name and surface-form
+          lookups (and the embedding search) additionally scope to the primary
+          ``entity_type``. Prevents linking e.g. a "Bella" person-fact to a
+          place/thing named Bella. Default False keeps the live extraction path
+          (which trusts the LLM's type) unchanged.
         """
         resolved_type = entity_type if entity_type in KG_ENTITY_TYPES else "thing"
         now = datetime.now(UTC).replace(tzinfo=None)
@@ -475,14 +488,17 @@ class KnowledgeGraphService:
         # Names are no longer unique (the embedding step is same-tier-guarded,
         # so the same name can exist at different tiers), so order
         # deterministically and take first instead of scalar_one.
+        exact_conds = [
+            func.lower(KGEntity.name) == name.lower(),
+            KGEntity.is_active == True,  # noqa: E712
+            KGEntity.canonical_id.is_(None),
+            or_(KGEntity.user_id == user_id, KGEntity.user_id.is_(None)),
+        ]
+        if match_entity_type:
+            exact_conds.append(KGEntity.entity_type == resolved_type)
         q = (
             select(KGEntity)
-            .where(
-                func.lower(KGEntity.name) == name.lower(),
-                KGEntity.is_active == True,  # noqa: E712
-                KGEntity.canonical_id.is_(None),
-                or_(KGEntity.user_id == user_id, KGEntity.user_id.is_(None)),
-            )
+            .where(*exact_conds)
             .order_by(KGEntity.circle_tier.asc(), KGEntity.mention_count.desc())
         )
         existing = (await self.db.execute(q)).scalars().first()
@@ -497,17 +513,21 @@ class KnowledgeGraphService:
         dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
         if dialect == "postgresql":
             sf_user = "AND (user_id = :uid OR user_id IS NULL)" if user_id is not None else ""
+            sf_type = "AND entity_type = :etype" if match_entity_type else ""
             sf_sql = text(f"""
                 SELECT id FROM kg_entities
                 WHERE is_active = true AND canonical_id IS NULL
                   AND surface_forms @> CAST(:sf AS jsonb)
                   {sf_user}
+                  {sf_type}
                 ORDER BY circle_tier ASC, mention_count DESC
                 LIMIT 1
             """)
             sf_params: dict = {"sf": json.dumps([name])}
             if user_id is not None:
                 sf_params["uid"] = user_id
+            if match_entity_type:
+                sf_params["etype"] = resolved_type
             sf_row = (await self.db.execute(sf_sql, sf_params)).fetchone()
             if sf_row:
                 ent = (await self.db.execute(
@@ -522,7 +542,9 @@ class KnowledgeGraphService:
         # (D10), embedded from name+description. A cross-tier or sub-threshold
         # near-duplicate is NOT folded in here; it falls through to "create new"
         # and the background reconciler proposes the review-gated merge.
-        default_tier = 0
+        # create_tier (Phase 3) overrides the legacy self-tier default; clamp to
+        # the valid 0..4 ladder so a bad caller can never mint an out-of-range row.
+        default_tier = 0 if create_tier is None else max(0, min(4, int(create_tier)))
         embedding = None
         try:
             embedding = await self._get_embedding(self._embed_input(name, description))
@@ -532,6 +554,7 @@ class KnowledgeGraphService:
         if embedding:
             similar = await self._find_similar_entity(
                 embedding, user_id=user_id, tier=default_tier,
+                entity_type=resolved_type if match_entity_type else None,
             )
             if similar is not None:
                 _bump(similar)
@@ -627,6 +650,7 @@ class KnowledgeGraphService:
         embedding: list[float],
         user_id: int | None,
         tier: int | None = None,
+        entity_type: str | None = None,
     ) -> KGEntity | None:
         """
         Find the nearest existing entity above the similarity threshold.
@@ -651,6 +675,10 @@ class KnowledgeGraphService:
         if tier is not None:
             tier_filter = "AND circle_tier = :tier"
             params["tier"] = tier
+        type_filter = ""
+        if entity_type is not None:
+            type_filter = "AND entity_type = :etype"
+            params["etype"] = entity_type
 
         # halfvec cast on BOTH sides is mandatory to use idx_kg_entities_embedding_hnsw
         # (built with halfvec_cosine_ops; regular `vector` caps at 2000 dims, prod
@@ -668,6 +696,7 @@ class KnowledgeGraphService:
               AND canonical_id IS NULL
               {user_filter}
               {tier_filter}
+              {type_filter}
             ORDER BY embedding::halfvec({dim}) <=> CAST(:embedding AS halfvec({dim}))
             LIMIT 1
         """)
