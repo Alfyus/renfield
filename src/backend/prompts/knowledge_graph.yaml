@@ -53,9 +53,15 @@ de:
     User: {user_message}
     Assistent: {assistant_response}
 
+    MEHRFACH-TYP: hat eine Entitaet mehrere Rollen (z.B. eine Person, die auch
+    Musiker ist), gib "types" als Liste — erster Eintrag aus
+    person|place|organization|thing|event|concept, weitere frei (z.B. "musician").
+    VORLIEBEN/GESCHMACK als RELATION zwischen Person und Sache modellieren
+    (Praedikat z.B. "mag", "mag_musik_von"), NICHT als generischen Knoten.
+
     Antworte als JSON-Objekt (leere Arrays wenn nichts relevant):
     {{
-      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "description": "..."}}],
+      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "types": ["person"], "description": "..."}}],
       "relations": [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.8}}]
     }}
 
@@ -165,9 +171,15 @@ en:
     User: {user_message}
     Assistant: {assistant_response}
 
+    MULTI-TYPE: if an entity has several roles (e.g. a person who is also a
+    musician), give "types" as a list — the first item from
+    person|place|organization|thing|event|concept, the rest free-form (e.g. "musician").
+    TASTES/PREFERENCES: model as a RELATION between the person and the thing
+    (predicate e.g. "likes", "likes_music_by"), NOT as a generic node.
+
     Reply as JSON object (empty arrays if nothing relevant):
     {{
-      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "description": "..."}}],
+      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "types": ["person"], "description": "..."}}],
       "relations": [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.8}}]
     }}
 

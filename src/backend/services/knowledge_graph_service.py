@@ -434,6 +434,7 @@ class KnowledgeGraphService:
         user_id: int | None,
         user_role: str | None = None,  # kept for back-compat; ignored under circles
         description: str | None = None,
+        extra_types: list[str] | None = None,
     ) -> KGEntity:
         """
         Resolve an entity by name, creating or merging as needed.
@@ -454,12 +455,20 @@ class KnowledgeGraphService:
         """
         resolved_type = entity_type if entity_type in KG_ENTITY_TYPES else "thing"
         now = datetime.now(UTC).replace(tzinfo=None)
+        # Multi-type superset (D4): scalar entity_type stays the closed-enum
+        # primary; entity_types may carry free-form extras (e.g. "musician").
+        extra = [t.strip() for t in (extra_types or []) if t and t.strip()]
+        seed_types = list(dict.fromkeys([resolved_type, *extra]))
 
         def _bump(ent: KGEntity) -> KGEntity:
             ent.mention_count = (ent.mention_count or 1) + 1
             ent.last_seen_at = now
             if description and not ent.description:
                 ent.description = description
+            if extra:  # fold any newly-observed types into the existing entity
+                ent.entity_types = list(dict.fromkeys(
+                    list(ent.entity_types or [ent.entity_type]) + extra
+                ))
             return ent
 
         # Step 1: exact name match (own + unowned, live, canonical only).
@@ -588,7 +597,7 @@ class KnowledgeGraphService:
                     user_id=owner_id,
                     name=name,
                     entity_type=resolved_type,
-                    entity_types=[resolved_type],
+                    entity_types=list(seed_types),
                     description=description,
                     embedding=embedding,
                     atom_id=atom_id,
@@ -602,7 +611,7 @@ class KnowledgeGraphService:
                 user_id=owner_id,
                 name=name,
                 entity_type=resolved_type,
-                entity_types=[resolved_type],
+                entity_types=list(seed_types),
                 description=description,
                 embedding=embedding,
                 atom_id=None,
@@ -700,8 +709,14 @@ class KnowledgeGraphService:
         user_id: int | None = None,
         confidence: float = 0.8,
         source_session_id: str | None = None,
+        stated_by_user_id: int | None = None,
+        source_message_id: int | None = None,
     ) -> KGRelation:
-        """Save a relation, deduplicating same subject+predicate+object."""
+        """Save a relation, deduplicating same subject+predicate+object.
+
+        ``stated_by_user_id`` is the speaker who asserted the fact (provenance),
+        distinct from ``user_id`` (the graph owner) — enables "who told me X".
+        """
         # Check for existing relation
         query = select(KGRelation).where(
             KGRelation.subject_id == subject_id,
@@ -744,6 +759,8 @@ class KnowledgeGraphService:
             object_id=object_id,
             confidence=confidence,
             source_session_id=source_session_id,
+            stated_by_user_id=stated_by_user_id,
+            source_message_id=source_message_id,
             atom_id=atom_id,
             circle_tier=relation_tier,
         )
@@ -1006,8 +1023,17 @@ class KnowledgeGraphService:
         rejected_count = 0
         for ent in entities_data:
             name = ent.get("name", "").strip()
-            etype = ent.get("type", "thing").strip().lower()
             desc = ent.get("description", "").strip() or None
+            # Accept single `type` or multi `types` (D4 multi-type). Primary =
+            # first closed-enum type; the rest become free-form entity_types
+            # extras (e.g. "musician") carried on the entity.
+            raw_types = ent.get("types") or ([ent.get("type")] if ent.get("type") else [])
+            raw_types = [str(t).strip().lower() for t in raw_types if t and str(t).strip()]
+            etype = next(
+                (t for t in raw_types if t in KG_ENTITY_TYPES),
+                raw_types[0] if raw_types else "thing",
+            )
+            extra_types = [t for t in raw_types if t != etype]
             if not name:
                 continue
 
@@ -1016,7 +1042,9 @@ class KnowledgeGraphService:
                 rejected_count += 1
                 continue
 
-            entity = await self.resolve_entity(name, etype, user_id, user_role, desc)
+            entity = await self.resolve_entity(
+                name, etype, user_id, user_role, desc, extra_types=extra_types or None,
+            )
             entity_map[name.lower()] = entity
             saved_entities.append(entity)
 
@@ -1072,6 +1100,7 @@ class KnowledgeGraphService:
                 user_id=user_id,
                 confidence=conf,
                 source_session_id=session_id,
+                stated_by_user_id=user_id,  # the authenticated speaker asserted it
             )
             saved_relations.append(relation)
 
@@ -1178,8 +1207,17 @@ class KnowledgeGraphService:
         rejected_count = 0
         for ent in entities_data:
             name = ent.get("name", "").strip()
-            etype = ent.get("type", "thing").strip().lower()
             desc = ent.get("description", "").strip() or None
+            # Accept single `type` or multi `types` (D4 multi-type). Primary =
+            # first closed-enum type; the rest become free-form entity_types
+            # extras (e.g. "musician") carried on the entity.
+            raw_types = ent.get("types") or ([ent.get("type")] if ent.get("type") else [])
+            raw_types = [str(t).strip().lower() for t in raw_types if t and str(t).strip()]
+            etype = next(
+                (t for t in raw_types if t in KG_ENTITY_TYPES),
+                raw_types[0] if raw_types else "thing",
+            )
+            extra_types = [t for t in raw_types if t != etype]
             if not name:
                 continue
 
@@ -1188,7 +1226,9 @@ class KnowledgeGraphService:
                 rejected_count += 1
                 continue
 
-            entity = await self.resolve_entity(name, etype, user_id, user_role, desc)
+            entity = await self.resolve_entity(
+                name, etype, user_id, user_role, desc, extra_types=extra_types or None,
+            )
             entity_map[name.lower()] = entity
             saved_entities.append(entity)
 
