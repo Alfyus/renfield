@@ -924,10 +924,12 @@ class KnowledgeGraphService:
             "WHERE atoms.atom_type = :edge AND atoms.source_id = r.id::text "
             "  AND (r.subject_id = :w OR r.object_id = :w)"
         ), {"edge": ATOM_TYPE_KG_EDGE, "w": wid})
-        # keep the survivor's own kg_node atom policy in lockstep with merged_tier
+        # keep the survivor's own kg_node atom policy in lockstep with merged_tier.
+        # CAST(:t AS INTEGER): json_build_object is VARIADIC "any", so asyncpg
+        # can't infer a bare param's type -> IndeterminateDatatypeError ($1).
         if winner.atom_id:
             await self.db.execute(text(
-                "UPDATE atoms SET policy = json_build_object('tier', :t), updated_at = NOW() "
+                "UPDATE atoms SET policy = json_build_object('tier', CAST(:t AS INTEGER)), updated_at = NOW() "
                 "WHERE atom_id = :a"
             ), {"t": merged_tier, "a": winner.atom_id})
 
