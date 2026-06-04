@@ -4,7 +4,7 @@ Datenbank Models
 from datetime import UTC, datetime
 
 from sqlalchemy import JSON, BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, FetchedValue, Float, ForeignKey, Index, Integer, Numeric, SmallInteger, String, Text, UniqueConstraint, text as sa_text
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
@@ -947,6 +947,19 @@ class ConversationMemory(Base):
     atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=True, index=True)
     circle_tier = Column(Integer, nullable=False, default=0)
 
+    # --- Structured Memory (Phase 0/D9): subject attribution ---
+    # WHO the fact is ABOUT ("Jutta mag X" -> subject = the Jutta entity),
+    # distinct from user_id (the OWNER) and from the speaker. Closes the
+    # flat-memory conflation bug: retrieval can subject-filter instead of
+    # relying on embedding neighborhood. subject_entity_id links to the
+    # canonical KG entity when one resolves; subject_name carries the raw
+    # name even when no entity exists yet (e.g. a not-yet-seen person).
+    subject_entity_id = Column(
+        Integer, ForeignKey("kg_entities.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    subject_name = Column(String(255), nullable=True, index=True)
+
     # Full-text search vector (Postgres GENERATED STORED column from
     # pc20260528). READ-ONLY from the app side — Postgres maintains it
     # via the multilingual union in services.fts_languages.
@@ -1409,12 +1422,47 @@ class KGEntity(Base):
     atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=True, index=True)
     circle_tier = Column(Integer, nullable=False, default=0)
 
+    # --- Structured Memory (Phase 0): canonicalization + multi-type ---
+    # NULL canonical_id == this row IS canonical/live; non-NULL == tombstone
+    # pointing at the surviving entity (mirrors procedural_skills.merged_into_id).
+    # merge_entities sets the pointer + is_active=False and reparents
+    # kg_relations FKs to the winner. Reads filter `canonical_id IS NULL`.
+    canonical_id = Column(
+        Integer, ForeignKey("kg_entities.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    # Absorbed alternate spellings / aliases, accumulated on the canonical row.
+    # JSON on sqlite (test shim), JSONB on Postgres (GIN-indexed in migration).
+    surface_forms = Column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False, default=list, server_default=sa_text("'[]'"),
+    )
+    # Multi-type superset, e.g. ["person","musician"]. The scalar entity_type
+    # stays the PRIMARY type for back-compat display/filter; entity_types is the
+    # full set. Backfilled to [entity_type] in the Phase-0 migration.
+    entity_types = Column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False, default=list, server_default=sa_text("'[]'"),
+    )
+    # Optional external grounding (e.g. Wikidata QID). Column only — no runtime
+    # linker (offline-first); reserved for a later phase.
+    external_id = Column(String(64), nullable=True, index=True)
+
     __table_args__ = (
         Index('ix_kg_entities_user_active', 'user_id', 'is_active'),
         Index('idx_kg_entities_owner_tier', 'user_id', 'circle_tier'),
+        # GIN index on surface_forms is created in the Phase-0 migration
+        # (postgresql_using='gin' + jsonb_path_ops) — not here, mirroring the
+        # vector-index convention (indexes that need a PG opclass live in
+        # migrations, not create_all, so the sqlite test shim stays clean).
     )
 
     user = relationship("User", foreign_keys=[user_id])
+    # Self-reference to the surviving (canonical) entity when this row is a
+    # merge tombstone. remote_side keeps it a many-to-one toward the winner.
+    canonical = relationship(
+        "KGEntity", foreign_keys=[canonical_id], remote_side="KGEntity.id",
+    )
     subject_relations = relationship(
         "KGRelation", foreign_keys="KGRelation.subject_id",
         back_populates="subject", cascade="all, delete-orphan"
@@ -1446,6 +1494,13 @@ class KGRelation(Base):
     # incident relations recompute their tier in the same transaction).
     atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=True, index=True)
     circle_tier = Column(Integer, nullable=False, default=0)
+
+    # --- Structured Memory (Phase 0): provenance ---
+    # Who ASSERTED this fact (the authenticated speaker at extraction time),
+    # distinct from user_id (the graph OWNER). Enables "who told me X about Y".
+    stated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    # The specific message the assertion was extracted from (when available).
+    source_message_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
 
     __table_args__ = (
         Index('idx_kg_relations_subj_tier', 'subject_id', 'circle_tier'),
