@@ -1243,6 +1243,19 @@ class AgentService:
                 summary_text=summary_text,
                 progress_sink=progress_sink,
             ):
+                # _run_impl records tool_call/tool_result/error into
+                # context.steps but yields the terminal final_answer WITHOUT
+                # recording it (it `return`s straight after the yield). The
+                # post-turn bookkeeping classifies the turn from context.steps,
+                # so a missing final_answer makes EVERY turn read as ABORT:
+                # the trajectory is dropped (default capture-set excludes
+                # abort) and turn_success is forced False (no skill auto-
+                # extraction; injected skills mis-recorded as failures).
+                # Record the terminal step here, at the single point every
+                # final_answer streams through, rather than at each of the
+                # ~10 yield sites inside _run_impl.
+                if step.step_type == "final_answer":
+                    context.steps.append(step)
                 yield step
         finally:
             # Publish real token counts from the AgentContext — fires on every
