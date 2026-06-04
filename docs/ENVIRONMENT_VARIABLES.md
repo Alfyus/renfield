@@ -484,6 +484,7 @@ MEMORY_CONTRADICTION_TOP_K=5            # Max bestehende Erinnerungen zum Vergle
 # Memory→KG Bridge (Structured Memory Phase 3) — opt-in, dark by default
 MEMORY_KG_BRIDGE_ENABLED=false              # Memory-Subjekte an kanonische KG-Entitaeten binden (save-time + entity-augmentiertes Retrieval)
 MEMORY_RETRIEVAL_SUBJECT_UNION_LIMIT=5      # Max deterministische subjekt-verlinkte Memories pro Turn (1-50)
+MEMORY_SUBSUME_TO_KG=false                  # Phase 3-subsume: zerlegbare Fakten (category=fact + Subjekt) NUR im KG, kein flaches Duplikat. Aggressiv, opt-in.
 ```
 
 **Memory→KG Bridge (Phase 3):** Wenn `MEMORY_KG_BRIDGE_ENABLED=true`, verlinkt der
@@ -496,6 +497,14 @@ deterministisch in die Embedding-Treffer (similarity-Floor, eigenes Limit,
 canonical_id-Tombstone-Chase) — **immer durch denselben `circle_sql`-Filter**.
 Bestandsdaten: `python bin/backfill_subject_entity_ids.py --dry-run` (Schaetzung,
 keine Writes) → `--commit`. Aus = Retrieval/Extraktion byte-identisch zu vorher.
+
+**Subsume (`MEMORY_SUBSUME_TO_KG`, Phase 3-subsume, aggressiv):** Wenn `true`, werden
+zerlegbare `fact`-Memories mit Subjekt **gar nicht** mehr flach gespeichert — sie
+leben nur noch im KG (Entitaeten + Relationen, die der KG-Hook im selben Turn
+extrahiert). Praeferenzen/Instruktionen/Kontext bleiben flach. **Risiko:** ein Fakt,
+dessen Objekt keine benannte Entitaet ist (z. B. „Anna ist müde"), wird ggf. nicht
+als KG-Relation erfasst und geht verloren. Erst aktivieren, wenn die Fakt-Erfassung
+der KG-Extraktion an echten Transkripten validiert ist. Aus (default) = unveraendert.
 
 **Defaults:**
 - `MEMORY_ENABLED`: `false`

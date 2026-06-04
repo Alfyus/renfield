@@ -473,6 +473,7 @@ class Settings(BaseSettings):
     kg_reconciler_max_per_run: int = Field(default=50, ge=1, le=500)             # Safety cap per user per run
     kg_reconciler_embed_backfill_per_run: int = Field(default=50, ge=0, le=500)  # Re-embed up to N null-embedding entities per pass (#6); 0 disables
     memory_kg_bridge_enabled: bool = False                                       # Phase 3: link memory subjects to canonical KG entities (save-time + entity-augmented retrieval). Opt-in.
+    memory_subsume_to_kg: bool = False                                           # Phase 3-subsume: decomposable facts (category=fact + subject) live in the KG only; skip the flat duplicate. Opt-in, aggressive.
     memory_retrieval_subject_union_limit: int = Field(default=5, ge=1, le=50)    # Phase 3c: max deterministic subject-linked memories merged into retrieval per turn
 
     # Skill draft-gate shadow log (v2.10 admin console rollout). When True,
