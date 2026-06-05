@@ -657,6 +657,7 @@ class ConversationMemoryService:
                 subject, "person", memory.user_id,
                 create_tier=memory.circle_tier,
                 match_entity_type=True,
+                use_embedding=False,  # bare names embed-conflate across people (Jutta→Anna); exact/surface/create only
             )
             memory.subject_entity_id = ent.id
             if not memory.subject_name:
