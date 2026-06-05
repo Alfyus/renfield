@@ -1,0 +1,79 @@
+# Memory subject-extraction eval (Phase 3 bridge feeder).
+#
+# The bridge/subsume only work if v1 extraction populates the `subject` field
+# correctly. This gold set measures two things against the LIVE model:
+#   1. named-subject recall  — a fact about a NAMED person gets that name as subject
+#   2. NO role/pronoun leak   — subject is never a pronoun ("sie") or a role
+#      phrase ("meine Frau", "der Benutzer"); those would mint junk KG entities
+#      via the bridge. Such cases must yield subject=null instead.
+#
+# Not a CI test — needs the prod extraction model (qwen3.6 via llama-server-agent).
+# Run in-pod:  python bin/run_memory_subject_eval.py /tests/eval/memory_subject_extraction_eval.yaml
+#
+# expect keys (per case):
+#   subjects_any:  list[str]  — every listed name must appear as some memory's subject
+#   all_null:      bool       — no extracted memory may have a non-null subject
+#   forbid_role_pronoun: bool — no subject may be a pronoun/role phrase (default true)
+forbidden_subjects:   # case-insensitive; a subject in this set is always a leak
+  - sie
+  - er
+  - es
+  - she
+  - he
+  - it
+  - meine frau
+  - mein bruder
+  - mein sohn
+  - der benutzer
+  - die frau des benutzers
+  - ehefrau
+  - frau
+
+cases:
+  - id: named-third-party
+    lang: de
+    user: "Anna wohnt in Bonn und mag Jazz."
+    assistant: "Ok."
+    expect: {subjects_any: ["Anna"]}
+
+  - id: named-possessive
+    lang: de
+    user: "Meine Frau Jutta mag Beachvolleyball."
+    assistant: "Schön."
+    expect: {subjects_any: ["Jutta"]}
+
+  - id: name-introduction
+    lang: de
+    user: "Meine Frau heißt Jutta."
+    assistant: "Ok."
+    expect: {subjects_any: ["Jutta"]}
+
+  - id: multi-subject
+    lang: de
+    user: "Ich heiße Max, meine Frau Jutta mag Jazz und mein Sohn Tim spielt Fussball."
+    assistant: "Notiert."
+    expect: {subjects_any: ["Jutta", "Tim"]}
+
+  - id: unnamed-possessive-null
+    lang: de
+    user: "Meine Frau ist ein Fan von Beachvolleyball."
+    assistant: "Ok."
+    expect: {all_null: true}
+
+  - id: pronoun-only-null
+    lang: de
+    user: "Sie mag übrigens auch Tennis."
+    assistant: "Ok."
+    expect: {all_null: true}
+
+  - id: self-fact-null
+    lang: de
+    user: "Ich heiße Max."
+    assistant: "Hallo Max."
+    expect: {all_null: true}
+
+  - id: named-en
+    lang: en
+    user: "My brother Tom plays tennis."
+    assistant: "Noted."
+    expect: {subjects_any: ["Tom"]}
