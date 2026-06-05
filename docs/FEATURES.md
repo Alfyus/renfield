@@ -339,6 +339,13 @@ Home Assistant Automation → POST /api/notifications/webhook
 - **LLM-Enrichment**: Benachrichtigungen werden durch LLM-Kontext angereichert (opt-in)
 - **Suppressions**: Nutzer können bestimmte Benachrichtigungs-Typen unterdrücken (semantisch)
 - **Feedback Learning**: System lernt aus Nutzer-Interaktionen mit Benachrichtigungen (opt-in)
+- **Privacy-aware TTS / Multi-Room-Auslieferung**: Benachrichtigungen werden präsenzabhängig im aktiven Raum vorgelesen; das `privacy`-Feld (public/personal/confidential) steuert, wer sie hört (Presence Detection + Audio Output Routing).
+
+### Konfiguration
+
+- **Master-Switch:** `PROACTIVE_ENABLED=true` (opt-in; aus = `/api/notifications/webhook` antwortet `503`). Webhook-Token via `POST /api/notifications/token` (Admin) generieren und in Home Assistant (`input_text.renfield_webhook_token`) hinterlegen.
+- **MCP-Polling:** `NOTIFICATION_POLLER_ENABLED=true` lässt Renfield MCP-Server (E-Mail, Kalender) aktiv nach Events abfragen, statt nur Push-Webhooks zu empfangen.
+- Vollständiger Einrichtungs-Guide + HA-Vorlagen: [`docs/PROACTIVE_NOTIFICATIONS.md`](PROACTIVE_NOTIFICATIONS.md) und [`docs/PROACTIVE_SCHEDULING_TEMPLATES.md`](PROACTIVE_SCHEDULING_TEMPLATES.md).
 
 ### Erinnerungen
 
