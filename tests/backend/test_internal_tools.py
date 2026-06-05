@@ -2063,6 +2063,256 @@ class TestRelativeVolume:
             service_data={"is_volume_muted": False},
         )
 
+    # --- status (what's playing) — room-based, read-only ---
+
+    @pytest.mark.unit
+    async def test_status_dlna(self, internal_tools):
+        """status on DLNA calls mcp.dlna.get_status and parses the nested
+        content-block payload (the REAL execute_tool shape, not a flat dict)."""
+        import json as _json
+        payload = _json.dumps({"state": "playing", "title": "1LIVE", "artist": "WDR"})
+
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_status":
+                return {"success": True, "data": [{"type": "text", "text": payload}]}
+            return {"success": True}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "status", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        mock_mcp_manager.execute_tool.assert_called_once_with(
+            "mcp.dlna.get_status", {"renderer_name": "HiFiBerry Arbeitszimmer"},
+        )
+        assert result["data"]["status"]["title"] == "1LIVE"
+        assert result["data"]["status"]["state"] == "playing"
+
+    @pytest.mark.unit
+    async def test_status_dlna_failure_surfaced(self, internal_tools):
+        """A failing get_status is surfaced as success=False, not wrapped as ok."""
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_status":
+                return {"success": False, "message": "Renderer 'X' not found"}
+            return {"success": True}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "status", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "not found" in result["message"]
+
+    @pytest.mark.unit
+    async def test_status_ha(self, internal_tools):
+        """status on an HA player reads get_state and normalizes the media fields."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.get_state = AsyncMock(return_value={
+            "state": "playing",
+            "attributes": {"media_title": "Song", "media_artist": "Artist",
+                           "media_album_name": "Album"},
+        })
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "status", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        st = result["data"]["status"]
+        assert st["state"] == "playing"
+        assert st["title"] == "Song"
+        assert st["artist"] == "Artist"
+
+    # --- seek / play_mode (Phase 2) ---
+
+    @pytest.mark.unit
+    async def test_seek_dlna(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.seek":
+                return {"success": True}
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._media_control({
+                "action": "seek", "room_name": "Arbeitszimmer", "position_seconds": 30,
+            })
+        assert result["success"] is True
+        mock_mgr.execute_tool.assert_called_once_with(
+            "mcp.dlna.seek", {"renderer_name": "HiFiBerry Arbeitszimmer", "position_seconds": 30},
+        )
+
+    @pytest.mark.unit
+    async def test_play_mode_dlna(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._media_control({
+                "action": "play_mode", "room_name": "Arbeitszimmer", "mode": "shuffle",
+            })
+        assert result["success"] is True
+        mock_mgr.execute_tool.assert_called_once_with(
+            "mcp.dlna.set_play_mode", {"renderer_name": "HiFiBerry Arbeitszimmer", "mode": "shuffle"},
+        )
+
+    @pytest.mark.unit
+    async def test_seek_missing_position_is_error(self, internal_tools):
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(return_value={"success": True})
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._media_control({
+                "action": "seek", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "position_seconds" in result["message"]
+
+    @pytest.mark.unit
+    async def test_seek_ha_media_seek(self, internal_tools):
+        mock_ha = MagicMock(); mock_ha.call_service = AsyncMock(return_value=True)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha):
+            result = await internal_tools._media_control({
+                "action": "seek", "room_name": "Arbeitszimmer", "position_seconds": 12,
+            })
+        assert result["success"] is True
+        mock_ha.call_service.assert_called_once_with(
+            domain="media_player", service="media_seek",
+            entity_id="media_player.arbeitszimmer", service_data={"seek_position": 12},
+        )
+
+    @pytest.mark.unit
+    async def test_seek_dlna_failure_surfaced(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.seek":
+                return {"success": False, "message": "seek not supported"}
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._media_control({
+                "action": "seek", "room_name": "Arbeitszimmer", "position_seconds": 5,
+            })
+        assert result["success"] is False
+        assert "seek" in result["message"].lower()
+
+    @pytest.mark.unit
+    async def test_play_mode_ha_missing_mode_is_error(self, internal_tools):
+        mock_ha = MagicMock(); mock_ha.call_service = AsyncMock(return_value=True)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha):
+            result = await internal_tools._media_control({
+                "action": "play_mode", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "mode" in result["message"].lower()
+        mock_ha.call_service.assert_not_called()
+
+
+# ============================================================================
+# Test internal.play_from_server (Phase 3 — media-server browsing)
+# ============================================================================
+
+class TestPlayFromServer:
+    @staticmethod
+    def _patch_main_app(mock_mcp_manager):
+        mock_app = MagicMock()
+        mock_app.state.mcp_manager = mock_mcp_manager
+        fake_main = ModuleType("main")
+        fake_main.app = mock_app
+        return patch.dict(sys.modules, {"main": fake_main})
+
+    @staticmethod
+    def _dlna_resolve():
+        return {
+            "success": True, "action_taken": True,
+            "data": {"target_type": "dlna", "dlna_renderer_name": "HiFiBerry Arbeitszimmer",
+                     "room_name": "Arbeitszimmer", "device_name": "HiFiBerry Arbeitszimmer"},
+        }
+
+    @pytest.mark.unit
+    async def test_play_from_server_resolves_room_and_plays(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.play_from_server":
+                return {"success": True, "data": [{"type": "text", "text": '{"played": 12}'}]}
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._play_from_server({
+                "server_name": "NAS", "object_id": "album-42", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        mock_mgr.execute_tool.assert_called_once_with(
+            "mcp.dlna.play_from_server",
+            {"server_name": "NAS", "object_id": "album-42", "renderer_name": "HiFiBerry Arbeitszimmer"},
+        )
+        assert result["data"]["result"]["played"] == 12
+
+    @pytest.mark.unit
+    async def test_play_from_server_requires_params(self, internal_tools):
+        result = await internal_tools._play_from_server({"server_name": "NAS", "object_id": "x"})
+        assert result["success"] is False
+        assert "room_name" in result["message"]
+
+    @pytest.mark.unit
+    async def test_play_from_server_non_dlna_room_errors(self, internal_tools):
+        ha_resolve = {"success": True, "data": {"target_type": "homeassistant",
+                      "entity_id": "media_player.x", "room_name": "Wohnzimmer"}}
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=ha_resolve):
+            result = await internal_tools._play_from_server({
+                "server_name": "NAS", "object_id": "y", "room_name": "Wohnzimmer",
+            })
+        assert result["success"] is False
+        assert "no dlna renderer" in result["message"].lower()
+
+    @pytest.mark.unit
+    async def test_play_from_server_failure_surfaced(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.play_from_server":
+                return {"success": False, "message": "object not found"}
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._play_from_server({
+                "server_name": "NAS", "object_id": "bad", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "failed" in result["message"].lower() or "not found" in result["message"].lower()
+
+    @pytest.mark.unit
+    async def test_play_from_server_busy_room_clear_error(self, internal_tools):
+        busy = {"success": False, "data": {"status": "busy", "target_type": "dlna",
+                "dlna_renderer_name": "HiFiBerry Arbeitszimmer", "room_name": "Arbeitszimmer"},
+                "message": "busy"}
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=busy):
+            result = await internal_tools._play_from_server({
+                "server_name": "NAS", "object_id": "x", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "stop it first" in result["message"].lower() or "currently playing" in result["message"].lower()
+
 
 # ============================================================================
 # Test play_album_on_dlna
