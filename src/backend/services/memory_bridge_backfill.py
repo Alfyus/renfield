@@ -118,6 +118,7 @@ async def run_backfill(db: AsyncSession, user_id: int | None = None, limit: int 
                 m.subject_name, "person", m.user_id,
                 create_tier=m.circle_tier,
                 match_entity_type=True,
+                use_embedding=False,  # bare names embed-conflate across people (Jutta→Anna); exact/surface/create only
             )
             m.subject_entity_id = ent.id
             await db.commit()  # per-row: create+link atomic, no orphan on crash

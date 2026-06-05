@@ -189,6 +189,19 @@ Rebuilt on the **post-RRF single-insertion design** (`docs/HANDOVER_graph_expans
 ### Structured Memory Phase 3-subsume — recall-loss watch (post-enable)
 Shipped dark (`MEMORY_SUBSUME_TO_KG`, off). When enabled, `fact`-category memories with a subject are NOT stored flat (they live in the KG). **Risk:** a fact whose object is not a named entity (e.g. "Anna ist müde") may not be captured as a KG relation → lost. Before enabling in prod, validate KG extraction's fact-capture rate on real transcripts; consider a shadow/measure pass first. Trigger: owner wants to reduce flat-memory duplication AND KG fact-capture is validated good.
 
+### KG extraction-path embedding conflation (original-bug root) — needs decision
+The Phase 3 bridge now resolves with `use_embedding=False` (exact/surface/create), so it
+no longer folds "Jutta" into "Anna" via name-embedding. BUT the LIVE KG **extraction** path
+(`resolve_entity` default `use_embedding=True`) still does this: a bare given name embeds
+>= `kg_similarity_threshold` (0.85) to a different same-tier person and gets merged in. Entity
+`Anna Johanna von den Bongard` has mention_count 127 — a hub that has likely absorbed other
+people (incl. Jutta) over time via exactly this. This is the mechanism behind the originally
+reported conflation. Options: (a) lower-risk — raise the threshold / require a stronger signal
+for name-only matches; (b) disable embedding match for extraction too (exact-name handles
+re-mentions; same-name reconciler gate + dedup cover the rest) — bigger blast radius, own review;
+(c) a cleanup pass to split mis-absorbed people out of hub entities. **Decide before trusting
+KG person-entities for retrieval.** Surfaced 2026-06-05 during the memory migration sample.
+
 ### Paperless PR 5 — Interactive confirm card
 In-chat card with per-field controls, tag chips, storage-path tree; structured-payload callback instead of free-text.
 - **Primary source:** `docs/design/paperless-llm-metadata.md` §Implementation plan → PR 5, §302-324

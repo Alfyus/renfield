@@ -437,6 +437,7 @@ class KnowledgeGraphService:
         extra_types: list[str] | None = None,
         create_tier: int | None = None,
         match_entity_type: bool = False,
+        use_embedding: bool = True,
     ) -> KGEntity:
         """
         Resolve an entity by name, creating or merging as needed.
@@ -551,7 +552,13 @@ class KnowledgeGraphService:
         except Exception as e:
             logger.warning(f"KG: Could not generate embedding for entity '{name}': {e}")
 
-        if embedding:
+        # use_embedding=False (the memory→KG bridge): SKIP the embedding-similarity
+        # match. A bare given name ("Jutta") embeds close to other same-tier person
+        # names ("Anna Johanna von den Bongard") and would be folded into the WRONG
+        # person — the exact conflation Phase 3 exists to prevent. The bridge resolves
+        # by exact-name + surface-form only, else CREATES a fresh entity; a genuine
+        # near-duplicate is left for the review-gated reconciler, never inline-merged.
+        if use_embedding and embedding:
             similar = await self._find_similar_entity(
                 embedding, user_id=user_id, tier=default_tier,
                 entity_type=resolved_type if match_entity_type else None,
