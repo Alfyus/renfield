@@ -464,6 +464,42 @@ def _schedule_kg_conflation_monitor():
     )
 
 
+def _schedule_obligation_deadline_notifier():
+    """Daily owner-targeted obligation-deadline notifier (Schicht A).
+
+    Scans dated ``document_facts`` obligations, fires the single current
+    lead-time milestone per obligation, and records it in the
+    ``obligation_acknowledgements`` ledger so a restart / re-run never re-fires
+    (the missed-deadline safety property).
+
+    Gated on BOTH ``obligation_notifier_enabled`` AND ``proactive_enabled``:
+    the notifier delivers via the proactive subsystem, so running it while
+    proactive delivery is off would consume each milestone in the ledger (the
+    scan records it) without ever delivering — the elapsed reminders would be
+    silently skipped once proactive is later enabled. Requiring both keeps the
+    ledger and delivery in lockstep.
+    """
+    if not (settings.obligation_notifier_enabled and settings.proactive_enabled):
+        return
+
+    async def _tick():
+        from services.obligation_deadline_notifier import scan_all_users
+
+        await scan_all_users()
+
+    _spawn_periodic_task(
+        name="Obligation deadline notifier",
+        interval=settings.obligation_notifier_interval,
+        work=_tick,
+        started_msg=(
+            f"Obligation Deadline Notifier gestartet "
+            f"(interval={settings.obligation_notifier_interval}s, "
+            f"overdue_grace={settings.obligation_notifier_overdue_grace_days}d)"
+        ),
+        run_at_boot=True,  # daily interval — must run on cold start (#678)
+    )
+
+
 def _schedule_skill_shadow_log_cleanup():
     """Prune `skill_would_have_injected_log` rows older than the
     configured retention.
@@ -862,6 +898,7 @@ async def lifespan(app: "FastAPI"):
     _schedule_skill_curator()
     _schedule_kg_reconciler()
     _schedule_kg_conflation_monitor()
+    _schedule_obligation_deadline_notifier()
     _schedule_skill_shadow_log_cleanup()
     _schedule_paperless_sweepers(app)
 
