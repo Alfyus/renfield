@@ -1888,6 +1888,17 @@ class DocumentFact(Base):
     source = Column(String(16), nullable=False, default=DOC_FACT_SOURCE_DETERMINISTIC)
     atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=False, index=True)
     circle_tier = Column(Integer, nullable=False, default=0)
+    # When True, this fact's circle_tier was set independently (e.g. a public
+    # issuer on an otherwise-private document) and the parent-document tier
+    # cascade (AtomService.update_tier) MUST NOT overwrite it — sticky in both
+    # directions for the life of this fact row, until explicitly reset to the
+    # document tier (reset_fact_tier). NOTE: re-ingest / re-OCR recreates the
+    # fact set from scratch (tier_overridden defaults False), so overrides do
+    # NOT survive a re-extraction — they are bound to the current fact set. A
+    # re-extracted fact reverts to its document's tier (never more visible than
+    # the parent doc). Carrying overrides across re-extraction is a P2 follow-up
+    # (TODOS.md).
+    tier_overridden = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=_utcnow)
 
     # Full-text search vector. Post-<id>_document_facts_fts this is a Postgres
