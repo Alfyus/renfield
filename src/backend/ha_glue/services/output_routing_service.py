@@ -193,14 +193,19 @@ class OutputRoutingService:
         """
         Check if an output device is available for playback.
         """
-        if output_device.is_renfield_device:
-            return await self._check_renfield_device_availability(output_device.renfield_device_id)
-        elif output_device.is_dlna_device:
-            # DLNA availability via SSDP probing is too expensive for routing checks.
-            # Assume available — playback will fail gracefully if renderer is off.
-            return DeviceAvailability.AVAILABLE
+        # Use the dual-read target_type so generic-provider rows (samsung/sonos/…
+        # with only the (output_provider, output_target_id) pair) resolve too.
+        target_type = output_device.target_type
+        if target_type == "renfield":
+            return await self._check_renfield_device_availability(output_device.target_id)
+        elif target_type == "homeassistant":
+            return await self._check_ha_device_availability(output_device.target_id)
         else:
-            return await self._check_ha_device_availability(output_device.ha_entity_id)
+            # dlna + any generic output provider (samsung, sonos, …). SSDP/network
+            # probing is too expensive for routing; assume available — playback
+            # (and the power-on poll for power-capable providers) verifies for real
+            # and fails gracefully / wakes the device at dispatch time.
+            return DeviceAvailability.AVAILABLE
 
     async def _check_renfield_device_availability(
         self,
@@ -282,6 +287,8 @@ class OutputRoutingService:
         renfield_device_id: str | None = None,
         ha_entity_id: str | None = None,
         dlna_renderer_name: str | None = None,
+        output_provider: str | None = None,
+        output_target_id: str | None = None,
         priority: int = 1,
         allow_interruption: bool = False,
         tts_volume: float | None = 0.5,
@@ -290,28 +297,60 @@ class OutputRoutingService:
         """
         Add a new output device to a room.
 
-        Exactly one of renfield_device_id, ha_entity_id, or dlna_renderer_name must be provided.
+        Two ways to identify the target:
+        - **Generic pair** ``(output_provider, output_target_id)`` — for any
+          provider, including brands with no legacy column (e.g. samsung). Legacy
+          columns stay NULL.
+        - **Legacy column** — exactly one of renfield_device_id / ha_entity_id /
+          dlna_renderer_name. The generic pair is dual-written from it so both
+          read paths resolve during the soak (docs/design/output-providers.md).
         """
-        identifiers = [renfield_device_id, ha_entity_id, dlna_renderer_name]
-        set_count = sum(1 for v in identifiers if v)
-        if set_count == 0:
-            raise ValueError("One of renfield_device_id, ha_entity_id, or dlna_renderer_name must be provided")
-        if set_count > 1:
-            raise ValueError("Only one of renfield_device_id, ha_entity_id, or dlna_renderer_name can be provided")
+        # Generic path: an explicit provider + target id.
+        if output_provider or output_target_id:
+            if not (output_provider and output_target_id):
+                raise ValueError(
+                    "output_provider and output_target_id must be provided together"
+                )
+            if any([renfield_device_id, ha_entity_id, dlna_renderer_name]):
+                raise ValueError(
+                    "Provide either the (output_provider, output_target_id) pair "
+                    "OR a single legacy id column, not both"
+                )
+            if not device_name:
+                device_name = output_target_id
+        else:
+            # Legacy path: exactly one of the three identity columns.
+            identifiers = [renfield_device_id, ha_entity_id, dlna_renderer_name]
+            set_count = sum(1 for v in identifiers if v)
+            if set_count == 0:
+                raise ValueError(
+                    "One of renfield_device_id, ha_entity_id, dlna_renderer_name, "
+                    "or the (output_provider, output_target_id) pair must be provided"
+                )
+            if set_count > 1:
+                raise ValueError("Only one of renfield_device_id, ha_entity_id, or dlna_renderer_name can be provided")
 
-        # Auto-generate device name if not provided
-        if not device_name:
+            # Auto-generate device name if not provided
+            if not device_name:
+                if renfield_device_id:
+                    device_name = renfield_device_id
+                elif dlna_renderer_name:
+                    device_name = dlna_renderer_name
+                else:
+                    # Try to get friendly name from HA
+                    try:
+                        state = await self.ha_client.get_state(ha_entity_id)
+                        device_name = state.get("attributes", {}).get("friendly_name", ha_entity_id)
+                    except Exception:
+                        device_name = ha_entity_id  # Fallback if HA unavailable
+
+            # Dual-write the generic pair from the legacy column.
             if renfield_device_id:
-                device_name = renfield_device_id
-            elif dlna_renderer_name:
-                device_name = dlna_renderer_name
+                output_provider, output_target_id = "renfield", renfield_device_id
+            elif ha_entity_id:
+                output_provider, output_target_id = "homeassistant", ha_entity_id
             else:
-                # Try to get friendly name from HA
-                try:
-                    state = await self.ha_client.get_state(ha_entity_id)
-                    device_name = state.get("attributes", {}).get("friendly_name", ha_entity_id)
-                except Exception:
-                    device_name = ha_entity_id  # Fallback if HA unavailable
+                output_provider, output_target_id = "dlna", dlna_renderer_name
 
         output_device = RoomOutputDevice(
             room_id=room_id,
@@ -319,6 +358,8 @@ class OutputRoutingService:
             renfield_device_id=renfield_device_id,
             ha_entity_id=ha_entity_id,
             dlna_renderer_name=dlna_renderer_name,
+            output_provider=output_provider,
+            output_target_id=output_target_id,
             priority=priority,
             allow_interruption=allow_interruption,
             tts_volume=tts_volume,
@@ -439,6 +480,79 @@ class OutputRoutingService:
 
         # Filter to devices with speaker capability
         return [d for d in devices if d.capabilities and d.capabilities.get("has_speaker", False)]
+
+    async def get_aggregated_outputs(self, room_id: int, mcp_manager) -> list[dict]:
+        """Capability-tagged union of every output target for a room, normalized to
+        ``{provider, target_id, name, capabilities[], room_hint, reachable}``.
+
+        Built-ins (renfield / homeassistant / dlna) come from the existing
+        per-source methods; MCP-declared providers (samsung, sonos, …) are
+        discovered in parallel with a per-provider timeout. A provider that times
+        out or errors is surfaced as a single DEGRADED entry (reachable=False),
+        never silently dropped — output discovery is a control surface, so a
+        missing-but-expected device is a silent failure.
+
+        Backs the flag-on ``available-outputs`` aggregation (docs/design/output-providers.md).
+        """
+        import asyncio
+
+        from utils.config import settings
+
+        targets: list[dict] = []
+
+        # --- built-ins (reuse the proven per-source methods) ---
+        for d in await self.get_available_renfield_devices(room_id):
+            targets.append({
+                "provider": "renfield", "target_id": d.device_id,
+                "name": d.device_name or d.device_id,
+                "capabilities": ["audio"], "room_hint": None, "reachable": True,
+            })
+        for m in await self.get_available_ha_media_players():
+            eid = m.get("entity_id", "")
+            targets.append({
+                "provider": "homeassistant", "target_id": eid,
+                "name": m.get("friendly_name") or eid,
+                "capabilities": ["audio", "video", "transport"], "room_hint": None,
+                "reachable": True,
+            })
+        for r in await self.get_available_dlna_renderers():
+            rid = r.get("name", "")
+            targets.append({
+                "provider": "dlna", "target_id": rid,
+                "name": r.get("friendly_name") or rid,
+                "capabilities": ["audio", "video", "transport"], "room_hint": None,
+                "reachable": True,
+            })
+
+        # --- MCP-declared providers (parallel discover, timeout, degraded-not-dropped) ---
+        if mcp_manager is not None:
+            from ha_glue.services.output_providers import (
+                OutputProviderError,
+                build_mcp_output_providers,
+            )
+
+            registry = build_mcp_output_providers(mcp_manager)
+            timeout = settings.output_provider_discover_timeout
+
+            async def _discover_one(provider) -> list[dict]:
+                try:
+                    found = await asyncio.wait_for(provider.discover(room_id), timeout=timeout)
+                    return [t.to_dict() for t in found]
+                except (OutputProviderError, asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
+                    logger.warning(f"output provider '{provider.key}' discover failed: {e}")
+                    return [{
+                        "provider": provider.key, "target_id": "",
+                        "name": f"{provider.key} (unreachable)",
+                        "capabilities": sorted(provider.capabilities),
+                        "room_hint": None, "reachable": False,
+                    }]
+
+            if registry:
+                results = await asyncio.gather(*[_discover_one(p) for p in registry.values()])
+                for r in results:
+                    targets.extend(r)
+
+        return targets
 
     async def get_available_dlna_renderers(self) -> list[dict]:
         """

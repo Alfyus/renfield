@@ -135,11 +135,19 @@ class ConnectedDeviceResponse(BaseModel):
 # --- Output Device Models ---
 
 class OutputDeviceCreate(BaseModel):
-    """Request model for creating an output device"""
+    """Request model for creating an output device.
+
+    Identify the target EITHER by the generic ``(output_provider,
+    output_target_id)`` pair (any provider, incl. samsung) OR by exactly one
+    legacy id column (the pair is dual-written from it). See
+    docs/design/output-providers.md.
+    """
     output_type: str = "audio"  # "audio" or "visual"
     renfield_device_id: str | None = None
     ha_entity_id: str | None = None
     dlna_renderer_name: str | None = None
+    output_provider: str | None = None
+    output_target_id: str | None = None
     priority: int = 1
     allow_interruption: bool = False
     tts_volume: float | None = 0.5
@@ -163,6 +171,8 @@ class OutputDeviceResponse(BaseModel):
     renfield_device_id: str | None
     ha_entity_id: str | None
     dlna_renderer_name: str | None = None
+    output_provider: str | None = None
+    output_target_id: str | None = None
     priority: int
     allow_interruption: bool
     tts_volume: float | None
@@ -181,7 +191,14 @@ class OutputDeviceReorderRequest(BaseModel):
 
 
 class AvailableOutputResponse(BaseModel):
-    """Response model for available output devices (HA + Renfield + DLNA)"""
+    """Response model for available output devices (HA + Renfield + DLNA).
+
+    When OUTPUT_PROVIDERS_ENABLED is on, ``output_targets`` carries the unified
+    capability-tagged union across all providers (built-in + MCP-declared like
+    samsung), each ``{provider, target_id, name, capabilities[], room_hint,
+    reachable}``. None when the flag is off (legacy three-list shape only).
+    """
     renfield_devices: list[dict]
     ha_media_players: list[dict]
     dlna_renderers: list[dict] = []
+    output_targets: list[dict] | None = None
