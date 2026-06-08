@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Keep strong references to fire-and-forget background tasks so they are not
@@ -47,6 +48,19 @@ class _ProcessorFailed(Exception):
     ``process_existing_document``'s ``history.track()`` block so the history
     row closes as ``failed``, then swallowed at the outer return to preserve
     the legacy contract (handled processor failure → return None)."""
+
+
+class DuplicateDocumentError(Exception):
+    """A document with the same ``(file_hash, knowledge_base_id)`` already
+    exists — surfaced as a ``uq_documents_file_hash_kb`` IntegrityError from a
+    concurrent insert. Carries the winning row (may be ``None`` if it could
+    not be re-fetched). Raised by :meth:`RAGService.create_document_record_safe`
+    so every caller (the upload route and the folder-ingest bridge) handles the
+    race in exactly one place (D3)."""
+
+    def __init__(self, winner: "Document | None"):
+        self.winner = winner
+        super().__init__("duplicate document")
 
 
 class RAGService:
@@ -220,6 +234,8 @@ class RAGService:
         knowledge_base_id: int | None = None,
         filename: str | None = None,
         file_hash: str | None = None,
+        owner_user_id_override: int | None = None,
+        circle_tier_override: int | None = None,
     ) -> Document:
         """Insert a ``Document`` row with status=pending and return it.
 
@@ -234,6 +250,14 @@ class RAGService:
         here, at the same time as the Document, so every document that
         exists in the DB is access-controlled from the first commit. Chunks
         created later inherit ``circle_tier`` from the document.
+
+        ``owner_user_id_override`` / ``circle_tier_override`` (D4): when set,
+        they replace the KB-derived owner / default tier for the atoms row +
+        the document's ``circle_tier``. The folder-ingest bridge passes the
+        configured ``folder_ingest_target_user`` + ``folder_ingest_default_tier``
+        so auto-filed documents are owned by the configured user at the
+        configured tier regardless of the target KB. None preserves the legacy
+        KB-derived behaviour (the upload route passes neither).
         """
         actual_filename = filename or os.path.basename(file_path)
 
@@ -249,7 +273,13 @@ class RAGService:
                 kb_owner_id = kb_info.owner_id
                 kb_default_tier = int(kb_info.default_circle_tier or 0)
 
-        atom_owner = await self._resolve_owner_user_id(kb_owner_id)
+        # D4 overrides win over the KB-derived values when provided.
+        if circle_tier_override is not None:
+            kb_default_tier = int(circle_tier_override)
+        if owner_user_id_override is not None:
+            atom_owner: int | None = owner_user_id_override
+        else:
+            atom_owner = await self._resolve_owner_user_id(kb_owner_id)
 
         # Pre-create the atoms row so the Document.atom_id FK has a valid
         # target when the document INSERT fires. Skipped only in empty-users
@@ -284,6 +314,59 @@ class RAGService:
             f"status=pending, atom_id={atom_id}, tier={kb_default_tier}"
         )
         return doc
+
+    async def create_document_record_safe(
+        self,
+        *,
+        file_path: str,
+        knowledge_base_id: int | None = None,
+        filename: str | None = None,
+        file_hash: str | None = None,
+        owner_user_id_override: int | None = None,
+        circle_tier_override: int | None = None,
+    ) -> Document:
+        """:meth:`create_document_record` plus concurrent-hash-race handling.
+
+        Shared by the upload route and the folder-ingest bridge so the
+        ``uq_documents_file_hash_kb`` race lives in exactly one place (D3).
+        On a concurrent insert of the same ``(file_hash, knowledge_base_id)``
+        pair, rolls back and raises :class:`DuplicateDocumentError` carrying the
+        winning row. Any other ``IntegrityError`` (FK / NOT NULL) is rolled back
+        and re-raised so the caller can surface a genuine 500 rather than
+        papering over it with a misleading duplicate.
+
+        ``owner_user_id_override`` / ``circle_tier_override`` are forwarded to
+        :meth:`create_document_record` (D4 owner/tier for folder-ingest).
+        """
+        try:
+            return await self.create_document_record(
+                file_path=file_path,
+                knowledge_base_id=knowledge_base_id,
+                filename=filename,
+                file_hash=file_hash,
+                owner_user_id_override=owner_user_id_override,
+                circle_tier_override=circle_tier_override,
+            )
+        except IntegrityError as ie:
+            orig_err = str(ie.orig) if ie.orig else str(ie)
+            await self.db.rollback()
+            if "uq_documents_file_hash_kb" not in orig_err:
+                logger.error(f"Unexpected IntegrityError on Document insert: {orig_err}")
+                raise
+            winner = (
+                await self.db.execute(
+                    select(Document).where(
+                        Document.file_hash == file_hash,
+                        Document.knowledge_base_id == knowledge_base_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            logger.warning(
+                f"Concurrent duplicate insert for hash "
+                f"{(file_hash or '')[:16]}... (kb={knowledge_base_id}); "
+                f"winner id={winner.id if winner else 'unknown'}"
+            )
+            raise DuplicateDocumentError(winner) from ie
 
     async def process_existing_document(
         self,
