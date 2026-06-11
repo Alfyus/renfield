@@ -572,8 +572,13 @@ class TestCuratorRun:
         monkeypatch.setattr(
             "services.auth_service.settings.auth_enabled", False, raising=False,
         )
+        # app is a shared singleton — pop the override in finally so it can't
+        # leak get_current_user=None into later tests (mirrors auth_as_admin).
         app_with_test_db.dependency_overrides[get_current_user] = lambda: None
-        resp = await async_client.post("/api/skills/curator/run", json={})
+        try:
+            resp = await async_client.post("/api/skills/curator/run", json={})
+        finally:
+            app_with_test_db.dependency_overrides.pop(get_current_user, None)
         assert resp.status_code == 200
         body = resp.json()
         assert body["run_type"] == "manual"
