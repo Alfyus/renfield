@@ -768,6 +768,7 @@ Raum-basierte Präsenzerkennung aus drei Quellen:
 | Quelle | Auslöser | Hysterese | Konfidenz |
 |--------|----------|-----------|-----------|
 | **BLE-Scanning** | Satellit erkennt BLE-Gerät (Telefon, Uhr) | Ja (N Scans) | RSSI-basiert |
+| **Classic-BT-Scanning** | Satellit erkennt Classic-BT-Gerät (Telefon) per `hcitool name` | Ja (N Scans) | RSSI-basiert (gedrosselt) |
 | **Voice Presence** | Sprechererkennung identifiziert Nutzer | Nein (sofort) | 1.0 |
 | **Web Auth Presence** | Authentifizierter Nutzer mit Raum-Kontext | Nein (sofort) | 1.0 |
 
@@ -776,6 +777,10 @@ Voice- und Auth-Presence umgehen die BLE-Hysterese — eine einzelne Interaktion
 ### BLE-Scanning
 
 Satelliten scannen per `bleak` nach registrierten BLE-Geräten und melden RSSI-Werte per WebSocket. Backend `PresenceService` nutzt "stärkstes RSSI gewinnt" + Hysterese (N aufeinanderfolgende Scans) um Raum-Flicker zu verhindern.
+
+### Classic-BT-Scanning
+
+Telefone, die ihre BLE-MAC rotieren (Apple), werden zusätzlich per Classic-BT erkannt: `hcitool name <MAC>` (binäre An/Abwesenheit). Da ein Name-Request kein Signal liefert, las dies früher ein konstantes synthetisches `-50` — bei zwei Satelliten ein Unentschieden, das den Raum „flattern" ließ. Der Satellit liest jetzt ein **echtes** RSSI über eine kurzlebige ACL-Verbindung (`hcitool cc/rssi/dc` via passwortloses `sudo`), **gedrosselt** auf einmal pro `classic_rssi_interval` (Default 300 s) pro Gerät — häufiges Verbinden lässt das Telefon sonst aufhören, auf `name` zu antworten (Präsenz fällt auf „abwesend"). Das golden-range-RSSI wird auf die Backend-Skala abgebildet und gepuffert; bei Read-Fehler greift der synthetische Fallback, sodass Präsenz nie verloren geht. Schalter: `ble.classic_rssi` (siehe `docs/ENVIRONMENT_VARIABLES.md`).
 
 ### Voice Presence
 

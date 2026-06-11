@@ -254,7 +254,11 @@ class Satellite:
             print("Warning: BLE enabled in config but bleak not installed. BLE scanning disabled.")
 
         # Classic BT Scanner (for Apple devices with permanent Classic BT MACs)
-        self.classic_bt_scanner = ClassicBTScanner(timeout=5.0)
+        self.classic_bt_scanner = ClassicBTScanner(
+            timeout=5.0,
+            read_rssi=self.config.ble.classic_rssi,
+            rssi_interval=self.config.ble.classic_rssi_interval,
+        )
         self._classic_bt_known_macs: set = set()
         if self.config.ble.enabled and self.classic_bt_scanner.available:
             print("Classic BT scanning enabled (hcitool available)")
