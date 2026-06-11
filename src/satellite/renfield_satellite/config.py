@@ -153,6 +153,7 @@ class BLEConfig:
     scan_duration: float = 5.0    # seconds per scan
     rssi_threshold: int = -80     # ignore weaker signals
     known_devices: List[str] = field(default_factory=list)  # MAC whitelist, pushed from backend
+    classic_rssi: bool = True     # read real Classic-BT RSSI (hcitool cc/rssi); off => synthetic -50
 
 
 @dataclass
@@ -312,6 +313,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.ble.scan_interval = ble.get("scan_interval", config.ble.scan_interval)
         config.ble.scan_duration = ble.get("scan_duration", config.ble.scan_duration)
         config.ble.rssi_threshold = ble.get("rssi_threshold", config.ble.rssi_threshold)
+        config.ble.classic_rssi = ble.get("classic_rssi", config.ble.classic_rssi)
         if "known_devices" in ble:
             config.ble.known_devices = ble["known_devices"]
 
