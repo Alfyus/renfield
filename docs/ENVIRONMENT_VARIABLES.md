@@ -433,10 +433,20 @@ ANNOUNCE_SNAPSHOT_TIMEOUT=8.0            # Sekunden Timeout für Satelliten-Snap
 ```yaml
 ble:
   enabled: true
-  scan_interval: 30        # Sekunden zwischen Scans
-  scan_duration: 5         # Sekunden pro Scan
-  rssi_threshold: -80      # Schwächere Signale ignorieren
+  scan_interval: 30          # Sekunden zwischen Scans
+  scan_duration: 5           # Sekunden pro Scan
+  rssi_threshold: -80        # Schwächere Signale ignorieren
+  classic_rssi: true         # Echtes Classic-BT-RSSI lesen (hcitool cc/rssi via sudo); false => synthetisch -50
+  classic_rssi_interval: 300 # Sekunden zwischen echten RSSI-Reads pro Gerät (begrenzt Verbindungs-Churn)
 ```
+
+> **Classic-BT-RSSI:** Classic-BT-Präsenz beruht auf `hcitool name` (binär an/aus) und lieferte
+> früher ein konstantes synthetisches `-50` von jedem Satelliten — bei zwei Satelliten gab das ein
+> Unentschieden und der Raum „flatterte". Mit `classic_rssi: true` liest der Satellit per kurzlebiger
+> ACL-Verbindung (`hcitool cc/rssi/dc` über passwortloses `sudo`) ein echtes RSSI, gedrosselt auf
+> einmal pro `classic_rssi_interval` (häufiges Verbinden lässt das Telefon sonst aufhören, auf
+> `name` zu antworten → Präsenz fällt auf „abwesend"). Schlägt der Read fehl, greift der synthetische
+> Fallback — Präsenz geht nie verloren.
 
 **Endpunkte:**
 - `GET /api/presence/rooms` — Alle Räume mit Anwesenden

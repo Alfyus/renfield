@@ -55,6 +55,14 @@ satellite logs `BLE/Classic BT scan loop started` and `… known devices receive
   in normal use it reports `Host is down`. So a registered `detection_method=
   classic_bt` phone stays invisible until paired per-satellite, or until phone
   presence is sourced from elsewhere (e.g. Home Assistant device_tracker).
+- **Classic-BT room arbitration needs real RSSI.** A `name` probe is binary, so
+  every satellite seeing the phone reported a constant synthetic `-50` → two
+  satellites tied → the room flip-flopped. The satellite now reads a real RSSI
+  via a short-lived ACL connection (`hcitool cc/rssi/dc` through passwordless
+  `sudo`, since the service runs as unprivileged `evdb`), **throttled** to once
+  per `ble.classic_rssi_interval` (default 300 s) — connecting every scan makes
+  the phone stop answering `name` (presence drops to "absent"). Failed reads
+  fall back to synthetic `-50`. Toggle with `ble.classic_rssi`.
 
 ## Robustness knobs (`server.*` in `satellite.yaml`)
 
