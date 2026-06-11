@@ -165,9 +165,17 @@ class ClassicBTScanner:
                 pass
 
     async def _run(self, *args: str) -> str:
-        """Run `hcitool <args>`, returning stdout. Raises on failure/timeout."""
+        """
+        Run `sudo -n hcitool <args>`, returning stdout. Raises on failure/timeout.
+
+        Creating an ACL connection / reading RSSI (cc/rssi/dc) needs
+        CAP_NET_ADMIN. The satellite service runs as an unprivileged user
+        that has passwordless sudo, so these go through `sudo -n`. `-n`
+        never prompts: if sudo isn't passwordless the call fails fast and
+        the caller falls back to SYNTHETIC_RSSI (presence is never lost).
+        """
         proc = await asyncio.create_subprocess_exec(
-            "hcitool", *args,
+            "sudo", "-n", "hcitool", *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

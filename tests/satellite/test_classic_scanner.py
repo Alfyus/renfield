@@ -16,6 +16,15 @@ from renfield_satellite.ble.classic_scanner import ClassicBTScanner
 MAC = "4C:E6:C0:27:52:93"
 
 
+def _subcmd(args) -> str:
+    """The hcitool subcommand (name/cc/rssi/dc), ignoring any `sudo -n` prefix."""
+    a = list(args)
+    if "hcitool" in a:
+        i = a.index("hcitool")
+        return a[i + 1] if i + 1 < len(a) else ""
+    return ""
+
+
 def _proc(stdout: bytes = b"", returncode: int = 0, stderr: bytes = b""):
     """Build a fake asyncio subprocess whose communicate() returns stdout/stderr."""
     class _FakeProc:
@@ -46,7 +55,7 @@ def _fake_hcitool(responses: dict, timeouts: set | None = None):
     timeouts = timeouts or set()
 
     async def _create(*args, **kwargs):
-        sub = args[1] if len(args) > 1 else ""
+        sub = _subcmd(args)
 
         class _FakeProc:
             returncode = responses.get(sub, _proc()).returncode
@@ -161,7 +170,7 @@ async def test_read_rssi_disabled_keeps_synthetic():
     fake_inner = _fake_hcitool({"name": _proc(b"Karnak")})
 
     async def _tracking(*args, **kwargs):
-        calls.append(args[1] if len(args) > 1 else "")
+        calls.append(_subcmd(args))
         return await fake_inner(*args, **kwargs)
 
     scanner = ClassicBTScanner(timeout=1.0, read_rssi=False)
