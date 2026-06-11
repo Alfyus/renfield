@@ -259,6 +259,33 @@ async def test_rssi_read_throttled_within_interval():
 
 @pytest.mark.satellite
 @pytest.mark.asyncio
+async def test_mac_normalized_and_cache_pruned():
+    """Lowercase MACs normalize to uppercase (result + cache key); stale cache entries are pruned."""
+    ok = {"name": _proc(b"Karnak"), "cc": _proc(b""), "rssi": _proc(b"RSSI return value: -6\n"), "dc": _proc(b"")}
+    scanner = ClassicBTScanner(timeout=1.0, read_rssi=True, rssi_interval=300.0)
+    with patch("renfield_satellite.ble.classic_scanner.shutil.which", return_value="/usr/bin/hcitool"), \
+         patch("asyncio.create_subprocess_exec", side_effect=_fake_hcitool(ok)):
+        result = await scanner.scan({MAC.lower()})
+
+    assert result == [{"mac": MAC, "rssi": -56}]
+    assert list(scanner._rssi_cache.keys()) == [MAC]  # uppercase key
+
+    # A scan with a different whitelist (device absent) prunes the stale entry.
+    with patch("renfield_satellite.ble.classic_scanner.shutil.which", return_value="/usr/bin/hcitool"), \
+         patch("asyncio.create_subprocess_exec", side_effect=_fake_hcitool({"name": _proc(b"")})):
+        await scanner.scan({"AA:BB:CC:DD:EE:FF"})
+
+    assert scanner._rssi_cache == {}
+
+
+@pytest.mark.satellite
+def test_negative_rssi_interval_clamped():
+    """A nonsensical negative interval is clamped to 0 (read every scan), never negative."""
+    assert ClassicBTScanner(rssi_interval=-5.0).rssi_interval == 0.0
+
+
+@pytest.mark.satellite
+@pytest.mark.asyncio
 async def test_cached_rssi_reused_when_later_read_fails():
     """Once a real RSSI is cached, a later failed read reuses it instead of dropping to synthetic."""
     ok = {"name": _proc(b"Karnak"), "cc": _proc(b""), "rssi": _proc(b"RSSI return value: -21\n"), "dc": _proc(b"")}

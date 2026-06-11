@@ -66,8 +66,8 @@ class ClassicBTScanner:
         # So read RSSI at most once per rssi_interval per device, cache it, and
         # report the cached value on every scan in between. Presence (name) still
         # runs every scan and is never gated on the RSSI read.
-        self.rssi_interval = rssi_interval
-        self._rssi_cache: dict[str, tuple[int, float]] = {}  # MAC -> (mapped_rssi, monotonic_ts)
+        self.rssi_interval = max(0.0, rssi_interval)  # negative is nonsensical; 0 = read every scan
+        self._rssi_cache: dict[str, tuple[int, float]] = {}  # UPPER MAC -> (mapped_rssi, monotonic_ts)
 
     @property
     def available(self) -> bool:
@@ -88,16 +88,20 @@ class ClassicBTScanner:
             return []
 
         now = time.monotonic()
+        known_upper = {m.upper() for m in known_macs}
         results = []
         for mac in known_macs:
             name = await self._query_name(mac)
             if not name:
                 continue
+            mac_u = mac.upper()
             results.append({
-                "mac": mac.upper(),
-                "rssi": await self._resolve_rssi(mac, now),
+                "mac": mac_u,
+                "rssi": await self._resolve_rssi(mac_u, now),
             })
 
+        # Drop cached RSSI for MACs no longer in the whitelist (bounded growth).
+        self._rssi_cache = {m: v for m, v in self._rssi_cache.items() if m in known_upper}
         return results
 
     async def _resolve_rssi(self, mac: str, now: float) -> int:
