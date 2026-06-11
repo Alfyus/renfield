@@ -232,11 +232,15 @@ export default function Layout({ children }: LayoutProps) {
   const railTranslate = hoverCapable ? 'lg:translate-x-0' : '';
   const railFade = hoverCapable ? 'lg:opacity-0 lg:group-hover/sidebar:opacity-100' : '';
   const railOnlyMenuBtn = hoverCapable ? 'hidden lg:flex lg:group-hover/sidebar:hidden' : 'hidden';
+  // CSS-grid 0fr↔1fr accordion: animates to the submenu's *natural* height with
+  // no hardcoded max-height, so it never clips regardless of how many admin items
+  // exist (a fixed max-h-[600px] silently clipped the bottom items once the list
+  // outgrew it). The parent <nav> (overflow-y-auto) scrolls if it exceeds viewport.
   const adminSubmenuCls = hoverCapable
     ? (adminExpanded
-        ? 'max-h-[600px] opacity-100 lg:max-h-0 lg:opacity-0 lg:group-hover/sidebar:max-h-[600px] lg:group-hover/sidebar:opacity-100'
-        : 'max-h-0 opacity-0')
-    : (adminExpanded ? 'max-h-[600px] opacity-100' : 'max-h-0 opacity-0');
+        ? 'grid-rows-[1fr] opacity-100 lg:grid-rows-[0fr] lg:opacity-0 lg:group-hover/sidebar:grid-rows-[1fr] lg:group-hover/sidebar:opacity-100'
+        : 'grid-rows-[0fr] opacity-0')
+    : (adminExpanded ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0');
 
   // Handle logout
   const handleLogout = () => {
@@ -507,15 +511,19 @@ export default function Layout({ children }: LayoutProps) {
                 />
               </button>
 
-              {/* Admin Submenu — hidden in rail, shown on hover when expanded */}
+              {/* Admin Submenu — hidden in rail, shown on hover when expanded.
+                  grid 0fr/1fr collapses to content height; inner overflow-hidden
+                  wrapper does the clipping during the transition. */}
               <div
                 id="admin-menu"
-                className={`overflow-hidden transition-all duration-200 ease-in-out ${adminSubmenuCls}`}
+                className={`grid transition-all duration-200 ease-in-out ${adminSubmenuCls}`}
               >
-                <div className="ml-3 pl-3 border-l border-gray-200 dark:border-gray-700 space-y-1 py-1">
-                  {visibleAdminNav.map((item) => (
-                    <NavLink key={item.href} item={item} onClick={handleNavClick} />
-                  ))}
+                <div className="overflow-hidden">
+                  <div className="ml-3 pl-3 border-l border-gray-200 dark:border-gray-700 space-y-1 py-1">
+                    {visibleAdminNav.map((item) => (
+                      <NavLink key={item.href} item={item} onClick={handleNavClick} />
+                    ))}
+                  </div>
                 </div>
               </div>
             </>
