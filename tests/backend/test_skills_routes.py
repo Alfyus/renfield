@@ -560,3 +560,21 @@ class TestCuratorRun:
             "/api/skills/curator/run", json={"user_id": auth_as_owner.id},
         )
         assert resp.status_code in (401, 403)
+
+    async def test_single_user_mode_no_500(
+        self, async_client: AsyncClient, app_with_test_db, patched_embed,
+        monkeypatch,
+    ):
+        """AUTH_ENABLED=false (single-user mode) → require_permission yields
+        admin=None. The route must not 500 dereferencing admin.id
+        (regression: 'NoneType' object has no attribute 'id')."""
+        from services.auth_service import get_current_user
+        monkeypatch.setattr(
+            "services.auth_service.settings.auth_enabled", False, raising=False,
+        )
+        app_with_test_db.dependency_overrides[get_current_user] = lambda: None
+        resp = await async_client.post("/api/skills/curator/run", json={})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["run_type"] == "manual"
+        assert body["triggered_by_user_id"] is None
