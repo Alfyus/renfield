@@ -255,7 +255,9 @@ class Satellite:
 
         # Classic BT Scanner (for Apple devices with permanent Classic BT MACs)
         self.classic_bt_scanner = ClassicBTScanner(
-            timeout=5.0, read_rssi=self.config.ble.classic_rssi
+            timeout=5.0,
+            read_rssi=self.config.ble.classic_rssi,
+            rssi_interval=self.config.ble.classic_rssi_interval,
         )
         self._classic_bt_known_macs: set = set()
         if self.config.ble.enabled and self.classic_bt_scanner.available:

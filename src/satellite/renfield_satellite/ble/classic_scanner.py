@@ -37,6 +37,7 @@ value.
 import asyncio
 import re
 import shutil
+import time
 
 # "RSSI return value: -4"
 _RSSI_RE = re.compile(r"RSSI return value:\s*(-?\d+)")
@@ -56,9 +57,17 @@ class ClassicBTScanner:
     PRESENT_FLOOR = -79   # Never report below this: a present device must stay above the
                           # backend's BLE rssi_threshold (-80) or it would be filtered as absent
 
-    def __init__(self, timeout: float = 5.0, read_rssi: bool = True):
+    def __init__(self, timeout: float = 5.0, read_rssi: bool = True,
+                 rssi_interval: float = 300.0):
         self.timeout = timeout
         self.read_rssi = read_rssi
+        # Reading RSSI needs an ACL connection, and connecting too often makes
+        # the phone stop answering name requests (presence drops to "absent").
+        # So read RSSI at most once per rssi_interval per device, cache it, and
+        # report the cached value on every scan in between. Presence (name) still
+        # runs every scan and is never gated on the RSSI read.
+        self.rssi_interval = rssi_interval
+        self._rssi_cache: dict[str, tuple[int, float]] = {}  # MAC -> (mapped_rssi, monotonic_ts)
 
     @property
     def available(self) -> bool:
@@ -78,18 +87,47 @@ class ClassicBTScanner:
         if not known_macs or not self.available:
             return []
 
+        now = time.monotonic()
         results = []
         for mac in known_macs:
             name = await self._query_name(mac)
             if not name:
                 continue
-            golden = await self._read_rssi(mac) if self.read_rssi else None
             results.append({
                 "mac": mac.upper(),
-                "rssi": self._to_backend_rssi(golden),
+                "rssi": await self._resolve_rssi(mac, now),
             })
 
         return results
+
+    async def _resolve_rssi(self, mac: str, now: float) -> int:
+        """
+        Return the RSSI to report for a present device, throttling real reads.
+
+        Reads a fresh RSSI (via a connection) at most once per rssi_interval per
+        device; otherwise returns the last cached value. On a read failure, keeps
+        the last cached value if any, else the synthetic baseline. This keeps the
+        connection churn low enough that name-based presence stays reliable.
+        """
+        if not self.read_rssi:
+            return self.SYNTHETIC_RSSI
+
+        cached = self._rssi_cache.get(mac)
+        if cached is not None and (now - cached[1]) < self.rssi_interval:
+            return cached[0]
+
+        golden = await self._read_rssi(mac)
+        if golden is not None:
+            mapped = self._to_backend_rssi(golden)
+            self._rssi_cache[mac] = (mapped, now)
+            print(f"Classic BT RSSI {mac}: golden={golden} -> {mapped}")
+            return mapped
+
+        if cached is not None:
+            print(f"Classic BT RSSI {mac}: read failed, reusing cached {cached[0]}")
+            return cached[0]
+        print(f"Classic BT RSSI {mac}: read failed, using synthetic {self.SYNTHETIC_RSSI}")
+        return self.SYNTHETIC_RSSI
 
     def _to_backend_rssi(self, golden: int | None) -> int:
         """

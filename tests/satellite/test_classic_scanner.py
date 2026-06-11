@@ -207,3 +207,69 @@ async def test_unavailable_hcitool_returns_empty():
         result = await scanner.scan({MAC})
 
     assert result == []
+
+
+def _counting_hcitool(responses):
+    """Like _fake_hcitool but counts how many times `hcitool cc` is invoked."""
+    counter = {"cc": 0}
+
+    async def _create(*args, **kwargs):
+        sub = _subcmd(args)
+        if sub == "cc":
+            counter["cc"] += 1
+
+        class _FakeProc:
+            returncode = responses.get(sub, _proc()).returncode
+
+            async def communicate(self):
+                return await responses.get(sub, _proc()).communicate()
+
+            async def wait(self):
+                return self.returncode
+
+            def kill(self):
+                pass
+
+        return _FakeProc()
+
+    return _create, counter
+
+
+@pytest.mark.satellite
+@pytest.mark.asyncio
+async def test_rssi_read_throttled_within_interval():
+    """RSSI is read once per interval; later scans reuse the cached value (no new connection)."""
+    responses = {
+        "name": _proc(b"Karnak"),
+        "cc": _proc(b""),
+        "rssi": _proc(b"RSSI return value: -21\n"),
+        "dc": _proc(b""),
+    }
+    create, counter = _counting_hcitool(responses)
+    scanner = ClassicBTScanner(timeout=1.0, read_rssi=True, rssi_interval=300.0)
+    with patch("renfield_satellite.ble.classic_scanner.shutil.which", return_value="/usr/bin/hcitool"), \
+         patch("asyncio.create_subprocess_exec", side_effect=create):
+        r1 = await scanner.scan({MAC})
+        r2 = await scanner.scan({MAC})
+        r3 = await scanner.scan({MAC})
+
+    assert r1 == r2 == r3 == [{"mac": MAC, "rssi": -71}]  # -50 + (-21)
+    assert counter["cc"] == 1  # only the first scan connected; rest used the cache
+
+
+@pytest.mark.satellite
+@pytest.mark.asyncio
+async def test_cached_rssi_reused_when_later_read_fails():
+    """Once a real RSSI is cached, a later failed read reuses it instead of dropping to synthetic."""
+    ok = {"name": _proc(b"Karnak"), "cc": _proc(b""), "rssi": _proc(b"RSSI return value: -21\n"), "dc": _proc(b"")}
+    fail = {"name": _proc(b"Karnak"), "cc": _proc(b"", returncode=1), "rssi": _proc(b"", returncode=1), "dc": _proc(b"", returncode=1)}
+    scanner = ClassicBTScanner(timeout=1.0, read_rssi=True, rssi_interval=0.0)  # 0 => read every scan
+    with patch("renfield_satellite.ble.classic_scanner.shutil.which", return_value="/usr/bin/hcitool"), \
+         patch("asyncio.create_subprocess_exec", side_effect=_fake_hcitool(ok)):
+        first = await scanner.scan({MAC})
+    with patch("renfield_satellite.ble.classic_scanner.shutil.which", return_value="/usr/bin/hcitool"), \
+         patch("asyncio.create_subprocess_exec", side_effect=_fake_hcitool(fail)):
+        second = await scanner.scan({MAC})
+
+    assert first == [{"mac": MAC, "rssi": -71}]
+    assert second == [{"mac": MAC, "rssi": -71}]  # cached, not -50
