@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { extractApiError } from '../utils/axios';
 import { useConfirmDialog } from '../components/ConfirmDialog';
+import { VOICE_MIC_CONSTRAINTS } from './ChatPage/hooks/voiceAudioUtils';
 import Modal from '../components/Modal';
 import PageHeader from '../components/PageHeader';
 import Alert from '../components/Alert';
@@ -208,7 +209,11 @@ export default function SpeakersPage() {
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Share VOICE_MIC_CONSTRAINTS with the recording/verify path so the ECAPA
+      // speaker embedding is enrolled on the SAME acoustic preprocessing it will
+      // be verified against (noiseSuppression + AGC-off). A raw-vs-suppressed
+      // enroll/verify mismatch widens the embedding gap and raises false rejects.
+      const stream = await navigator.mediaDevices.getUserMedia(VOICE_MIC_CONSTRAINTS);
       streamRef.current = stream;
 
       const mediaRecorder = new MediaRecorder(stream);

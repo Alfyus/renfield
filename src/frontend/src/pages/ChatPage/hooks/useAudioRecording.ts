@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { AxiosError } from 'axios';
 import apiClient from '../../../utils/axios';
 import { debug } from '../../../utils/debug';
+import { VOICE_MIC_CONSTRAINTS } from './voiceAudioUtils';
 
 // VAD Configuration Constants
 const VAD_CONFIG = {
@@ -145,7 +146,10 @@ export function useAudioRecording({
 
     try {
       debug.log('Starting recording with Voice Activity Detection...');
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Shared VOICE_MIC_CONSTRAINTS: noiseSuppression + AGC-off keep the ambient
+      // noise floor below speech level so the VAD can detect end-of-utterance
+      // silence (raw {audio:true} let AGC push a quiet room's floor to speech level).
+      const stream = await navigator.mediaDevices.getUserMedia(VOICE_MIC_CONSTRAINTS);
       streamRef.current = stream;
       debug.log('Microphone access granted');
       debug.log('Stream Tracks:', stream.getTracks().map(t => ({
