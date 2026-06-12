@@ -72,15 +72,20 @@ export default function PresenceHeatmap({ data }: PresenceHeatmapProps) {
 
   return (
     <div className="card overflow-hidden">
-      <h3 className="text-base font-semibold text-gray-900 dark:text-white p-4 pb-2">
-        {t('presence.heatmapTitle')}
-      </h3>
+      <div className="p-4 pb-2">
+        <h3 className="text-base font-semibold text-gray-900 dark:text-white">
+          {t('presence.heatmapTitle')}
+        </h3>
+        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+          {t('presence.heatmapDescription')}
+        </p>
+      </div>
       <div className="overflow-x-auto p-4 pt-0">
         <table className="w-full text-xs">
           <thead>
             <tr>
               <th className="text-left py-2 px-2 font-medium text-gray-600 dark:text-gray-400 sticky left-0 bg-white dark:bg-gray-800 z-10 min-w-[100px]">
-                &nbsp;
+                {t('presence.heatmapRoomLabel')}
               </th>
               {hours.map((h) => (
                 <th key={h} className="py-2 px-1 font-medium text-gray-500 dark:text-gray-400 text-center min-w-[32px]">
@@ -105,7 +110,7 @@ export default function PresenceHeatmap({ data }: PresenceHeatmapProps) {
                             ? getHeatColor(count, maxCount)
                             : 'bg-gray-50 dark:bg-gray-800/50 text-gray-300 dark:text-gray-600'
                         }`}
-                        title={`${room.name} @ ${h}:00 — ${count} ${count === 1 ? 'entry' : 'entries'}`}
+                        title={t('presence.heatmapCellTooltip', { room: room.name, hour: h, count })}
                       >
                         {count > 0 ? count : ''}
                       </div>
@@ -116,6 +121,21 @@ export default function PresenceHeatmap({ data }: PresenceHeatmapProps) {
             ))}
           </tbody>
         </table>
+
+        {/* Axis caption + intensity legend so the grid explains itself */}
+        <div className="flex flex-wrap items-center justify-between gap-2 mt-3 text-[11px] text-gray-500 dark:text-gray-400">
+          <span>{t('presence.heatmapHourAxis')}</span>
+          <div className="flex items-center gap-1.5">
+            <span>{t('presence.heatmapLegendLess')}</span>
+            <span className="flex items-center gap-0.5">
+              <span className="w-3 h-3 rounded-sm bg-blue-100 dark:bg-blue-900/50" />
+              <span className="w-3 h-3 rounded-sm bg-blue-200 dark:bg-blue-800" />
+              <span className="w-3 h-3 rounded-sm bg-blue-400 dark:bg-blue-600" />
+              <span className="w-3 h-3 rounded-sm bg-blue-600 dark:bg-blue-500" />
+            </span>
+            <span>{t('presence.heatmapLegendMore')}</span>
+          </div>
+        </div>
       </div>
     </div>
   );
