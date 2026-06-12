@@ -271,6 +271,13 @@ HOOK_EVENTS: frozenset[str] = frozenset({
     # Return value is ignored; exceptions are caught (run_hooks) so a faulty
     # filter degrades to the unfiltered registry rather than breaking the turn.
     "filter_agent_tools",
+    # Role-specific system prompt for the MAIN agent loop — fired by
+    # AgentService once per request (where the JSON system message is built),
+    # with the classified `role` and `lang` in scope. A handler returns a
+    # string to PREPEND to the system message (e.g. an edition's role-specific
+    # prompt), or None. Renfield does not ship a handler; the default is
+    # byte-identical. Symmetric, for the system prompt, to filter_agent_tools.
+    "agent_system_prompt",
     "check_output",
     "extract_context_vars",
     "build_synthesis_context",

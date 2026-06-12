@@ -50,6 +50,7 @@ def test_uplift_events_are_registerable():
         "post_sub_agent",
         "check_output",
         "filter_agent_tools",
+        "agent_system_prompt",
     }
     missing = uplift_events - HOOK_EVENTS
     assert not missing, (
