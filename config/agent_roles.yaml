@@ -57,8 +57,8 @@ roles:
 
   workflow:
     description:
-      de: "Automatisierungen: n8n Workflows erstellen, bearbeiten, verwalten, ausfuehren"
-      en: "Automations: create, edit, manage, execute n8n workflows"
+      de: "n8n-Automatisierung NUR: n8n-Workflows / Automations-Pipelines erstellen, bearbeiten, verwalten, ausfuehren. NICHT fuer das Verfassen/Erstellen von Texten, Dokumenten, Fragebögen, Checklisten, Konzepten oder Plänen (das ist 'conversation'/'general') — nicht hierher nur weil 'erstelle' oder 'Programm' vorkommt"
+      en: "n8n automation ONLY: create, edit, manage, execute n8n workflows / automation pipelines. NOT for writing/creating text, documents, questionnaires, checklists, concepts or plans (that is 'conversation'/'general') — not here just because the words 'create' or 'program' appear"
     mcp_servers: [n8n]
     max_steps: 10
     prompt_key: agent_prompt_workflow
@@ -98,6 +98,6 @@ roles:
 
   conversation:
     description:
-      de: "Konversation: Smalltalk, Allgemeinwissen, Meinungen — KEINE Aktion und KEINE Weitergabe einer Nachricht an eine Person (eine Nachricht ausrichten gehoert zu 'presence')"
-      en: "Conversation: smalltalk, general knowledge, opinions — NO action and NOT relaying a message to a person (relaying a message belongs to 'presence')"
+      de: "Konversation & Texterstellung: Smalltalk, Allgemeinwissen, Meinungen, sowie das Verfassen/Erstellen von Texten, Dokumenten, Fragebögen, Checklisten, Konzepten, Plänen, Vorlagen — KEINE Aktion und KEINE Weitergabe einer Nachricht an eine Person (eine Nachricht ausrichten gehoert zu 'presence')"
+      en: "Conversation & writing: smalltalk, general knowledge, opinions, and writing/creating text, documents, questionnaires, checklists, concepts, plans, templates — NO action and NOT relaying a message to a person (relaying a message belongs to 'presence')"
     # No agent loop - direct LLM response
