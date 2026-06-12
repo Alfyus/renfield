@@ -736,6 +736,139 @@ class TestPlayInRoom:
 
 
 # ============================================================================
+# Test play_radio invalid-station guard
+# ============================================================================
+
+class TestPlayRadioInvalidStation:
+    """A guessed/invalid station_id resolves to TuneIn's 'notcompatible'
+    placeholder (silent dead air). play_radio must fail loudly and steer the
+    agent to search_stations instead of streaming the placeholder."""
+
+    def _mcp_with_stream_url(self, stream_url: str) -> MagicMock:
+        import json as _json
+
+        mock_mgr = MagicMock()
+        mock_mgr.execute_tool = AsyncMock(
+            return_value={
+                "success": True,
+                "data": [{"type": "text", "text": _json.dumps({"stream_url": stream_url})}],
+            }
+        )
+        return mock_mgr
+
+    @pytest.mark.unit
+    async def test_notcompatible_placeholder_is_rejected(self, internal_tools):
+        mock_mgr = self._mcp_with_stream_url(
+            "http://cdn-cms.tunein.com/service/Audio/notcompatible.enUS.mp3"
+        )
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock) as resolve, \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_radio({
+                "station_id": "s12345",  # a guessed/example id → placeholder
+                "room_name": "Arbeitszimmer",
+                "station_name": "1Live",
+            })
+
+        assert result["success"] is False, result
+        assert result["action_taken"] is False
+        assert "search_stations" in result["message"]
+        # Must bail BEFORE resolving the room / playing anything.
+        resolve.assert_not_awaited()
+        # Only the stream-url resolution ran — never a play tool.
+        assert mock_mgr.execute_tool.await_count == 1
+        assert mock_mgr.execute_tool.await_args.args[0] == "mcp.radio.get_stream_url"
+
+    @pytest.mark.unit
+    async def test_valid_stream_url_is_not_rejected(self, internal_tools):
+        """A real station stream proceeds PAST the guard to room resolution.
+
+        Stubs room resolution as not-found so the flow stops there with the room
+        error — proving the guard did NOT fire (it would have returned its own
+        'search_stations' message and never awaited _resolve_room_player).
+        """
+        mock_mgr = self._mcp_with_stream_url(
+            "https://wdr-1live-live.icecastssl.wdr.de/wdr/1live/live/mp3/128/stream.mp3"
+        )
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+        resolve_result = {"success": False, "message": "Room 'Arbeitszimmer' not found", "action_taken": False}
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=resolve_result) as resolve, \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_radio({
+                "station_id": "s25260",
+                "room_name": "Arbeitszimmer",
+                "station_name": "1Live",
+            })
+
+        # Positive proof the guard did NOT fire: the flow advanced to room
+        # resolution and surfaced THAT error (not the guard's message).
+        resolve.assert_awaited_once()
+        assert result["message"] == "Room 'Arbeitszimmer' not found"
+        assert "search_stations" not in result["message"]
+
+    @pytest.mark.unit
+    async def test_placeholder_match_is_case_insensitive(self, internal_tools):
+        """A mixed-case 'NotCompatible' placeholder is still caught (.lower())."""
+        mock_mgr = self._mcp_with_stream_url(
+            "http://cdn-cms.tunein.com/service/Audio/NotCompatible.deDE.mp3"
+        )
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock) as resolve, \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_radio(
+                {"station_id": "s99999", "room_name": "Arbeitszimmer"}
+            )
+
+        assert result["success"] is False
+        assert "search_stations" in result["message"]
+        resolve.assert_not_awaited()
+
+    @pytest.mark.unit
+    async def test_placeholder_caught_even_in_non_stream_url_shape(self, internal_tools):
+        """If the resolver returns the placeholder in an unexpected shape (not a
+        parseable {"stream_url": ...}), the whole-response scan still catches it
+        and the guard fires with the actionable message — not a generic error."""
+        import json as _json
+
+        mock_mgr = MagicMock()
+        # camelCase key → parsed['stream_url'] is empty, but raw_text holds the URL.
+        mock_mgr.execute_tool = AsyncMock(
+            return_value={
+                "success": True,
+                "data": [{"type": "text", "text": _json.dumps(
+                    {"streamUrl": "http://cdn-cms.tunein.com/service/Audio/notcompatible.enUS.mp3"}
+                )}],
+            }
+        )
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock) as resolve, \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_radio(
+                {"station_id": "s12345", "room_name": "Arbeitszimmer"}
+            )
+
+        assert result["success"] is False
+        assert "search_stations" in result["message"]
+        resolve.assert_not_awaited()
+
+
+# ============================================================================
 # Test execute() routing
 # ============================================================================
 

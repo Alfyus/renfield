@@ -108,9 +108,9 @@ class InternalToolService:
             },
         },
         "internal.play_radio": {
-            "description": "Play a radio station in a room. Resolves the stream URL from a station ID and plays it on the room's audio device. Use after mcp.radio.search_stations to get a station_id.",
+            "description": "Play a radio station in a room. Resolves the stream URL from a station ID and plays it on the room's audio device. ALWAYS call mcp.radio.search_stations FIRST to obtain the station_id — TuneIn IDs are opaque and cannot be known without searching.",
             "parameters": {
-                "station_id": "TuneIn station ID, e.g. 's12345' (required)",
+                "station_id": "Opaque TuneIn station ID taken from a mcp.radio.search_stations result in THIS request (required). NEVER invent, guess, copy from an example, or reuse an ID from memory/context — always search first.",
                 "room_name": "Target room name (required)",
                 "station_name": "Station display name for the media player UI (optional)",
                 "station_image": "Station logo URL for the media player UI (optional)",
@@ -2176,6 +2176,33 @@ class InternalToolService:
                 parsed = {}
 
             stream_url = parsed.get("stream_url", "")
+
+            # Guard against TuneIn's "not compatible" placeholder. An invalid or
+            # guessed station_id (the classic failure: the LLM skips
+            # mcp.radio.search_stations and copies a schema example or reuses an
+            # id from memory) resolves to
+            # cdn-cms.tunein.com/service/Audio/notcompatible.<locale>.mp3 — a
+            # dead placeholder that "plays" as silence and made the agent loop on
+            # a bad id. Scan the WHOLE resolver response (not just the parsed
+            # stream_url field) so a response-shape change can't slip it past,
+            # and check this BEFORE the empty-url branch so a bad id gets the
+            # actionable "search first" message rather than a generic error.
+            if "notcompatible" in f"{raw_text} {stream_url}".lower():
+                logger.warning(
+                    "Radio station_id '%s' resolved to the TuneIn 'notcompatible' "
+                    "placeholder — invalid or guessed id (search_stations was likely skipped)",
+                    station_id,
+                )
+                return {
+                    "success": False,
+                    "message": (
+                        f"'{station_id}' is not a valid radio station. Call "
+                        "mcp.radio.search_stations(query=...) to find the correct "
+                        "station_id, then play that — never guess or reuse an id."
+                    ),
+                    "action_taken": False,
+                }
+
             if not stream_url:
                 return {
                     "success": False,
