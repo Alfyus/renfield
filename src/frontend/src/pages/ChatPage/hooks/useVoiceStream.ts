@@ -89,15 +89,13 @@ const VAD = {
   // — so 22 clears the floor with margin while staying well under speech
   // (median ~40-54 on this scale). Sits just above BARGE_IN_RMS_THRESHOLD (20),
   // the codebase's other "voiced" gate. Raising it further risks clipping soft
-  // speakers — MAX_RECORDING_MS is the backstop for a never-voiced session.
+  // speakers; a never-voiced session (soft/distant speaker, or a wedged mic) is
+  // finalized by the server VAD instead. NOTE: there is deliberately NO
+  // client-side max-duration cap — long-form capture (e.g. the diary use case)
+  // must be able to run well past any fixed limit.
   SILENCE_THRESHOLD: 22,
   SILENCE_DURATION_MS: 1500,  // total silence before auto-stop
   MIN_RECORDING_MS: 800,      // ignore silence in the first ~800 ms
-  // Hard cap so the recorder always stops client-side, even if the user is so
-  // soft/distant they never cross SILENCE_THRESHOLD (so `speechSeen` never
-  // flips and the silence branch can't fire) or the mic wedges. Server VAD
-  // also finalizes, but this keeps the client from streaming indefinitely.
-  MAX_RECORDING_MS: 20000,
   FFT_SIZE: 512,
   SMOOTHING: 0.3,
 };
@@ -597,16 +595,6 @@ export function useVoiceStream({
         const rms = computeRms(a, dataArray);
         const now = Date.now();
         const recordingTime = now - recordingStart;
-
-        // Hard backstop: stop after MAX_RECORDING_MS regardless of VAD state.
-        // Covers a never-voiced session (soft/distant speaker who never crosses
-        // SILENCE_THRESHOLD, so `speechSeen` never flips and the silence branch
-        // can't fire) and a wedged mic, so the client never streams forever.
-        if (recordingTime > VAD.MAX_RECORDING_MS) {
-          try { rec.stop(); } catch { /* ignore */ }
-          vadFrameRef.current = null;
-          return;
-        }
 
         // Compute the silence-auto-stop decision every frame (cheap,
         // VAD timing precision matters), but throttle React state
