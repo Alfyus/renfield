@@ -138,6 +138,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "frame-ancestors 'none';"
             )
 
+        # API responses must never be HTTP-cached. If a transient HTML/SPA
+        # fallback is ever served for an /api path (e.g. during a backend
+        # rollout), caching it would replay a non-JSON body to the SPA.
+        # Only default when the route hasn't set its own policy (e.g. the TTS
+        # cache route sets no-cache for DLNA renderers — don't clobber it).
+        if path.startswith("/api/") and "cache-control" not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
+
         return response
 
 

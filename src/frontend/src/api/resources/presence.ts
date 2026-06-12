@@ -45,13 +45,15 @@ export interface NewDevicePayload {
 
 async function fetchRooms(): Promise<PresenceRoom[]> {
   const response = await apiClient.get<PresenceRoom[]>('/api/presence/rooms');
-  return response.data ?? [];
+  // Guard against a non-array body (e.g. a stale cached HTML/SPA fallback) so
+  // consumers never crash on `.flatMap`/`.map`.
+  return Array.isArray(response.data) ? response.data : [];
 }
 
 async function fetchDevices(): Promise<BleDevice[]> {
   try {
     const response = await apiClient.get<BleDevice[]>('/api/presence/devices');
-    return response.data ?? [];
+    return Array.isArray(response.data) ? response.data : [];
   } catch {
     // May fail if non-admin
     return [];
@@ -77,7 +79,7 @@ async function fetchHeatmap({ days, userId }: AnalyticsArgs): Promise<unknown[]>
   const params: Record<string, unknown> = { days };
   if (userId) params.user_id = userId;
   const response = await apiClient.get<unknown[]>('/api/presence/analytics/heatmap', { params });
-  return response.data ?? [];
+  return Array.isArray(response.data) ? response.data : [];
 }
 
 async function fetchPredictions({ days, userId }: AnalyticsArgs): Promise<unknown[]> {
@@ -85,7 +87,7 @@ async function fetchPredictions({ days, userId }: AnalyticsArgs): Promise<unknow
   const response = await apiClient.get<unknown[]>('/api/presence/analytics/predictions', {
     params: { user_id: userId, days },
   });
-  return response.data ?? [];
+  return Array.isArray(response.data) ? response.data : [];
 }
 
 async function fetchPresenceStatus(): Promise<{ enabled: boolean }> {

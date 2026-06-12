@@ -38,12 +38,13 @@ export type ConflictResolution = 'skip' | 'link' | 'overwrite';
 
 async function fetchRooms(): Promise<Room[]> {
   const response = await apiClient.get<Room[]>('/api/rooms');
-  return response.data ?? [];
+  // Guard against a non-array body (e.g. a stale cached HTML/SPA fallback).
+  return Array.isArray(response.data) ? response.data : [];
 }
 
 async function fetchHAAreas(): Promise<HAArea[]> {
   const response = await apiClient.get<HAArea[]>('/api/rooms/ha/areas');
-  return response.data ?? [];
+  return Array.isArray(response.data) ? response.data : [];
 }
 
 export interface CreateRoomInput {
