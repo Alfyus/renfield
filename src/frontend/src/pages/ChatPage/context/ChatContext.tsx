@@ -48,6 +48,7 @@ import type { Conversation } from '../../../types/chat';
 import type { TraceEntity } from '../../../api/resources/wissensbasis';
 import { useConfirmDialog } from '../../../components/ConfirmDialog';
 import { drainSentenceTts, type SentenceStreamState } from './sentenceStream';
+import { shouldRearmWakeWord } from './wakeWordRecovery';
 
 const SESSION_STORAGE_KEY = 'renfield_current_session';
 // How long sendMessageInternal waits for the WebSocket handshake before
@@ -281,6 +282,18 @@ export function ChatProvider({ children }: ChatProviderProps) {
   const wakeWordActivatedRef = useRef(false);
   const wakeWordEnabledRef = useRef(false);
   const audioContextUnlockedRef = useRef<AudioContext | null>(null);
+  // Wake-word reconnect-recovery refs — read inside the wsConnected-edge
+  // effect below so it doesn't re-subscribe to every listening/recording
+  // change (which would let it fire mid normal turn). See wakeWordRecovery.ts.
+  const wakeWordListeningRef = useRef(false);
+  const recordingRef = useRef(false);
+  const resumeWakeWordRef = useRef<() => Promise<void>>(async () => undefined);
+  const hasConnectedRef = useRef(false);
+  // True while a chat turn is streaming over the WS (set after a successful
+  // wsSendMessage, cleared on `done`). Lets reconnect recovery interrupt ONLY a
+  // dead WS stream — never a REST-fallback turn, which completes on its own and
+  // would otherwise get a spurious "connection interrupted" message.
+  const wsStreamingTurnRef = useRef(false);
 
   // Voice input tracking
   const lastInputChannelRef = useRef<'text' | 'voice'>('text');
@@ -662,6 +675,8 @@ export function ChatProvider({ children }: ChatProviderProps) {
       }
       return prev;
     });
+    // Turn finished cleanly — no longer a live WS stream for reconnect to interrupt.
+    wsStreamingTurnRef.current = false;
     setLoading(false);
   }, [resumeWakeWord]);
 
@@ -1024,6 +1039,9 @@ export function ChatProvider({ children }: ChatProviderProps) {
 
   // Handle recording error
   const handleRecordingError = useCallback((errorMessage: string) => {
+    // The turn errored and is being reported now — clear the streaming-turn
+    // latch so a later benign WS reconnect doesn't re-flag it as interrupted.
+    wsStreamingTurnRef.current = false;
     setMessages((prev) => [...prev, { role: 'assistant', content: errorMessage }]);
     setLoading(false);
   }, []);
@@ -1173,6 +1191,95 @@ export function ChatProvider({ children }: ChatProviderProps) {
   const startRecording = VOICE_STREAM_ENABLED ? startStreamRecording : audioRec.startRecording;
   const toggleRecording = VOICE_STREAM_ENABLED ? toggleStreamRecording : audioRec.toggleRecording;
 
+  // Keep the latest wake-word/recording values in refs so the recovery effects
+  // below read them without depending on (and re-running for) every
+  // isListening/recording change — which would let them fire in the middle of
+  // a normal turn. Runs after every render (cheap ref writes).
+  useEffect(() => {
+    wakeWordListeningRef.current = wakeWord.isListening;
+    recordingRef.current = recording;
+    resumeWakeWordRef.current = resumeWakeWord;
+  });
+
+  // Resume a stranded wake-word engine when a recovery trigger fires (chat-WS
+  // reconnect, tab becoming visible, network back online). The local engine is
+  // independent of the WS, but it can be left paused — by a mid-turn WS drop, an
+  // engine error (useWakeWord flips isListening:false), or a tab/network
+  // suspend — with no `done` frame to resume it, until a manual reload. The
+  // guards (see wakeWordRecovery.ts) skip the happy path (already listening),
+  // an active capture, and a live wake-word turn. Reads live refs so callers
+  // can stay edge-triggered.
+  const attemptWakeWordRearm = useCallback((trigger: string) => {
+    if (
+      shouldRearmWakeWord({
+        isRecoveryTrigger: true,
+        wakeWordEnabled: wakeWordEnabledRef.current,
+        isListening: wakeWordListeningRef.current,
+        recording: recordingRef.current,
+        wakeWordActivated: wakeWordActivatedRef.current,
+      })
+    ) {
+      debug.log(`🔁 ${trigger} — re-arming stranded wake word`);
+      setWakeWordStatus('listening');
+      void resumeWakeWordRef.current();
+    }
+  }, []);
+
+  // Chat-WS reconnect recovery. A backend Recreate rollout (deploy / ConfigMap
+  // reload) drops the WS; if it dropped mid-turn the turn is dead (its `done`
+  // will never arrive on the new socket). Clear the stuck "thinking" spinner +
+  // tell the user, clear the mid-turn latch, then re-arm wake word. Edge-
+  // triggered on wsConnected ONLY (other values via refs) so it cannot fire
+  // mid normal turn when isListening/recording churn.
+  useEffect(() => {
+    if (!wsConnected) return;
+    const isReconnect = hasConnectedRef.current;
+    hasConnectedRef.current = true;
+    if (!isReconnect) return; // initial connect — useWakeWord auto-enable handles startup
+    // A WS chat turn in flight when the socket dropped is dead — its stream
+    // won't resume on the new socket. Clear the stuck "thinking" spinner and
+    // tell the user. Guarded on the streaming-turn ref (NOT loading) so a
+    // REST-fallback turn, which completes on its own, isn't falsely interrupted.
+    if (wsStreamingTurnRef.current) {
+      wsStreamingTurnRef.current = false;
+      setLoading(false);
+      // Finalize any half-streamed assistant bubble (else it spins forever and
+      // its speak/intent UI never shows), then append the interruption note.
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        const finalized =
+          last && last.role === 'assistant' && last.streaming
+            ? [...prev.slice(0, -1), { ...last, streaming: false }]
+            : prev;
+        return [...finalized, { role: 'assistant', content: t('errors.connectionInterrupted') }];
+      });
+    }
+    // The dead turn's latch must be cleared so the resume guards apply here
+    // and in handleRecordingStop (if a capture is still running).
+    wakeWordActivatedRef.current = false;
+    attemptWakeWordRearm('Chat WS reconnected');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsConnected]);
+
+  // Wake-from-suspend recovery: a backgrounded tab or a dropped network can
+  // stall the wake-word engine (suspended AudioContext / ended mic track). When
+  // the tab becomes visible again or the network returns, re-arm it. These do
+  // NOT clear the activation latch (unlike reconnect, the current turn is not
+  // necessarily dead), so the latch guard keeps a live turn from being double-
+  // armed.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') attemptWakeWordRearm('Tab visible');
+    };
+    const onOnline = () => attemptWakeWordRearm('Network online');
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('online', onOnline);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('online', onOnline);
+    };
+  }, [attemptWakeWordRearm]);
+
   // Streaming-aware speakText. Resolves when the TTS request is dispatched
   // (streaming) or playback completes (legacy). Existing callers see the
   // same Promise<void> shape.
@@ -1284,6 +1391,8 @@ export function ChatProvider({ children }: ChatProviderProps) {
     sentenceStreamRef.current.dispatchedIdx = 0;
     sentenceStreamRef.current.active = false;
     sentenceStreamRef.current.streamDone = false;
+    // New turn — not streaming over the WS until a wsSendMessage succeeds below.
+    wsStreamingTurnRef.current = false;
 
     lastUserQueryRef.current = text;
     lastIntentInfoRef.current = null;
@@ -1349,6 +1458,9 @@ export function ChatProvider({ children }: ChatProviderProps) {
     // if the socket isn't OPEN, so we close the race between whenReady()
     // resolving true and the actual transmit.
     if (isReady() && wsSendMessage(wsMessage)) {
+      // The turn is now streaming over the WS; a mid-stream socket drop makes it
+      // recoverable (the reconnect effect clears the spinner + notifies).
+      wsStreamingTurnRef.current = true;
       setRagSources([]);
     } else {
       try {

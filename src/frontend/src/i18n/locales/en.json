@@ -955,7 +955,8 @@
     "forbidden": "Access denied",
     "serverError": "Server error",
     "validationError": "Validation error",
-    "couldNotProcess": "Sorry, there was an error processing your request."
+    "couldNotProcess": "Sorry, there was an error processing your request.",
+    "connectionInterrupted": "The connection was interrupted during the response. Please try again."
   },
   "errorBoundary": {
     "title": "Something went wrong",

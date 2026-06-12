@@ -955,7 +955,8 @@
     "forbidden": "Zugriff verweigert",
     "serverError": "Serverfehler",
     "validationError": "Validierungsfehler",
-    "couldNotProcess": "Entschuldigung, es gab einen Fehler bei der Verarbeitung deiner Anfrage."
+    "couldNotProcess": "Entschuldigung, es gab einen Fehler bei der Verarbeitung deiner Anfrage.",
+    "connectionInterrupted": "Die Verbindung wurde während der Antwort unterbrochen. Bitte versuche es erneut."
   },
   "errorBoundary": {
     "title": "Etwas ist schiefgelaufen",
