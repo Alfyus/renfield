@@ -836,16 +836,13 @@ async def _cancel_startup_tasks():
 # to connected devices.
 
 
-async def _load_plugin_module():
-    """Load the plugin module specified in settings.plugin_module.
+async def _load_one_plugin(spec: str):
+    """Load and invoke a single plugin spec.
 
     Format: "package.module:callable" — the callable receives no args
     and is expected to call register_hook() for the events it cares about.
+    A failing plugin is logged and swallowed so it cannot crash startup.
     """
-    spec = settings.plugin_module
-    if not spec:
-        return
-
     try:
         import importlib
 
@@ -866,6 +863,27 @@ async def _load_plugin_module():
         logger.info(f"Plugin module loaded: {spec}")
     except Exception:
         logger.opt(exception=True).error(f"Failed to load plugin module: {spec}")
+
+
+async def _load_plugin_module():
+    """Load all configured startup plugins.
+
+    Sources, in order: settings.plugin_module (singular, backward-compat) then
+    settings.plugin_modules (a comma-separated list of "module:callable"
+    entries). Entries are deduped so the same spec is invoked only once even if
+    it appears in both. Each is loaded independently — one failing plugin is
+    logged and skipped, never crashing startup.
+    """
+    specs: list[str] = []
+    seen: set[str] = set()
+    for raw in [settings.plugin_module, *settings.plugin_modules.split(",")]:
+        spec = raw.strip()
+        if spec and spec not in seen:
+            seen.add(spec)
+            specs.append(spec)
+
+    for spec in specs:
+        await _load_one_plugin(spec)
 
 
 @asynccontextmanager

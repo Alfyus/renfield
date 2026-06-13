@@ -619,6 +619,10 @@ class Settings(BaseSettings):
 
     # === Plugin / Extension System ===
     plugin_module: str = ""  # e.g. "renfield_twin.hooks:register"
+    # Comma-separated list of additional "module:callable" startup plugins,
+    # e.g. "renfield_twin.hooks:register,other_pkg.mod:init". Loaded in order
+    # after plugin_module; duplicates across both are deduped.
+    plugin_modules: str = ""
 
     # === Authentication ===
     # Set to True to enable authentication (default: False for development)
