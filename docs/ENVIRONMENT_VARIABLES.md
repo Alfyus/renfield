@@ -1457,20 +1457,27 @@ EVOLUTION_API_URL=http://evolution-api:8080
 
 ## Hook / Extension System
 
-Das Hook-System ermöglicht externen Paketen (z.B. `renfield-twin`) sich an definierten Lifecycle-Stellen einzuhängen, ohne dass renfield eine Abhängigkeit zum Plugin hat.
+Das Hook-System ermöglicht externen Paketen, sich an definierten Lifecycle-Stellen einzuhängen, ohne dass renfield eine Abhängigkeit zum Plugin hat.
 
 ```bash
-# Entry-Point für Hook-basierte Extensions
-# Format: "package.module:callable" — wird beim Startup aufgerufen
-# Leer = deaktiviert (Standard)
+# Entry-Point für eine Hook-basierte Extension.
+# Format: "package.module:callable" — wird beim Startup aufgerufen.
+# Leer = deaktiviert (Standard).
 PLUGIN_MODULE=
 
-# Beispiel: renfield-twin Extension
-PLUGIN_MODULE=renfield_twin.hooks:register
+# Mehrere Extensions: komma-separierte Liste von "package.module:callable".
+# Wird nach PLUGIN_MODULE geladen und dedupliziert; ein fehlerhaftes Plugin
+# wird geloggt und übersprungen, bricht den Startup also nicht ab.
+PLUGIN_MODULES=
+
+# Beispiele
+PLUGIN_MODULE=example_pkg.plugin:register
+PLUGIN_MODULES=pkg_a.plugin:register,pkg_b.plugin:register
 ```
 
 **Defaults:**
 - `PLUGIN_MODULE`: `""` (deaktiviert)
+- `PLUGIN_MODULES`: `""` (deaktiviert)
 
 **Hook Events:** `startup`, `shutdown`, `register_routes`, `register_tools`, `post_message`, `retrieve_context`
 

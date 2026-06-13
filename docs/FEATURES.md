@@ -841,7 +841,10 @@ Async Hook-System für die Open-Core-Architektur. Externe Pakete registrieren Ca
 
 **Aktivierung:**
 ```bash
-PLUGIN_MODULE=renfield_twin.hooks:register
+# Ein Plugin:
+PLUGIN_MODULE=example_pkg.plugin:register
+# Mehrere (komma-separiert, dedupliziert, fehlertolerant):
+PLUGIN_MODULES=pkg_a.plugin:register,pkg_b.plugin:register
 ```
 
 **Verfügbare Hook Events:**
