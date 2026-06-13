@@ -415,6 +415,35 @@ def _llm_options_or_default(prompt_key: str, fallback: dict) -> dict:
     return cfg if cfg is not None else fallback
 
 
+async def _apply_agent_system_prompt_hook(
+    json_system_message: str, role: Any, lang: str | None
+) -> str:
+    """Let a plugin prepend a role-specific system prompt to the agent's system message.
+
+    Fires the ``agent_system_prompt`` hook (``role``, ``lang``). The first
+    handler returning a non-empty string has it PREPENDED to ``json_system_message``
+    (which carries the "respond only with JSON" format directive); the full ReAct
+    format + tools live in the user-message ``agent_prompt``, so prepending adds
+    role identity without disturbing the format contract.
+
+    Fail-open by contract: with 0 handlers (e.g. standalone Renfield) the input is
+    returned unchanged — byte-identical — and any handler error is swallowed so a
+    misbehaving plugin can never break the agent loop.
+    """
+    try:
+        from utils.hooks import run_hooks
+
+        results = await run_hooks("agent_system_prompt", role=role, lang=lang)
+        role_sys = next(
+            (r for r in (results or []) if isinstance(r, str) and r.strip()), None
+        )
+        if role_sys:
+            return role_sys + "\n\n" + json_system_message
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"agent_system_prompt hook skipped: {e}")
+    return json_system_message
+
+
 # Fields that contain large binary data (base64-encoded)
 _BLOB_FIELDS = {"content_base64"}
 
@@ -642,6 +671,7 @@ class AgentService:
         self.step_timeout = step_timeout or settings.agent_step_timeout
         self.total_timeout = total_timeout or settings.agent_total_timeout
         self._prompt_key = (role.prompt_key if role else None) or "agent_prompt"
+        self._role = role  # exposed to the agent_system_prompt hook (plugin role prompts)
         self._preselected_tools: dict | None = None
 
     def _should_use_native_fc(self, agent_client) -> bool:
@@ -1390,6 +1420,11 @@ class AgentService:
         llm_options = _llm_options_or_default("llm_options", _DEFAULT_LLM_OPTIONS)
         llm_options_retry = _llm_options_or_default("llm_options_retry", _DEFAULT_LLM_OPTIONS_RETRY)
         json_system_message = prompt_manager.get("agent", "json_system_message", lang=lang)
+        # Let a plugin (e.g. an edition's role-specific prompts) prepend a role
+        # system prompt. Computed once — reused at every LLM call site below.
+        json_system_message = await _apply_agent_system_prompt_hook(
+            json_system_message, getattr(self, "_role", None), lang
+        )
 
         # Native function calling — opt-in per role AND requires the agent client
         # to advertise `supports_native_tools`. Default path stays on ReAct.
