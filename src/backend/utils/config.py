@@ -51,6 +51,21 @@ class Settings(BaseSettings):
     feature_knowledge: bool | None = None        # None = use edition default
     feature_knowledge_graph: bool | None = None  # None = use edition default
 
+    # Day/night awareness — time-of-day windows used by services/daypart_service.py
+    # to compute the current daypart (day/evening/night) for the agent prompt and
+    # the `daypart_changed` hook. Windows are HH:MM in the local timezone.
+    daypart_timezone: str = ""  # empty => reuse ha_glue presence_analytics_timezone, else UTC
+    daypart_night_start: str = "22:00"
+    daypart_night_end: str = "07:00"
+    daypart_evening_start: str = "18:00"
+    # Satellite LED brightness (0-31, APA102/XVF3800 scale) per daypart. The
+    # backend pushes the night level to all connected satellites on the
+    # `daypart_changed` → night transition (and rides it in register_ack so a
+    # mid-night reconnect comes up dimmed). Animations are never disabled — only
+    # their brightness is scaled. See ha_glue/services/led_dimming_service.py.
+    led_day_brightness: int = 20
+    led_night_brightness: int = 5
+
     # Datenbank - Einzelfelder für dynamischen DATABASE_URL-Aufbau
     database_url: str | None = None
     postgres_user: str = "renfield"

@@ -129,8 +129,13 @@ class WebSocketClient:
         self._on_update_request: Optional[Callable[[str, str, str, int], None]] = None  # version, url, checksum, size
         self._on_ble_known_devices: Optional[Callable[[List[str]], None]] = None
         self._on_classic_bt_known_devices: Optional[Callable[[List[str]], None]] = None
+        # Backend-pushed LED brightness (night-dimming). Carried both as a live
+        # `led_config` message and inside register_ack (mid-night reconnect).
+        self._on_led_config: Optional[Callable[[int], None]] = None
         # Async callback returning JPEG bytes (or None) for an on-demand snapshot.
         self._capture_snapshot: Optional[Callable[[], Any]] = None
+        # Async callback(params) -> list[dict] for an on-demand BT discovery scan.
+        self._on_bt_scan_request: Optional[Callable[[Dict[str, Any]], Any]] = None
 
         # Tasks
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -221,6 +226,15 @@ class WebSocketClient:
     def on_classic_bt_known_devices(self, callback: Callable[[List[str]], None]):
         """Register callback for Classic BT known devices list from server"""
         self._on_classic_bt_known_devices = callback
+
+    def on_led_config(self, callback: Callable[[int], None]):
+        """Register callback for backend-pushed LED brightness (0-31)"""
+        self._on_led_config = callback
+
+    def on_bt_scan_request(self, callback: Callable[[Dict[str, Any]], Any]):
+        """Register async callback(params)->list[dict] for a backend-requested
+        Bluetooth discovery scan. Returns the discovered device list."""
+        self._on_bt_scan_request = callback
 
     def set_metrics_callback(self, callback: Callable[[], Dict[str, Any]]):
         """Register callback to get current metrics for heartbeat"""
@@ -381,6 +395,14 @@ class WebSocketClient:
                 )
                 print(f"Registered successfully. Server protocol: {server_protocol}")
                 print(f"Config: wake_words={self._server_config.wake_words}, threshold={self._server_config.threshold}")
+
+                # Apply the backend's current LED brightness immediately so a
+                # satellite reconnecting mid-night comes up already dimmed.
+                if self._on_led_config and "led_brightness" in data:
+                    try:
+                        self._on_led_config(int(data["led_brightness"]))
+                    except (TypeError, ValueError) as e:
+                        print(f"Invalid register_ack led_brightness: {e}")
 
                 if self._on_connected:
                     self._on_connected(self._server_config)
@@ -568,11 +590,49 @@ class WebSocketClient:
             if self._on_classic_bt_known_devices:
                 self._on_classic_bt_known_devices(devices)
 
+        elif msg_type == "led_config":
+            # Backend pushed a new LED brightness (night-dimming). Guard a
+            # missing/garbage value so a malformed push can't crash the loop.
+            if self._on_led_config and "brightness" in data:
+                try:
+                    self._on_led_config(int(data["brightness"]))
+                except (TypeError, ValueError) as e:
+                    print(f"Invalid led_config brightness: {e}")
+
         elif msg_type == "capture_snapshot":
             # Backend asked for an on-demand camera snapshot (e.g. occupancy
             # check before a private announcement). Reply asynchronously so we
             # never block the receive loop on camera capture.
             asyncio.create_task(self._handle_capture_snapshot(data.get("request_id")))
+
+        elif msg_type == "bt_scan_request":
+            # Backend asked for an on-demand Bluetooth discovery scan ("scan all
+            # bluetooth devices"). Reply asynchronously so the long BLE+Classic
+            # scan never blocks the receive loop.
+            asyncio.create_task(
+                self._handle_bt_scan(data.get("request_id"), data.get("params", {}))
+            )
+
+    async def _handle_bt_scan(self, request_id, params):
+        """Run the BT discovery scan and send back a bt_scan_result. Always
+        replies (devices=[] + error on failure) so the backend never hangs."""
+        devices: list = []
+        error = None
+        try:
+            if self._on_bt_scan_request is not None:
+                devices = await self._on_bt_scan_request(params or {})
+        except Exception as e:  # noqa: BLE001
+            error = str(e)
+            print(f"BT discovery scan failed: {e}")
+        try:
+            await self._send({
+                "type": "bt_scan_result",
+                "request_id": request_id,
+                "devices": devices,
+                "error": error,
+            })
+        except Exception as e:  # noqa: BLE001
+            print(f"Failed to send bt_scan_result: {e}")
 
     async def _handle_capture_snapshot(self, request_id):
         """Capture a snapshot and send it back as a snapshot_result. Always sends

@@ -35,6 +35,7 @@ from .network.model_downloader import get_model_downloader, ModelDownloader
 from .wakeword.detector import MICRO_BUILTIN_MODELS
 from .ble.scanner import BLEScanner, BLEAK_AVAILABLE
 from .ble.classic_scanner import ClassicBTScanner
+from .ble.discovery_scanner import BTDiscoveryScanner
 from .update import UpdateManager, UpdateStage
 
 
@@ -265,6 +266,10 @@ class Satellite:
         elif self.config.ble.enabled:
             print("Warning: hcitool not found. Classic BT scanning disabled.")
 
+        # On-demand broad BT discovery scanner (backend "scan all bluetooth
+        # devices" request). Independent of the known-MAC presence scanners.
+        self.bt_discovery_scanner = BTDiscoveryScanner()
+
         # Wire up callbacks
         self._setup_callbacks()
 
@@ -286,8 +291,12 @@ class Satellite:
         self.ws_client.on_ble_known_devices(self._on_ble_known_devices)
         # Classic BT known devices callback
         self.ws_client.on_classic_bt_known_devices(self._on_classic_bt_known_devices)
+        # Backend-pushed LED brightness (night-dimming)
+        self.ws_client.on_led_config(self._on_led_config_update)
         # On-demand camera snapshot (backend occupancy check for private announcements)
         self.ws_client._capture_snapshot = self._capture_snapshot_for_request
+        # On-demand Bluetooth discovery scan ("scan all bluetooth devices")
+        self.ws_client.on_bt_scan_request(self._handle_bt_scan_for_request)
 
         # Update manager progress callback
         self.update_manager.on_progress(self._on_update_progress)
@@ -441,6 +450,14 @@ class Satellite:
         if self.camera and self.camera.available:
             return await self.camera.capture()
         return None
+
+    async def _handle_bt_scan_for_request(self, params: dict) -> list[dict]:
+        """Run a broad BT discovery scan for a backend "scan all bluetooth
+        devices" request, returning the discovered device list (BLE + Classic)."""
+        return await self.bt_discovery_scanner.discover(
+            params.get("ble_duration", 10.0),
+            params.get("classic_timeout", 12.0),
+        )
 
     async def _reconnect_with_discovery(self):
         """
@@ -1050,6 +1067,28 @@ class Satellite:
         """Handle Classic BT known devices list pushed from server"""
         self._classic_bt_known_macs = {mac.upper() for mac in devices}
         print(f"Classic BT known devices updated: {len(self._classic_bt_known_macs)} MACs")
+
+    def _on_led_config_update(self, brightness: int):
+        """Apply a backend-pushed LED brightness (night-dimming).
+
+        Only scales animation brightness — never stops/restarts the running
+        pattern. Brightness is clamped to the APA102/XVF3800 0-31 range. For the
+        XVF3800 (XMOS renders effects in hardware) an explicit LED_BRIGHTNESS
+        command is needed; APA102/GPIO read ``self.leds.brightness`` live per
+        frame so setting the attribute is enough.
+        """
+        clamped = min(31, max(0, int(brightness)))
+        old = getattr(self.leds, "brightness", None)
+        self.leds.brightness = clamped
+
+        # XVF3800: push the brightness to the XMOS chip at runtime.
+        if hasattr(self.leds, "_run"):
+            try:
+                self.leds._run("LED_BRIGHTNESS", str(clamped))
+            except Exception as e:
+                print(f"Failed to set XVF3800 LED brightness: {e}")
+
+        print(f"LED brightness updated: {old} -> {clamped}")
 
     async def _start_ble_scan_loop(self):
         """Start the BLE scanning background loop"""
