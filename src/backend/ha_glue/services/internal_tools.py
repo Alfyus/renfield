@@ -549,6 +549,26 @@ class InternalToolService:
             logger.error(f"Error announcing in room '{room_name}': {e}")
             return {"success": False, "message": f"Error announcing: {e!s}", "action_taken": False}
 
+    def _presence_room_user(self, room_id: int) -> int | None:
+        """The single user presence currently places in ``room_id``, else None.
+
+        Used to attribute a media session when there is no authenticated chat
+        user (AUTH disabled / single-user mode) — Media Follow Me keys sessions
+        on user_id and presence_leave_room fires with the presence-resolved
+        user_id, so the playback side must agree. Returns None when the room has
+        zero or ambiguous (>1) occupants, so we never attribute (and later stop)
+        the wrong person's music.
+        """
+        try:
+            from ha_glue.services.presence_service import get_presence_service
+
+            occupants = get_presence_service().get_room_occupants(room_id)
+            if len(occupants) == 1:
+                return occupants[0].user_id
+            return None
+        except Exception:
+            return None
+
     async def _register_media_follow(
         self, params: dict, room_name: str, media_type, **kwargs
     ) -> None:
@@ -557,25 +577,38 @@ class InternalToolService:
 
         if not _settings.media_follow_enabled:
             return
-        user_id = params.get("user_id")
-        if not user_id:
-            return
         try:
+            rid = await self._get_room_id(room_name)
+            if rid is None:
+                return
+            # Session owner: in practice always the presence-resolved occupant of
+            # the playback room. `params` never carries a user_id today (the
+            # dispatcher passes it as a kwarg, not in params, and the LLM tool
+            # schema has no user_id arg), so the `or` first operand is currently
+            # inert — kept only for a future authenticated-caller path. Without
+            # the presence fallback, AUTH-disabled playback has user_id=None → no
+            # session registered → leaving never stops the music, even though
+            # presence_leave_room fires with that same presence-resolved user.
+            # Caveat: presence is BLE-cadence (~30-60s), so "play then walk away
+            # immediately" may register no session if the scan hasn't yet placed
+            # the user in the room; >1 occupants → None (no follow, by design).
+            user_id = params.get("user_id") or self._presence_room_user(rid)
+            if not user_id:
+                return
+
             from ha_glue.services.media_follow_service import MediaType, get_media_follow_service
 
             mf = get_media_follow_service()
             # Convert string to enum if needed
             if isinstance(media_type, str):
                 media_type = MediaType(media_type)
-            rid = await self._get_room_id(room_name)
-            if rid is not None:
-                mf.register_playback(
-                    user_id=int(user_id),
-                    room_id=rid,
-                    room_name=room_name,
-                    media_type=media_type,
-                    **kwargs,
-                )
+            mf.register_playback(
+                user_id=int(user_id),
+                room_id=rid,
+                room_name=room_name,
+                media_type=media_type,
+                **kwargs,
+            )
         except Exception as e:
             logger.debug(f"Media follow registration failed: {e}")
 
