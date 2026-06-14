@@ -19,6 +19,7 @@ On any failure after backup creation, the backup is restored automatically.
 import asyncio
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -90,11 +91,16 @@ class UpdateManager:
             # Try to detect install path
             self.install_path = self._detect_install_path()
 
-        # Backup path within installation directory (user has write access)
+        # Backup path — a SIBLING of the install dir, never inside it. A backup
+        # under install_path/.backup gets deleted by the rollback's own
+        # rmtree(install_path), so the restore then finds nothing and the whole
+        # install (venv included) is lost — this bricked a satellite in prod.
         if backup_path:
             self.backup_path = Path(backup_path)
         else:
-            self.backup_path = self.install_path / ".backup"
+            self.backup_path = self.install_path.parent / (
+                self.install_path.name + ".update-backup"
+            )
         self.service_name = service_name
 
         # State
@@ -350,42 +356,41 @@ class UpdateManager:
             raise UpdateError(UpdateStage.VERIFYING, str(e))
 
     def _create_backup(self):
-        """Create backup of current installation"""
-        self._report_progress(UpdateStage.BACKING_UP, 45, "Creating backup...")
+        """Back up only the parts of the install the update will replace.
 
-        def ignore_special_files(directory, files):
-            """Ignore special files that can't be copied (named pipes, sockets, etc.)"""
-            ignored = []
-            for f in files:
-                path = os.path.join(directory, f)
-                # Skip named pipes, sockets, device files
-                if os.path.exists(path):
-                    mode = os.stat(path).st_mode
-                    import stat
-                    if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
-                        ignored.append(f)
-                # Also skip common cache/temp directories
-                if f in ['__pycache__', '.pytest_cache', '.git', 'venv', '.backup']:
-                    ignored.append(f)
-            return ignored
+        _install_package swaps out exactly `renfield_satellite/` and
+        `requirements.txt` — nothing else. So the backup covers only those, NOT
+        the venv / config / models, which the update never touches and which MUST
+        survive a rollback. (The old code backed up the whole install_path but
+        excluded the venv, then the rollback rmtree'd the whole install_path —
+        deleting the venv it had no backup of. Net: a failed update bricked the
+        device.) The backup lives outside install_path (see __init__).
+        """
+        self._report_progress(UpdateStage.BACKING_UP, 45, "Creating backup...")
 
         try:
             # Remove old backup if exists
             if self.backup_path.exists():
                 shutil.rmtree(self.backup_path)
 
-            # Copy current installation to backup (ignoring special files)
-            if self.install_path.exists():
-                shutil.copytree(
-                    self.install_path,
-                    self.backup_path,
-                    ignore=ignore_special_files
-                )
-                self._backup_created = True
-                self._report_progress(UpdateStage.BACKING_UP, 55, "Backup created")
-            else:
+            code_dir = self.install_path / "renfield_satellite"
+            if not code_dir.exists():
                 # No existing installation to back up
                 self._report_progress(UpdateStage.BACKING_UP, 55, "No existing installation, skipping backup")
+                return
+
+            self.backup_path.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                code_dir,
+                self.backup_path / "renfield_satellite",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
+            )
+            req = self.install_path / "requirements.txt"
+            if req.exists():
+                shutil.copy(req, self.backup_path / "requirements.txt")
+
+            self._backup_created = True
+            self._report_progress(UpdateStage.BACKING_UP, 55, "Backup created")
 
         except Exception as e:
             raise UpdateError(UpdateStage.BACKING_UP, str(e))
@@ -469,30 +474,65 @@ class UpdateManager:
         except Exception as e:
             raise UpdateError(UpdateStage.INSTALLING, str(e))
 
-    # Known-safe packages that may appear in satellite requirements
+    # Known-safe packages that may appear in satellite requirements.
+    # MUST stay in sync with src/satellite/requirements.txt — a missing entry
+    # makes the OTA installer reject the satellite's OWN dependency and roll the
+    # whole update back (the bug that blocked every OTA: soundcard / pymicro- /
+    # pyopen-wakeword / bleak were missing and RPi.GPIO failed name matching).
+    # Stored as written; compared after PEP 503 canonicalization, so RPi.GPIO,
+    # rpi-gpio and rpi_gpio all match. The regression test parses the real
+    # requirements.txt against this set.
     SAFE_PACKAGES = frozenset({
         "websockets", "aiohttp", "numpy", "onnxruntime",
-        "openwakeword", "webrtcvad", "noisereduce", "spidev",
+        "openwakeword", "pymicro-wakeword", "pyopen-wakeword",
+        "webrtcvad", "noisereduce", "spidev", "soundcard", "bleak",
         "lgpio", "python-mpv", "psutil", "pyyaml", "zeroconf",
-        "sounddevice", "pyaudio", "scipy", "librosa", "rpigpio",
+        "sounddevice", "pyaudio", "scipy", "librosa", "RPi.GPIO",
     })
+
+    @staticmethod
+    def _canonical_pkg(name: str) -> str:
+        """PEP 503 canonical project name: lowercase, collapse runs of -_. to -.
+
+        This is the rule pip/PyPI use to resolve a project, so the validator's
+        equivalence classes line up with what `pip install` actually fetches.
+        Deleting the separators instead (the earlier approach) would let
+        `s.o.u.n.d.c.a.r.d` collapse onto `soundcard` while pip resolves it to a
+        DISTINCT PyPI project an attacker could register — an OTA RCE bypass.
+        """
+        return re.sub(r"[-_.]+", "-", name.split("[")[0].strip().lower())
 
     def _install_requirements(self, req_file: Path):
         """Install requirements with package whitelist validation"""
+        safe = {self._canonical_pkg(p) for p in self.SAFE_PACKAGES}
         # Parse and validate packages
         packages = []
         with open(req_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or line.startswith("-"):
+            for raw in f:
+                # Strip inline comments (PEP 508 `pkg>=1  # note`) and trim.
+                line = raw.split("#", 1)[0].strip()
+                if not line:
                     continue
-                # Extract package name (before any version specifier)
-                pkg_name = line.split("==")[0].split(">=")[0].split("<=")[0].split("~=")[0].split("!=")[0].split("[")[0].strip().lower().replace("-", "").replace("_", "")
-                packages.append((pkg_name, line))
+                # Reject pip option / flag / file-redirection lines OUTRIGHT.
+                # `pip install -r <file>` honours options inside the file, so a
+                # silently-skipped `--index-url https://evil/…` would repoint the
+                # whole install at an attacker index — bypassing the name
+                # allowlist entirely. Fail closed.
+                if line.startswith("-"):
+                    raise UpdateError(
+                        UpdateStage.INSTALLING,
+                        f"Disallowed pip option in requirements: {line!r}",
+                    )
+                # Extract package name (before any version specifier / marker).
+                # `@`/whitespace are intentionally NOT split on, so a direct URL
+                # reference (`pkg @ https://evil/x.whl`) keeps the URL in the
+                # token and fails the allowlist instead of resolving to `pkg`.
+                pkg_name = line
+                for sep in ("==", ">=", "<=", "~=", "!=", ">", "<", ";"):
+                    pkg_name = pkg_name.split(sep)[0]
+                packages.append((self._canonical_pkg(pkg_name), line))
 
-        rejected = [(name, spec) for name, spec in packages
-                     if name.replace("-", "").replace("_", "") not in
-                     {p.replace("-", "").replace("_", "") for p in self.SAFE_PACKAGES}]
+        rejected = [(name, spec) for name, spec in packages if name not in safe]
         if rejected:
             rejected_names = [spec for _, spec in rejected]
             print(f"[Update] Rejected unknown packages: {rejected_names}")
@@ -530,20 +570,29 @@ class UpdateManager:
             # Process might be killed by the restart, so don't raise
 
     def _rollback(self):
-        """Rollback to backup"""
+        """Restore the code + requirements from the external backup.
+
+        Only the items the update replaced are restored; the venv, config and
+        models are left untouched. NEVER rmtree install_path — doing that (with
+        an in-tree backup) is exactly what destroyed the install before.
+        """
         self._report_progress(UpdateStage.ROLLING_BACK, 0, "Rolling back...")
 
         try:
-            if not self.backup_path.exists():
+            backup_code = self.backup_path / "renfield_satellite"
+            if not backup_code.exists():
                 print("[Update] No backup to restore")
                 return
 
-            # Remove failed installation
-            if self.install_path.exists():
-                shutil.rmtree(self.install_path)
+            # Swap the failed code dir back for the backed-up one.
+            target_code = self.install_path / "renfield_satellite"
+            if target_code.exists():
+                shutil.rmtree(target_code)
+            shutil.copytree(backup_code, target_code)
 
-            # Restore from backup
-            shutil.copytree(self.backup_path, self.install_path)
+            backup_req = self.backup_path / "requirements.txt"
+            if backup_req.exists():
+                shutil.copy(backup_req, self.install_path / "requirements.txt")
 
             print("[Update] Rollback complete")
 
