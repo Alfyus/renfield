@@ -539,7 +539,16 @@ Die „Re-OCR"-Aktion läuft **nicht** mehr blind über Paperless' eigene OCR (d
 
 ### Admin UI (`/admin/paperless-audit`)
 
-4 Tabs: Audit Control (Start/Status), Review Queue (Sortierung, Suche, Freigabe), OCR Issues (Re-OCR-Angebot), Statistics.
+Tabs: Audit Control (Start/Status), Review Queue (Sortierung, Suche, Freigabe), OCR Issues (Re-OCR-Angebot), **Niedrige OCR-Qualität** (siehe unten), Vollständigkeit, Duplikate, Ansprechpartner, Statistics.
+
+### Niedrige OCR-Qualität (Triage statt SQL)
+
+Eigener Tab, der Dokumente sichtbar macht, deren **Ingest** an der Qualität gescheitert ist — damit der Operator sie in der UI statt per SQL bearbeitet. Ein Dokument gilt als „niedrige OCR-Qualität", wenn **eines** zutrifft:
+
+1. Die renfield-interne `documents`-Zeile hat `status='failed'` mit `error_message LIKE 'ocr_quality%'` (die Ingest-Pipeline hat es an der Qualitätsschwelle abgewiesen), **oder**
+2. der **letzte** `document_processing_history`-Eintrag hat ≥ 30 % der Chunks an der Qualitätsschwelle verworfen (`chunks_dropped_low_quality / (produced + dropped) ≥ 0.30`).
+
+Das Signal lebt am renfield-internen `Document`, der Audit-Datensatz am Paperless-externen `paperless_doc_id` — verknüpft über `Document.paperless_document_id`. Paperless-only-Dokumente (nie in die KB ingestet) tragen kein Badge. Jede betroffene Zeile zeigt ein Badge (`X % verworfen` bzw. `OCR fehlgeschlagen`) und zwei Aktionen: **Erneut OCR** (derselbe lokale Re-OCR-Pfad wie der OCR-Tab) und **Ignorieren** — letzteres setzt `documents.quality_ignored` (Migration `pc20260618_doc_quality_ignored`), wodurch das Dokument vom periodischen Cleanup-Lauf (`bin/purge_low_quality_chunks.py`) übersprungen und aus dem Tab herausgefiltert wird; **Wieder berücksichtigen** hebt das auf. Das Badge erscheint zusätzlich inline im OCR-Tab. Endpunkt: `POST /api/admin/paperless-audit/quality-ignore` (ADMIN-gated, wie alle Audit-Routen); der `low_quality_only`-Filter beschränkt die Ergebnisliste serverseitig.
 
 ### Konfiguration
 
