@@ -19,6 +19,28 @@ def internal_tools():
     return InternalToolService()
 
 
+@pytest.fixture(autouse=True)
+def _stub_room_id_db():
+    """Stub ``_get_room_id`` so tests never open a real DB connection.
+
+    ``_get_room_id`` opens a REAL ``AsyncSessionLocal()`` (asyncpg SSL connect to
+    Postgres). The play paths reach it via ``_register_media_follow`` and it
+    isn't mocked by the per-class ``_patch_main_app`` helpers. Left live, every
+    such test leaks a real Postgres connection; under pytest-asyncio's per-test
+    event loops these accumulate and trip a latent OpenSSL/asyncpg
+    use-after-free → process SEGFAULT (faulthandler points at asyncpg
+    ``_create_ssl_connection``; a segfault is NOT caught by the method's
+    ``try/except``). Stubbing ``_get_room_id`` (the actual DB choke point) rather
+    than ``_register_media_follow`` keeps that method's real presence-fallback
+    logic testable — the ``TestRegisterMediaFollowPresenceFallback`` class sets
+    its own per-instance ``_get_room_id`` mock, which overrides this class-level
+    default.
+    """
+    from unittest.mock import AsyncMock as _AsyncMock
+    with patch.object(InternalToolService, "_get_room_id", new_callable=_AsyncMock, return_value=1):
+        yield
+
+
 import sys
 from types import ModuleType
 
@@ -84,11 +106,12 @@ class TestResolveRoomPlayer:
         mock_room.name = "Arbeitszimmer"
 
         mock_output_device = MagicMock()
-        mock_output_device.ha_entity_id = "media_player.arbeitszimmer_speaker"
         mock_output_device.device_name = "Arbeitszimmer Speaker"
 
         mock_decision = MagicMock()
         mock_decision.output_device = mock_output_device
+        mock_decision.target_type = "homeassistant"
+        mock_decision.target_id = "media_player.arbeitszimmer_speaker"
         mock_decision.reason = "device_available"
 
         mock_room_service = MagicMock()
@@ -114,11 +137,12 @@ class TestResolveRoomPlayer:
         mock_room.name = "Wohnzimmer"
 
         mock_output_device = MagicMock()
-        mock_output_device.ha_entity_id = "media_player.wohnzimmer"
         mock_output_device.device_name = "Wohnzimmer Speaker"
 
         mock_decision = MagicMock()
         mock_decision.output_device = mock_output_device
+        mock_decision.target_type = "homeassistant"
+        mock_decision.target_id = "media_player.wohnzimmer"
         mock_decision.reason = "device_available"
 
         mock_room_service = MagicMock()
@@ -178,11 +202,13 @@ class TestResolveRoomPlayer:
         mock_room.name = "Küche"
 
         mock_output_device = MagicMock()
-        mock_output_device.ha_entity_id = None
         mock_output_device.device_name = "Satellite Küche"
 
         mock_decision = MagicMock()
         mock_decision.output_device = mock_output_device
+        # HA-typed decision with no resolvable entity id → "no HA media player".
+        mock_decision.target_type = "homeassistant"
+        mock_decision.target_id = None
         mock_decision.reason = "device_available"
 
         mock_room_service = MagicMock()
@@ -270,13 +296,12 @@ class TestResolveRoomPlayer:
         mock_room.name = "Garten"
 
         mock_output_device = MagicMock()
-        mock_output_device.ha_entity_id = None
-        mock_output_device.dlna_renderer_name = "HiFiBerry Garten"
         mock_output_device.device_name = "HiFiBerry Garten"
 
         mock_decision = MagicMock()
         mock_decision.output_device = mock_output_device
         mock_decision.target_type = "dlna"
+        mock_decision.target_id = "HiFiBerry Garten"  # DLNA target_id == renderer name
         mock_decision.reason = "device_available"
 
         mock_room_service = MagicMock()
@@ -2867,13 +2892,13 @@ class TestResolveRoomVisualPlayer:
         mock_room_service.get_room_by_alias = AsyncMock(return_value=None)
 
         mock_output_device = MagicMock()
-        mock_output_device.dlna_renderer_name = "Samsung TV"
         mock_output_device.device_name = "Samsung TV"
 
         mock_decision = MagicMock()
         mock_decision.reason = "ok"
         mock_decision.output_device = mock_output_device
         mock_decision.target_type = "dlna"
+        mock_decision.target_id = "Samsung TV"  # DLNA target_id == renderer name
 
         mock_routing_service = MagicMock()
         mock_routing_service.get_visual_output_for_room = AsyncMock(return_value=mock_decision)
