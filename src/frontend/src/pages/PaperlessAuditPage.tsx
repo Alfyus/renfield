@@ -320,6 +320,24 @@ export default function PaperlessAuditPage() {
     }
   };
 
+  // Re-OCR from the low-quality tab drives its OWN loading set (the OCR tab's
+  // `reOcr` toggles `ocrActionLoading`, which this tab doesn't render).
+  const reOcrLowQuality = async (ids: number[]) => {
+    setLowQualityActionLoading((prev) => new Set([...prev, ...ids]));
+    try {
+      await reOcrMutation.mutateAsync(ids);
+    } catch (err) {
+      const status = (err as AxiosError | undefined)?.response?.status;
+      if (status !== 503) setError(t('paperlessAudit.error'));
+    } finally {
+      setLowQualityActionLoading((prev) => {
+        const next = new Set(prev);
+        ids.forEach((id) => next.delete(id));
+        return next;
+      });
+    }
+  };
+
   const detectDuplicates = async () => {
     setError(null);
     try {
@@ -454,7 +472,7 @@ export default function PaperlessAuditPage() {
           page={lowQualityPage}
           setPage={setLowQualityPage}
           actionLoading={lowQualityActionLoading}
-          onReOcr={reOcr}
+          onReOcr={reOcrLowQuality}
           onMarkIgnored={markQualityIgnored}
         />
       )}
