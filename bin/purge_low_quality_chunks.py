@@ -382,9 +382,12 @@ async def _iter_doc_ids(batch_size: int):
     last_id = 0
     while True:
         async with AsyncSessionLocal() as session:
+            # Skip documents the operator deliberately ignored from the
+            # Paperless Audit page's low-quality-OCR tab (Document.quality_ignored).
             stmt = (
                 select(Document.id)
                 .where(Document.id > last_id)
+                .where(Document.quality_ignored.is_(False))
                 .order_by(Document.id.asc())
                 .limit(batch_size)
             )

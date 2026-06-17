@@ -12,7 +12,7 @@ import { useTranslation } from 'react-i18next';
 import {
   FileSearch, Play, Square, Loader, Check, X,
   RotateCcw, BarChart3, ClipboardList, Eye, ChevronLeft, ChevronRight,
-  Copy, Users, FileText,
+  Copy, Users, FileText, AlertTriangle, EyeOff,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import Alert from '../components/Alert';
@@ -25,11 +25,13 @@ import {
   useAuditStatsQuery,
   useDuplicateGroupsQuery,
   useCorrespondentClustersQuery,
+  useLowQualityResultsQuery,
   useStartAudit,
   useStopAudit,
   useApplyResults,
   useSkipResults,
   useReOcr,
+  useMarkQualityIgnored,
   useDetectDuplicates,
   type AuditMode,
   type FixMode,
@@ -40,9 +42,9 @@ import {
   type CorrespondentCluster,
 } from '../api/resources/paperlessAudit';
 
-type AuditTab = 'control' | 'review' | 'ocr' | 'completeness' | 'duplicates' | 'correspondents' | 'stats';
+type AuditTab = 'control' | 'review' | 'ocr' | 'lowquality' | 'completeness' | 'duplicates' | 'correspondents' | 'stats';
 
-const TABS: AuditTab[] = ['control', 'review', 'ocr', 'completeness', 'duplicates', 'correspondents', 'stats'];
+const TABS: AuditTab[] = ['control', 'review', 'ocr', 'lowquality', 'completeness', 'duplicates', 'correspondents', 'stats'];
 const PAGE_SIZE = 20;
 
 const OCR_COLORS: Partial<Record<number, string>> = {
@@ -86,6 +88,10 @@ export default function PaperlessAuditPage() {
   const [ocrPage, setOcrPage] = useState(0);
   const [ocrActionLoading, setOcrActionLoading] = useState<Set<number>>(new Set());
 
+  // Low-quality OCR tab state
+  const [lowQualityPage, setLowQualityPage] = useState(0);
+  const [lowQualityActionLoading, setLowQualityActionLoading] = useState<Set<number>>(new Set());
+
   // Completeness tab state
   const [completenessPage, setCompletenessPage] = useState(0);
 
@@ -121,6 +127,14 @@ export default function PaperlessAuditPage() {
   const ocrTotal = ocrQuery.data?.total ?? 0;
   const ocrLoading = ocrQuery.isLoading;
 
+  const lowQualityQuery = useLowQualityResultsQuery(
+    { page: lowQualityPage, perPage: PAGE_SIZE },
+    activeTab === 'lowquality',
+  );
+  const lowQualityResults: AuditResult[] = lowQualityQuery.data?.results ?? [];
+  const lowQualityTotal = lowQualityQuery.data?.total ?? 0;
+  const lowQualityLoading = lowQualityQuery.isLoading;
+
   const completenessQuery = useCompletenessResultsQuery(
     { page: completenessPage, perPage: PAGE_SIZE },
     activeTab === 'completeness',
@@ -150,6 +164,7 @@ export default function PaperlessAuditPage() {
   const applyMutation = useApplyResults();
   const skipMutation = useSkipResults();
   const reOcrMutation = useReOcr();
+  const markIgnoredMutation = useMarkQualityIgnored();
   const detectDuplicatesMutation = useDetectDuplicates();
 
   const starting = startMutation.isPending;
@@ -162,6 +177,7 @@ export default function PaperlessAuditPage() {
     statusQuery.error,
     reviewQuery.error,
     ocrQuery.error,
+    lowQualityQuery.error,
     completenessQuery.error,
     statsQuery.error,
     duplicatesQuery.error,
@@ -288,6 +304,22 @@ export default function PaperlessAuditPage() {
     }
   };
 
+  const markQualityIgnored = async (ids: number[], ignored: boolean) => {
+    setLowQualityActionLoading((prev) => new Set([...prev, ...ids]));
+    try {
+      await markIgnoredMutation.mutateAsync({ result_ids: ids, ignored });
+    } catch (err) {
+      const status = (err as AxiosError | undefined)?.response?.status;
+      if (status !== 503) setError(t('paperlessAudit.error'));
+    } finally {
+      setLowQualityActionLoading((prev) => {
+        const next = new Set(prev);
+        ids.forEach((id) => next.delete(id));
+        return next;
+      });
+    }
+  };
+
   const detectDuplicates = async () => {
     setError(null);
     try {
@@ -320,6 +352,7 @@ export default function PaperlessAuditPage() {
     control: Play,
     review: ClipboardList,
     ocr: Eye,
+    lowquality: AlertTriangle,
     completeness: FileText,
     duplicates: Copy,
     correspondents: Users,
@@ -409,6 +442,20 @@ export default function PaperlessAuditPage() {
           setPage={setOcrPage}
           actionLoading={ocrActionLoading}
           onReOcr={reOcr}
+        />
+      )}
+
+      {activeTab === 'lowquality' && (
+        <LowQualityTab
+          t={t}
+          results={lowQualityResults}
+          loading={lowQualityLoading}
+          total={lowQualityTotal}
+          page={lowQualityPage}
+          setPage={setLowQualityPage}
+          actionLoading={lowQualityActionLoading}
+          onReOcr={reOcr}
+          onMarkIgnored={markQualityIgnored}
         />
       )}
 
@@ -844,7 +891,12 @@ function OcrTab({ t, results, loading, total, page, setPage, actionLoading, onRe
               return (
                 <tr key={r.id} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50">
                   <td className="py-3 px-2 text-gray-900 dark:text-gray-100 font-mono text-xs">{r.paperless_doc_id}</td>
-                  <td className="py-3 px-2 text-gray-900 dark:text-gray-100">{r.current_title || r.suggested_title || '-'}</td>
+                  <td className="py-3 px-2 text-gray-900 dark:text-gray-100">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span>{r.current_title || r.suggested_title || '-'}</span>
+                      {r.low_quality_ocr && <LowQualityBadge t={t} result={r} />}
+                    </div>
+                  </td>
                   <td className="py-3 px-2">
                     <span className={`inline-flex items-center gap-1.5 ${OCR_TEXT_COLORS[quality] || 'text-gray-500'}`}>
                       <span className={`w-2.5 h-2.5 rounded-full ${OCR_COLORS[quality] || 'bg-gray-400'}`} />
@@ -864,6 +916,124 @@ function OcrTab({ t, results, loading, total, page, setPage, actionLoading, onRe
                       {isLoading ? <Loader className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
                       {t('paperlessAudit.ocr.reocr')}
                     </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {totalPages > 1 && (
+        <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
+      )}
+    </div>
+  );
+}
+
+// --- Low-Quality OCR Badge (shared by the OCR + Low-Quality tabs) ---
+function LowQualityBadge({ t, result }: { t: TFunction; result: AuditResult }) {
+  const total = result.chunks_total ?? 0;
+  const dropped = result.chunks_dropped ?? 0;
+  // Drop-ratio signal → show the percentage; failed-status signal → generic label.
+  const label = total > 0
+    ? t('paperlessAudit.lowQuality.droppedBadge', { pct: Math.round((dropped / total) * 100) })
+    : t('paperlessAudit.lowQuality.failedBadge');
+  return (
+    <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300">
+      <AlertTriangle className="w-3 h-3" />
+      {label}
+    </span>
+  );
+}
+
+interface LowQualityTabProps {
+  t: TFunction;
+  results: AuditResult[];
+  loading: boolean;
+  total: number;
+  page: number;
+  setPage: (n: number) => void;
+  actionLoading: Set<number>;
+  onReOcr: (ids: number[]) => void;
+  onMarkIgnored: (ids: number[], ignored: boolean) => void;
+}
+
+// --- Low-Quality OCR Tab Component ---
+function LowQualityTab({ t, results, loading, total, page, setPage, actionLoading, onReOcr, onMarkIgnored }: LowQualityTabProps) {
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader className="w-6 h-6 animate-spin text-gray-400" />
+      </div>
+    );
+  }
+
+  if (results.length === 0) {
+    return (
+      <div className="card p-8 text-center">
+        <AlertTriangle className="w-12 h-12 text-gray-400 dark:text-gray-500 mx-auto mb-4" />
+        <p className="text-gray-500 dark:text-gray-400">{t('paperlessAudit.lowQuality.empty')}</p>
+      </div>
+    );
+  }
+
+  const totalPages = Math.ceil(total / PAGE_SIZE);
+
+  return (
+    <div className="space-y-4">
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-gray-200 dark:border-gray-700">
+              <th className="text-left py-3 px-2 font-medium text-gray-500 dark:text-gray-400">{t('paperlessAudit.review.docId')}</th>
+              <th className="text-left py-3 px-2 font-medium text-gray-500 dark:text-gray-400">{t('paperlessAudit.lowQuality.title')}</th>
+              <th className="text-right py-3 px-2 font-medium text-gray-500 dark:text-gray-400"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {results.map((r) => {
+              const isLoading = actionLoading.has(r.id);
+              const ignored = !!r.quality_ignored;
+              return (
+                <tr
+                  key={r.id}
+                  className={`border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50 ${ignored ? 'opacity-60' : ''}`}
+                >
+                  <td className="py-3 px-2 text-gray-900 dark:text-gray-100 font-mono text-xs">{r.paperless_doc_id}</td>
+                  <td className="py-3 px-2 text-gray-900 dark:text-gray-100">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span>{r.current_title || r.suggested_title || '-'}</span>
+                      <LowQualityBadge t={t} result={r} />
+                      {ignored && (
+                        <span className="inline-flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400">
+                          <EyeOff className="w-3 h-3" />
+                          {t('paperlessAudit.lowQuality.ignored')}
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="py-3 px-2 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        onClick={() => onReOcr([r.id])}
+                        disabled={isLoading}
+                        className="btn-secondary text-xs flex items-center gap-1"
+                        title={t('paperlessAudit.lowQuality.reocr')}
+                      >
+                        {isLoading ? <Loader className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                        {t('paperlessAudit.lowQuality.reocr')}
+                      </button>
+                      <button
+                        onClick={() => onMarkIgnored([r.id], !ignored)}
+                        disabled={isLoading}
+                        className="btn-secondary text-xs flex items-center gap-1"
+                        title={ignored ? t('paperlessAudit.lowQuality.unignore') : t('paperlessAudit.lowQuality.ignore')}
+                      >
+                        <EyeOff className="w-3.5 h-3.5" />
+                        {ignored ? t('paperlessAudit.lowQuality.unignore') : t('paperlessAudit.lowQuality.ignore')}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );

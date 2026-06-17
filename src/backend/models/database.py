@@ -276,6 +276,14 @@ class Document(Base):
     # filename+date match in bin/backfill_paperless_metadata.py).
     paperless_document_id = Column(Integer, nullable=True)
 
+    # Operator flag (set from the Paperless Audit page's "low-quality OCR" tab):
+    # when True, this document is deliberately ignored by the low-quality-chunk
+    # cleanup (bin/purge_low_quality_chunks.py) and can be filtered out of the
+    # audit UI. Additive; migration pc20260618_doc_quality_ignored.
+    quality_ignored = Column(
+        Boolean, nullable=False, server_default=sa_text("false"), default=False
+    )
+
     # Timestamps
     created_at = Column(DateTime, default=_utcnow)
     processed_at = Column(DateTime, nullable=True)
