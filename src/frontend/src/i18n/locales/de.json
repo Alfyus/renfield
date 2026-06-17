@@ -1170,6 +1170,7 @@
       "control": "Audit-Steuerung",
       "review": "Prüf-Warteschlange",
       "ocr": "OCR-Probleme",
+      "lowquality": "Niedrige OCR-Qualität",
       "completeness": "Vollständigkeit",
       "duplicates": "Duplikate",
       "correspondents": "Ansprechpartner",
@@ -1215,6 +1216,16 @@
       "issues": "Probleme",
       "reocr": "Neu verarbeiten",
       "noIssues": "Keine OCR-Probleme gefunden"
+    },
+    "lowQuality": {
+      "title": "Dokument",
+      "empty": "Keine Dokumente mit niedriger OCR-Qualität gefunden",
+      "failedBadge": "OCR fehlgeschlagen",
+      "droppedBadge": "{{pct}} % verworfen",
+      "ignore": "Ignorieren",
+      "unignore": "Wieder berücksichtigen",
+      "ignored": "ignoriert",
+      "reocr": "Erneut OCR"
     },
     "completeness": {
       "score": "Vollständigkeit",

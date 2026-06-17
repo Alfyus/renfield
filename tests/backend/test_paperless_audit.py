@@ -1226,6 +1226,318 @@ def _mcp_router(mcp, responses, sink=None):
     mcp.execute_tool.side_effect = _call
 
 
+def _rows_query_result(rows):
+    """Wrap a list of tuple-rows as an ``execute(...).all()`` result."""
+    return MagicMock(all=MagicMock(return_value=rows))
+
+
+def _scalars_result(values):
+    """Wrap a list as an ``execute(...).scalars().all()`` result."""
+    scalars = MagicMock()
+    scalars.all.return_value = values
+    return MagicMock(scalars=MagicMock(return_value=scalars))
+
+
+# ============================================================================
+# Low-Quality OCR signal  (Admin UX for low-quality OCR documents)
+# ============================================================================
+
+
+class TestLowQualityLookup:
+    """Test _low_quality_lookup — the per-page batch signal resolution.
+
+    Row tuple order matches the SELECT in the service:
+        (paperless_document_id, Document.id, status, error_message,
+         quality_ignored, chunks_produced, chunks_dropped_low_quality)
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_drop_ratio_at_30_percent_flagged(self, service, mock_db_factory):
+        """Exactly 30% dropped IS flagged (boundary inclusive). 3 dropped of 10
+        total (7 produced + 3 dropped) = 30%."""
+        db = mock_db_factory._mock_session
+        db.execute.return_value = _rows_query_result(
+            [(100, 1, "completed", None, False, 7, 3)]
+        )
+        lookup = await service._low_quality_lookup(db, [100])
+        entry = lookup[100]
+        assert entry["low_quality_ocr"] is True
+        assert entry["chunks_dropped"] == 3
+        assert entry["chunks_total"] == 10
+        assert entry["renfield_document_id"] == 1
+        assert entry["quality_ignored"] is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_drop_ratio_above_30_percent_flagged(self, service, mock_db_factory):
+        """5 dropped of 10 total = 50% → flagged, pct computable."""
+        db = mock_db_factory._mock_session
+        db.execute.return_value = _rows_query_result(
+            [(100, 1, "completed", None, False, 5, 5)]
+        )
+        lookup = await service._low_quality_lookup(db, [100])
+        entry = lookup[100]
+        assert entry["low_quality_ocr"] is True
+        # pct the UI would render = round(5/10*100) = 50
+        assert round(entry["chunks_dropped"] / entry["chunks_total"] * 100) == 50
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_drop_ratio_below_30_percent_not_flagged(self, service, mock_db_factory):
+        """29% dropped is NOT flagged. 29 dropped of 100 total."""
+        db = mock_db_factory._mock_session
+        db.execute.return_value = _rows_query_result(
+            [(100, 1, "completed", None, False, 71, 29)]
+        )
+        lookup = await service._low_quality_lookup(db, [100])
+        assert lookup[100]["low_quality_ocr"] is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_failed_status_signal_flagged(self, service, mock_db_factory):
+        """status='failed' AND error_message LIKE 'ocr_quality%' → flagged even
+        with no chunk history."""
+        db = mock_db_factory._mock_session
+        db.execute.return_value = _rows_query_result(
+            [(100, 1, "failed", "ocr_quality: too garbled", False, None, None)]
+        )
+        lookup = await service._low_quality_lookup(db, [100])
+        entry = lookup[100]
+        assert entry["low_quality_ocr"] is True
+        assert entry["chunks_total"] is None
+        assert entry["chunks_dropped"] is None
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_failed_status_other_error_not_flagged(self, service, mock_db_factory):
+        """A failed doc whose error is NOT ocr_quality* is not flagged by the
+        status signal."""
+        db = mock_db_factory._mock_session
+        db.execute.return_value = _rows_query_result(
+            [(100, 1, "failed", "network timeout", False, None, None)]
+        )
+        lookup = await service._low_quality_lookup(db, [100])
+        assert lookup[100]["low_quality_ocr"] is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_quality_ignored_carried(self, service, mock_db_factory):
+        """quality_ignored rides on the entry."""
+        db = mock_db_factory._mock_session
+        db.execute.return_value = _rows_query_result(
+            [(100, 1, "completed", None, True, 1, 9)]
+        )
+        lookup = await service._low_quality_lookup(db, [100])
+        assert lookup[100]["quality_ignored"] is True
+        assert lookup[100]["low_quality_ocr"] is True
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_empty_ids_short_circuits(self, service, mock_db_factory):
+        """No paperless_doc_ids → empty map, no query."""
+        db = mock_db_factory._mock_session
+        lookup = await service._low_quality_lookup(db, [])
+        assert lookup == {}
+        db.execute.assert_not_called()
+
+
+class TestInjectLowQuality:
+    """Test _inject_low_quality — merges the signal into a result dict."""
+
+    @pytest.mark.unit
+    def test_none_signal_defaults_false(self):
+        """Paperless-only doc (no Document row) → false/null shape, no badge."""
+        d = {"id": 1, "paperless_doc_id": 100}
+        PaperlessAuditService._inject_low_quality(d, None)
+        assert d["low_quality_ocr"] is False
+        assert d["chunks_dropped"] is None
+        assert d["chunks_total"] is None
+        assert d["quality_ignored"] is False
+        assert d["renfield_document_id"] is None
+
+    @pytest.mark.unit
+    def test_signal_merged(self):
+        d = {"id": 1, "paperless_doc_id": 100}
+        PaperlessAuditService._inject_low_quality(d, {
+            "renfield_document_id": 5,
+            "low_quality_ocr": True,
+            "chunks_dropped": 4,
+            "chunks_total": 10,
+            "quality_ignored": True,
+        })
+        assert d["low_quality_ocr"] is True
+        assert d["chunks_dropped"] == 4
+        assert d["chunks_total"] == 10
+        assert d["quality_ignored"] is True
+        assert d["renfield_document_id"] == 5
+
+
+class TestGetResultsLowQuality:
+    """Test get_results injection + the low_quality_only filter."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_injects_signal_into_each_result(self, service, mock_db_factory):
+        """get_results enriches every result dict with the low-quality signal,
+        resolved via a single _low_quality_lookup call (no N+1)."""
+        db = mock_db_factory._mock_session
+        row = _make_audit_row(doc_id=100, result_id=1)
+        # execute() is called twice: count query, then the paginated main query.
+        db.execute.side_effect = [
+            MagicMock(scalar=MagicMock(return_value=1)),  # count
+            _scalars_result([row]),                       # page
+        ]
+        with patch.object(
+            service, "_low_quality_lookup", new_callable=AsyncMock,
+            return_value={100: {
+                "renfield_document_id": 5,
+                "low_quality_ocr": True,
+                "chunks_dropped": 4,
+                "chunks_total": 10,
+                "quality_ignored": False,
+            }},
+        ) as mock_lookup, patch.object(
+            service, "_result_to_dict",
+            return_value={"id": 1, "paperless_doc_id": 100},
+        ):
+            out = await service.get_results(page=1, per_page=20)
+
+        # ONE lookup call for the whole page (batch, not per-row).
+        mock_lookup.assert_called_once()
+        assert out["total"] == 1
+        result = out["results"][0]
+        assert result["low_quality_ocr"] is True
+        assert result["chunks_dropped"] == 4
+        assert result["chunks_total"] == 10
+        assert result["renfield_document_id"] == 5
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_low_quality_only_adds_filter(self, service, mock_db_factory):
+        """low_quality_only=True restricts the page to qualifying docs by
+        adding a paperless_doc_id IN (subquery) WHERE clause to BOTH the count
+        and the main query."""
+        db = mock_db_factory._mock_session
+        captured = []
+
+        async def _exec(stmt, *a, **k):
+            captured.append(str(stmt))
+            if len(captured) == 1:
+                return MagicMock(scalar=MagicMock(return_value=0))  # count
+            return _scalars_result([])                              # page
+
+        db.execute.side_effect = _exec
+
+        with patch.object(
+            service, "_low_quality_lookup", new_callable=AsyncMock, return_value={}
+        ):
+            await service.get_results(page=1, per_page=20, low_quality_only=True)
+
+        # The compiled count + main queries both reference the documents table
+        # (the qualifying subquery) — the filter was applied, not dropped.
+        assert captured, "expected execute() to be called"
+        assert any("documents" in sql.lower() for sql in captured)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_low_quality_only_off_no_documents_join(self, service, mock_db_factory):
+        """Without low_quality_only the main listing query does NOT join the
+        documents table (the signal is resolved separately, batched)."""
+        db = mock_db_factory._mock_session
+        captured = []
+
+        async def _exec(stmt, *a, **k):
+            captured.append(str(stmt))
+            if len(captured) == 1:
+                return MagicMock(scalar=MagicMock(return_value=0))
+            return _scalars_result([])
+
+        db.execute.side_effect = _exec
+
+        with patch.object(
+            service, "_low_quality_lookup", new_callable=AsyncMock, return_value={}
+        ):
+            await service.get_results(page=1, per_page=20)
+
+        # Count + page queries are over paperless_audit_results only.
+        assert all("documents" not in sql.lower() for sql in captured)
+
+
+class TestSetQualityIgnored:
+    """Test set_quality_ignored — flips Document.quality_ignored."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_flips_flag_and_counts_matched(self, service, mock_db_factory):
+        """Resolves audit results → paperless ids → Documents, sets the flag,
+        counts only matched docs."""
+        db = mock_db_factory._mock_session
+        doc1 = MagicMock()
+        doc2 = MagicMock()
+        db.execute.side_effect = [
+            _scalars_result([100, 200]),   # paperless ids for the result_ids
+            _scalars_result([doc1, doc2]), # matching Document rows
+        ]
+        out = await service.set_quality_ignored([1, 2], ignored=True)
+        assert out["updated"] == 2
+        assert doc1.quality_ignored is True
+        assert doc2.quality_ignored is True
+        db.commit.assert_awaited()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_unignore_sets_false(self, service, mock_db_factory):
+        db = mock_db_factory._mock_session
+        doc = MagicMock()
+        db.execute.side_effect = [
+            _scalars_result([100]),
+            _scalars_result([doc]),
+        ]
+        out = await service.set_quality_ignored([1], ignored=False)
+        assert out["updated"] == 1
+        assert doc.quality_ignored is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_no_matching_document_counts_zero(self, service, mock_db_factory):
+        """Audit rows whose paperless doc has no renfield Document are skipped."""
+        db = mock_db_factory._mock_session
+        db.execute.side_effect = [
+            _scalars_result([100]),  # has a paperless id
+            _scalars_result([]),     # but no Document row matches
+        ]
+        out = await service.set_quality_ignored([1], ignored=True)
+        assert out["updated"] == 0
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_empty_result_ids_short_circuits(self, service, mock_db_factory):
+        out = await service.set_quality_ignored([], ignored=True)
+        assert out["updated"] == 0
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_all_paperless_ids_null_counts_zero(self, service, mock_db_factory):
+        """If the selected audit rows carry no paperless_doc_id, nothing to do."""
+        db = mock_db_factory._mock_session
+        db.execute.side_effect = [_scalars_result([None])]
+        out = await service.set_quality_ignored([1], ignored=True)
+        assert out["updated"] == 0
+
+
+class TestQualityIgnoreRequest:
+    """Validate the new request model."""
+
+    @pytest.mark.unit
+    def test_model_fields(self):
+        from ha_glue.api.routes.paperless_audit import QualityIgnoreRequest
+
+        req = QualityIgnoreRequest(result_ids=[1, 2], ignored=True)
+        assert req.result_ids == [1, 2]
+        assert req.ignored is True
+
+
 class TestReprocessDocuments:
     """Test reprocess_documents — now a local-OCR-then-write-back pipeline
     with a Paperless-native reprocess fallback."""

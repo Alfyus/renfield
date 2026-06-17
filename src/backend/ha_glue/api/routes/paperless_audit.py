@@ -40,6 +40,11 @@ class ReOcrRequest(BaseModel):
     result_ids: list[int]
 
 
+class QualityIgnoreRequest(BaseModel):
+    result_ids: list[int]
+    ignored: bool
+
+
 # --- Helper ---
 
 def _get_service(request: Request):
@@ -104,6 +109,7 @@ async def get_results(
     sort_by: str | None = None,
     sort_order: str = "desc",
     search: str | None = None,
+    low_quality_only: bool | None = None,
     _user: User = Depends(require_permission(Permission.ADMIN)),
 ):
     """Get paginated audit results with optional filters, sorting, and search."""
@@ -121,6 +127,7 @@ async def get_results(
         sort_by=sort_by,
         sort_order=sort_order,
         search=search,
+        low_quality_only=low_quality_only,
     )
 
 
@@ -160,6 +167,18 @@ async def trigger_reocr(body: ReOcrRequest, request: Request, _user: User = Depe
     """Trigger re-OCR for selected results."""
     service = _get_service(request)
     return await service.reprocess_documents(body.result_ids)
+
+
+@router.post("/quality-ignore")
+async def set_quality_ignored(
+    body: QualityIgnoreRequest,
+    request: Request,
+    _user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Mark/unmark the documents behind the selected results as quality-ignored
+    (skipped by the low-quality-chunk cleanup + filterable in the UI)."""
+    service = _get_service(request)
+    return await service.set_quality_ignored(body.result_ids, body.ignored)
 
 
 @router.post("/detect-duplicates")
