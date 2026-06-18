@@ -63,19 +63,20 @@ Preview changes without applying:
 ansible-playbook -i inventory.yml provision.yml --limit satellite-fitnessraum --check -v
 ```
 
-## HiFiBerry DLNA Renderers (https TTS)
+## HiFiBerry DLNA Renderers (http TTS)
 
 The `hifiberry` inventory group + `provision-hifiberry.yml` are **separate from
 the satellites** — a HiFiBerry is a DLNA music renderer, not a Renfield
-satellite. The playbook installs the Renfield TLS CA and pins `renfield.local`
-in `/etc/hosts` so the HiFiBerry's gstreamer can fetch backend-served **https**
-TTS audio (relay/announce). Without it, TTS to the HiFiBerry fails *silently*
-(the renderer reports `playing` but never fetches the URL).
+satellite. The playbook pins `renfield.local` in `/etc/hosts` so the HiFiBerry's
+gstreamer can fetch backend-served **http** TTS audio (relay/announce). Without
+it, TTS to the HiFiBerry fails *silently* (the renderer reports `playing` but
+never fetches the URL).
 
 Why only the HiFiBerry: Linn/openHome renderers resolve `renfield.local` via DNS
-and accept the self-signed cert natively; the HiFiBerry's gstreamer is strict
-(rejects the self-signed cert) and its systemd-resolved hijacks `.local` as mDNS
-(NOTFOUND before DNS). Full background: `docs/MESSAGE_RELAY.md` → "TTS audio
+natively; the HiFiBerry's systemd-resolved hijacks `.local` as mDNS (NOTFOUND
+before DNS), so gstreamer's getaddrinfo can't resolve it. (TTS delivery is http,
+so no TLS/CA step is needed — that was removed when delivery moved off the
+self-signed https URL.) Full background: `docs/MESSAGE_RELAY.md` → "TTS audio
 delivery to renderers".
 
 ```bash
@@ -87,10 +88,8 @@ ansible-playbook -i inventory.yml provision-hifiberry.yml --ask-pass --limit hif
 ansible-playbook -i inventory.yml provision-hifiberry.yml --ask-pass --check
 ```
 
-Idempotent. Tags: `ca`, `hosts`. **Re-run after a HiFiBerryOS update** — an OS
-update wipes the CA + `/etc/hosts` edits. `files/renfield-ca.pem` is the
-cluster's public TLS cert (no key); if it ever rotates, refresh it per the
-comment at the top of `provision-hifiberry.yml`.
+Idempotent. Tags: `hosts`. **Re-run after a HiFiBerryOS update** — an OS update
+wipes the `/etc/hosts` edit.
 
 ## Adding a New Satellite
 
