@@ -92,6 +92,7 @@ aiosmtplib>=3.0                  # Required by renfield-mcp-mail (not auto-resol
 renfield-mcp-jellyfin @ https://github.com/ebongard/renfield-mcp-jellyfin/archive/refs/heads/main.tar.gz
 renfield-mcp-tunein @ https://github.com/ebongard/renfield-mcp-tunein/archive/refs/heads/main.tar.gz
 renfield-mcp-calendar @ https://github.com/ebongard/renfield-mcp-calendar/archive/refs/heads/main.tar.gz
+renfield-mcp-tracking @ https://github.com/ebongard/renfield-mcp-tracking/archive/refs/heads/main.tar.gz
 # renfield-mcp-dlna moved to a DEDICATED image (registry/renfield/dlna-mcp, see
 # renfield-mcp-dlna/Dockerfile). The backend reaches dlna over HTTP only (never
 # imports it), so the package + its deps (async-upnp-client, python-didl-lite)

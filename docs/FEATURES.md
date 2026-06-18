@@ -269,6 +269,7 @@ Alle externen Integrationen laufen als MCP-Server. Tools werden automatisch als 
 | **n8n** | stdio (npx) | Workflow Automation | 12 (Workflow CRUD, Templates) |
 | **paperless** | stdio (Python) | Dokumenten-Management | 4 agentsichtbar (search, get, update, download); `upload_document` ist bewusst nicht im Agent-Prompt — siehe `internal.forward_attachment_to_paperless` |
 | **email** | stdio (Python) | Multi-Account IMAP/SMTP | 4 (List, Search, Read, Send) |
+| **tracking** | stdio (Python) | Multi-Carrier Paketverfolgung — Direkt-APIs (DHL/Deutsche Post, UPS, FedEx), kein Aggregator; DPD/Hermes/GLS als Web-Deep-Link | 2 agentsichtbar (`track_parcel`, `list_carriers`); `detect_carrier` als Helfer |
 | **homeassistant** | streamable_http | Smart Home | 5+ (Steuerung, Status) |
 
 ### Konfiguration

@@ -466,6 +466,52 @@ servers:
         - "What's in the work calendar this week?"
         - "Create a family appointment tomorrow at 2 PM: Dentist"
 
+  # --- Parcel Tracking MCP Server (multi-carrier, direct carrier APIs) ---
+  # Custom Python stdio MCP server (renfield-mcp-tracking) — talks DIRECTLY to
+  # the carriers, no third-party aggregator (no Shippo/AfterShip/EasyPost):
+  #   DHL / Deutsche Post — Shipment Tracking Unified API (free, production key)
+  #   UPS / FedEx         — official OAuth client-credentials Track APIs
+  #   DPD / Hermes / GLS  — no free public API → returns a deep-link into the
+  #                         carrier's OWN web tracker (same normalized shape;
+  #                         swap in a real adapter later, no other code changes)
+  # Each adapter self-disables if its credentials are missing — list_carriers
+  # reports the configured state. The keys are READ-ONLY tracking keys, so they
+  # are safe in the backend image (unlike the email-ingest/filesystem servers,
+  # which run as dedicated images only to keep WRITE credentials out of backend).
+  # GitHub: https://github.com/ebongard/renfield-mcp-tracking
+  - name: tracking
+    transport: stdio
+    command: python
+    args: ["-m", "renfield_mcp_tracking"]
+    enabled: "${TRACKING_ENABLED:-false}"
+    refresh_interval: 300
+    example_intent: mcp.tracking.track_parcel
+    env:
+      DHL_API_KEY: "${DHL_API_KEY:-}"
+      UPS_CLIENT_ID: "${UPS_CLIENT_ID:-}"
+      UPS_CLIENT_SECRET: "${UPS_CLIENT_SECRET:-}"
+      FEDEX_CLIENT_ID: "${FEDEX_CLIENT_ID:-}"
+      FEDEX_CLIENT_SECRET: "${FEDEX_CLIENT_SECRET:-}"
+      # Fallback carrier when the number format can't be auto-detected
+      # (ambiguous numeric numbers — UPS '1Z'/DHL 'JJD' detect confidently).
+      TRACKING_DEFAULT_CARRIER: "${TRACKING_DEFAULT_CARRIER:-dhl}"
+    # detect_carrier stays out of the prompt — it's a helper the agent rarely
+    # needs directly (track_parcel auto-detects). It remains executable.
+    prompt_tools:
+      - track_parcel
+      - list_carriers
+    examples:
+      de:
+        - "Wo ist mein Paket mit der Nummer JJD000390007054021440?"
+        - "Verfolge meine DHL-Sendung"
+        - "Tracking-Status von 1Z999AA10123456784"
+        - "Wann kommt mein UPS-Paket an?"
+      en:
+        - "Where is my parcel JJD000390007054021440?"
+        - "Track my DHL shipment"
+        - "Tracking status of 1Z999AA10123456784"
+        - "When will my UPS package arrive?"
+
   # --- Home Assistant MCP Server ---
   # Uses HA's built-in MCP server at /api/mcp
   # Requires: MCP Server integration enabled in HA
