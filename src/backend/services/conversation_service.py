@@ -96,17 +96,25 @@ class ConversationService:
         # depth bound make this terminate even on corrupt data. Order the
         # final result by (timestamp, id) so a fork that reuses an earlier
         # timestamp still lands in chronological position (matches history).
+        #
+        # SECURITY (defense in depth): carry conversation_id through the CTE and
+        # require the recursive step to stay WITHIN the seed conversation
+        # (``p.conversation_id = b.conversation_id``). Scoping only the seed row
+        # guards the first hop; a stray cross-conversation parent pointer
+        # (however it got set) could otherwise make the walk climb into another
+        # conversation. This clause makes that impossible.
         sql = text("""
-            WITH RECURSIVE branch(id, parent_message_id, timestamp, depth) AS (
-                SELECT m.id, m.parent_message_id, m.timestamp, 0
+            WITH RECURSIVE branch(id, parent_message_id, conversation_id, timestamp, depth) AS (
+                SELECT m.id, m.parent_message_id, m.conversation_id, m.timestamp, 0
                 FROM messages m
                 WHERE m.id = :leaf_id
                   AND m.conversation_id = :conv_id
                 UNION ALL
-                SELECT p.id, p.parent_message_id, p.timestamp, b.depth + 1
+                SELECT p.id, p.parent_message_id, p.conversation_id, p.timestamp, b.depth + 1
                 FROM messages p
                 JOIN branch b ON p.id = b.parent_message_id
                 WHERE b.depth < 10000
+                  AND p.conversation_id = b.conversation_id
             )
             SELECT id FROM branch
             ORDER BY timestamp ASC, id ASC
@@ -129,14 +137,22 @@ class ConversationService:
         """
         if not self._is_postgres():
             return []
+        # SECURITY (defense in depth): carry conversation_id through the CTE and
+        # require each descendant to share the root's conversation
+        # (``c.conversation_id = s.conversation_id``). A stray
+        # cross-conversation child pointer could otherwise pull a foreign
+        # message into the abandoned set (and thus deactivate a foreign
+        # conversation's memories). This clause confines the walk to the root's
+        # own conversation.
         sql = text("""
-            WITH RECURSIVE subtree(id, depth) AS (
-                SELECT m.id, 0 FROM messages m WHERE m.id = :root_id
+            WITH RECURSIVE subtree(id, conversation_id, depth) AS (
+                SELECT m.id, m.conversation_id, 0 FROM messages m WHERE m.id = :root_id
                 UNION ALL
-                SELECT c.id, s.depth + 1
+                SELECT c.id, c.conversation_id, s.depth + 1
                 FROM messages c
                 JOIN subtree s ON c.parent_message_id = s.id
                 WHERE s.depth < 10000
+                  AND c.conversation_id = s.conversation_id
             )
             SELECT id FROM subtree
         """)
@@ -929,6 +945,11 @@ class ConversationService:
                     FROM messages p
                     JOIN active a ON p.id = a.parent_message_id
                     WHERE a.depth < 10000
+                      -- SECURITY (defense in depth): confine the upward walk to
+                      -- the seed conversation, so a stray cross-conversation
+                      -- parent pointer can never pull a foreign message into the
+                      -- search results (the seed JOIN only guards the first hop).
+                      AND p.conversation_id = a.conversation_id
                 ),
                 indexed AS (
                     SELECT

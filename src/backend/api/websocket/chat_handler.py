@@ -2033,42 +2033,71 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                         assistant_parent_id: int | None = None
                         if fork_from_message_id is not None:
                             _bsvc = ConversationService(db_session)
+                            # SECURITY (IDOR): scope the fork-target lookup to the
+                            # CALLER'S conversation. The client controls
+                            # fork_from_message_id, so an unscoped lookup would let
+                            # it name ANY message id in the DB — disclosing another
+                            # user's message role and, worse, seeding a fork whose
+                            # parent points into a foreign conversation. Joining on
+                            # the session id (mirrors the _abandoned query below)
+                            # makes a foreign/nonexistent target resolve to None →
+                            # treated as "no fork": ignore the id and fall back to a
+                            # normal appended turn.
                             _fork_msg = (
                                 await db_session.execute(
-                                    select(Message.role).where(
-                                        Message.id == fork_from_message_id
+                                    select(Message.role)
+                                    .join(
+                                        Conversation,
+                                        Message.conversation_id == Conversation.id,
+                                    )
+                                    .where(
+                                        Message.id == fork_from_message_id,
+                                        Conversation.session_id == msg_session_id,
                                     )
                                 )
                             ).scalar_one_or_none()
-                            regenerate_mode = _fork_msg == "user"
-                            # Abandoned root = the message on the CURRENT active
-                            # path whose parent is fork_from (the sibling we are
-                            # replacing). Deactivate its subtree's memories.
-                            try:
-                                _abandoned = (
-                                    await db_session.execute(
-                                        select(Message.id)
-                                        .join(
-                                            Conversation,
-                                            Message.conversation_id == Conversation.id,
-                                        )
-                                        .where(
-                                            Conversation.session_id == msg_session_id,
-                                            Message.parent_message_id
-                                            == fork_from_message_id,
-                                        )
-                                    )
-                                ).scalars().all()
-                                for _aid in _abandoned:
-                                    await _bsvc.deactivate_memories_for_abandoned_subtree(
-                                        _aid
-                                    )
-                                if _abandoned:
-                                    await db_session.commit()
-                            except Exception as _de:  # noqa: BLE001
+                            if _fork_msg is None:
+                                # Foreign/nonexistent target → not a valid fork.
+                                # Drop the id so the save path below appends a
+                                # normal turn (regenerate_mode stays False).
                                 logger.warning(
-                                    f"⚠️ Fork memory-deactivation failed: {_de}"
+                                    "🌿 Fork target %s not in session %s — "
+                                    "ignoring fork_from_message_id (normal turn)",
+                                    fork_from_message_id, msg_session_id,
                                 )
+                                fork_from_message_id = None
+                            else:
+                                regenerate_mode = _fork_msg == "user"
+                                # Abandoned root = the message on the CURRENT active
+                                # path whose parent is fork_from (the sibling we are
+                                # replacing). Deactivate its subtree's memories. The
+                                # query is session-scoped, so even a same-conversation
+                                # fork can never reach into another conversation.
+                                try:
+                                    _abandoned = (
+                                        await db_session.execute(
+                                            select(Message.id)
+                                            .join(
+                                                Conversation,
+                                                Message.conversation_id == Conversation.id,
+                                            )
+                                            .where(
+                                                Conversation.session_id == msg_session_id,
+                                                Message.parent_message_id
+                                                == fork_from_message_id,
+                                            )
+                                        )
+                                    ).scalars().all()
+                                    for _aid in _abandoned:
+                                        await _bsvc.deactivate_memories_for_abandoned_subtree(
+                                            _aid
+                                        )
+                                    if _abandoned:
+                                        await db_session.commit()
+                                except Exception as _de:  # noqa: BLE001
+                                    logger.warning(
+                                        f"⚠️ Fork memory-deactivation failed: {_de}"
+                                    )
 
                         # Save user message
                         user_metadata = {}

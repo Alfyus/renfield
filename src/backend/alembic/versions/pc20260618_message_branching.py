@@ -9,9 +9,12 @@ Chat message branching, Phase 1. Adds the conversation tree:
   * ``messages.parent_message_id`` — nullable self-FK (ON DELETE CASCADE) to the
     message immediately preceding this one on its branch (NULL = conversation
     root). Indexed (backs the recursive active-path walk).
-  * ``conversations.active_leaf_message_id`` — nullable FK to ``messages.id``, the
-    tip of the active branch. The active path is the recursive walk of
-    ``parent_message_id`` upward from this leaf.
+  * ``conversations.active_leaf_message_id`` — nullable FK to ``messages.id``
+    (ON DELETE SET NULL), the tip of the active branch. The active path is the
+    recursive walk of ``parent_message_id`` upward from this leaf. SET NULL is
+    required because a conversation delete cascade-deletes its messages first —
+    without it the conversation row would still reference a deleted leaf and the
+    DELETE would raise an FK violation on Postgres.
 
 The self-FK + the conversation→message FK form a cycle at CREATE time, but both
 tables already exist here, so we add the columns and constraints with plain
@@ -67,12 +70,17 @@ def upgrade() -> None:
         ["id"],
         ondelete="CASCADE",
     )
+    # ON DELETE SET NULL: a conversation delete cascade-deletes its messages
+    # (the ORM relationship cascade), so the leaf pointer must clear itself as
+    # those rows go — else the conversation row still references a deleted leaf
+    # and the DELETE raises an FK violation on Postgres.
     op.create_foreign_key(
         "fk_conversations_active_leaf_message_id",
         "conversations",
         "messages",
         ["active_leaf_message_id"],
         ["id"],
+        ondelete="SET NULL",
     )
 
     bind = op.get_bind()

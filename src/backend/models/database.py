@@ -50,7 +50,14 @@ class Conversation(Base):
     # CHAT_BRANCHING_ENABLED flag — the flag only gates the fork affordances/UI).
     # NULL = empty conversation. Plain Integer FK (constraint added post-create in the
     # migration to avoid the circular conversations<->messages create-order issue).
-    active_leaf_message_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
+    # ON DELETE SET NULL: deleting a conversation cascade-deletes its messages
+    # (Conversation.messages cascade="all, delete-orphan"), which would otherwise
+    # leave this column dangling at the now-deleted leaf → FK violation / 500 on
+    # Postgres (DELETE /api/chat/session/{id} + the cleanup loop). SET NULL clears
+    # it as the messages go, so the conversation row deletes cleanly.
+    active_leaf_message_id = Column(
+        Integer, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
 
     # Beziehungen
     messages = relationship(
