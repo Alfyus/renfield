@@ -20,6 +20,10 @@ export interface DoneMessage extends BaseWsMessage {
   sources?: MessageSource[];
   /** Resolved agent role for this turn (item 6 role badge). */
   role?: string;
+  /** Persisted DB ids for this turn (chat branching). The frontend stamps them
+   *  onto the rendered user/assistant turns so edit/regenerate can fork. */
+  user_message_id?: number;
+  assistant_message_id?: number;
 }
 
 export interface FollowupsMessage extends BaseWsMessage {

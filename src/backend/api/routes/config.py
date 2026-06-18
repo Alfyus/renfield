@@ -51,6 +51,11 @@ class FeatureFlags(BaseModel):
     # `media_handoff` device-WS frame is never emitted and the indicator never
     # renders. See utils/config.py::room_handoff_enabled.
     room_handoff_enabled: bool
+    # Gates the chat message-branching UI (edit/regenerate per-message actions).
+    # Off => no edit/regenerate affordances; the backend also ignores any inbound
+    # fork_from_message_id. The conversation tree + active-path query are always
+    # on. See utils/config.py::chat_branching_enabled.
+    chat_branching_enabled: bool
 
 
 @router.get("/features", response_model=FeatureFlags)
@@ -66,4 +71,5 @@ async def get_features(
         message_search_enabled=settings.message_search_enabled,
         artifacts_typed_enabled=settings.artifacts_typed_enabled,
         room_handoff_enabled=settings.room_handoff_enabled,
+        chat_branching_enabled=settings.chat_branching_enabled,
     )

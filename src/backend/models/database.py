@@ -43,8 +43,22 @@ class Conversation(Base):
     context_vars = Column(JSON, nullable=True)   # Pinned structured state (entities, focus)
     summary = Column(Text, nullable=True)         # LLM-generated summary of older messages
 
+    # Chat branching (edit-and-fork, Phase 1). The tip of the ACTIVE branch —
+    # the active conversation path is the recursive walk of Message.parent_message_id
+    # UPWARD from this leaf (see ConversationService.active_path_message_ids). Always
+    # maintained on every save_message (CTE-always-on, independent of the
+    # CHAT_BRANCHING_ENABLED flag — the flag only gates the fork affordances/UI).
+    # NULL = empty conversation. Plain Integer FK (constraint added post-create in the
+    # migration to avoid the circular conversations<->messages create-order issue).
+    active_leaf_message_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
+
     # Beziehungen
-    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
+    messages = relationship(
+        "Message",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        foreign_keys="Message.conversation_id",
+    )
     user = relationship("User", back_populates="conversations", foreign_keys=[user_id])
     speaker = relationship("Speaker", foreign_keys=[speaker_id])
 
@@ -58,6 +72,22 @@ class Message(Base):
     content = Column(Text)
     timestamp = Column(DateTime, default=_utcnow)
     message_metadata = Column(JSON, nullable=True)  # Umbenannt von 'metadata'
+
+    # Chat branching (edit-and-fork, Phase 1). Self-FK to the message that
+    # immediately PRECEDES this one on its branch (NULL = the conversation root).
+    # The active branch is reconstructed by walking this pointer upward from
+    # Conversation.active_leaf_message_id (recursive CTE). A FORK inserts a NEW
+    # message sharing the same parent as the one it replaces (a sibling), so the
+    # original turn is preserved (Phase 2's switcher can resurrect it). Always
+    # maintained on every save (CTE-always-on); the CHAT_BRANCHING_ENABLED flag
+    # only gates the fork affordances/UI, not this column or the active-path query.
+    # ON DELETE CASCADE: deleting a parent prunes its whole subtree.
+    parent_message_id = Column(
+        Integer,
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Full-text search vector for chat message search (roadmap item 3). Post-
     # pc20260617 this is a Postgres GENERATED STORED column that unions
@@ -73,7 +103,15 @@ class Message(Base):
     search_vector = Column(TSVECTOR, FetchedValue(), nullable=True)
 
     # Beziehungen
-    conversation = relationship("Conversation", back_populates="messages")
+    # Explicit foreign_keys: two FK paths now exist between conversations and
+    # messages (Message.conversation_id → conversations.id AND
+    # Conversation.active_leaf_message_id → messages.id), so pin the join column
+    # for this relationship to avoid AmbiguousForeignKeysError at mapper config.
+    conversation = relationship(
+        "Conversation",
+        back_populates="messages",
+        foreign_keys=[conversation_id],
+    )
 
 class Task(Base):
     """Aufgaben"""

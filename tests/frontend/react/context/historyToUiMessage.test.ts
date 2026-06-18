@@ -96,4 +96,16 @@ describe('historyToUiMessage', () => {
     });
     expect(r).toEqual({ role: 'user', content: 'x' });
   });
+
+  // Chat branching (Phase 1): the persisted message id must ride through so the
+  // frontend can fork (edit/regenerate) from a specific turn.
+  it('carries the persisted message id when present', () => {
+    const r = historyToUiMessage({ id: 42, role: 'user', content: 'hi' });
+    expect(r.id).toBe(42);
+  });
+
+  it('omits id when absent (no id key, not undefined)', () => {
+    const r = historyToUiMessage({ role: 'assistant', content: 'x' });
+    expect(r).not.toHaveProperty('id');
+  });
 });

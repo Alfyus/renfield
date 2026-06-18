@@ -857,11 +857,20 @@ WICHTIGE REGELN FÜR ANTWORTEN:
         db: AsyncSession,
         metadata: dict | None = None,
         user_id: int | None = None,
+        parent_message_id: int | None = None,
     ) -> "Message":
-        """Speichere eine einzelne Nachricht (delegiert an ConversationService)"""
+        """Speichere eine einzelne Nachricht (delegiert an ConversationService).
+
+        ``parent_message_id`` (chat branching, Phase 1): when given, the message
+        forks as a sibling under that parent; else it chains onto the current
+        active tip. See ConversationService.save_message.
+        """
         from services.conversation_service import ConversationService
         service = ConversationService(db)
-        return await service.save_message(session_id, role, content, metadata, user_id=user_id)
+        return await service.save_message(
+            session_id, role, content, metadata,
+            user_id=user_id, parent_message_id=parent_message_id,
+        )
 
     async def get_conversation_summary(
         self,

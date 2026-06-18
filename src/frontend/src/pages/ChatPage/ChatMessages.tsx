@@ -1,7 +1,7 @@
 import { useRef, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Volume2, Loader, FileText, AlertCircle, CheckCircle, Search, CheckCircle2, XCircle, ChevronRight, Radio } from 'lucide-react';
+import { Volume2, Loader, FileText, AlertCircle, CheckCircle, Search, CheckCircle2, XCircle, ChevronRight, Radio, Pencil, RotateCcw } from 'lucide-react';
 import AdaptiveCardRenderer from '../../components/AdaptiveCardRenderer';
 import IntentCorrectionButton from '../../components/IntentCorrectionButton';
 import AttachmentQuickActions from './AttachmentQuickActions';
@@ -149,10 +149,32 @@ export default function ChatMessages() {
     handleSendViaEmail, emailDialog, confirmSendViaEmail, cancelEmailDialog,
     sendMessage, sessionId, submitPaperlessConfirm,
     pendingScrollIndex, clearPendingScroll,
+    editAndResubmit, regenerateTurn,
   } = useChatContext();
   const { data: features } = useFeatureFlags();
   const roleSurfacingEnabled = features?.role_surfacing_enabled ?? false;
   const artifactsEnabled = features?.artifacts_typed_enabled ?? false;
+  // Chat branching (Phase 1): edit/regenerate fork affordances. Dark by default.
+  const branchingEnabled = features?.chat_branching_enabled ?? false;
+  // Index of the user message currently being edited inline (null = none).
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState('');
+
+  // Phase 1 gating: only the LATEST user message is editable and the LATEST
+  // assistant turn is regenerable (mid-conversation forking + the multi-sibling
+  // switcher are Phase 2). Compute those indices once per render.
+  const lastUserIndex = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') return i;
+    }
+    return -1;
+  }, [messages]);
+  const lastAssistantIndex = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'assistant') return i;
+    }
+    return -1;
+  }, [messages]);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   // Per-message element refs so a search jump can scroll/focus a specific turn.
   const messageRefs = useRef<Array<HTMLDivElement | null>>([]);
@@ -354,7 +376,73 @@ export default function ChatMessages() {
               </ul>
             )}
 
-            {message.role === 'assistant' ? renderMessageContent(message.content, t('chat.albumArt'), message.entities ?? chipEntities, `msg-${index}`) : <p className="whitespace-pre-wrap">{message.content}</p>}
+            {message.role === 'assistant'
+              ? renderMessageContent(message.content, t('chat.albumArt'), message.entities ?? chipEntities, `msg-${index}`)
+              : editingIndex === index ? (
+                /* Inline edit-and-resubmit editor (chat branching, Phase 1). */
+                <div className="flex flex-col gap-2">
+                  <textarea
+                    className="input w-full text-gray-900 dark:text-gray-100"
+                    rows={Math.min(6, Math.max(2, editDraft.split('\n').length))}
+                    value={editDraft}
+                    autoFocus
+                    aria-label={t('chat.editMessage')}
+                    onChange={(e) => setEditDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        if (editDraft.trim()) {
+                          editAndResubmit(index, editDraft);
+                          setEditingIndex(null);
+                        }
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        setEditingIndex(null);
+                      }
+                    }}
+                  />
+                  <div className="flex gap-2 justify-end">
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs px-3 py-1"
+                      onClick={() => setEditingIndex(null)}
+                    >
+                      {t('common.cancel')}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-primary text-xs px-3 py-1"
+                      disabled={!editDraft.trim()}
+                      onClick={() => {
+                        if (editDraft.trim()) {
+                          editAndResubmit(index, editDraft);
+                          setEditingIndex(null);
+                        }
+                      }}
+                    >
+                      {t('chat.resubmit')}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="whitespace-pre-wrap">{message.content}</p>
+              )}
+
+            {/* Edit affordance (chat branching, Phase 1): only on the LATEST
+                user message, dark behind chat_branching_enabled. Keyboard-
+                reachable (a real focusable button, not hover-only). */}
+            {branchingEnabled && message.role === 'user' && index === lastUserIndex
+              && editingIndex !== index && !loading && (
+              <button
+                type="button"
+                onClick={() => { setEditingIndex(index); setEditDraft(message.content); }}
+                className="mt-2 text-xs text-white/80 hover:text-white flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-white/50 rounded"
+                aria-label={t('chat.editMessage')}
+              >
+                <Pencil className="w-3 h-3" aria-hidden="true" />
+                <span>{t('chat.edit')}</span>
+              </button>
+            )}
 
             {/* Provenance source chips — KB documents a knowledge-backed answer
                 used. Renders nothing when the turn had no sources. */}
@@ -455,6 +543,22 @@ export default function ChatMessages() {
               >
                 <Volume2 className="w-3 h-3" aria-hidden="true" />
                 <span>{t('chat.readAloud')}</span>
+              </button>
+            )}
+
+            {/* Regenerate affordance (chat branching, Phase 1): only on the
+                LATEST assistant turn, dark behind chat_branching_enabled.
+                Keyboard-reachable. Re-runs the same user query → new sibling. */}
+            {branchingEnabled && message.role === 'assistant' && !message.streaming
+              && index === lastAssistantIndex && !loading && (
+              <button
+                type="button"
+                onClick={() => regenerateTurn(index)}
+                className="mt-2 ml-3 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white inline-flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-accent-400 rounded"
+                aria-label={t('chat.regenerate')}
+              >
+                <RotateCcw className="w-3 h-3" aria-hidden="true" />
+                <span>{t('chat.regenerate')}</span>
               </button>
             )}
 

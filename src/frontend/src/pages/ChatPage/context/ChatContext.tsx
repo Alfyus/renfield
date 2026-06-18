@@ -91,6 +91,11 @@ interface IntentInfo {
 }
 
 export interface ChatUiMessage {
+  /** Persisted DB message id. Set on history load and on the `done` frame
+   *  (user_message_id / assistant_message_id). Needed for chat branching
+   *  (edit/regenerate fork from a specific turn). Undefined while streaming
+   *  before the `done` frame lands. */
+  id?: number;
   role: 'user' | 'assistant';
   content: string;
   streaming?: boolean;
@@ -202,6 +207,7 @@ function dedupAppend(prev: unknown[], incoming: unknown[]): unknown[] {
 
 /** Map a persisted history message to the in-memory UI shape. */
 export function historyToUiMessage(m: {
+  id?: number;
   role: string;
   content: string;
   metadata?: unknown;
@@ -216,6 +222,7 @@ export function historyToUiMessage(m: {
       }
     | undefined;
   return {
+    ...(typeof m.id === 'number' && { id: m.id }),
     role: m.role === 'system' ? 'assistant' : (m.role as 'user' | 'assistant'),
     content: m.content,
     ...(meta?.attachments && meta.attachments.length > 0 && { attachments: meta.attachments }),
@@ -349,6 +356,11 @@ export interface ChatContextValue {
     correctedValue: string,
   ) => Promise<void>;
   regenerateWithCorrectedIntent: (text: string, correctedIntent: string) => void;
+  // Chat branching (Phase 1): edit-and-resubmit the user turn at `messageIndex`
+  // (forks from its parent); regenerate the assistant turn at `assistantIndex`
+  // (forks a new assistant sibling under the same user message).
+  editAndResubmit: (messageIndex: number, newText: string) => void;
+  regenerateTurn: (assistantIndex: number) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -708,6 +720,9 @@ export function ChatProvider({ children }: ChatProviderProps) {
           ...lastMsg,
           streaming: false,
           intentInfo,
+          // Chat branching: stamp the persisted assistant message id so a later
+          // regenerate can fork from this turn's user message.
+          ...(typeof data.assistant_message_id === 'number' && { id: data.assistant_message_id }),
           // Resolved agent role for the role badge (item 6). Present on router-path
           // turns; absent on legacy/shortcut turns (→ no badge). On an orchestrated
           // multi-domain turn this is the single primary-classified role (known
@@ -799,7 +814,20 @@ export function ChatProvider({ children }: ChatProviderProps) {
           }
         }
 
-        return [...prev.slice(0, -1), completedMessage];
+        // Chat branching: stamp the persisted user message id onto the
+        // immediately-preceding user turn so an edit can fork from its parent.
+        const head = prev.slice(0, -1);
+        if (
+          typeof data.user_message_id === 'number' &&
+          head.length > 0 &&
+          head[head.length - 1].role === 'user'
+        ) {
+          head[head.length - 1] = {
+            ...head[head.length - 1],
+            id: data.user_message_id,
+          };
+        }
+        return [...head, completedMessage];
       }
       return prev;
     });
@@ -1564,7 +1592,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     text: string,
     fromVoice = false,
     voiceMeta?: { speakerEmbedding?: number[] | null },
-    opts?: { correctedIntent?: string },
+    opts?: { correctedIntent?: string; forkFromMessageId?: number; suppressAppend?: boolean },
   ): Promise<void> => {
     if (!text.trim()) return;
 
@@ -1609,12 +1637,17 @@ export function ChatProvider({ children }: ChatProviderProps) {
       .filter((a) => a.status === 'completed')
       .map((a) => a.id);
 
-    const userMessage: ChatUiMessage = {
-      role: 'user',
-      content: text,
-      ...(currentAttachments.length > 0 && { attachments: currentAttachments }),
-    };
-    setMessages((prev) => [...prev, userMessage]);
+    // Chat branching: a regenerate re-runs an EXISTING user turn, so the user
+    // bubble is already in the array (suppressAppend) — only an edit/normal send
+    // appends a new user bubble.
+    if (!opts?.suppressAppend) {
+      const userMessage: ChatUiMessage = {
+        role: 'user',
+        content: text,
+        ...(currentAttachments.length > 0 && { attachments: currentAttachments }),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+    }
     if (!isRerun) {
       setInput('');
       setAttachments([]);
@@ -1665,6 +1698,10 @@ export function ChatProvider({ children }: ChatProviderProps) {
       // "Korrigieren & neu beantworten": the corrected intent is mapped to the
       // owning agent role server-side and used as the route for this re-run.
       ...(opts?.correctedIntent && { corrected_intent: opts.correctedIntent }),
+      // Chat branching: fork this turn from the given message (edit → the edited
+      // user msg's parent; regenerate → the user msg itself). Backend honors it
+      // only when chat_branching_enabled; ignored otherwise.
+      ...(typeof opts?.forkFromMessageId === 'number' && { fork_from_message_id: opts.forkFromMessageId }),
     };
 
     // wsSendMessage re-checks readyState before .send() and returns false
@@ -1708,6 +1745,47 @@ export function ChatProvider({ children }: ChatProviderProps) {
   const regenerateWithCorrectedIntent = useCallback((text: string, correctedIntent: string) => {
     void sendMessageInternal(text, false, undefined, { correctedIntent });
   }, [sendMessageInternal]);
+
+  // Chat branching (Phase 1): edit-and-resubmit a user turn. Forks from the
+  // edited user message's PARENT (the preceding assistant, or root) so the new
+  // user message becomes a sibling of the edited one; the old branch is dropped
+  // from the view (still preserved server-side). Phase 1 only allows editing the
+  // LATEST user message — the UI gates this — so the abandoned tail is simply
+  // everything from the edited message onward.
+  const editAndResubmit = useCallback((messageIndex: number, newText: string) => {
+    if (!newText.trim()) return;
+    setMessages((prev) => {
+      const target = prev[messageIndex];
+      if (!target || target.role !== 'user') return prev;
+      // Truncate the abandoned tail: keep everything BEFORE the edited message.
+      return prev.slice(0, messageIndex);
+    });
+    // Parent of the edited message = the message immediately before it (an
+    // assistant turn), if any. Undefined → the edited message was the root.
+    const parent = messageIndex > 0 ? messages[messageIndex - 1]?.id : undefined;
+    void sendMessageInternal(newText, false, undefined, {
+      ...(typeof parent === 'number' && { forkFromMessageId: parent }),
+    });
+  }, [messages, sendMessageInternal]);
+
+  // Chat branching (Phase 1): regenerate a turn — re-run the same user message,
+  // forking a new assistant sibling under it. Phase 1 only allows regenerating
+  // the LATEST assistant turn (UI-gated). Forks from the turn's USER message id
+  // (backend reads its 'user' role → regenerate mode, no duplicate user bubble).
+  const regenerateTurn = useCallback((assistantIndex: number) => {
+    const assistantMsg = messages[assistantIndex];
+    const userMsg = messages[assistantIndex - 1];
+    if (!assistantMsg || assistantMsg.role !== 'assistant') return;
+    if (!userMsg || userMsg.role !== 'user' || typeof userMsg.id !== 'number') return;
+    const forkId = userMsg.id;
+    const userText = userMsg.content;
+    // Drop the abandoned assistant turn from the view; keep the user message.
+    setMessages((prev) => prev.slice(0, assistantIndex));
+    void sendMessageInternal(userText, false, undefined, {
+      forkFromMessageId: forkId,
+      suppressAppend: true,
+    });
+  }, [messages, sendMessageInternal]);
 
   // Summarize handler (must be after sendMessageInternal)
   const handleSummarize = useCallback((uploadId: string) => {
@@ -1921,9 +1999,12 @@ export function ChatProvider({ children }: ChatProviderProps) {
     speakText,
     handleFeedbackSubmit,
     regenerateWithCorrectedIntent,
+    editAndResubmit,
+    regenerateTurn,
   }), [
     messages, loading, input, historyLoading, sendMessageInternal, submitPaperlessConfirm,
     regenerateWithCorrectedIntent,
+    editAndResubmit, regenerateTurn,
     paletteOpen, pendingRoleHint,
     sessionId, sidebarOpen, switchConversation, startNewChat, handleDeleteConversation,
     pendingScrollIndex, jumpToMessage, clearPendingScroll,

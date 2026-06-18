@@ -61,6 +61,88 @@ class ConversationService:
         """
         self.db = db
 
+    async def active_path_message_ids(self, conversation: Conversation) -> list[int]:
+        """Return the ids of the messages on the conversation's ACTIVE branch,
+        ordered ``timestamp ASC, id ASC`` (the exact order
+        ``/api/chat/history`` returns).
+
+        Chat branching (Phase 1), the CORE primitive. The active branch is the
+        recursive walk of ``messages.parent_message_id`` UPWARD from
+        ``conversation.active_leaf_message_id``. For a linear (un-forked,
+        backfilled) conversation this reproduces the historical flat ordering
+        byte-for-byte, so it is safe to use everywhere "the messages on the
+        active branch" is needed regardless of the CHAT_BRANCHING_ENABLED flag
+        (CTE-always-on).
+
+        ``active_leaf_message_id IS NULL`` (empty conversation, or a row that
+        predates the backfill) → empty list, and callers fall back to their
+        flat query (see ``load_context`` / the history route). Postgres-only
+        recursive CTE; on a non-PG dialect (sqlite test harness) returns ``[]``
+        so callers transparently keep the flat path.
+
+        RISK NOTE (reviewer): this is a recursive CTE. ``parent_message_id`` is
+        a strict-ancestor pointer maintained by ``save_message`` / the fork
+        path, so the walk terminates at the root (NULL parent). A pathological
+        cycle (should be impossible — we never set a parent to a descendant)
+        would loop; Postgres caps recursion via ``max_stack_depth`` and we also
+        bound the depth defensively below.
+        """
+        leaf_id = getattr(conversation, "active_leaf_message_id", None)
+        if leaf_id is None:
+            return []
+        if not self._is_postgres():
+            return []
+        # Walk parent_message_id upward from the leaf. The CYCLE guard +
+        # depth bound make this terminate even on corrupt data. Order the
+        # final result by (timestamp, id) so a fork that reuses an earlier
+        # timestamp still lands in chronological position (matches history).
+        sql = text("""
+            WITH RECURSIVE branch(id, parent_message_id, timestamp, depth) AS (
+                SELECT m.id, m.parent_message_id, m.timestamp, 0
+                FROM messages m
+                WHERE m.id = :leaf_id
+                  AND m.conversation_id = :conv_id
+                UNION ALL
+                SELECT p.id, p.parent_message_id, p.timestamp, b.depth + 1
+                FROM messages p
+                JOIN branch b ON p.id = b.parent_message_id
+                WHERE b.depth < 10000
+            )
+            SELECT id FROM branch
+            ORDER BY timestamp ASC, id ASC
+        """)
+        rows = await self.db.execute(
+            sql, {"leaf_id": leaf_id, "conv_id": conversation.id}
+        )
+        return [int(r[0]) for r in rows.all()]
+
+    async def _abandoned_subtree_message_ids(self, root_message_id: int) -> list[int]:
+        """Return ``root_message_id`` + ALL its descendants via a DOWNWARD
+        recursive CTE over ``parent_message_id``.
+
+        Used by the fork path to collect the messages abandoned when a branch
+        is replaced, so their derived state (memories, seam 3) can be
+        deactivated. Postgres-only; ``[]`` on other dialects.
+
+        RISK NOTE (reviewer): recursive CTE walking children. Same termination
+        argument + depth bound as ``active_path_message_ids``.
+        """
+        if not self._is_postgres():
+            return []
+        sql = text("""
+            WITH RECURSIVE subtree(id, depth) AS (
+                SELECT m.id, 0 FROM messages m WHERE m.id = :root_id
+                UNION ALL
+                SELECT c.id, s.depth + 1
+                FROM messages c
+                JOIN subtree s ON c.parent_message_id = s.id
+                WHERE s.depth < 10000
+            )
+            SELECT id FROM subtree
+        """)
+        rows = await self.db.execute(sql, {"root_id": root_message_id})
+        return [int(r[0]) for r in rows.all()]
+
     async def load_context(
         self,
         session_id: str,
@@ -87,14 +169,31 @@ class ConversationService:
                 logger.debug(f"Keine Konversation gefunden für session_id: {session_id}")
                 return []
 
-            # Lade letzte N Nachrichten
-            result = await self.db.execute(
-                select(Message)
-                .where(Message.conversation_id == conversation.id)
-                .order_by(Message.timestamp.desc())
-                .limit(max_messages)
-            )
-            messages = result.scalars().all()
+            # Chat branching (Phase 1): the agent's conversation_history must
+            # follow the ACTIVE branch, not the flat message set (else an edited
+            # turn would still feed the abandoned sibling to the LLM). Resolve the
+            # active-path ids (CTE-always-on) and load the last N of THOSE. Empty
+            # path (null leaf / pre-backfill / sqlite) → fall back to the flat
+            # query below, byte-identical to pre-branching.
+            active_ids = await self.active_path_message_ids(conversation)
+            if active_ids:
+                window_ids = active_ids[-max_messages:]
+                result = await self.db.execute(
+                    select(Message).where(Message.id.in_(window_ids))
+                )
+                by_id = {m.id: m for m in result.scalars().all()}
+                # Preserve the active-path order (ascending); reversed() below
+                # expects newest-first, so hand it the descending slice.
+                messages = [by_id[i] for i in reversed(window_ids) if i in by_id]
+            else:
+                # Lade letzte N Nachrichten
+                result = await self.db.execute(
+                    select(Message)
+                    .where(Message.conversation_id == conversation.id)
+                    .order_by(Message.timestamp.desc())
+                    .limit(max_messages)
+                )
+                messages = result.scalars().all()
 
             # Konvertiere zu Chat-Format (älteste zuerst)
             # Reconstruct action summary prefix for LLM context (kept out of DB content for clean UI)
@@ -129,6 +228,7 @@ class ConversationService:
         content: str,
         metadata: dict | None = None,
         user_id: int | None = None,
+        parent_message_id: int | None = None,
     ) -> Message:
         """
         Speichere eine einzelne Nachricht.
@@ -138,6 +238,14 @@ class ConversationService:
             role: "user" oder "assistant"
             content: Nachrichteninhalt
             metadata: Optional zusätzliche Metadaten
+            parent_message_id: Chat branching (Phase 1). When given (a FORK), the
+                new message is inserted as a SIBLING under that parent — preserving
+                the message it replaces. When ``None`` (the normal append), the new
+                message is chained onto the current tip
+                (``conversation.active_leaf_message_id``). Either way the leaf is
+                advanced to the new message id, so the tree stays walkable for
+                EVERY conversation regardless of CHAT_BRANCHING_ENABLED
+                (CTE-always-on).
 
         Returns:
             Gespeicherte Message
@@ -175,14 +283,28 @@ class ConversationService:
                 conversation.user_id = user_id
                 await self.db.flush()
 
+            # Chat branching (Phase 1): wire the message into the conversation
+            # tree. Explicit parent (a fork) → sibling under that parent; else
+            # chain onto the current tip. Then advance the active leaf to this
+            # new message so the next append/CTE walk starts here.
+            effective_parent = (
+                parent_message_id
+                if parent_message_id is not None
+                else conversation.active_leaf_message_id
+            )
+
             # Erstelle Message
             message = Message(
                 conversation_id=conversation.id,
                 role=role,
                 content=content,
-                message_metadata=metadata
+                message_metadata=metadata,
+                parent_message_id=effective_parent,
             )
             self.db.add(message)
+            # Flush so message.id is available to set as the new active leaf.
+            await self.db.flush()
+            conversation.active_leaf_message_id = message.id
 
             # Update conversation timestamp
             conversation.updated_at = datetime.now(UTC).replace(tzinfo=None)
@@ -197,6 +319,94 @@ class ConversationService:
             logger.error(f"Fehler beim Speichern der Nachricht: {e}")
             await self.db.rollback()
             raise
+
+    async def deactivate_memories_for_abandoned_subtree(
+        self, abandoned_root_message_id: int
+    ) -> int:
+        """Deactivate-at-fork (chat branching, seam 3).
+
+        When a fork ABANDONS a branch, flip ``is_active=False`` on every
+        ``ConversationMemory`` whose ``source_message_id`` is in the abandoned
+        subtree — the message being replaced PLUS all its descendants (collected
+        via the downward recursive CTE). ``retrieve_for_prompt`` already filters
+        ``is_active == True``, so the abandoned turn's facts stop being injected
+        without deleting anything (recoverable, mirrors the soft-delete posture
+        in ``conversation_memory_service._apply_delete_v2``).
+
+        Returns the number of rows deactivated. No internal commit — the caller
+        commits as part of the fork transaction.
+
+        NARROW RACE (documented, NOT solved in Phase 1): memory extraction runs
+        in a BACKGROUND task AFTER the turn's ``done`` frame. A fork that lands
+        WHILE the abandoned turn's extraction is still running could re-add an
+        ``is_active=True`` memory after this deactivation pass. The window is
+        small (extraction is fast and a user can't realistically edit a turn
+        before its own extraction completes) and the failure mode is benign (one
+        stale memory survives, not data loss). PHASE 2 will need either
+        reactivation-on-branch-switch or active-path-scoped memory retrieval
+        (so an inactive-branch memory is filtered at read time regardless of the
+        flag) — that is the proper fix; do NOT paper over it here.
+
+        Sqlite test harness: the subtree CTE returns ``[]`` (PG-only), so this
+        is a no-op there; tests seed + assert the deactivation against PG.
+        """
+        from sqlalchemy import update
+
+        from models.database import ConversationMemory
+
+        subtree_ids = await self._abandoned_subtree_message_ids(
+            abandoned_root_message_id
+        )
+        if not subtree_ids:
+            return 0
+        result = await self.db.execute(
+            update(ConversationMemory)
+            .where(ConversationMemory.source_message_id.in_(subtree_ids))
+            .where(ConversationMemory.is_active.is_(True))
+            .values(is_active=False)
+        )
+        count = result.rowcount or 0
+        if count:
+            logger.info(
+                f"🌿 Fork: deactivated {count} memories from abandoned subtree "
+                f"(root msg {abandoned_root_message_id}, {len(subtree_ids)} msgs)"
+            )
+        return count
+
+    async def set_active_leaf(
+        self, session_id: str, message_id: int, *, user_id: int | None = None
+    ) -> bool:
+        """Switch a conversation's active branch to the branch ending at
+        ``message_id`` (chat branching, the active-leaf endpoint).
+
+        Validates that ``message_id`` belongs to the conversation (and, when
+        ``user_id`` is given, that the caller owns the conversation) before
+        repointing ``active_leaf_message_id``. Returns False (caller → 404) when
+        the conversation is missing, unowned, or the message is foreign. No
+        generation; commits the leaf change.
+        """
+        result = await self.db.execute(
+            select(Conversation).where(Conversation.session_id == session_id)
+        )
+        conversation = result.scalar_one_or_none()
+        if not conversation:
+            return False
+        if user_id is not None and conversation.user_id != user_id:
+            return False
+
+        msg_result = await self.db.execute(
+            select(Message.id).where(
+                Message.id == message_id,
+                Message.conversation_id == conversation.id,
+            )
+        )
+        if msg_result.scalar_one_or_none() is None:
+            return False
+
+        conversation.active_leaf_message_id = message_id
+        conversation.updated_at = datetime.now(UTC).replace(tzinfo=None)
+        await self.db.commit()
+        return True
 
     async def associate_speaker(
         self,
@@ -683,28 +893,58 @@ class ConversationService:
                 "MaxFragments=2, MaxWords=18, MinWords=5, ShortWord=2"
             )
 
-            # message_index: 0-based position within the conversation in
-            # timestamp-ASC order (id as the stable tiebreaker — matches
-            # /api/chat/history which orders by timestamp ASC). Computed via a
-            # window function over the FULL message set, then we filter to the
-            # FTS matches. ts_headline produces the highlighted snippet from the
-            # SAME tsquery.
+            # Chat branching (Phase 1), seam 4: search is restricted to the
+            # ACTIVE branch of each conversation, and message_index is the ordinal
+            # WITHIN that branch (not the global position) — else jump-to-message
+            # would scroll to the wrong row now that /api/chat/history only returns
+            # the active path.
+            #
+            # `active` walks parent_message_id UPWARD from each conversation's
+            # active_leaf_message_id (recursive CTE seeded per owned/scoped
+            # conversation). `indexed` then numbers ONLY those active-branch
+            # messages by (timestamp ASC, id ASC) — the same ordering history
+            # returns — so message_index aligns with the rendered thread. For a
+            # linear (un-forked, backfilled) conversation the active branch == the
+            # full message set, so this is byte-identical to the pre-branching
+            # query.
+            #
+            # RISK NOTE (reviewer): recursive CTE. Bounded by depth < 10000 and
+            # terminates at the root (NULL parent). Conversations with a NULL
+            # active_leaf (pre-backfill / empty) contribute no rows — acceptable
+            # (search over an un-backfilled conversation returns nothing rather
+            # than wrong indices; the backfill makes this a non-issue in prod).
             sql = text(f"""
-                WITH indexed AS (
+                WITH RECURSIVE scoped_conv AS (
+                    SELECT c.id, c.session_id, c.active_leaf_message_id
+                    FROM conversations c
+                    WHERE c.active_leaf_message_id IS NOT NULL
+                      {owner_clause} {session_clause}
+                ),
+                active(conversation_id, id, parent_message_id, timestamp, depth) AS (
+                    SELECT sc.id, m.id, m.parent_message_id, m.timestamp, 0
+                    FROM scoped_conv sc
+                    JOIN messages m ON m.id = sc.active_leaf_message_id
+                    UNION ALL
+                    SELECT a.conversation_id, p.id, p.parent_message_id, p.timestamp, a.depth + 1
+                    FROM messages p
+                    JOIN active a ON p.id = a.parent_message_id
+                    WHERE a.depth < 10000
+                ),
+                indexed AS (
                     SELECT
                         m.id AS id,
                         m.role AS role,
                         m.content AS content,
                         m.timestamp AS timestamp,
                         m.search_vector AS search_vector,
-                        c.session_id AS session_id,
+                        sc.session_id AS session_id,
                         (row_number() OVER (
-                            PARTITION BY m.conversation_id
+                            PARTITION BY a.conversation_id
                             ORDER BY m.timestamp ASC, m.id ASC
                         ) - 1) AS message_index
-                    FROM messages m
-                    JOIN conversations c ON m.conversation_id = c.id
-                    WHERE 1=1 {owner_clause} {session_clause}
+                    FROM active a
+                    JOIN messages m ON m.id = a.id
+                    JOIN scoped_conv sc ON sc.id = a.conversation_id
                 )
                 SELECT
                     session_id,

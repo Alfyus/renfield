@@ -894,6 +894,14 @@ async def websocket_endpoint(
                 attachment_ids = msg.attachment_ids or []
                 msg_speaker_embedding = msg.speaker_embedding
                 msg_request_id = msg.request_id
+                # Chat branching (Phase 1): a fork is only honored when the flag
+                # is on; otherwise the inbound id is ignored and the turn appends
+                # normally (CTE-always-on keeps the tree walkable regardless).
+                fork_from_message_id = (
+                    msg.fork_from_message_id
+                    if settings.chat_branching_enabled
+                    else None
+                )
             except ValidationError as e:
                 await send_ws_error(websocket, WSErrorCode.INVALID_MESSAGE, str(e))
                 continue
@@ -2000,27 +2008,100 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                 )
 
             # Persist messages to DB if session_id is provided
+            saved_user_message_id: int | None = None
+            saved_assistant_message_id: int | None = None
             if msg_session_id and full_response:
                 try:
                     async with AsyncSessionLocal() as db_session:
+                        # Chat branching (Phase 1): resolve the fork shape from the
+                        # role of `fork_from_message_id` (only set when the flag is
+                        # on). A fork_from pointing at a USER message = REGENERATE
+                        # (re-run the same turn → new assistant sibling under that
+                        # user message, NO new user message). A fork_from pointing
+                        # at an assistant message OR the conversation root (NULL
+                        # parent of the edited user msg) = EDIT-AND-RESUBMIT (new
+                        # user message as a sibling under fork_from, then the
+                        # assistant chains under it). Before generating we already
+                        # have full_response; deactivate the abandoned branch's
+                        # memories here so they stop being injected.
+                        from sqlalchemy import select
+
+                        from models.database import Conversation, Message
+                        from services.conversation_service import ConversationService
+
+                        regenerate_mode = False
+                        assistant_parent_id: int | None = None
+                        if fork_from_message_id is not None:
+                            _bsvc = ConversationService(db_session)
+                            _fork_msg = (
+                                await db_session.execute(
+                                    select(Message.role).where(
+                                        Message.id == fork_from_message_id
+                                    )
+                                )
+                            ).scalar_one_or_none()
+                            regenerate_mode = _fork_msg == "user"
+                            # Abandoned root = the message on the CURRENT active
+                            # path whose parent is fork_from (the sibling we are
+                            # replacing). Deactivate its subtree's memories.
+                            try:
+                                _abandoned = (
+                                    await db_session.execute(
+                                        select(Message.id)
+                                        .join(
+                                            Conversation,
+                                            Message.conversation_id == Conversation.id,
+                                        )
+                                        .where(
+                                            Conversation.session_id == msg_session_id,
+                                            Message.parent_message_id
+                                            == fork_from_message_id,
+                                        )
+                                    )
+                                ).scalars().all()
+                                for _aid in _abandoned:
+                                    await _bsvc.deactivate_memories_for_abandoned_subtree(
+                                        _aid
+                                    )
+                                if _abandoned:
+                                    await db_session.commit()
+                            except Exception as _de:  # noqa: BLE001
+                                logger.warning(
+                                    f"⚠️ Fork memory-deactivation failed: {_de}"
+                                )
+
                         # Save user message
                         user_metadata = {}
                         if room_context:
                             user_metadata["room_context"] = room_context
                         if attachment_ids:
                             user_metadata["attachment_ids"] = attachment_ids
-                        await ollama.save_message(
-                            msg_session_id, "user", content, db_session,
-                            metadata=user_metadata if user_metadata else None,
-                            user_id=user_id,
-                        )
+                        if regenerate_mode:
+                            # Re-run of an existing turn: reuse the existing user
+                            # message as the assistant's parent; do NOT duplicate it.
+                            saved_user_message_id = fork_from_message_id
+                            assistant_parent_id = fork_from_message_id
+                        else:
+                            _user_msg = await ollama.save_message(
+                                msg_session_id, "user", content, db_session,
+                                metadata=user_metadata if user_metadata else None,
+                                user_id=user_id,
+                                parent_message_id=fork_from_message_id,
+                            )
+                            saved_user_message_id = _user_msg.id
+                            # Assistant chains onto the just-saved user message
+                            # (save_message advanced the leaf there already; passing
+                            # None keeps it appending to that tip).
+                            assistant_parent_id = None
                         # Save assistant response (clean content for UI display)
                         # action_summary stored in metadata for LLM context reconstruction
-                        await ollama.save_message(
+                        _asst_msg = await ollama.save_message(
                             msg_session_id, "assistant", full_response, db_session,
                             metadata=assistant_metadata,
                             user_id=user_id,
+                            parent_message_id=assistant_parent_id,
                         )
+                        saved_assistant_message_id = _asst_msg.id
                         logger.debug(f"💾 Messages saved to DB: session_id={msg_session_id}, user_id={user_id}")
 
                         # Trigger summary generation if conversation is long enough
@@ -2105,6 +2186,15 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                 "type": "done",
                 "tts_handled": tts_handled_by_server
             }
+            # Chat branching (Phase 1): the persisted message ids for THIS turn so
+            # the frontend can attach them to the rendered turn (needed to fork
+            # from the latest user/assistant message). Always emitted when known —
+            # harmless when the flag is off (the frontend simply doesn't act on
+            # them).
+            if saved_user_message_id is not None:
+                done_msg["user_message_id"] = saved_user_message_id
+            if saved_assistant_message_id is not None:
+                done_msg["assistant_message_id"] = saved_assistant_message_id
             if agent_used:
                 done_msg["agent_steps"] = agent_steps_count
             if agent_sources:
