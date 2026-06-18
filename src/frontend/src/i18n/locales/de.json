@@ -127,6 +127,10 @@
     "yourMessage": "Deine Nachricht",
     "assistantResponse": "Antwort von {{appName}}",
     "readAloud": "Vorlesen",
+    "edit": "Bearbeiten",
+    "editMessage": "Nachricht bearbeiten",
+    "resubmit": "Erneut senden",
+    "regenerate": "Neu generieren",
     "albumArt": "Albumcover",
     "mediaHandoff": {
       "followed": "Wiedergabe folgt nach {{room}}",

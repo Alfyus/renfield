@@ -127,6 +127,10 @@
     "yourMessage": "Your message",
     "assistantResponse": "Response from {{appName}}",
     "readAloud": "Read aloud",
+    "edit": "Edit",
+    "editMessage": "Edit message",
+    "resubmit": "Resubmit",
+    "regenerate": "Regenerate",
     "albumArt": "Album art",
     "mediaHandoff": {
       "followed": "Playback following you to {{room}}",

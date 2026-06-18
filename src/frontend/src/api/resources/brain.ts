@@ -105,6 +105,8 @@ export interface FeatureFlags {
   artifacts_typed_enabled: boolean;
   /** Gates the chat room-handoff affordance (item 8): the inline meta line shown when Media Follow moves playback to a new room. */
   room_handoff_enabled: boolean;
+  /** Gates the chat message-branching UI (edit/regenerate per-message fork actions). */
+  chat_branching_enabled: boolean;
 }
 
 async function fetchAtomSearch(query: string): Promise<AtomMatch[]> {

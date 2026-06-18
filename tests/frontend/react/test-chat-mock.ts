@@ -99,6 +99,9 @@ export const defaultChatContextValue: ChatContextValue = {
   speakText: async () => {},
   handleFeedbackSubmit: async () => {},
   regenerateWithCorrectedIntent: () => {},
+  // Chat branching (Phase 1)
+  editAndResubmit: () => {},
+  regenerateTurn: () => {},
 
   // Paperless confirm card
   submitPaperlessConfirm: () => {},

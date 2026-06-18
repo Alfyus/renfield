@@ -294,6 +294,19 @@ COMMAND_PALETTE_ENABLED=false
 backendseitige `role_hint`-Handling ist immer aktiv (No-op ohne Hint), daher braucht
 das Umschalten **kein** Backend-Redeploy.
 
+### Nachrichten-Branching (Edit-and-Fork)
+
+```bash
+CHAT_BRANCHING_ENABLED=false
+```
+
+**Default:** `false` (Opt-in/dark; Frontend-Gate via `/api/config/features`). Schaltet
+die Edit-/Regenerate-Affordances (Phase 1: letzte Nutzernachricht bearbeiten / letzten
+Assistenten-Turn neu generieren → Branch) frei. Das Konversationsbaum-**Schema** und die
+aktive-Pfad-CTE laufen **immer** (der einmalige Backfill macht den Flag-aus-Zustand
+byte-identisch), nur die Fork-Affordances/Endpunkte sind gegated. Design:
+`docs/design/chat-branching.md`.
+
 ### Nachrichtensuche (Message Search)
 
 ```bash

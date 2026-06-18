@@ -397,6 +397,15 @@ class Settings(BaseSettings):
     # to the same room audience as the existing follow info push (no privacy
     # widening). Ships dark; flip without a rebuild.
     room_handoff_enabled: bool = False
+    # Chat message branching (edit-and-fork, Phase 1). Gates the FORK affordances:
+    # the per-message edit/regenerate actions in the frontend (exposed via
+    # /api/config/features) AND whether the backend honors an inbound
+    # `fork_from_message_id` on a chat turn. The conversation TREE
+    # (messages.parent_message_id / conversations.active_leaf_message_id) and the
+    # active-path query are ALWAYS maintained regardless of this flag — the
+    # backfill makes flag-off byte-identical to pre-branching. Ships dark; flip
+    # without a rebuild. See docs/design/chat-ui-modernization.md.
+    chat_branching_enabled: bool = False
     # Chat artifacts Lane B (free-form HTML/SVG in a sandboxed iframe). DEFERRED —
     # NOT wired to anything in this delivery. Placeholder so the per-lane flag
     # split (§8 Q5) exists; defaults off and requires its own security review
