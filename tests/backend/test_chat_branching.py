@@ -482,9 +482,21 @@ class TestDeletionFkSqlite:
         raise. Enable sqlite FK enforcement for this test so the SET NULL action
         is actually exercised (sqlite ignores FKs by default)."""
         await db_session.execute(text("PRAGMA foreign_keys=ON"))
+        # With FK enforcement ON, the conversation's user_id FK is also checked,
+        # so seed a real user (else the conversation INSERT fails on the users
+        # FK, masking what this test is actually about).
+        role = Role(name="del-role", description="role for delete test")
+        db_session.add(role)
+        await db_session.flush()
+        u = User(
+            username="del-u1", email="del-u1@example.invalid",
+            password_hash="x", is_active=True, role_id=role.id,
+        )
+        db_session.add(u)
+        await db_session.flush()
         svc = ConversationService(db_session)
-        await svc.save_message("del-conv", "user", "frage", user_id=5)
-        await svc.save_message("del-conv", "assistant", "antwort", user_id=5)
+        await svc.save_message("del-conv", "user", "frage", user_id=u.id)
+        await svc.save_message("del-conv", "assistant", "antwort", user_id=u.id)
         conv = (
             await db_session.execute(
                 select(Conversation).where(Conversation.session_id == "del-conv")

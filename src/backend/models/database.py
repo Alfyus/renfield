@@ -55,8 +55,21 @@ class Conversation(Base):
     # leave this column dangling at the now-deleted leaf → FK violation / 500 on
     # Postgres (DELETE /api/chat/session/{id} + the cleanup loop). SET NULL clears
     # it as the messages go, so the conversation row deletes cleanly.
+    # use_alter=True breaks the conversations<->messages FK cycle for
+    # metadata.create_all (the sqlite test harness has no ALTER ADD CONSTRAINT,
+    # so it omits this FK there — fine; prod's schema comes from the migration,
+    # which adds it with ON DELETE SET NULL). Without this, create_all can't
+    # sequence the cyclic constraints and even a NULL-leaf conversation INSERT
+    # fails under PRAGMA foreign_keys=ON.
     active_leaf_message_id = Column(
-        Integer, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+        Integer,
+        ForeignKey(
+            "messages.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_conversations_active_leaf_message_id",
+        ),
+        nullable=True,
     )
 
     # Beziehungen
