@@ -703,9 +703,53 @@ def _clean_str(value: Any, maxlen: int) -> str | None:
     return s[:maxlen] if s else None
 
 
+# ISO-4217 active alpha-3 currency codes. A static set (no runtime dependency):
+# the LLM is asked for a currency but can hallucinate a free-form string, so we
+# validate against the standard and drop anything that isn't a real code.
+_ISO_4217: frozenset[str] = frozenset({
+    "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN",
+    "BAM", "BBD", "BDT", "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BOV",
+    "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD", "CDF", "CHE", "CHF",
+    "CHW", "CLF", "CLP", "CNY", "COP", "COU", "CRC", "CUC", "CUP", "CVE",
+    "CZK", "DJF", "DKK", "DOP", "DZD", "EGP", "ERN", "ETB", "EUR", "FJD",
+    "FKP", "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD", "HKD",
+    "HNL", "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD",
+    "JOD", "JPY", "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD",
+    "KZT", "LAK", "LBP", "LKR", "LRD", "LSL", "LYD", "MAD", "MDL", "MGA",
+    "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MXV",
+    "MYR", "MZN", "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB",
+    "PEN", "PGK", "PHP", "PKR", "PLN", "PYG", "QAR", "RON", "RSD", "RUB",
+    "RWF", "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SOS",
+    "SRD", "SSP", "STN", "SVC", "SYP", "SZL", "THB", "TJS", "TMT", "TND",
+    "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "USN", "UYI",
+    "UYU", "UYW", "UZS", "VED", "VES", "VND", "VUV", "WST", "XAF", "XAG",
+    "XAU", "XCD", "XDR", "XOF", "XPF", "XSU", "XUA", "YER", "ZAR", "ZMW",
+    "ZWG",
+})
+
+# Common symbols / words the LLM may emit instead of an ISO code, mapped to the
+# canonical alpha-3. Applied before the ISO-4217 check.
+_CURRENCY_ALIASES: dict[str, str] = {
+    "€": "EUR", "EURO": "EUR", "EUROS": "EUR",
+    "$": "USD", "US$": "USD", "USD$": "USD", "DOLLAR": "USD", "DOLLARS": "USD",
+    "£": "GBP", "POUND": "GBP", "POUNDS": "GBP",
+    "¥": "JPY", "FR": "CHF", "FR.": "CHF", "SFR": "CHF", "CHF.": "CHF",
+}
+
+
 def _clean_currency(value: Any) -> str | None:
+    """Normalize a currency to a valid ISO-4217 alpha-3 code, else drop it.
+
+    Maps common symbols/words (€, $, "Euro", …) to their code, then validates
+    against ISO-4217. A hallucinated / non-currency string returns None so it
+    never lands on a fact as bogus data (the field is nullable).
+    """
     c = _clean_str(value, 8)
-    return c.upper() if c else None
+    if not c:
+        return None
+    up = c.upper()
+    up = _CURRENCY_ALIASES.get(up, up)
+    return up if up in _ISO_4217 else None
 
 
 # ---------------------------------------------------------------------------

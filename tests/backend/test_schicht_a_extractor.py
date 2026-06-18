@@ -31,6 +31,7 @@ for _mod in _missing_stubs:
 from services.schicht_a_extractor import (  # noqa: E402
     _MAX_OPEN_FACTS,
     SchichtAExtractor,
+    _clean_currency,
     _facts_from_payload,
     _parse_amount,
     _parse_date,
@@ -39,6 +40,35 @@ from services.schicht_a_extractor import (  # noqa: E402
     extract_identifiers,
     normalize_field_text,
 )
+
+
+class TestCleanCurrency:
+    """amount_currency is validated against ISO-4217, not just truncated."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("EUR", "EUR"),
+        ("eur", "EUR"),       # lowercased input
+        (" usd ", "USD"),     # whitespace
+        ("€", "EUR"),         # symbol alias
+        ("Euro", "EUR"),      # word alias
+        ("$", "USD"),
+        ("CHF", "CHF"),
+        ("GBP", "GBP"),
+    ])
+    def test_valid_codes_and_aliases(self, raw, expected):
+        assert _clean_currency(raw) == expected
+
+    @pytest.mark.parametrize("raw", [
+        "XYZ",          # not a real code
+        "Dollarsss",    # hallucinated
+        "1234",         # numeric junk
+        "EU",           # too short / not a code
+        "",
+        None,
+        "   ",
+    ])
+    def test_invalid_dropped_to_none(self, raw):
+        assert _clean_currency(raw) is None
 
 # The doc-44 reality: poppler -layout letter-spaces the wide-tracked line, both
 # the keyword AND the value.

@@ -18,6 +18,38 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # Keep strong references to fire-and-forget background tasks so they are not
 # garbage-collected before they finish (asyncio only holds weak refs).
 _background_tasks: set[asyncio.Task] = set()
+
+# Languages with dedicated extraction-prompt variants (Schicht A + KG hooks).
+# A detected language outside this set falls back to settings.default_language
+# so a hook never selects a prompt it doesn't have.
+_SUPPORTED_EXTRACTION_LANGS = frozenset({"de", "en"})
+
+
+def detect_document_language(field_text: str, default: str) -> str:
+    """Best-effort detect the language of an ingested document's text.
+
+    Renfield stores no per-document language, so the ``post_document_ingest``
+    consumers (Schicht A field extraction, KG extraction) otherwise always run
+    under ``settings.default_language`` — extracting a non-default-language doc
+    under the wrong prompt. Detect from the field text and clamp to the
+    languages that actually have prompt variants; fall back to ``default`` on
+    short text or any detector error (langdetect is best-effort, never fatal).
+    """
+    text = (field_text or "").strip()
+    if len(text) < 50:  # too little signal — detection would be noise
+        return default
+    try:
+        from langdetect import DetectorFactory, detect
+        from langdetect.lang_detect_exception import LangDetectException
+
+        DetectorFactory.seed = 0  # deterministic output (langdetect is RNG-seeded)
+        try:
+            code = detect(text[:2000])
+        except LangDetectException:
+            return default
+    except Exception:  # import failure / unexpected — never break ingestion
+        return default
+    return code if code in _SUPPORTED_EXTRACTION_LANGS else default
 from sqlalchemy.orm import selectinload
 
 from models.database import (
@@ -502,6 +534,12 @@ class RAGService:
                     if kg_chunks:
                         from utils.hooks import run_hooks
 
+                        # Resolve the document's language from its text so the
+                        # extraction hooks pick the right prompt variant instead
+                        # of always falling back to settings.default_language.
+                        doc_lang = detect_document_language(
+                            field_text, settings.default_language
+                        )
                         _task = asyncio.create_task(
                             run_hooks(
                                 "post_document_ingest",
@@ -512,6 +550,7 @@ class RAGService:
                                 # field extractors (Schicht A). KG hook ignores it via
                                 # **kwargs; it reads entity-rich chunks, not fields.
                                 field_text=field_text,
+                                lang=doc_lang,
                             )
                         )
                         _background_tasks.add(_task)
