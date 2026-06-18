@@ -1457,6 +1457,22 @@ EMAIL_MCP_ENABLED=true
 
 # Calendar (Google Calendar via n8n)
 CALENDAR_ENABLED=true
+
+# Parcel Tracking (Multi-Carrier, Direkt-APIs — kein Aggregator)
+# DHL/Deutsche Post (gratis, produktiv), UPS + FedEx (OAuth). DPD/Hermes/GLS
+# haben keine freie öffentliche API → Web-Deep-Link. Jeder Adapter deaktiviert
+# sich selbst ohne Keys (list_carriers zeigt den configured-Status).
+TRACKING_ENABLED=true
+DHL_API_KEY=                           # DHL Developer Portal App-Key (DHL-API-Key)
+UPS_CLIENT_ID=                         # UPS Developer App
+UPS_CLIENT_SECRET=
+FEDEX_CLIENT_ID=                       # FedEx Developer App
+FEDEX_CLIENT_SECRET=
+TRACKING_DEFAULT_CARRIER=dhl           # Fallback wenn Carrier nicht aus der Nummer erkennbar
+# Optional: API-Basis-URLs überschreiben (Test-Umgebungen)
+# DHL_TRACKING_BASE_URL=https://api-eu.dhl.com
+# UPS_TRACKING_BASE_URL=https://wwwcie.ups.com       # CIE-Testumgebung
+# FEDEX_TRACKING_BASE_URL=https://apis-sandbox.fedex.com
 ```
 
 **Defaults:** Alle `false`
@@ -1474,6 +1490,9 @@ CALENDAR_ENABLED=true
 | `HOME_ASSISTANT_TOKEN` | HA Long-Lived Access Token | `secrets/home_assistant_token` |
 | `PAPERLESS_API_TOKEN` | Paperless-NGX API Token | `secrets/paperless_api_token` |
 | `MAIL_PRIMARY_PASSWORD` | Email IMAP/SMTP Passwort (primary mail account from `mail_accounts.yaml`) | `secrets/mail_primary_password` |
+| `DHL_API_KEY` | DHL Shipment-Tracking-Unified API-Key (read-only) | `secrets/dhl_api_key` |
+| `UPS_CLIENT_SECRET` | UPS OAuth Client Secret (read-only Tracking) | `secrets/ups_client_secret` |
+| `FEDEX_CLIENT_SECRET` | FedEx OAuth Client Secret (read-only Tracking) | `secrets/fedex_client_secret` |
 | `PRESENCE_WEBHOOK_SECRET` | Shared-Secret für `X-Webhook-Secret` Header bei ausgehenden Presence-Webhooks | `secrets/presence_webhook_secret` |
 
 > Die kanonische Liste inkl. Consumer-Mapping und Upgrade-Hinweise liegt in [`docs/SECRETS_MANAGEMENT.md`](SECRETS_MANAGEMENT.md). Optionale Integration-Secrets (alles ausser den drei Core-Secrets) dürfen als leere Placeholder-Datei existieren — der Stack bleibt startfähig, das Feature deaktiviert sich einfach.
