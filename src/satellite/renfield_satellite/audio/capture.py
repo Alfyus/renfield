@@ -201,14 +201,25 @@ class AudioCapture:
         if not self._pyaudio:
             return None
 
-        # If device specified, try to find it
+        # If device specified, try to find it. Prefer an EXACT name match before
+        # falling back to substring: the configured device "default" must resolve
+        # to the ALSA "default" PCM (our /etc/asound.conf → XVF3800 dsnoop), NOT
+        # "sysdefault" (raw card, opened exclusively, silent on this hardware) —
+        # a plain substring match picks "sysdefault" because it *contains*
+        # "default", which captured pure silence and broke wake-word detection.
         if self.device_name:
-            for i in range(self._pyaudio.get_device_count()):
+            name = self.device_name.lower()
+            count = self._pyaudio.get_device_count()
+            for i in range(count):
                 info = self._pyaudio.get_device_info_by_index(i)
-                if info['maxInputChannels'] > 0:
-                    if self.device_name.lower() in info['name'].lower():
-                        print(f"Found microphone: {info['name']} (index {i})")
-                        return i
+                if info['maxInputChannels'] > 0 and info['name'].lower() == name:
+                    print(f"Found microphone (exact): {info['name']} (index {i})")
+                    return i
+            for i in range(count):
+                info = self._pyaudio.get_device_info_by_index(i)
+                if info['maxInputChannels'] > 0 and name in info['name'].lower():
+                    print(f"Found microphone (substring): {info['name']} (index {i})")
+                    return i
 
         # Use default input device
         try:
