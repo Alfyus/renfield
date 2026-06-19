@@ -298,6 +298,8 @@ class Satellite:
         self.ws_client.on_ble_known_devices(self._on_ble_known_devices)
         # Classic BT known devices callback
         self.ws_client.on_classic_bt_known_devices(self._on_classic_bt_known_devices)
+        # Backend-pushed per-person IRKs (resolve rotating RPAs)
+        self.ws_client.on_ble_irks(self._on_ble_irks_received)
         # Backend-pushed LED brightness (night-dimming)
         self.ws_client.on_led_config(self._on_led_config_update)
         # On-demand camera snapshot (backend occupancy check for private announcements)
@@ -1105,6 +1107,16 @@ class Satellite:
         """Handle Classic BT known devices list pushed from server"""
         self._classic_bt_known_macs = {mac.upper() for mac in devices}
         print(f"Classic BT known devices updated: {len(self._classic_bt_known_macs)} MACs")
+
+    def _on_ble_irks_received(self, irks: list):
+        """Handle per-person IRKs pushed from the backend ([{name, irk(hex)}]).
+        Parses hex → 16 bytes and feeds the scanner's RPA resolver."""
+        parsed = self._parse_irks({item.get("name"): item.get("irk")
+                                   for item in irks if item.get("name") and item.get("irk")})
+        self._ble_irks = parsed
+        if self.ble_scanner is not None:
+            self.ble_scanner.update_irks(parsed)
+        print(f"BLE IRKs updated: {len(parsed)}")
 
     def _on_led_config_update(self, brightness: int):
         """Apply a backend-pushed LED brightness (night-dimming).

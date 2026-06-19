@@ -129,6 +129,7 @@ class WebSocketClient:
         self._on_update_request: Optional[Callable[[str, str, str, int], None]] = None  # version, url, checksum, size
         self._on_ble_known_devices: Optional[Callable[[List[str]], None]] = None
         self._on_classic_bt_known_devices: Optional[Callable[[List[str]], None]] = None
+        self._on_ble_irks: Optional[Callable[[List[Dict[str, Any]]], None]] = None
         # Backend-pushed LED brightness (night-dimming). Carried both as a live
         # `led_config` message and inside register_ack (mid-night reconnect).
         self._on_led_config: Optional[Callable[[int], None]] = None
@@ -222,6 +223,10 @@ class WebSocketClient:
     def on_ble_known_devices(self, callback: Callable[[List[str]], None]):
         """Register callback for BLE known devices list from server"""
         self._on_ble_known_devices = callback
+
+    def on_ble_irks(self, callback: Callable[[List[Dict[str, Any]]], None]):
+        """Register callback for backend-pushed per-person IRKs."""
+        self._on_ble_irks = callback
 
     def on_classic_bt_known_devices(self, callback: Callable[[List[str]], None]):
         """Register callback for Classic BT known devices list from server"""
@@ -589,6 +594,14 @@ class WebSocketClient:
             print(f"Classic BT known devices received: {len(devices)} MACs")
             if self._on_classic_bt_known_devices:
                 self._on_classic_bt_known_devices(devices)
+
+        elif msg_type == "ble_known_irks":
+            # Server pushed per-person IRKs ([{"name","irk"(hex)}]) for resolving
+            # rotating RPAs to a stable identity.
+            irks = data.get("irks", [])
+            print(f"BLE known IRKs received: {len(irks)}")
+            if self._on_ble_irks:
+                self._on_ble_irks(irks)
 
         elif msg_type == "led_config":
             # Backend pushed a new LED brightness (night-dimming). Guard a
