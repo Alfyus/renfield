@@ -94,6 +94,7 @@ satellite_python_packages:
   - aiohttp
   - requests
   - bleak
+  - cryptography   # IRK-based RPA resolution (ble/rpa.py) — resolve rotating phone addresses
   - Pillow
 
 # XVF3800 LED control
