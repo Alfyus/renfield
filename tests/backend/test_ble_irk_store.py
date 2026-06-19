@@ -86,3 +86,29 @@ class TestPresenceIRKHelpers:
             room_name="Kitchen",
         )
         assert svc._sightings == {}
+
+    @pytest.mark.asyncio
+    async def test_load_irks_skips_undecryptable_rows(self):
+        """A row that fails to decrypt (e.g. SECRET_KEY changed) is skipped while
+        good rows still load — the decrypt-skip silent-failure branch."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        svc = _svc()
+        good = SimpleNamespace(label="alice-iphone", irk_encrypted="good-token", user_id=7, is_enabled=True)
+        bad = SimpleNamespace(label="bob-iphone", irk_encrypted="stale-token", user_id=8, is_enabled=True)
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [good, bad]
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=result)
+
+        def fake_decrypt(token):
+            if token == "good-token":
+                return IRK_HEX
+            raise InvalidToken()
+
+        with patch("services.secret_encryption.decrypt_secret", side_effect=fake_decrypt):
+            await svc._load_irks(db)
+
+        assert svc._irks_hex == {"alice-iphone": IRK_HEX}
+        assert svc._irk_label_to_user == {"alice-iphone": 7}

@@ -355,6 +355,37 @@ async def create_irk(
     )
 
 
+class BLEIrkUpdate(BaseModel):
+    is_enabled: bool
+
+
+@router.patch("/irks/{irk_id}", response_model=BLEIrkResponse)
+async def update_irk(
+    irk_id: int,
+    body: BLEIrkUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Enable/disable an IRK without deleting it (disabling stops resolution +
+    re-pushes the reduced set to satellites)."""
+    from models.database import UserBleIrk
+    row = (await db.execute(select(UserBleIrk).where(UserBleIrk.id == irk_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="IRK not found")
+    row.is_enabled = body.is_enabled
+    await db.commit()
+    await db.refresh(row)
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)
+    await presence.push_macs_to_satellites()
+
+    return BLEIrkResponse(
+        id=row.id, user_id=row.user_id, label=row.label, is_enabled=row.is_enabled,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
 @router.delete("/irks/{irk_id}", status_code=204)
 async def delete_irk(
     irk_id: int,

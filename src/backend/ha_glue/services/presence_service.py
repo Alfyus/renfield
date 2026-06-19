@@ -121,6 +121,13 @@ class PresenceService:
             label_to_user[row.label] = row.user_id
         self._irk_label_to_user = label_to_user
         self._irks_hex = irks_hex
+        if rows and not irks_hex:
+            # All IRKs failed to decrypt — almost certainly a SECRET_KEY change.
+            # Surface a single aggregate signal, not just scattered per-row warns.
+            logger.error(
+                f"Presence: {len(rows)} BLE IRK(s) present but 0 decryptable — "
+                "SECRET_KEY may have rotated; phone presence will not resolve."
+            )
         logger.info(f"Presence: loaded {len(irks_hex)} BLE IRK(s)")
 
     def set_room_name(self, room_id: int, name: str):
