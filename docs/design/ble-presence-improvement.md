@@ -52,11 +52,31 @@ needs Experimental (now enabled). Follow-on to the continuous callback above.
 Median/EWMA + hand-off hysteresis in the room-arbitration logic to kill
 flip-flop. Touches the production backend → its own reviewed change.
 
-### Phase 2 — Defeat MAC randomization via IRK/bonding  ⏳ DEFERRED (the real win)
-Bond household devices so BlueZ resolves rotating RPAs to a stable identity via
-the IRK; presence keys on resolved identity, not raw MAC. Largest surface:
-satellite (bonding/resolution) + backend (identity store, IRK distribution,
-presence model) + a small enroll UX + privacy review (storing IRKs).
+### Phase 2 — Defeat MAC randomization via IRK-based RPA resolution  🔶 IN PROGRESS (the real win)
+**Corrected mechanism** (the original "bond the phone to the satellite" is
+infeasible — iOS/Android won't expose themselves for passive bonding). Instead,
+the same approach Home Assistant's *Private BLE Device* / Bermuda use, which is
+reliable with iPhones and needs **no new hardware and no app**:
+
+- **Obtain the IRK out-of-band, once per person.** An iPhone's IRK lives in the
+  owner's **Mac / iCloud keychain**; an Android's in its bonded-device info. No
+  pairing to the satellite.
+- **Resolve the rotating RPA in software.** Given the IRK, each advertised
+  random address is checked with the BLE `ah` hash (AES-128) → matches map the
+  rotating address back to a stable identity. Advertisement-scanning only — no
+  raw HCI, no Classic-BT, no bonding — so it **works on the AIC8800 board**.
+
+**Built (this change):** `ble/rpa.py` (spec-validated `ah` resolution),
+`BLEScanner` IRK routing (`update_irks` / resolve in the continuous + periodic
+paths → presence keyed by resolved identity), config plumbing (`ble.irks`,
+name→hex), `cryptography` dep, unit tests (incl. the BT spec vector).
+
+**Remaining:** backend per-person IRK store (encrypted) + push to satellites
+(like the known-devices list); enrollment flow + documented Mac-export step;
+privacy review for storing IRKs; live end-to-end proof with one real IRK.
+
+> Classic-BT (BlueZ connection-RSSI) was evaluated and rejected for iPhones —
+> no API to poll an iPhone over BR/EDR and iPhones aren't Classic-discoverable.
 
 ### Phase 3 — Optional reach  ⏳ DEFERRED
 Coded-PHY (Long Range) scanning for compatible tags/beacons; connection-based

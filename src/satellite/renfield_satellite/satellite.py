@@ -244,6 +244,7 @@ class Satellite:
         # BLE Scanner (optional, for presence detection)
         self.ble_scanner: Optional[BLEScanner] = None
         self._ble_known_macs: set = set()
+        self._ble_irks: dict = {}
         if self.config.ble.enabled and BLEAK_AVAILABLE:
             self.ble_scanner = BLEScanner(
                 scan_duration=self.config.ble.scan_duration,
@@ -253,7 +254,10 @@ class Satellite:
             )
             # Pre-populate from config (backend will push updates)
             self._ble_known_macs = {mac.upper() for mac in self.config.ble.known_devices}
-            print(f"BLE scanning enabled (interval={self.config.ble.scan_interval}s)")
+            self._ble_irks = self._parse_irks(self.config.ble.irks)
+            self.ble_scanner.update_irks(self._ble_irks)
+            print(f"BLE scanning enabled (interval={self.config.ble.scan_interval}s, "
+                  f"known_macs={len(self._ble_known_macs)}, irks={len(self._ble_irks)})")
         elif self.config.ble.enabled and not BLEAK_AVAILABLE:
             print("Warning: BLE enabled in config but bleak not installed. BLE scanning disabled.")
 
@@ -1124,6 +1128,23 @@ class Satellite:
 
         print(f"LED brightness updated: {old} -> {clamped}")
 
+    @staticmethod
+    def _parse_irks(irks_hex: dict) -> dict:
+        """Convert a name->hex IRK map (from config/backend) to name->16 bytes.
+        Skips malformed entries. Hex is MSO-first (see ble/rpa.py)."""
+        out = {}
+        for name, h in (irks_hex or {}).items():
+            try:
+                b = bytes.fromhex(str(h).replace(":", "").strip())
+            except ValueError:
+                print(f"BLE: invalid IRK hex for '{name}', skipping")
+                continue
+            if len(b) == 16:
+                out[name] = b
+            else:
+                print(f"BLE: IRK for '{name}' is {len(b)} bytes (need 16), skipping")
+        return out
+
     async def _start_ble_scan_loop(self):
         """Start the BLE scanning background loop"""
         # Avoid duplicate loops
@@ -1146,7 +1167,7 @@ class Satellite:
                 await asyncio.sleep(self.config.ble.scan_interval)
                 if not self._running or not self.ws_client.is_connected:
                     continue
-                if not self._ble_known_macs:
+                if not self._ble_known_macs and not self._ble_irks:
                     continue
 
                 try:
