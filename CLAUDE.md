@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Renfield is a fully offline-capable, self-hosted **digital assistant** — a personal AI hub for knowledge retrieval, tool access, and smart home control. Serves multiple household users in parallel.
 
-**Tech Stack:** Python 3.11 + FastAPI + SQLAlchemy | React 18 + TypeScript + Vite + Tailwind CSS + PWA | Docker Compose, PostgreSQL 16, Redis 7, Ollama | Satellites: Pi Zero 2 W + ReSpeaker + OpenWakeWord
+**Tech Stack:** Python 3.11 + FastAPI + SQLAlchemy | React 18 + TypeScript + Vite + Tailwind CSS + PWA | Docker Compose, PostgreSQL 16, Redis 7, Ollama | Satellites: Pi Zero 2 W + ReSpeaker + OpenWakeWord (bare-metal via Ansible). The Esszimmer satellite is the first **arm64 / k8s-pod** satellite — an Orange Pi Zero 3W (Allwinner A733) with a USB ReSpeaker XVF3800, run as a node-pinned privileged pod (`k8s/satellite-esszimmer.yaml`); see the **BLE phone presence** note below.
 
 **LLM:** Local models via Ollama (multi-model: chat, intent, RAG, agent, vision, embeddings).
 
@@ -77,6 +77,17 @@ docker exec -it renfield-backend alembic downgrade -1
 **Key config:** All via `.env` loaded by `utils/config.py` (Pydantic Settings). Full list: `docs/ENVIRONMENT_VARIABLES.md`.
 
 For architecture questions, use the `architecture-guide` agent.
+
+### BLE phone presence via IRK resolution + the k8s satellite
+
+Modern phones advertise a **rotating** BLE Resolvable Private Address (RPA), so a static MAC whitelist can't track them. Renfield resolves the rotating address back to a stable identity using the device's **Identity Resolving Key (IRK)** — the same mechanism as Home Assistant's *Private BLE Device* / Bermuda. No app, no extra hardware. Design + status: [`docs/design/ble-presence-improvement.md`](docs/design/ble-presence-improvement.md) (SHIPPED + DEPLOYED).
+
+- **Resolver** (`src/satellite/renfield_satellite/ble/rpa.py`): the BLE-spec `ah` hash (AES-128, validated against the spec vector); pure software on scanned adverts → works on any adapter (no raw HCI / Classic-BT / bonding). The continuous scanner (`ble/scanner.py`, `ble.continuous`) keeps one `BleakScanner` running with EWMA-smoothed RSSI; default stays periodic.
+- **Backend IRK store** (`user_ble_irks`, migration `pc20260619`): per-person IRK **encrypted at rest** via `services/secret_encryption.py` (Fernet from `SECRET_KEY` — rotating `SECRET_KEY` is destructive to these secrets). Admin API `GET/POST/PATCH/DELETE /api/presence/irks` (the IRK is **never returned**). Pushed to satellites via the `ble_known_irks` WS message; `presence_service.process_ble_report` maps a resolved `identity` back to the user (`irk:<label>` key, survives rotation).
+- **UI pairing flow** ("pair my phone for presence", `components/presence/IrkPairing.tsx`): `POST /api/presence/irks/capture` → `satellite_manager.request_irk_capture` → the satellite opens a bounded BlueZ pairing window (`_capture_irk_for_request`: discoverable + `bt-agent`), reads the bonded phone's IRK from `/var/lib/bluetooth` (BlueZ doesn't expose IRKs over D-Bus), re-secures, replies `irk_capture_result`; the backend stores it encrypted. Mirrors the `capture_snapshot`/`bt_scan_request` request-response pattern.
+- **The Esszimmer k8s satellite** (`k8s/satellite-esszimmer.yaml`): node-pinned privileged pod, `hostNetwork`, `hostAliases renfield.local→Traefik LB`, hostPath `/dev/snd` + `/dev/bus/usb` (USB audio + XVF3800 LED via `xvf_host`) + `/run/dbus` (BLE via host BlueZ) + **`/var/lib/bluetooth` RO** (IRK capture). Image built on the Pi, imported into the node containerd (`ctr -n k8s.io images import`), `imagePullPolicy: Never`. The custom `hey_renfield.onnx` wakeword model + personal device MACs/IRKs live in the image build context / backend DB, never in git.
+- **Bonded vs resolver:** a satellite that has *bonded* the phone (Esszimmer did) lets BlueZ resolve the RPA to the identity MAC natively → it's tracked as a normal `ble` known-device. Non-bonded satellites use the pushed IRK + the software resolver. Device identities live in the **backend known-devices DB** (`UserBleDevice`) — not in the manifest. With the BLE stack on multiple satellites, the backend's `_assign_room` does multi-satellite RSSI arbitration (mean RSSI + per-extra-satellite bonus + hysteresis).
+- Deploy note: the satellite image needs `bluez`/`bluez-tools` + `cryptography`; bare-metal Pis need the `cryptography` dep (in the Ansible `satellite_python_packages`) and `sudo` for the `/var/lib/bluetooth` read.
 
 ### Platform-owned internal agent tools
 

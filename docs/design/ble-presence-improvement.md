@@ -52,7 +52,14 @@ needs Experimental (now enabled). Follow-on to the continuous callback above.
 Median/EWMA + hand-off hysteresis in the room-arbitration logic to kill
 flip-flop. Touches the production backend → its own reviewed change.
 
-### Phase 2 — Defeat MAC randomization via IRK-based RPA resolution  🔶 IN PROGRESS (the real win)
+> **STATUS 2026-06-19: SHIPPED + DEPLOYED.** Phase 1 (continuous scan + BlueZ
+> Experimental) and Phase 2 (IRK store + RPA resolution + UI pairing flow) are
+> merged (#825/#826/#828/#829) and live: backend IRK store deployed, the
+> Esszimmer Orange Pi satellite resolves an iPhone via BLE, and the BLE stack is
+> rolled out to the Pi fleet (multi-satellite room arbitration active). Phases
+> 1b/1c/3 remain deferred.
+
+### Phase 2 — Defeat MAC randomization via IRK-based RPA resolution  ✅ SHIPPED + DEPLOYED (the real win)
 **Corrected mechanism** (the original "bond the phone to the satellite" is
 infeasible — iOS/Android won't expose themselves for passive bonding). Instead,
 the same approach Home Assistant's *Private BLE Device* / Bermuda use, which is
