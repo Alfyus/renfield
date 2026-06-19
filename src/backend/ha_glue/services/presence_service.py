@@ -198,7 +198,7 @@ class PresenceService:
             # `mac` would never match a whitelist); key it by the identity so a
             # phone is tracked across RPA rotation. Otherwise key by MAC.
             identity = device.get("identity")
-            if identity and identity in self._irk_label_to_user:
+            if identity and identity in getattr(self, "_irk_label_to_user", {}):
                 key = "irk:" + identity
             else:
                 key = device.get("mac", "").upper()
@@ -234,7 +234,7 @@ class PresenceService:
         user_id. Keeps IRK identities out of the MAC caches used for the
         satellite known-MAC push."""
         if key.startswith("irk:"):
-            return self._irk_label_to_user.get(key[4:])
+            return getattr(self, "_irk_label_to_user", {}).get(key[4:])
         return self._mac_to_user.get(key)
 
     def _assign_room(self, mac: str):
@@ -547,7 +547,7 @@ class PresenceService:
     def get_ble_irks(self) -> list[dict]:
         """Per-person IRKs to push to satellites: [{'name': label, 'irk': hex}].
         IRK hex is decrypted in memory; only ever leaves over the WS link."""
-        return [{"name": label, "irk": irk} for label, irk in self._irks_hex.items()]
+        return [{"name": label, "irk": irk} for label, irk in getattr(self, "_irks_hex", {}).items()]
 
     async def push_macs_to_satellites(self):
         """Push current known MACs + IRKs to all connected satellites."""
