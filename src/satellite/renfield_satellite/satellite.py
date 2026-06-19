@@ -248,6 +248,8 @@ class Satellite:
             self.ble_scanner = BLEScanner(
                 scan_duration=self.config.ble.scan_duration,
                 rssi_threshold=self.config.ble.rssi_threshold,
+                smoothing_alpha=self.config.ble.smoothing_alpha,
+                freshness_seconds=self.config.ble.freshness_seconds,
             )
             # Pre-populate from config (backend will push updates)
             self._ble_known_macs = {mac.upper() for mac in self.config.ble.known_devices}
@@ -1130,8 +1132,15 @@ class Satellite:
         self._ble_task = asyncio.create_task(self._ble_scan_loop())
 
     async def _ble_scan_loop(self):
-        """Background loop that periodically scans for BLE devices"""
-        print("BLE scan loop started")
+        """Background loop reporting BLE presence.
+
+        Continuous mode (config.ble.continuous): keep ONE BleakScanner running
+        with a detection callback and poll its smoothed per-device RSSI every
+        scan_interval — lower latency + steadier RSSI. Periodic mode (default):
+        a discover() burst each scan_interval (works on any adapter).
+        """
+        continuous = self.config.ble.continuous
+        print(f"BLE scan loop started ({'continuous' if continuous else 'periodic'})")
         try:
             while self._running:
                 await asyncio.sleep(self.config.ble.scan_interval)
@@ -1141,7 +1150,13 @@ class Satellite:
                     continue
 
                 try:
-                    devices = await self.ble_scanner.scan(self._ble_known_macs)
+                    if continuous:
+                        # idempotent: starts once, then just refreshes the
+                        # known-MAC whitelist the callback filters on
+                        await self.ble_scanner.start_continuous(self._ble_known_macs)
+                        devices = self.ble_scanner.get_readings()
+                    else:
+                        devices = await self.ble_scanner.scan(self._ble_known_macs)
                     if devices:
                         await self.ws_client.send_ble_presence(devices)
                         print(f"BLE scan: {len(devices)} known devices detected")
@@ -1149,6 +1164,9 @@ class Satellite:
                     print(f"BLE scan error: {e}")
         except asyncio.CancelledError:
             pass
+        finally:
+            if continuous and self.ble_scanner is not None:
+                await self.ble_scanner.stop_continuous()
         print("BLE scan loop stopped")
 
     async def _start_classic_bt_scan_loop(self):
