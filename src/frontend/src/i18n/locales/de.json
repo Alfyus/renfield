@@ -926,6 +926,24 @@
     }
   },
   "presence": {
+    "irk": {
+      "title": "Telefon-Präsenz (BLE-Kopplung)",
+      "description": "Koppeln Sie ein Telefon einmalig, damit seine wechselnde Bluetooth-Adresse einer festen Identität für die Raumpräsenz zugeordnet wird. Keine App nötig.",
+      "user": "Benutzer",
+      "selectUser": "Benutzer wählen…",
+      "satellite": "Satellit",
+      "selectSatellite": "Satellit wählen…",
+      "label": "Bezeichnung",
+      "labelPlaceholder": "z. B. eduard-iphone",
+      "startPairing": "Kopplung starten",
+      "waiting": "Warte auf Telefon…",
+      "instructions": "Am Telefon: Einstellungen → Bluetooth → „Renfield {{room}}“ antippen.",
+      "theSatellite": "den Satelliten",
+      "captured": "Gekoppelt — Telefon-Präsenz wird jetzt erfasst.",
+      "failed": "Kein Telefon rechtzeitig gekoppelt. Bitte erneut versuchen.",
+      "disabled": "deaktiviert",
+      "revoke": "Entfernen"
+    },
     "title": "Anwesenheit",
     "subtitle": "Wer ist wo — Raumpräsenz via BLE, Sprache und Web",
     "roomOccupancy": "Raumbelegung",

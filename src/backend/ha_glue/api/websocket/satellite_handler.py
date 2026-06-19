@@ -718,6 +718,14 @@ Gib eine kurze, natürliche Antwort. KEIN JSON, nur Text."""
                     data.get("error"),
                 )
 
+            # Reply to an on-demand IRK pairing capture request
+            elif msg_type == "irk_capture_result":
+                satellite_manager.resolve_irk_capture(
+                    data.get("request_id"),
+                    data.get("result"),
+                    data.get("error"),
+                )
+
             # Handle BLE presence scan results
             elif msg_type == "ble_presence":
                 if satellite_id and ha_glue_settings.presence_enabled:

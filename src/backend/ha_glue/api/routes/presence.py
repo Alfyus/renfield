@@ -355,6 +355,57 @@ async def create_irk(
     )
 
 
+class BLEIrkCaptureRequest(BaseModel):
+    satellite_id: str
+    user_id: int
+    label: str = Field(..., min_length=1, max_length=100)
+    window_seconds: int = Field(default=60, ge=10, le=180)
+
+
+@router.post("/irks/capture", response_model=BLEIrkResponse, status_code=201)
+async def capture_irk(
+    body: BLEIrkCaptureRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Drive the UI pairing flow: open a one-time pairing window on a satellite,
+    capture the phone's IRK when it bonds, and store it (encrypted) for `user_id`.
+    The caller shows the user the 'pair to Renfield <room>' prompt meanwhile."""
+    from models.database import User as DBUser, UserBleIrk
+    from services.secret_encryption import encrypt_secret
+    from ha_glue.services.satellite_manager import get_satellite_manager
+
+    if not (await db.execute(select(DBUser).where(DBUser.id == body.user_id))).scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="User not found")
+    if (await db.execute(select(UserBleIrk).where(UserBleIrk.label == body.label))).scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Label already exists")
+
+    manager = get_satellite_manager()
+    res = await manager.request_irk_capture(body.satellite_id, body.label, body.window_seconds)
+    if res.get("error"):
+        raise HTTPException(status_code=502, detail=f"Capture failed: {res['error']}")
+    irk = (res.get("irk") or "").lower()
+    if len(irk) != 32 or any(c not in "0123456789abcdef" for c in irk):
+        raise HTTPException(status_code=408, detail="No phone paired during the capture window")
+
+    row = UserBleIrk(
+        user_id=body.user_id, label=body.label,
+        irk_encrypted=encrypt_secret(irk), is_enabled=True,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)
+    await presence.push_macs_to_satellites()
+
+    return BLEIrkResponse(
+        id=row.id, user_id=row.user_id, label=row.label, is_enabled=row.is_enabled,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
 class BLEIrkUpdate(BaseModel):
     is_enabled: bool
 

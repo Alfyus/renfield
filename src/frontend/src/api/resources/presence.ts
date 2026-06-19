@@ -216,3 +216,78 @@ export function useDeletePresenceDevice() {
     'common.error',
   );
 }
+
+// --- Per-person BLE IRK store (resolve rotating phone addresses) ---
+
+export interface BleIrk {
+  id: number;
+  user_id: number;
+  label: string;
+  is_enabled: boolean;
+  created_at?: string | null;
+}
+
+export interface IrkCapturePayload {
+  satellite_id: string;
+  user_id: number;
+  label: string;
+  window_seconds?: number;
+}
+
+async function fetchIrks(): Promise<BleIrk[]> {
+  try {
+    const response = await apiClient.get<BleIrk[]>('/api/presence/irks');
+    return Array.isArray(response.data) ? response.data : [];
+  } catch {
+    return [];
+  }
+}
+
+async function captureIrkRequest(input: IrkCapturePayload): Promise<BleIrk> {
+  // Long-poll: the backend holds the request open for the pairing window.
+  const response = await apiClient.post<BleIrk>('/api/presence/irks/capture', input, {
+    timeout: ((input.window_seconds ?? 60) + 30) * 1000,
+  });
+  return response.data;
+}
+
+async function deleteIrkRequest(id: number): Promise<void> {
+  await apiClient.delete(`/api/presence/irks/${id}`);
+}
+
+export function usePresenceIrksQuery() {
+  return useApiQuery(
+    {
+      queryKey: [...keys.presence.all, 'irks'] as const,
+      queryFn: fetchIrks,
+      staleTime: STALE.DEFAULT,
+    },
+    'common.error',
+  );
+}
+
+export function useCaptureIrk() {
+  const queryClient = useQueryClient();
+  return useApiMutation(
+    {
+      mutationFn: captureIrkRequest,
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: [...keys.presence.all, 'irks'] });
+      },
+    },
+    'common.error',
+  );
+}
+
+export function useDeletePresenceIrk() {
+  const queryClient = useQueryClient();
+  return useApiMutation(
+    {
+      mutationFn: deleteIrkRequest,
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: [...keys.presence.all, 'irks'] });
+      },
+    },
+    'common.error',
+  );
+}

@@ -306,6 +306,8 @@ class Satellite:
         self.ws_client._capture_snapshot = self._capture_snapshot_for_request
         # On-demand Bluetooth discovery scan ("scan all bluetooth devices")
         self.ws_client.on_bt_scan_request(self._handle_bt_scan_for_request)
+        # On-demand IRK pairing capture (UI "pair my phone for presence")
+        self.ws_client.on_irk_capture(self._capture_irk_for_request)
 
         # Update manager progress callback
         self.update_manager.on_progress(self._on_update_progress)
@@ -488,6 +490,92 @@ class Satellite:
             params.get("ble_duration", 10.0),
             params.get("classic_timeout", 12.0),
         )
+
+    @staticmethod
+    def _read_bonded_irks(bt_root: str = "/var/lib/bluetooth") -> dict:
+        """Map bonded-device MAC -> IRK hex from BlueZ's store. BlueZ does not
+        expose bonding keys over D-Bus, so we read the on-disk info files
+        (requires root / a hostPath mount in the k8s pod)."""
+        import glob
+        import os
+        found = {}
+        for info_path in glob.glob(f"{bt_root}/*/*/info"):
+            try:
+                with open(info_path) as fh:
+                    txt = fh.read()
+            except OSError:
+                continue
+            if "[IdentityResolvingKey]" not in txt:
+                continue
+            mac = os.path.basename(os.path.dirname(info_path)).upper()
+            irk = None
+            in_section = False
+            for raw in txt.splitlines():
+                line = raw.strip()
+                if line == "[IdentityResolvingKey]":
+                    in_section = True
+                    continue
+                if in_section and line.startswith("["):
+                    break
+                if in_section and line.startswith("Key="):
+                    irk = line.split("=", 1)[1].strip()
+                    break
+            if irk:
+                found[mac] = irk
+        return found
+
+    async def _capture_irk_for_request(self, params: dict) -> dict:
+        """Open a one-time pairing window, let a phone bond, and capture its IRK
+        from BlueZ; re-secure the adapter afterward. Returns
+        {'irk': hex, 'mac': str, 'name': label} or {} (no new bond in time).
+        Raises (→ surfaced as error) if the BlueZ store isn't readable."""
+        import asyncio as _aio
+        import os
+
+        label = params.get("label") or "device"
+        window = int(params.get("window_seconds", 60))
+        bt_root = "/var/lib/bluetooth"
+
+        if not os.path.isdir(bt_root) or not os.access(bt_root, os.R_OK):
+            raise RuntimeError(
+                f"{bt_root} not readable — IRK capture needs root / a hostPath mount"
+            )
+
+        async def _bctl(*args):
+            proc = await _aio.create_subprocess_exec(
+                "bluetoothctl", *args,
+                stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+
+        before = set(self._read_bonded_irks(bt_root).keys())
+        await _bctl("system-alias", f"Renfield {self.config.satellite.room}")
+        await _bctl("power", "on")
+        await _bctl("pairable", "on")
+        await _bctl("discoverable-timeout", "0")
+        await _bctl("discoverable", "on")
+        agent = await _aio.create_subprocess_exec(
+            "bt-agent", "-c", "NoInputNoOutput",
+            stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL,
+        )
+        print(f"IRK capture window open ({window}s) — pair the phone now")
+        try:
+            for _ in range(window):
+                await _aio.sleep(1)
+                current = self._read_bonded_irks(bt_root)
+                new_macs = set(current.keys()) - before
+                if new_macs:
+                    mac = sorted(new_macs)[0]
+                    print(f"IRK captured for newly-bonded {mac}")
+                    return {"irk": current[mac], "mac": mac, "name": label}
+            return {}
+        finally:
+            await _bctl("discoverable", "off")
+            await _bctl("pairable", "off")
+            try:
+                agent.terminate()
+            except ProcessLookupError:
+                pass
 
     async def _reconnect_with_discovery(self):
         """

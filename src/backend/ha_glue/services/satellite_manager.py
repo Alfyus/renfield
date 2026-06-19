@@ -137,6 +137,7 @@ class SatelliteManager:
         # On-demand camera snapshot requests: request_id → Future[image_b64|None].
         self._pending_snapshots: dict[str, asyncio.Future] = {}
         self._pending_bt_scans: dict[str, asyncio.Future] = {}
+        self._pending_irk_captures: dict[str, asyncio.Future] = {}
 
         # Configuration - use settings from config
         from utils.config import settings
@@ -762,6 +763,44 @@ class SatelliteManager:
         fut = self._pending_bt_scans.get(request_id)
         if fut is not None and not fut.done():
             fut.set_result([] if error else (devices or []))
+
+    async def request_irk_capture(
+        self, satellite_id: str, label: str, window_seconds: int = 60,
+        timeout: float | None = None,
+    ) -> dict:
+        """Ask a satellite to open a one-time pairing window and capture a phone's
+        IRK. Returns {'irk','mac','name'} on success, {} on no-bond-in-window, or
+        {'error': ...} on failure/timeout. Mirrors request_bt_scan; the reply
+        arrives as an 'irk_capture_result' message (resolved via resolve_irk_capture)."""
+        sat = self.satellites.get(satellite_id)
+        if sat is None:
+            return {"error": "satellite not connected"}
+        if timeout is None:
+            timeout = window_seconds + 15.0
+        request_id = uuid.uuid4().hex
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_irk_captures[request_id] = fut
+        try:
+            await sat.websocket.send_json({
+                "type": "irk_capture_request",
+                "request_id": request_id,
+                "params": {"label": label, "window_seconds": window_seconds},
+            })
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"error": "timed out waiting for the satellite"}
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)}
+        finally:
+            self._pending_irk_captures.pop(request_id, None)
+
+    def resolve_irk_capture(
+        self, request_id: str, result: dict | None, error: str | None
+    ) -> None:
+        """Resolve a pending request_irk_capture() future with the satellite's reply."""
+        fut = self._pending_irk_captures.get(request_id)
+        if fut is not None and not fut.done():
+            fut.set_result({"error": error} if error else (result or {}))
 
     async def cleanup_stale(self):
         """Remove stale satellites and timed-out sessions"""
