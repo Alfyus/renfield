@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         mpv libmpv2 \
         libsamplerate0 libopenblas0 \
         libusb-1.0-0 \
+        bluez bluez-tools \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 

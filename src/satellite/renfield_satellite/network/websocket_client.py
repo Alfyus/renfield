@@ -137,6 +137,8 @@ class WebSocketClient:
         self._capture_snapshot: Optional[Callable[[], Any]] = None
         # Async callback(params) -> list[dict] for an on-demand BT discovery scan.
         self._on_bt_scan_request: Optional[Callable[[Dict[str, Any]], Any]] = None
+        # Async callback(params) -> dict for a backend-requested IRK pairing capture.
+        self._on_irk_capture: Optional[Callable[[Dict[str, Any]], Any]] = None
 
         # Tasks
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -240,6 +242,11 @@ class WebSocketClient:
         """Register async callback(params)->list[dict] for a backend-requested
         Bluetooth discovery scan. Returns the discovered device list."""
         self._on_bt_scan_request = callback
+
+    def on_irk_capture(self, callback: Callable[[Dict[str, Any]], Any]):
+        """Register async callback(params)->dict for a backend-requested IRK
+        pairing capture. Returns {'irk': hex, 'mac': str, 'name': str} or {}."""
+        self._on_irk_capture = callback
 
     def set_metrics_callback(self, callback: Callable[[], Dict[str, Any]]):
         """Register callback to get current metrics for heartbeat"""
@@ -625,6 +632,36 @@ class WebSocketClient:
             asyncio.create_task(
                 self._handle_bt_scan(data.get("request_id"), data.get("params", {}))
             )
+
+        elif msg_type == "irk_capture_request":
+            # Backend asked us to open a one-time pairing window and capture a
+            # phone's IRK. Async so the capture window never blocks receive.
+            asyncio.create_task(
+                self._handle_irk_capture(data.get("request_id"), data.get("params", {}))
+            )
+
+    async def _handle_irk_capture(self, request_id, params):
+        """Run the IRK pairing capture and send back an irk_capture_result.
+        Always replies (result=None + error on failure) so the backend never hangs."""
+        result = None
+        error = None
+        try:
+            if self._on_irk_capture is not None:
+                result = await self._on_irk_capture(params or {})
+            else:
+                error = "irk_capture not supported on this satellite"
+        except Exception as e:  # noqa: BLE001
+            error = str(e)
+            print(f"IRK capture failed: {e}")
+        try:
+            await self._send({
+                "type": "irk_capture_result",
+                "request_id": request_id,
+                "result": result,
+                "error": error,
+            })
+        except Exception as e:  # noqa: BLE001
+            print(f"Failed to send irk_capture_result: {e}")
 
     async def _handle_bt_scan(self, request_id, params):
         """Run the BT discovery scan and send back a bt_scan_result. Always
