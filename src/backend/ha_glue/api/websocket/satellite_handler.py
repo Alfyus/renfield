@@ -264,11 +264,19 @@ async def satellite_websocket(
                                 "type": "classic_bt_known_devices",
                                 "devices": list(classic_macs),
                             })
+                        # Per-person IRKs for resolving rotating RPAs (iPhones)
+                        irks = presence_svc.get_ble_irks()
+                        if irks:
+                            await websocket.send_json({
+                                "type": "ble_known_irks",
+                                "irks": irks,
+                            })
                         total = len(ble_macs) + len(classic_macs)
-                        if total:
-                            logger.debug(f"Pushed {len(ble_macs)} BLE + {len(classic_macs)} Classic BT MACs to {satellite_id}")
+                        if total or irks:
+                            logger.debug(f"Pushed {len(ble_macs)} BLE + {len(classic_macs)} Classic BT MACs "
+                                         f"+ {len(irks)} IRK(s) to {satellite_id}")
                     except Exception as e:
-                        logger.warning(f"Failed to push MACs: {e}")
+                        logger.warning(f"Failed to push MACs/IRKs: {e}")
 
             # Handle config acknowledgment from satellite
             elif msg_type == "config_ack":

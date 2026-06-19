@@ -381,6 +381,36 @@ class UserBleDevice(Base):
     user = relationship("User", backref="ble_devices")
 
 
+class UserBleIrk(Base):
+    """Per-person BLE Identity Resolving Key for presence.
+
+    Modern phones (iPhone/Android) advertise with rotating Resolvable Private
+    Addresses, so a static MAC whitelist can't track them. The IRK — obtained
+    out-of-band once (iPhone: Mac/iCloud keychain or a one-time bond to a
+    satellite; Android: bonded-device info) — lets a satellite resolve the
+    rotating address back to this stable `label`. See
+    docs/design/ble-presence-improvement.md.
+
+    The IRK is a device-tracking secret: stored ENCRYPTED at rest
+    (services/secret_encryption) and pushed to satellites over the WS link only.
+    """
+
+    __tablename__ = "user_ble_irks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # Globally-unique stable identity the satellite reports on a resolved match;
+    # the backend maps it back to this user for presence attribution.
+    label = Column(String(100), unique=True, nullable=False, index=True)
+    # Fernet token of the 32-hex-char IRK — never stored or logged in plaintext.
+    irk_encrypted = Column(String(255), nullable=False)
+    is_enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = relationship("User", backref="ble_irks")
+
+
 class PresenceEvent(Base):
     """Persisted presence event for analytics (heatmap, predictions)."""
 

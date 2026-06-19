@@ -285,6 +285,126 @@ async def delete_device(
         raise HTTPException(status_code=404, detail="Device not found")
 
 
+# --- Per-person BLE IRK store (resolve rotating RPAs → stable identity) ---
+
+class BLEIrkCreate(BaseModel):
+    user_id: int
+    label: str = Field(..., min_length=1, max_length=100,
+                       description="Globally-unique stable identity (e.g. 'eduard-iphone')")
+    irk: str = Field(..., pattern=r"^[0-9A-Fa-f]{32}$",
+                     description="16-byte IRK as 32 hex chars, MSO-first")
+
+
+class BLEIrkResponse(BaseModel):
+    id: int
+    user_id: int
+    label: str
+    is_enabled: bool
+    created_at: str | None = None
+
+
+@router.get("/irks", response_model=list[BLEIrkResponse])
+async def list_irks(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """List registered BLE IRKs (metadata only — the key itself is never returned)."""
+    from models.database import UserBleIrk
+    rows = (await db.execute(select(UserBleIrk))).scalars().all()
+    return [
+        BLEIrkResponse(
+            id=r.id, user_id=r.user_id, label=r.label, is_enabled=r.is_enabled,
+            created_at=r.created_at.isoformat() if r.created_at else None,
+        )
+        for r in rows
+    ]
+
+
+@router.post("/irks", response_model=BLEIrkResponse, status_code=201)
+async def create_irk(
+    body: BLEIrkCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Register a per-person IRK (stored encrypted, pushed to satellites)."""
+    from models.database import User as DBUser, UserBleIrk
+    from services.secret_encryption import encrypt_secret
+
+    if not (await db.execute(select(DBUser).where(DBUser.id == body.user_id))).scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="User not found")
+    if (await db.execute(select(UserBleIrk).where(UserBleIrk.label == body.label))).scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Label already exists")
+
+    row = UserBleIrk(
+        user_id=body.user_id,
+        label=body.label,
+        irk_encrypted=encrypt_secret(body.irk.lower()),
+        is_enabled=True,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)   # reloads MAC + IRK caches
+    await presence.push_macs_to_satellites()
+
+    return BLEIrkResponse(
+        id=row.id, user_id=row.user_id, label=row.label, is_enabled=row.is_enabled,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
+class BLEIrkUpdate(BaseModel):
+    is_enabled: bool
+
+
+@router.patch("/irks/{irk_id}", response_model=BLEIrkResponse)
+async def update_irk(
+    irk_id: int,
+    body: BLEIrkUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Enable/disable an IRK without deleting it (disabling stops resolution +
+    re-pushes the reduced set to satellites)."""
+    from models.database import UserBleIrk
+    row = (await db.execute(select(UserBleIrk).where(UserBleIrk.id == irk_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="IRK not found")
+    row.is_enabled = body.is_enabled
+    await db.commit()
+    await db.refresh(row)
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)
+    await presence.push_macs_to_satellites()
+
+    return BLEIrkResponse(
+        id=row.id, user_id=row.user_id, label=row.label, is_enabled=row.is_enabled,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
+@router.delete("/irks/{irk_id}", status_code=204)
+async def delete_irk(
+    irk_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Revoke a BLE IRK (deletes it + re-pushes the reduced set to satellites)."""
+    from models.database import UserBleIrk
+    row = (await db.execute(select(UserBleIrk).where(UserBleIrk.id == irk_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="IRK not found")
+    await db.delete(row)
+    await db.commit()
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)
+    await presence.push_macs_to_satellites()
+
+
 # --- Analytics ---
 
 class HeatmapCell(BaseModel):

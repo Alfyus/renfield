@@ -2594,6 +2594,7 @@ _HA_GLUE_REEXPORT_NAMES = frozenset({
     "RoomOutputDevice",
     "RoomSatellite",
     "UserBleDevice",
+    "UserBleIrk",
 })
 
 
