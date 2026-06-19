@@ -30,6 +30,11 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
+    - name: restart bluetooth
+      ansible.builtin.systemd:
+        name: bluetooth
+        state: restarted
+
   tasks:
     # =========================================================================
     # SYSTEM — System preparation
@@ -524,6 +529,21 @@
         name: renfield-bt
         enabled: true
         state: started
+
+    # Enable BlueZ experimental features — required for the AdvertisementMonitor
+    # API (continuous, kernel-offloaded, threshold-based per-device RSSI used by
+    # the continuous BLE presence scanner). Without this, BlueZ rejects the
+    # passive/monitor APIs. Survives re-image; restarts bluetoothd on change.
+    - name: Enable BlueZ Experimental (AdvertisementMonitor API)
+      tags: [bluetooth, config]
+      ansible.builtin.ini_file:
+        path: /etc/bluetooth/main.conf
+        section: General
+        option: Experimental
+        value: "true"
+        no_extra_spaces: true
+        mode: "0644"
+      notify: restart bluetooth
 
     # =========================================================================
     # SERVICE — Systemd service

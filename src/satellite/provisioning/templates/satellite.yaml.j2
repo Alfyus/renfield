@@ -94,6 +94,9 @@ ble:
   scan_interval: {{ ble_scan_interval }}
   scan_duration: {{ ble_scan_duration }}
   rssi_threshold: {{ ble_rssi_threshold }}
+  continuous: {{ ble_continuous | default(false) | lower }}
+  smoothing_alpha: {{ ble_smoothing_alpha | default(0.4) }}
+  freshness_seconds: {{ ble_freshness_seconds | default(20.0) }}
 {% if enviro_phat_enabled | default(false) %}
 
 enviro:

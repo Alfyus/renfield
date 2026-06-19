@@ -160,6 +160,13 @@ class BLEConfig:
     known_devices: List[str] = field(default_factory=list)  # MAC whitelist, pushed from backend
     classic_rssi: bool = True     # read real Classic-BT RSSI (hcitool cc/rssi); off => synthetic -50
     classic_rssi_interval: float = 300.0  # seconds between real RSSI reads per device (throttle connect churn)
+    # Continuous scanning (BT 5.x / mains-powered nodes): keep a single BleakScanner
+    # running with a detection callback instead of periodic discover() bursts, and
+    # report a smoothed (EWMA) per-device RSSI. Lower latency + steadier RSSI for
+    # room arbitration. Falls back to the discover() loop when False.
+    continuous: bool = False
+    smoothing_alpha: float = 0.4      # EWMA weight for each new RSSI sample (0..1)
+    freshness_seconds: float = 20.0   # drop a device from presence if unseen this long
 
 
 @dataclass
@@ -322,6 +329,9 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.ble.rssi_threshold = ble.get("rssi_threshold", config.ble.rssi_threshold)
         config.ble.classic_rssi = ble.get("classic_rssi", config.ble.classic_rssi)
         config.ble.classic_rssi_interval = ble.get("classic_rssi_interval", config.ble.classic_rssi_interval)
+        config.ble.continuous = ble.get("continuous", config.ble.continuous)
+        config.ble.smoothing_alpha = ble.get("smoothing_alpha", config.ble.smoothing_alpha)
+        config.ble.freshness_seconds = ble.get("freshness_seconds", config.ble.freshness_seconds)
         if "known_devices" in ble:
             config.ble.known_devices = ble["known_devices"]
 
