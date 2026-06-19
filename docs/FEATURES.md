@@ -446,6 +446,7 @@ RAG_CONTEXT_WINDOW=1              # Benachbarte Chunks (0=deaktiviert)
 - **Hardware-Button** — Manuelle Aktivierung
 - **Auto-Discovery** — Backend-Erkennung via Zeroconf/mDNS
 - **OTA-Updates** — Version-Tracking und Update-Pakete
+- **Orange Pi / k8s-Variante** — der Esszimmer-Satellit ist der erste **arm64-/k8s-Pod**-Satellit: ein Orange Pi Zero 3W (Allwinner A733) mit USB-ReSpeaker XVF3800, als node-fixierter privilegierter Pod im privaten Cluster (`k8s/satellite-esszimmer.yaml`) statt bare-metal. Stärkeres Bluetooth (BT 5.4) → gut geeignet als BLE-Präsenz-Anker.
 
 ### Zentrale Wake-Word-Verwaltung
 - Admin-UI für zentrale Konfiguration
@@ -867,6 +868,14 @@ Jeder Raumwechsel (`enter`/`leave`) wird dauerhaft in `presence_events` protokol
 "Scanne die Bluetooth-Geräte" → das Tool `internal.bluetooth_scan` fächert eine Discovery an alle Satelliten aus (Backend hat keine BT-Hardware). Jeder Satellit führt eine Classic-BT-Inquiry (`hcitool scan`) **und** eine BLE-Discovery (`BleakScanner`) aus; das Backend dedupliziert per MAC, behält das stärkste RSSI, sammelt pro Raum und löst die Herstellerkennung (OUI→Vendor) auf. Ergebnis: Adresse, Name (oft leer), Raum/Satellit, RSSI, Hersteller.
 
 Hinweise: nur **sichtbare/advertisende** Geräte erscheinen (die meisten Handys sind standardmäßig nicht auffindbar); ein Scan dauert ~15-30 s. Opt-in via `BT_SCAN_ENABLED` (zählt alle Geräte im Haus auf → Privatsphäre).
+
+### Telefon-Präsenz per IRK (rotierende BLE-Adressen auflösen)
+
+Moderne Telefone senden eine **rotierende** BLE-Adresse (Resolvable Private Address), daher kann eine feste MAC-Whitelist sie nicht verfolgen. Renfield löst die wechselnde Adresse über den **Identity Resolving Key (IRK)** des Geräts auf eine stabile Identität auf — dasselbe Verfahren wie Home Assistants *Private BLE Device* / Bermuda. **Keine App, keine Zusatz-Hardware.** Reines Software-Matching (AES-128, BLE-Spec `ah`-Hash) auf den gescannten Advertisements → funktioniert auf jedem Adapter (kein rohes HCI, kein Classic-BT, kein Pairing nötig zur Auflösung).
+
+**IRK-Erfassung über die UI** ("Telefon für Präsenz koppeln", auf der Anwesenheits-Seite): Admin wählt Nutzer + Satellit + Bezeichnung → der gewählte Satellit öffnet ein einmaliges, zeitlich begrenztes Kopplungsfenster (auto-akzeptierender BlueZ-Agent). Der Nutzer koppelt das Telefon über **Einstellungen → Bluetooth → „Renfield \<Raum\>"**; der Satellit liest den dabei ausgetauschten IRK aus BlueZ, sichert den Adapter wieder ab und meldet ihn zurück. Der IRK wird **verschlüsselt at rest** gespeichert (Fernet aus `SECRET_KEY`) und über die WS-Verbindung an die Satelliten verteilt; er wird **nie** in einer API-Antwort oder im Log im Klartext zurückgegeben. Verwaltung: `GET/POST/PATCH/DELETE /api/presence/irks` (Admin). Entkoppeln/Widerrufen am Telefon **oder** über „Entfernen" in der UI.
+
+**Kontinuierliches Scannen** (`ble.continuous`, opt-in pro Satellit): ein dauerhaft laufender Scanner mit EWMA-geglättetem RSSI statt periodischer Bursts → geringere Latenz + ruhigere Raumzuordnung; Standard bleibt periodisch. Bei mehreren Satelliten mit aktivem BLE-Stack führt das Backend eine **Multi-Satelliten-Raumzuordnung** durch (mittleres RSSI + Bonus je zusätzlichem Satelliten + Hysterese). Design + Status: `docs/design/ble-presence-improvement.md`.
 
 ## Tageszeit-Bewusstsein & LED-Nachtdimmung
 
