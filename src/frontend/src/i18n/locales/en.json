@@ -926,6 +926,24 @@
     }
   },
   "presence": {
+    "irk": {
+      "title": "Phone presence (BLE pairing)",
+      "description": "Pair a phone once so its rotating Bluetooth address resolves to a stable identity for room presence. No app required.",
+      "user": "User",
+      "selectUser": "Select user…",
+      "satellite": "Satellite",
+      "selectSatellite": "Select satellite…",
+      "label": "Label",
+      "labelPlaceholder": "e.g. eduard-iphone",
+      "startPairing": "Start pairing",
+      "waiting": "Waiting for phone…",
+      "instructions": "On the phone: Settings → Bluetooth → tap “Renfield {{room}}”.",
+      "theSatellite": "the satellite",
+      "captured": "Paired — phone presence is now tracked.",
+      "failed": "No phone paired in time. Try again.",
+      "disabled": "disabled",
+      "revoke": "Revoke"
+    },
     "title": "Presence",
     "subtitle": "Who is where — room presence via BLE, voice, and web",
     "roomOccupancy": "Room Occupancy",

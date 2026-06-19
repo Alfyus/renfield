@@ -19,6 +19,7 @@ import PageHeader from '../components/PageHeader';
 import Alert from '../components/Alert';
 import Badge from '../components/Badge';
 import AnalyticsTab from '../components/presence/AnalyticsTab';
+import IrkPairing from '../components/presence/IrkPairing';
 import {
   usePresenceRoomsQuery,
   usePresenceDevicesQuery,
@@ -564,6 +565,8 @@ export default function PresencePage() {
           </div>
         </div>
       )}
+
+      <IrkPairing />
 
       <AddDeviceModal
         isOpen={showAddDevice}
