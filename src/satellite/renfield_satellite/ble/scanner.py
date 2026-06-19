@@ -23,6 +23,8 @@ except ImportError:
     _BleakScanner = None
     BLEAK_AVAILABLE = False
 
+from .rpa import is_resolvable_private_address, resolve_identity
+
 
 class BLEScanner:
     """
@@ -47,7 +49,11 @@ class BLEScanner:
         # Continuous-mode state
         self._scanner = None
         self._known_macs: set[str] = set()
-        # mac -> [ewma_rssi, last_seen_monotonic]
+        # identity_name -> IRK (16 bytes, MSO-first) for resolving rotating RPAs
+        self._irks: dict[str, bytes] = {}
+        # tracking key -> [ewma_rssi, last_seen_monotonic, last_mac, identity]
+        # key is the MAC for whitelisted devices, or "id:<name>" for an
+        # IRK-resolved identity (stable across the phone's RPA rotation).
         self._readings: dict[str, list] = {}
 
         if not BLEAK_AVAILABLE:
@@ -69,8 +75,9 @@ class BLEScanner:
         Returns:
             List of dicts with 'mac' and 'rssi' for each detected known device.
         """
-        if not BLEAK_AVAILABLE or not known_macs:
+        if not BLEAK_AVAILABLE or (not known_macs and not self._irks):
             return []
+        self._known_macs = {m.upper() for m in known_macs}
 
         try:
             devices = await _BleakScanner.discover(
@@ -85,41 +92,76 @@ class BLEScanner:
         # devices is dict {BLEDevice: AdvertisementData} when return_adv=True
         for device, adv_data in devices.values():
             mac = (device.address or "").upper()
-            if mac in known_macs:
-                rssi = adv_data.rssi
-                if rssi is not None and rssi >= self.rssi_threshold:
-                    results.append({"mac": mac, "rssi": rssi})
+            key, identity = self._classify(mac)
+            if key is None:
+                continue
+            rssi = adv_data.rssi
+            if rssi is not None and rssi >= self.rssi_threshold:
+                entry = {"mac": mac, "rssi": rssi}
+                if identity:
+                    entry["identity"] = identity
+                results.append(entry)
 
         return results
 
     # ---- Continuous mode --------------------------------------------------
 
+    def _classify(self, mac: str):
+        """Map a discovered address to (tracking_key, identity).
+
+        Returns (mac, None) for a whitelisted MAC, ("id:<name>", "<name>") for
+        an IRK-resolved rotating RPA, or (None, None) if it's neither.
+        """
+        if mac in self._known_macs:
+            return mac, None
+        if self._irks and is_resolvable_private_address(mac):
+            identity = resolve_identity(mac, self._irks)
+            if identity is not None:
+                return "id:" + identity, identity
+        return None, None
+
     def update_known(self, known_macs: set[str]) -> None:
         """Update the known-MAC whitelist the detection callback filters on
         (the backend pushes updates while the continuous scanner keeps running)."""
         self._known_macs = {m.upper() for m in known_macs}
-        # Drop readings for devices no longer tracked
-        for mac in list(self._readings):
-            if mac not in self._known_macs:
-                self._readings.pop(mac, None)
+        # Drop readings for whitelisted MACs no longer tracked (leave id: keys,
+        # which are managed by update_irks).
+        for key in list(self._readings):
+            if not key.startswith("id:") and key not in self._known_macs:
+                self._readings.pop(key, None)
+
+    def update_irks(self, irks: dict) -> None:
+        """Set the identity->IRK map (16-byte IRKs, MSO-first) used to resolve
+        rotating RPAs. Drops readings for identities no longer tracked."""
+        self._irks = {
+            name: bytes(irk)
+            for name, irk in (irks or {}).items()
+            if irk and len(irk) == 16
+        }
+        valid = {"id:" + n for n in self._irks}
+        for key in list(self._readings):
+            if key.startswith("id:") and key not in valid:
+                self._readings.pop(key, None)
 
     def _on_detection(self, device, adv_data) -> None:
         """bleak detection callback: fold each advertisement into a per-device
-        EWMA RSSI. Cheap and runs on the event loop."""
-        mac = (device.address or "").upper()
-        if mac not in self._known_macs:
-            return
+        (or per-resolved-identity) EWMA RSSI. Cheap; runs on the event loop."""
         rssi = getattr(adv_data, "rssi", None)
         if rssi is None:
             return
+        mac = (device.address or "").upper()
+        key, identity = self._classify(mac)
+        if key is None:
+            return
         now = time.monotonic()
-        entry = self._readings.get(mac)
+        entry = self._readings.get(key)
         if entry is None:
-            self._readings[mac] = [float(rssi), now]
+            self._readings[key] = [float(rssi), now, mac, identity]
         else:
             a = self.smoothing_alpha
             entry[0] = a * float(rssi) + (1.0 - a) * entry[0]
             entry[1] = now
+            entry[2] = mac  # remember the latest (rotating) RPA seen
 
     async def start_continuous(self, known_macs: set[str]) -> bool:
         """Start a single long-running scanner with the detection callback.
@@ -153,12 +195,15 @@ class BLEScanner:
         Prunes stale entries (unseen > freshness_seconds)."""
         now = time.monotonic()
         results = []
-        for mac in list(self._readings):
-            rssi, last_seen = self._readings[mac]
+        for key in list(self._readings):
+            rssi, last_seen, mac, identity = self._readings[key]
             if now - last_seen > self.freshness_seconds:
-                self._readings.pop(mac, None)
+                self._readings.pop(key, None)
                 continue
             rssi_i = int(round(rssi))
             if rssi_i >= self.rssi_threshold:
-                results.append({"mac": mac, "rssi": rssi_i})
+                entry = {"mac": mac, "rssi": rssi_i}
+                if identity:
+                    entry["identity"] = identity
+                results.append(entry)
         return results

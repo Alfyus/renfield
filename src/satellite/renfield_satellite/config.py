@@ -6,7 +6,7 @@ Loads configuration from YAML file and environment variables.
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 import yaml
 
 
@@ -167,6 +167,11 @@ class BLEConfig:
     continuous: bool = False
     smoothing_alpha: float = 0.4      # EWMA weight for each new RSSI sample (0..1)
     freshness_seconds: float = 20.0   # drop a device from presence if unseen this long
+    # Identity Resolving Keys for resolving rotating RPAs (iPhones/Android) to a
+    # stable identity — name -> 32-char hex IRK (16 bytes, MSO-first). Obtained
+    # out-of-band (iPhone: Mac/iCloud keychain; Android: bonded-device info),
+    # pushed from the backend. See docs/design/ble-presence-improvement.md.
+    irks: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -332,6 +337,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.ble.continuous = ble.get("continuous", config.ble.continuous)
         config.ble.smoothing_alpha = ble.get("smoothing_alpha", config.ble.smoothing_alpha)
         config.ble.freshness_seconds = ble.get("freshness_seconds", config.ble.freshness_seconds)
+        if "irks" in ble and isinstance(ble["irks"], dict):
+            config.ble.irks = ble["irks"]
         if "known_devices" in ble:
             config.ble.known_devices = ble["known_devices"]
 

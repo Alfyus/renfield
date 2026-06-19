@@ -59,6 +59,7 @@ RUN pip3 install --break-system-packages \
         noisereduce \
         scikit-learn \
         bleak \
+        cryptography \
         Pillow \
     && pip3 install --break-system-packages --no-deps openwakeword
 
