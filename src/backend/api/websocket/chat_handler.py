@@ -929,6 +929,93 @@ async def websocket_endpoint(
                     )
                 continue
 
+            # Interactive device-control widget click (Gen-UI). The widget sends
+            # {type:"device_action", entity_id, action}; we gate on the HA_CONTROL
+            # permission (fail-closed), then route to internal.device_action which
+            # re-validates domain/action/entity before calling HA. The widget can
+            # grant NO control the user doesn't already have via the agent (same
+            # HA_CONTROL gate). Handled before WSChatMessage validation.
+            # NOTE (by design): this direct, authenticated click does NOT fire the
+            # `verify_tool_call` hook (which only runs on the agent's `mcp.*`
+            # path). A plugin voice-2FA gate on agent-issued HA calls therefore
+            # does not intercept widget clicks — that gate is for LLM/voice-
+            # originated actions, not a deliberate tap; HA_CONTROL is the gate here.
+            if isinstance(data, dict) and data.get("type") == "device_action":
+                da_user_id = auth_result.get("user_id") if isinstance(auth_result, dict) else None
+                entity_id = data.get("entity_id")
+                action = data.get("action")
+                if (not isinstance(entity_id, str) or not entity_id or len(entity_id) > 255
+                        or not isinstance(action, str) or not action):
+                    await send_ws_error(
+                        websocket, WSErrorCode.INVALID_MESSAGE,
+                        "device_action requires 'entity_id' (≤255 chars) and 'action'",
+                    )
+                    continue
+                # AUTH-enabled mode: a frame with NO resolved human user is a
+                # device/satellite token (user_id=None) — NOT a person with a
+                # permission list. Deny: only TRUE single-user mode (auth
+                # disabled) may actuate without HA_CONTROL. (A da_perms=None below
+                # is otherwise reachable by such a token and would skip the gate.)
+                if settings.auth_enabled and da_user_id is None:
+                    await websocket.send_json({
+                        "type": "device_action_result",
+                        "entity_id": entity_id,
+                        "success": False,
+                        "message": "Keine Berechtigung zum Steuern von Geräten.",
+                    })
+                    continue
+                # HA_CONTROL gate. da_perms is None ONLY in auth-disabled
+                # single-user mode now (parity with the agent's unrestricted
+                # actuation there); when a permission list exists, HA_CONTROL is
+                # required — fail-closed.
+                try:
+                    from models.permissions import Permission, has_permission
+                    da_perms = None
+                    if da_user_id is not None:
+                        from sqlalchemy import select as _select
+                        from sqlalchemy.orm import selectinload as _sel
+                        from models.database import User as _User
+                        async with AsyncSessionLocal() as _db:
+                            _u = (await _db.execute(
+                                _select(_User).options(_sel(_User.role)).where(_User.id == int(da_user_id))
+                            )).scalar_one_or_none()
+                            if _u:
+                                da_perms = _u.get_permissions()
+                    if da_perms is not None and not has_permission(da_perms, Permission.HA_CONTROL):
+                        await websocket.send_json({
+                            "type": "device_action_result",
+                            "entity_id": entity_id,
+                            "success": False,
+                            "message": "Keine Berechtigung zum Steuern von Geräten.",
+                        })
+                        continue
+
+                    from services.action_executor import ActionExecutor
+                    _mcp = getattr(app.state, "mcp_manager", None)
+                    _res = await ActionExecutor(mcp_manager=_mcp).execute(
+                        {
+                            "intent": "internal.device_action",
+                            "parameters": {"entity_id": entity_id, "action": action},
+                            "confidence": 1.0,
+                        },
+                        user_id=da_user_id,
+                    )
+                    await websocket.send_json({
+                        "type": "device_action_result",
+                        "entity_id": entity_id,
+                        "success": bool(_res.get("success")),
+                        "state": (_res.get("data") or {}).get("state"),
+                        "message": _res.get("message", ""),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"⚠️ device_action failed: {e}")
+                    await websocket.send_json({
+                        "type": "device_action_result",
+                        "entity_id": entity_id, "success": False,
+                        "message": "Aktion fehlgeschlagen.",
+                    })
+                continue
+
             # Validate message
             try:
                 msg = WSChatMessage(**data)
