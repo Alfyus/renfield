@@ -356,3 +356,31 @@ class TestBackupRollback:
         mgr._rollback()
         assert (install / "venv" / "bin" / "python").exists()
         assert (install / "renfield_satellite" / "__init__.py").exists()
+
+
+@pytest.mark.satellite
+@pytest.mark.unit
+class TestDefaultBackupPathWritable:
+    """Regression for the OTA-backup permission bug: the default backup path must
+    be writable by the (non-root) service user AND live outside install_path.
+
+    The previous default — a sibling of install_path — failed with
+    `[Errno 13] Permission denied` in prod: install_path is /opt/renfield-satellite
+    (evdb-owned) but /opt is root-owned, so the evdb service could not create the
+    sibling /opt/renfield-satellite.update-backup, and every OTA died at backup.
+    """
+
+    def test_default_backup_is_external_and_writable(self, tmp_path):
+        import os
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+        (install_path / "renfield_satellite").mkdir()
+
+        mgr = UpdateManager(install_path=str(install_path))  # no explicit backup_path
+
+        bp = mgr.backup_path
+        # Outside install_path so the rollback's rmtree(install_path) can't delete it.
+        assert bp != install_path and install_path not in bp.parents
+        # Parent must exist and be writable by THIS process (the bug was a
+        # non-writable parent), not assumed-writable.
+        assert bp.parent.exists() and os.access(bp.parent, os.W_OK)

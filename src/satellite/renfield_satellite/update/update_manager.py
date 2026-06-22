@@ -91,16 +91,18 @@ class UpdateManager:
             # Try to detect install path
             self.install_path = self._detect_install_path()
 
-        # Backup path — a SIBLING of the install dir, never inside it. A backup
-        # under install_path/.backup gets deleted by the rollback's own
-        # rmtree(install_path), so the restore then finds nothing and the whole
-        # install (venv included) is lost — this bricked a satellite in prod.
+        # Backup path — must be (1) OUTSIDE install_path, so the rollback's own
+        # rmtree(install_path) can't delete it (a backup under install_path/.backup
+        # bricked a satellite in prod — #775), AND (2) writable by the service user.
+        # The earlier "sibling of install_path" choice broke #2: install_path.parent
+        # is typically /opt, which is root-owned, so a non-root satellite (runs as
+        # `evdb`) hit `[Errno 13] Permission denied` at the backup step and every OTA
+        # failed there. Use the running user's home (writable + external), falling
+        # back to the temp dir.
         if backup_path:
             self.backup_path = Path(backup_path)
         else:
-            self.backup_path = self.install_path.parent / (
-                self.install_path.name + ".update-backup"
-            )
+            self.backup_path = self._default_backup_path()
         self.service_name = service_name
 
         # State
@@ -109,6 +111,23 @@ class UpdateManager:
         self._progress = 0
         self._on_progress: Optional[Callable[[UpdateStage, int, str], None]] = None
         self._backup_created = False
+
+    def _default_backup_path(self) -> Path:
+        """A backup dir that is OUTSIDE install_path and writable by this process.
+
+        Prefers the running user's home (writable, external to the typically
+        root-owned /opt where install_path lives); falls back to the temp dir if
+        home is missing or not writable. Never a child of install_path.
+        """
+        name = ".renfield-update-backup-" + self.install_path.name
+        try:
+            import pwd
+            home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+            if home and home != self.install_path and os.access(home, os.W_OK):
+                return home / name
+        except (KeyError, OSError, ImportError):
+            pass
+        return Path(tempfile.gettempdir()) / name
 
     def _detect_install_path(self) -> Path:
         """Detect the satellite installation path"""
