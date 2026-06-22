@@ -1218,6 +1218,16 @@ class Satellite:
         if self.ble_scanner is not None:
             self.ble_scanner.update_irks(parsed)
         print(f"BLE IRKs updated: {len(parsed)}")
+        # Loud guard: without `cryptography`, rpa.resolve_rpa() silently returns
+        # False for every address, so the IRKs are dead weight and NO phone is
+        # ever resolved — a silent, total feature failure. Surface it (this is
+        # exactly how the missing-cryptography drift hid for so long, 2026-06).
+        if parsed:
+            from .ble.rpa import _CRYPTO_AVAILABLE
+            if not _CRYPTO_AVAILABLE:
+                print(f"⚠️ {len(parsed)} BLE IRK(s) received but `cryptography` is "
+                      "NOT installed in the venv — RPA resolution is DISABLED; no "
+                      "phone will be detected via IRK until it is installed.")
 
     def _on_led_config_update(self, brightness: int):
         """Apply a backend-pushed LED brightness (night-dimming).
