@@ -27,7 +27,9 @@ _(no active blockers — all prior P0 items resolved and merged)_
 
 ## P1 — Next substantive batch
 
-_(no P1 items — WICHTIG sweep complete. W10 closed via #487 on 2026-04-27. `tasks/audit-findings-plan.md` swept on 2026-04-30: every W1-W14 entry now points at the actual landed code/PR, and the Phase 1-4 checklists are fully ticked.)_
+- **Broadcast announcement (announce to all occupied rooms)** — PLANNED, reviewed via `/plan-eng-review`, not yet implemented. New `internal.broadcast_announcement` tool: "Ansage an alle: Mittagessen" → plays TTS in every room with a present user. Reuses the existing targeted relay (`internal.announce_in_room`) by extracting a shared `_announce_core` (own AsyncSession), public-only, dedup rooms via `get_all_presence`, synth-once + sem-bounded parallel fan-out. Full plan (decisions, data flow, failure modes, test plan, 8 tasks, parallelization lanes): **`docs/design/broadcast-announcement.md`** (primary source). Critical path = `_announce_core` extraction → tool → tests in `src/backend/ha_glue/services/internal_tools.py`.
+
+_(WICHTIG sweep complete. W10 closed via #487 on 2026-04-27. `tasks/audit-findings-plan.md` swept on 2026-04-30: every W1-W14 entry now points at the actual landed code/PR, and the Phase 1-4 checklists are fully ticked.)_
 
 ---
 
