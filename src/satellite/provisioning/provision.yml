@@ -35,6 +35,10 @@
         name: bluetooth
         state: restarted
 
+    - name: reexec systemd
+      ansible.builtin.systemd:
+        daemon_reexec: true
+
   tasks:
     # =========================================================================
     # SYSTEM — System preparation
@@ -68,6 +72,24 @@
         - "{{ satellite_config_dir }}"
         - "{{ satellite_models_dir }}"
         - "{{ satellite_code_dir }}"
+
+    # =========================================================================
+    # WATCHDOG — Hardware watchdog: auto-reboot on a total system/kernel hang
+    # (the failure mode where the Pi goes fully unreachable for minutes). systemd
+    # opens /dev/watchdog and pets it; if PID 1 or the kernel wedges, the SoC
+    # watchdog hard-resets the board. Does NOT catch an app-only hang (the
+    # satellite process self-exits via server.max_disconnected_seconds for that).
+    # =========================================================================
+
+    - name: Enable systemd hardware watchdog (RuntimeWatchdogSec)
+      tags: [watchdog, system]
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system.conf
+        regexp: '^#?RuntimeWatchdogSec='
+        line: "RuntimeWatchdogSec={{ satellite_hw_watchdog_sec }}s"
+        state: present
+      when: satellite_hw_watchdog_sec | int > 0
+      notify: reexec systemd
 
     # =========================================================================
     # BOOT — Boot configuration (config.txt)

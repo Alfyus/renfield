@@ -493,9 +493,17 @@ class Satellite:
 
     @staticmethod
     def _read_bonded_irks(bt_root: str = "/var/lib/bluetooth") -> dict:
-        """Map bonded-device MAC -> IRK hex from BlueZ's store. BlueZ does not
-        expose bonding keys over D-Bus, so we read the on-disk info files
-        (requires root / a hostPath mount in the k8s pod)."""
+        """Map bonded-device MAC -> IRK hex (most-significant-octet first) from
+        BlueZ's store. BlueZ does not expose bonding keys over D-Bus, so we read
+        the on-disk info files (requires root / a hostPath mount in the k8s pod).
+
+        BlueZ writes the IdentityResolvingKey *least*-significant-octet first,
+        but the RPA resolver and the backend store expect it MSO-first (see
+        ble/rpa.py — "reverse them at the config boundary, not here"). This
+        reader IS that boundary, so it reverses the bytes; without this, a
+        captured IRK is stored byte-swapped and silently never resolves a
+        rotating address (a bonded satellite still resolves natively via BlueZ,
+        which masked the bug)."""
         import glob
         import os
         found = {}
@@ -521,7 +529,12 @@ class Satellite:
                     irk = line.split("=", 1)[1].strip()
                     break
             if irk:
-                found[mac] = irk
+                try:
+                    # BlueZ stores the IRK LSO-first; convert to the MSO-first
+                    # form the resolver + backend expect.
+                    found[mac] = bytes.fromhex(irk)[::-1].hex().upper()
+                except ValueError:
+                    continue
         return found
 
     async def _capture_irk_for_request(self, params: dict) -> dict:

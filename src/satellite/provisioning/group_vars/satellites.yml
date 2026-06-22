@@ -27,6 +27,11 @@ server_ping_timeout: 8            # drop the link if no pong within (s)
 server_register_timeout: 15       # cap the post-connect register handshake (s)
 server_max_disconnected_seconds: 300  # exit→systemd restart if unreconnectable this long (0=off)
 
+# Hardware watchdog: systemd pets /dev/watchdog every cycle; if PID 1 / the kernel
+# hangs, the SoC watchdog hard-resets the board. Keep <= the SoC max (BCM2835 ~15s,
+# sunxi ~16s) or the timer won't arm. 0 disables.
+satellite_hw_watchdog_sec: 14
+
 # Wake word
 wakeword_model: "hey_renfield"
 wakeword_threshold: 0.5
