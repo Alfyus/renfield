@@ -108,6 +108,30 @@ privacy review for storing IRKs; live end-to-end proof with one real IRK.
 > while `_CRYPTO_AVAILABLE` is False. Verified live: installing `cryptography` and
 > restarting made arbeitszimmer resolve the phone and presence flip to Arbeitszimmer.
 
+> **Bonded-satellite arbitration bias — un-bond to fix (2026-06-22).** Once every
+> satellite could resolve the phone, room assignment in **adjacent / open-plan
+> rooms became wrong**: standing in the Wohnzimmer, presence showed **Esszimmer**.
+> Cause: the phone was *bonded* on the Esszimmer (Orange Pi), so BlueZ resolved it
+> **natively on every advert** — a strong, near-constant signal (~20 matches/min)
+> — while the non-bonded Wohnzimmer (weak Pi-Zero radio + software IRK) caught only
+> a trickle (~2/min). `_assign_room`'s RSSI arbitration therefore picked the
+> Esszimmer even with the user in the Wohnzimmer. The match *count* isn't the
+> arbitration input (it's smoothed RSSI), but native bonding makes the bonded
+> satellite report a consistently strong signal that a weaker neighbour can't beat.
+>
+> **Fix: un-bond the phone so all satellites use the same software IRK path.**
+> `bluetoothctl remove <identity-mac>` on the bonding satellite's **host** (the bond
+> is in the host's `/var/lib/bluetooth`; the k8s pod mounts it RO and cannot remove
+> it). The IRK is already stored in the backend (`user_ble_irks`), so the formerly-
+> bonded satellite keeps detecting via the software resolver — only the unfair
+> native edge is gone, so it reports *real* advert RSSI like everyone else. Verified
+> live: after un-bonding, presence tracked the actual room **bidirectionally**
+> (Arbeitszimmer↔Wohnzimmer), held stably with no flicker. Reversible — re-pair via
+> the IRK pairing flow if a satellite genuinely needs native resolution. The general
+> lesson: **don't bond the phone to only one of several overlapping satellites** —
+> either bond none (software IRK everywhere, fair RSSI) or accept that the bonded
+> one will dominate its RF neighbourhood.
+
 > Classic-BT (BlueZ connection-RSSI) was evaluated and rejected for iPhones —
 > no API to poll an iPhone over BR/EDR and iPhones aren't Classic-discoverable.
 
