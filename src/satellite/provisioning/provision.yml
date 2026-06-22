@@ -119,6 +119,16 @@
         state: absent
       notify: reexec systemd
 
+    - name: Ensure satellite bin dir exists (not all HAT profiles create it)
+      tags: [watchdog, system]
+      ansible.builtin.file:
+        path: "{{ satellite_base_dir }}/bin"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+      when: net_watchdog_enabled | default(true)
+
     - name: Deploy network watchdog script
       tags: [watchdog, system]
       ansible.builtin.template:
