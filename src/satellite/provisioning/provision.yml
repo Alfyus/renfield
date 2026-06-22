@@ -109,14 +109,14 @@
       notify: reexec systemd
 
     # A previous revision wrote RuntimeWatchdogSec into the main system.conf
-    # (inert — the OS drop-in outranks it). Restore the shipped default there.
-    - name: Restore system.conf RuntimeWatchdogSec default (now set via drop-in)
+    # (inert — the OS drop-in outranks it). Remove it; idempotent on a clean
+    # system (no match → no change → no reexec).
+    - name: Remove inert RuntimeWatchdogSec from system.conf (now set via drop-in)
       tags: [watchdog, system]
       ansible.builtin.lineinfile:
         path: /etc/systemd/system.conf
         regexp: '^RuntimeWatchdogSec='
-        line: "#RuntimeWatchdogSec=off"
-        state: present
+        state: absent
       notify: reexec systemd
 
     - name: Deploy network watchdog script
