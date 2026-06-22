@@ -488,6 +488,7 @@ class UpdateManager:
         "webrtcvad", "noisereduce", "spidev", "soundcard", "bleak",
         "lgpio", "python-mpv", "psutil", "pyyaml", "zeroconf",
         "sounddevice", "pyaudio", "scipy", "librosa", "RPi.GPIO",
+        "cryptography",
     })
 
     @staticmethod
