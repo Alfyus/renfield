@@ -1,0 +1,11 @@
+[Unit]
+Description=Renfield satellite network watchdog (reboot if local network is wedged)
+# Don't run while shutting down/rebooting.
+DefaultDependencies=no
+After=network.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart={{ satellite_base_dir }}/bin/renfield-net-watchdog.sh "{{ net_watchdog_target | default('') }}" {{ net_watchdog_fail_threshold | default(5) }}

@@ -103,19 +103,33 @@ Client behavior fixes (shipped in the satellite package):
 > The watchdog uses a **clean `os._exit`**, never a SIGKILL-mid-restart — so it
 > does not risk the SD-card corruption that bricked a satellite before.
 
-### Hardware watchdog (SoC-level, complements the app watchdog)
+### Watchdogs beyond the app-level disconnect exit
 
 The `max_disconnected_seconds` watchdog only fires while the **process is still
-running** — it can't recover a *total* system hang (kernel / Wi-Fi-stack lockup)
-where the board goes fully unreachable for minutes. For that, provisioning
-enables the **SoC hardware watchdog** via systemd: `RuntimeWatchdogSec`
-(`satellite_hw_watchdog_sec`, default **14 s**) in `/etc/systemd/system.conf`.
-systemd opens `/dev/watchdog` and pets it every cycle; if PID 1 or the kernel
-wedges, the SoC watchdog hard-resets the board. Keep the value **≤ the SoC max**
-(BCM2835 ~15 s, sunxi/Allwinner ~16 s) or the timer won't arm. Applied via the
-`watchdog` tag; a `reexec systemd` handler re-arms it without a reboot
-(`daemon-reload` alone does **not** activate the watchdog device). Set to `0` to
-disable.
+running**, so it can't recover a *total* hang where the board goes unreachable
+for minutes. Two lower layers cover that (both under the `watchdog` tag):
+
+**1. SoC hardware watchdog — kernel / PID-1 hangs.** systemd opens
+`/dev/watchdog` and pets it every cycle; if PID 1 or the kernel wedges, the SoC
+watchdog hard-resets the board. Raspberry Pi OS **already ships this enabled at
+1 min** (`/usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf`), so a bare
+edit to `/etc/systemd/system.conf` is **inert** — that OS drop-in outranks it.
+We instead write a **higher-precedence drop-in**
+`/etc/systemd/system.conf.d/50-renfield-watchdog.conf` with
+`RuntimeWatchdogSec={{ satellite_hw_watchdog_sec }}s` (default **14 s**). Keep it
+**≤ the SoC max** (BCM2835 ~15 s, sunxi/Allwinner ~16 s) or the timer won't arm.
+A `reexec systemd` handler re-arms it live (verified: `RuntimeWatchdogUSec`
+drops to 14 s without a reboot — `daemon-reload` alone does **not** re-arm it).
+
+**2. Network watchdog — wedged Wi-Fi / IP stack.** The HW watchdog can *not*
+catch the most common drop-off: the kernel stays healthy (so it keeps petting
+`/dev/watchdog`) but Wi-Fi/IP is dead and the satellite can't reach the backend.
+`renfield-net-watchdog.timer` runs `renfield-net-watchdog.sh` every ~60 s; if the
+Pi can't reach its **default gateway** for `net_watchdog_fail_threshold`
+consecutive checks (default **5** ≈ 5 min) it `systemctl reboot`s. It keys on the
+*gateway*, not the backend, so a backend redeploy never triggers a reboot; a
+**10-min post-boot grace** (read from `/proc/uptime`) prevents reboot loops.
+Disable with `net_watchdog_enabled: false`.
 
 ## Diagnosing "X won't connect"
 

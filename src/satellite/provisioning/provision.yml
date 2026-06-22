@@ -74,22 +74,82 @@
         - "{{ satellite_code_dir }}"
 
     # =========================================================================
-    # WATCHDOG — Hardware watchdog: auto-reboot on a total system/kernel hang
-    # (the failure mode where the Pi goes fully unreachable for minutes). systemd
-    # opens /dev/watchdog and pets it; if PID 1 or the kernel wedges, the SoC
-    # watchdog hard-resets the board. Does NOT catch an app-only hang (the
-    # satellite process self-exits via server.max_disconnected_seconds for that).
+    # WATCHDOG — two complementary layers:
+    #   1. SoC hardware watchdog (RuntimeWatchdogSec): auto-reboots on a kernel /
+    #      PID-1 hang. Raspberry Pi OS already ships this at 1 min via
+    #      /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf; we tighten
+    #      it with a 50- drop-in (higher precedence) so it actually takes effect.
+    #   2. Network watchdog (renfield-net-watchdog.timer): reboots if the Pi can't
+    #      reach its default gateway for N minutes — the wedged-Wi-Fi/IP failure
+    #      the HW watchdog can't catch (kernel stays healthy and keeps petting it).
     # =========================================================================
 
-    - name: Enable systemd hardware watchdog (RuntimeWatchdogSec)
+    - name: Ensure systemd manager drop-in dir exists
+      tags: [watchdog, system]
+      ansible.builtin.file:
+        path: /etc/systemd/system.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # Drop a 50- override above the OS 40-rpi-enable-watchdog.conf default.
+    - name: Tighten SoC hardware watchdog (RuntimeWatchdogSec drop-in)
+      tags: [watchdog, system]
+      ansible.builtin.copy:
+        dest: /etc/systemd/system.conf.d/50-renfield-watchdog.conf
+        content: |
+          # Managed by Ansible — overrides 40-rpi-enable-watchdog.conf.
+          [Manager]
+          RuntimeWatchdogSec={{ satellite_hw_watchdog_sec }}s
+        owner: root
+        group: root
+        mode: "0644"
+      when: satellite_hw_watchdog_sec | int > 0
+      notify: reexec systemd
+
+    # A previous revision wrote RuntimeWatchdogSec into the main system.conf
+    # (inert — the OS drop-in outranks it). Restore the shipped default there.
+    - name: Restore system.conf RuntimeWatchdogSec default (now set via drop-in)
       tags: [watchdog, system]
       ansible.builtin.lineinfile:
         path: /etc/systemd/system.conf
-        regexp: '^#?RuntimeWatchdogSec='
-        line: "RuntimeWatchdogSec={{ satellite_hw_watchdog_sec }}s"
+        regexp: '^RuntimeWatchdogSec='
+        line: "#RuntimeWatchdogSec=off"
         state: present
-      when: satellite_hw_watchdog_sec | int > 0
       notify: reexec systemd
+
+    - name: Deploy network watchdog script
+      tags: [watchdog, system]
+      ansible.builtin.template:
+        src: renfield-net-watchdog.sh.j2
+        dest: "{{ satellite_base_dir }}/bin/renfield-net-watchdog.sh"
+        owner: root
+        group: root
+        mode: "0755"
+      when: net_watchdog_enabled | default(true)
+
+    - name: Deploy network watchdog systemd units
+      tags: [watchdog, system]
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - renfield-net-watchdog.service
+        - renfield-net-watchdog.timer
+      when: net_watchdog_enabled | default(true)
+      notify: reload systemd
+
+    - name: Enable + start the network watchdog timer
+      tags: [watchdog, system]
+      ansible.builtin.systemd:
+        name: renfield-net-watchdog.timer
+        enabled: "{{ net_watchdog_enabled | default(true) }}"
+        state: "{{ 'started' if (net_watchdog_enabled | default(true)) else 'stopped' }}"
+        daemon_reload: true
 
     # =========================================================================
     # BOOT — Boot configuration (config.txt)

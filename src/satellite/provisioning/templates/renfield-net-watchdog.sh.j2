@@ -1,0 +1,46 @@
+#!/bin/bash
+# Renfield satellite network watchdog (managed by Ansible — do not edit on host).
+#
+# Recovers a *wedged network stack* — the failure the SoC hardware watchdog
+# CANNOT catch: the kernel + systemd stay healthy (so /dev/watchdog keeps being
+# pet) but Wi-Fi/IP is dead and the satellite can't reach the backend. The
+# app-level reconnect (server.max_disconnected_seconds) only restarts the
+# process; if the whole stack is wedged that doesn't help, so as a last resort
+# we reboot the board.
+#
+# Decision signal = reachability of the DEFAULT GATEWAY, not the backend: a
+# down backend (e.g. a rolling redeploy) is not the Pi's fault and must NOT
+# trigger a reboot. Only when the Pi can't reach its own gateway is the local
+# network genuinely dead.
+set -u
+
+TARGET="${1:-}"
+THRESHOLD="${2:-5}"            # consecutive failures (timer cadence ≈ 1/min) → reboot
+STATE=/run/renfield-net-watchdog.fails
+
+# Derive the default gateway if no explicit target was given.
+if [ -z "$TARGET" ]; then
+    TARGET=$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')
+fi
+# No gateway known (boot race / no route) — can't decide, stay hands-off.
+[ -z "$TARGET" ] && exit 0
+
+# Don't reboot during the first 10 min of uptime: let the network settle after a
+# boot and avoid a tight reboot loop if the gateway is persistently unreachable.
+up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+[ "$up" -lt 600 ] && exit 0
+
+if ping -c 2 -W 3 "$TARGET" >/dev/null 2>&1; then
+    rm -f "$STATE"
+    exit 0
+fi
+
+fails=$(( $(cat "$STATE" 2>/dev/null || echo 0) + 1 ))
+echo "$fails" > "$STATE"
+logger -t renfield-net-watchdog "gateway $TARGET unreachable ($fails/$THRESHOLD)"
+
+if [ "$fails" -ge "$THRESHOLD" ]; then
+    logger -t renfield-net-watchdog "threshold reached after ${fails} checks — rebooting"
+    rm -f "$STATE"
+    systemctl reboot
+fi

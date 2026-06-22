@@ -29,8 +29,17 @@ server_max_disconnected_seconds: 300  # exit→systemd restart if unreconnectabl
 
 # Hardware watchdog: systemd pets /dev/watchdog every cycle; if PID 1 / the kernel
 # hangs, the SoC watchdog hard-resets the board. Keep <= the SoC max (BCM2835 ~15s,
-# sunxi ~16s) or the timer won't arm. 0 disables.
+# sunxi ~16s) or the timer won't arm. 0 disables. Set via a 50- drop-in that
+# overrides the Raspberry Pi OS default (40-rpi-enable-watchdog.conf = 1 min).
 satellite_hw_watchdog_sec: 14
+
+# Network watchdog: reboots the Pi if its default gateway is unreachable for
+# net_watchdog_fail_threshold consecutive ~1-min checks — recovers a wedged
+# Wi-Fi/IP stack that the HW watchdog can't (kernel stays healthy). Empty target
+# = auto-derive the gateway. A 10-min post-boot grace prevents reboot loops.
+net_watchdog_enabled: true
+net_watchdog_target: ""
+net_watchdog_fail_threshold: 5
 
 # Wake word
 wakeword_model: "hey_renfield"
