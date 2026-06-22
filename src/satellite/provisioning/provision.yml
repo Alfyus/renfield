@@ -401,6 +401,21 @@
         name: "{{ satellite_python_packages }}"
         virtualenv: "{{ satellite_venv }}"
 
+    # Also tagged `app`: cryptography is a HARD runtime dep of ble/rpa.py (IRK
+    # RPA resolution) but rpa.py silently no-ops without it — resolve_rpa()
+    # returns False for every address, so phone presence dies invisibly. It was
+    # added to satellite_python_packages after sats were first provisioned, and
+    # the safety code-only deploy (`--tags app`) skips `[python]`, so it never
+    # landed and IRK resolution was dead on every bare-metal satellite (2026-06).
+    # Same drift the envirophat task below guards against. Restart-free (no
+    # handler notify); the running process picks it up on its next restart.
+    - name: Ensure cryptography in venv (IRK RPA resolution — also on app deploys)
+      tags: [python, app]
+      become_user: "{{ ansible_user }}"
+      ansible.builtin.pip:
+        name: cryptography
+        virtualenv: "{{ satellite_venv }}"
+
     - name: Install openwakeword (--no-deps for Python 3.13+ compat)
       tags: [python]
       become_user: "{{ ansible_user }}"

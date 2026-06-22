@@ -94,6 +94,20 @@ privacy review for storing IRKs; live end-to-end proof with one real IRK.
 > MSO-first hex, so both converge). Proven: the device's real advertised RPA
 > resolves only against the reversed bytes.
 
+> **Silent-no-op gotcha (fixed 2026-06-22).** `ble/rpa.py` guards on
+> `_CRYPTO_AVAILABLE` and **returns `False` for every address** when the
+> `cryptography` package isn't importable — so a satellite missing the dep
+> receives IRKs, scans, sees the phone's RPA at −40 dBm 1 m away, and resolves
+> *nothing*, with no error. `cryptography` lived only in `satellite_python_packages`
+> (installed under the `[python]` tag); the safety code-only `--tags app` deploy
+> skips that tag, so the dep was never installed on **any** bare-metal satellite
+> and software IRK resolution was dead house-wide — presence only ever worked on
+> the Esszimmer, which resolves the *bonded* phone natively via BlueZ and bypasses
+> the software resolver. Fix: a dedicated `[python, app]` pip task + `cryptography`
+> in the satellite `requirements.txt` + a loud startup warning when IRKs arrive
+> while `_CRYPTO_AVAILABLE` is False. Verified live: installing `cryptography` and
+> restarting made arbeitszimmer resolve the phone and presence flip to Arbeitszimmer.
+
 > Classic-BT (BlueZ connection-RSSI) was evaluated and rejected for iPhones —
 > no API to poll an iPhone over BR/EDR and iPhones aren't Classic-discoverable.
 

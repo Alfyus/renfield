@@ -48,3 +48,7 @@ psutil>=5.9.0
 
 # BLE scanning (for presence detection, optional)
 bleak>=0.22.0
+
+# IRK-based RPA resolution (ble/rpa.py) — REQUIRED for phone presence; rpa.py
+# silently no-ops (resolve_rpa() always returns False) if this is missing.
+cryptography>=42.0.0
