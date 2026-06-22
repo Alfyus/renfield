@@ -82,6 +82,18 @@ name→hex), `cryptography` dep, unit tests (incl. the BT spec vector).
 (like the known-devices list); enrollment flow + documented Mac-export step;
 privacy review for storing IRKs; live end-to-end proof with one real IRK.
 
+> **Byte-order gotcha (fixed #840, 2026-06-22).** BlueZ stores the
+> `IdentityResolvingKey` in `/var/lib/bluetooth/.../info` **least-significant-octet
+> first**, but `ble/rpa.py` and the backend IRK store expect it **MSO-first** (the
+> BLE-spec `ah` order). The UI pairing-capture reader (`_read_bonded_irks`) read
+> the key as-is, so a captured IRK was stored byte-swapped and **silently never
+> resolved** a rotating address — masked because a *bonded* satellite resolves the
+> phone natively via BlueZ, and because the first captured IRK never persisted to
+> the backend until the bug was hit live. `_read_bonded_irks` now reverses at that
+> single boundary (the manual `POST /api/presence/irks` path already takes
+> MSO-first hex, so both converge). Proven: the device's real advertised RPA
+> resolves only against the reversed bytes.
+
 > Classic-BT (BlueZ connection-RSSI) was evaluated and rejected for iPhones —
 > no API to poll an iPhone over BR/EDR and iPhones aren't Classic-discoverable.
 

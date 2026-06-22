@@ -103,6 +103,20 @@ Client behavior fixes (shipped in the satellite package):
 > The watchdog uses a **clean `os._exit`**, never a SIGKILL-mid-restart — so it
 > does not risk the SD-card corruption that bricked a satellite before.
 
+### Hardware watchdog (SoC-level, complements the app watchdog)
+
+The `max_disconnected_seconds` watchdog only fires while the **process is still
+running** — it can't recover a *total* system hang (kernel / Wi-Fi-stack lockup)
+where the board goes fully unreachable for minutes. For that, provisioning
+enables the **SoC hardware watchdog** via systemd: `RuntimeWatchdogSec`
+(`satellite_hw_watchdog_sec`, default **14 s**) in `/etc/systemd/system.conf`.
+systemd opens `/dev/watchdog` and pets it every cycle; if PID 1 or the kernel
+wedges, the SoC watchdog hard-resets the board. Keep the value **≤ the SoC max**
+(BCM2835 ~15 s, sunxi/Allwinner ~16 s) or the timer won't arm. Applied via the
+`watchdog` tag; a `reexec systemd` handler re-arms it without a reboot
+(`daemon-reload` alone does **not** activate the watchdog device). Set to `0` to
+disable.
+
 ## Diagnosing "X won't connect"
 
 ```bash
