@@ -22,3 +22,8 @@ led_idle_color: "green"
 
 # 2-mic overlay variant: "simple" or "full"
 overlay_variant: "simple"
+
+# BLE presence: keep one scanner running continuously (vs 30 s bursts) so the
+# weak Pi Zero radio is more likely to catch a phone's intermittent adverts.
+# Enabled here because this room sits at the edge of phone BLE range.
+ble_continuous: true
