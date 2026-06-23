@@ -146,7 +146,13 @@ async def get_entity(
 ):
     """Get a single entity by ID."""
     svc = KnowledgeGraphService(db)
-    entity = await svc.get_entity(entity_id)
+    # Circle access (review H4): scope the read to the asker. An inaccessible
+    # entity returns 404 (indistinguishable from non-existent — no oracle).
+    entity = await svc.get_entity(
+        entity_id,
+        asker_id=user.id if user else None,
+        enforce_circle=True,
+    )
     if not entity:
         raise HTTPException(status_code=404, detail="Entity not found")
     return _entity_to_response(entity)
@@ -264,6 +270,8 @@ async def list_relations(
             entity_id=entity_id,
             page=page,
             size=size,
+            asker_id=user.id if user else None,
+            enforce_circle=True,
         )
         return RelationListResponse(
             relations=[
@@ -399,7 +407,11 @@ async def get_stats(
     """Get knowledge graph statistics."""
     try:
         svc = KnowledgeGraphService(db)
-        stats = await svc.get_stats(user_id=user_id)
+        stats = await svc.get_stats(
+            user_id=user_id,
+            asker_id=user.id if user else None,
+            enforce_circle=True,
+        )
         return KGStatsResponse(**stats)
     except Exception as e:
         logger.error(f"KG stats error: {e}")

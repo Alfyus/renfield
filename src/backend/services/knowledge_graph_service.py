@@ -1562,14 +1562,42 @@ class KnowledgeGraphService:
 
         return entities, total
 
-    async def get_entity(self, entity_id: int) -> KGEntity | None:
-        result = await self.db.execute(
-            select(KGEntity).where(
-                KGEntity.id == entity_id,
-                KGEntity.is_active == True,  # noqa: E712
-            )
+    async def get_entity(
+        self,
+        entity_id: int,
+        asker_id: int | None = None,
+        enforce_circle: bool = False,
+    ) -> KGEntity | None:
+        """Fetch a single active entity by id.
+
+        Circle access (review H2/H4): when ``enforce_circle`` is set (the
+        KG_VIEW read route), the entity is returned only if the asker can see it
+        (own + public + explicit-grant + tier-reach). ``asker_id=None`` in
+        auth-enabled mode falls back to public-tier only; ``AUTH_ENABLED=false``
+        skips the check. Internal/admin callers (update/delete, KG_MANAGE-gated)
+        leave the flag False and read unfiltered — byte-identical to before.
+        """
+        query = select(KGEntity).where(
+            KGEntity.id == entity_id,
+            KGEntity.is_active == True,  # noqa: E712
         )
+        if enforce_circle:
+            query = self._apply_entity_circle_filter(query, asker_id)
+        result = await self.db.execute(query)
         return result.scalar_one_or_none()
+
+    def _apply_entity_circle_filter(self, query, asker_id: int | None):
+        """Append the auth-aware circle clause to a ``select(KGEntity)`` query."""
+        from sqlalchemy import text as sa_text
+        from services.circle_sql import kg_entities_circles_filter
+
+        if not settings.auth_enabled:
+            return query  # single-user bypass
+        if asker_id is None:
+            from models.database import TIER_PUBLIC
+            return query.where(KGEntity.circle_tier == TIER_PUBLIC)
+        clause, params = kg_entities_circles_filter(asker_id, alias="kg_entities")
+        return query.where(sa_text(clause).bindparams(**params))
 
     async def update_entity(
         self,
@@ -1680,8 +1708,20 @@ class KnowledgeGraphService:
         entity_id: int | None = None,
         page: int = 1,
         size: int = 50,
+        asker_id: int | None = None,
+        enforce_circle: bool = False,
     ) -> tuple[list[dict], int]:
-        """List active relations with entity data."""
+        """List active relations with entity data.
+
+        Circle access (review H4): when ``enforce_circle`` is set (the KG_VIEW
+        read route), relations are restricted to those the asker can access
+        (the denormalized ``kg_relations.circle_tier`` = MIN(subject, object)).
+        ``?user_id=X`` stays orthogonal to the circle check — without it, any
+        KG_VIEW caller could page the full relation set. Mirrors ``list_entities``.
+        """
+        from sqlalchemy import text as sa_text
+        from services.circle_sql import kg_relations_circles_filter
+
         query = (
             select(KGRelation)
             .where(KGRelation.is_active == True)  # noqa: E712
@@ -1691,6 +1731,23 @@ class KnowledgeGraphService:
         if user_id is not None:
             query = query.where(KGRelation.user_id == user_id)
             count_query = count_query.where(KGRelation.user_id == user_id)
+
+        if enforce_circle:
+            if not settings.auth_enabled:
+                pass  # single-user bypass
+            elif asker_id is None:
+                from models.database import TIER_PUBLIC
+                query = query.where(KGRelation.circle_tier == TIER_PUBLIC)
+                count_query = count_query.where(KGRelation.circle_tier == TIER_PUBLIC)
+            else:
+                clause, circle_params = kg_relations_circles_filter(
+                    asker_id, alias="kg_relations"
+                )
+                query = query.where(sa_text(clause).bindparams(**circle_params))
+                count_query = count_query.where(
+                    sa_text(clause).bindparams(**circle_params)
+                )
+
         if entity_id is not None:
             query = query.where(
                 (KGRelation.subject_id == entity_id) | (KGRelation.object_id == entity_id)
@@ -1798,26 +1855,53 @@ class KnowledgeGraphService:
         await self.db.commit()
         return True
 
-    async def get_stats(self, user_id: int | None = None) -> dict:
-        """Get knowledge graph statistics."""
+    async def get_stats(
+        self,
+        user_id: int | None = None,
+        asker_id: int | None = None,
+        enforce_circle: bool = False,
+    ) -> dict:
+        """Get knowledge graph statistics.
+
+        Circle access (review H4): when ``enforce_circle`` is set, counts are
+        restricted to the asker-visible slice (auth-off → bypass; asker None →
+        public only). Prevents a KG_VIEW caller learning another user's graph
+        size via ``?user_id=X``.
+        """
+        from sqlalchemy import text as sa_text
+        from services.circle_sql import (
+            kg_entities_circles_filter,
+            kg_relations_circles_filter,
+        )
+
         base_entity = select(func.count(KGEntity.id)).where(KGEntity.is_active == True)  # noqa: E712
         base_relation = select(func.count(KGRelation.id)).where(KGRelation.is_active == True)  # noqa: E712
-
-        if user_id is not None:
-            base_entity = base_entity.where(KGEntity.user_id == user_id)
-            base_relation = base_relation.where(KGRelation.user_id == user_id)
-
-        entity_count = (await self.db.execute(base_entity)).scalar() or 0
-        relation_count = (await self.db.execute(base_relation)).scalar() or 0
-
-        # Entity type distribution
         type_query = (
             select(KGEntity.entity_type, func.count(KGEntity.id))
             .where(KGEntity.is_active == True)  # noqa: E712
             .group_by(KGEntity.entity_type)
         )
+
         if user_id is not None:
+            base_entity = base_entity.where(KGEntity.user_id == user_id)
+            base_relation = base_relation.where(KGRelation.user_id == user_id)
             type_query = type_query.where(KGEntity.user_id == user_id)
+
+        if enforce_circle and settings.auth_enabled:
+            if asker_id is None:
+                from models.database import TIER_PUBLIC
+                base_entity = base_entity.where(KGEntity.circle_tier == TIER_PUBLIC)
+                base_relation = base_relation.where(KGRelation.circle_tier == TIER_PUBLIC)
+                type_query = type_query.where(KGEntity.circle_tier == TIER_PUBLIC)
+            else:
+                e_clause, e_params = kg_entities_circles_filter(asker_id, alias="kg_entities")
+                r_clause, r_params = kg_relations_circles_filter(asker_id, alias="kg_relations")
+                base_entity = base_entity.where(sa_text(e_clause).bindparams(**e_params))
+                type_query = type_query.where(sa_text(e_clause).bindparams(**e_params))
+                base_relation = base_relation.where(sa_text(r_clause).bindparams(**r_params))
+
+        entity_count = (await self.db.execute(base_entity)).scalar() or 0
+        relation_count = (await self.db.execute(base_relation)).scalar() or 0
 
         type_result = await self.db.execute(type_query)
         entity_types = {row[0]: row[1] for row in type_result.fetchall()}
