@@ -1241,6 +1241,7 @@ class KnowledgeGraphService:
                         }
                         for r in saved_relations
                     ],
+                    owner_user_id=user_id,
                 )
             except Exception as e:
                 logger.debug(f"KG live broadcast failed (non-critical): {e}")
