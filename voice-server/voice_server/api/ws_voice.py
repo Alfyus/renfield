@@ -413,16 +413,22 @@ async def ws_voice(websocket: WebSocket, token: str | None = Query(default=None)
 
     user_id = str(payload.get("sub") or payload.get("user_id") or "unknown")
     await websocket.accept()
+    # SessionState is a plain dataclass (no I/O), so build it BEFORE bumping the
+    # counter — the finally references it, and this guarantees it's bound.
+    state = SessionState(user_id=user_id, started_at=time.monotonic())
     _active_sessions += 1
     logger.info("voice session opened user=%s (active=%d)", user_id, _active_sessions)
 
-    stt: STTService = websocket.app.state.stt
-    tts: TTSService = websocket.app.state.tts
-    speaker: SpeakerService = websocket.app.state.speaker
-
-    state = SessionState(user_id=user_id, started_at=time.monotonic())
-
     try:
+        # Resolve services INSIDE the try (review M4 follow-up): the counter is
+        # already incremented, so any setup failure here (e.g. an app.state attr
+        # not yet initialized) must still reach the finally that decrements it —
+        # otherwise the slot leaks permanently and the cap eventually wedges the
+        # server into rejecting every session.
+        stt: STTService = websocket.app.state.stt
+        tts: TTSService = websocket.app.state.tts
+        speaker: SpeakerService = websocket.app.state.speaker
+
         while True:
             msg = await websocket.receive()
             if msg["type"] == "websocket.disconnect":
