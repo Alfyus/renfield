@@ -842,12 +842,21 @@ WICHTIGE REGELN FÜR ANTWORTEN:
         self,
         session_id: str,
         db: AsyncSession,
-        max_messages: int = 20
+        max_messages: int = 20,
+        user_id: int | None = None,
+        enforce_ownership: bool = False,
     ) -> list[dict]:
-        """Lade Konversationskontext aus der Datenbank (delegiert an ConversationService)"""
+        """Lade Konversationskontext aus der Datenbank (delegiert an ConversationService).
+
+        ``user_id`` + ``enforce_ownership`` close the cross-user history-read IDOR on
+        the WS path; see ConversationService.load_context.
+        """
         from services.conversation_service import ConversationService
         service = ConversationService(db)
-        return await service.load_context(session_id, max_messages)
+        return await service.load_context(
+            session_id, max_messages,
+            user_id=user_id, enforce_ownership=enforce_ownership,
+        )
 
     async def save_message(
         self,
@@ -858,18 +867,23 @@ WICHTIGE REGELN FÜR ANTWORTEN:
         metadata: dict | None = None,
         user_id: int | None = None,
         parent_message_id: int | None = None,
+        enforce_ownership: bool = False,
     ) -> "Message":
         """Speichere eine einzelne Nachricht (delegiert an ConversationService).
 
         ``parent_message_id`` (chat branching, Phase 1): when given, the message
         forks as a sibling under that parent; else it chains onto the current
         active tip. See ConversationService.save_message.
+
+        ``enforce_ownership`` (auth-enabled WS path): raises ``PermissionError``
+        rather than appending into another user's conversation.
         """
         from services.conversation_service import ConversationService
         service = ConversationService(db)
         return await service.save_message(
             session_id, role, content, metadata,
             user_id=user_id, parent_message_id=parent_message_id,
+            enforce_ownership=enforce_ownership,
         )
 
     async def get_conversation_summary(
