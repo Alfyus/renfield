@@ -17,8 +17,6 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.permissions import Permission
-from services.auth_service import require_permission
 from models.database import (
     UPLOAD_STATUS_COMPLETED,
     UPLOAD_STATUS_FAILED,
@@ -27,7 +25,8 @@ from models.database import (
     Conversation,
     KnowledgeBase,
 )
-from services.auth_service import get_optional_user
+from models.permissions import Permission
+from services.auth_service import get_optional_user, require_permission
 from services.database import AsyncSessionLocal, get_db
 from services.document_processor import DocumentProcessor
 from utils.config import settings
