@@ -758,6 +758,15 @@ class Settings(BaseSettings):
     ws_auth_enabled: bool = False  # Enable WebSocket authentication (set True in production)
     ws_token_expire_minutes: int = 60  # WebSocket token expiration
 
+    # Security (review H1): comma-separated allowlist of satellite_ids permitted
+    # to receive per-person BLE IRKs (which permanently de-anonymize a resident's
+    # rotating BLE address — a location-tracking key). When non-empty, IRKs are
+    # pushed ONLY to listed satellites; when empty (default) the push is ungated
+    # for backward compatibility but logs a loud one-shot warning per satellite.
+    # NOTE: this is a stop-gap — the full fix is a per-satellite enrollment
+    # credential so a rogue LAN device can't register as a satellite at all.
+    satellite_irk_allowlist: str = ""
+
     # WebSocket Rate Limiting
     # Note: Audio streaming sends ~12.5 chunks/second, so limits must accommodate this
     ws_rate_limit_enabled: bool = True

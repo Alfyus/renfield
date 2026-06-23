@@ -264,8 +264,11 @@ async def satellite_websocket(
                                 "type": "classic_bt_known_devices",
                                 "devices": list(classic_macs),
                             })
-                        # Per-person IRKs for resolving rotating RPAs (iPhones)
-                        irks = presence_svc.get_ble_irks()
+                        # Per-person IRKs for resolving rotating RPAs (iPhones).
+                        # Allowlist-gated per satellite (review H1) — IRKs are
+                        # location-tracking keys; don't hand them to any device
+                        # that registers.
+                        irks = presence_svc.irks_for_satellite(satellite_id)
                         if irks:
                             await websocket.send_json({
                                 "type": "ble_known_irks",
