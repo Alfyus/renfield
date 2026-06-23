@@ -1011,6 +1011,38 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def fail_closed_on_insecure_jwt_key(self) -> "Settings":
+        """Security (review M1): refuse to boot when JWT auth is enabled but the
+        signing key is still the in-repo placeholder default.
+
+        A WARNING is insufficient for this case: the placeholder is public (it
+        ships in the repo), so with AUTH_ENABLED=true anyone can forge a valid
+        admin JWT (HS256 over the known key) — a full auth bypass. This check is
+        independent of RENFIELD_ENV (closing the "forgot to set it" gap) and only
+        fires when auth is actually on, so AUTH_ENABLED=false single-user /
+        household deployments and dev/test are unaffected.
+        """
+        if not self.auth_enabled:
+            return self
+        field_info = type(self).model_fields.get("secret_key")
+        placeholder = field_info.default if field_info else None
+        if isinstance(placeholder, SecretStr):
+            placeholder = placeholder.get_secret_value()
+        current = (
+            self.secret_key.get_secret_value()
+            if isinstance(self.secret_key, SecretStr)
+            else self.secret_key
+        )
+        if placeholder is not None and current == placeholder:
+            raise ValueError(
+                "SECRET_KEY is still the placeholder default while "
+                "AUTH_ENABLED=true — refusing to start. The default key is public "
+                "(it ships in the repo), so anyone could forge an admin JWT. Set "
+                "SECRET_KEY to a strong random value (env var or Docker secret)."
+            )
+        return self
+
     class Config:
         env_file = ".env"
         secrets_dir = "/run/secrets"
