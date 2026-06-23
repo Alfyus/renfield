@@ -238,8 +238,11 @@ class Satellite:
         # Service discovery for auto-finding server
         self.discovery = ServiceDiscovery()
 
-        # OTA Update manager
-        self.update_manager = UpdateManager()
+        # OTA Update manager — verify TLS on the package download per the same
+        # policy as the WS/auth paths (review H6).
+        self.update_manager = UpdateManager(
+            verify_tls=self.config.server.verify_tls,
+        )
 
         # BLE Scanner (optional, for presence detection)
         self.ble_scanner: Optional[BLEScanner] = None
