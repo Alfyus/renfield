@@ -565,6 +565,49 @@ ble:
 
 ---
 
+### Satellite-Enrollment (Security Review H1)
+
+Per-Satellite-Identität: ein Satellit weist sich mit einem eigenen PSK
+(256-bit, server-seitig nur als bcrypt-Hash gespeichert) im register-Frame aus,
+statt eine `satellite_id` nur zu *behaupten*. Schließt die Wurzel von H1
+(IRK-Disclosure + Raum-Hijack durch ein beliebiges LAN-Gerät).
+
+```bash
+# Effektiv-Modus-Zustandsmaschine (siehe docs/private/security/satellite-trust-design.md):
+#   aus (Default)            → Legacy, keine PSK-Prüfung, register-Pfad byte-identisch
+#   an + nicht erzwingend    → PERMISSIVE/Soak: vorgelegter PSK wird geprüft
+#                              (falsch/unbekannt/widerrufen → abgelehnt), kein PSK →
+#                              erlaubt aber als unenrolled geloggt; IRKs nur an verifizierte Sats
+#   ENFORCING (Auto-Flip)    → kein gültiger PSK → abgelehnt
+SATELLITE_ENROLLMENT_ENABLED=false
+# Auto-Flip PERMISSIVE→ENFORCING, sobald JEDE eingeschriebene Zeile sich mindestens
+# einmal authentifiziert hat (nicht nur die aktuell verbundenen) — dann persistent
+# verriegelt. Default aus, bis die Flotte vollständig eingeschrieben ist.
+SATELLITE_ENROLLMENT_AUTOFLIP_ENABLED=false
+
+# Stop-gap aus der chirurgischen H1-Mitigation (greift nur wenn ENROLLMENT aus):
+# Komma-Liste der satellite_ids, die per-Person-IRKs empfangen dürfen. Leer =
+# ungated (Legacy) mit lauter Einmal-Warnung pro Satellit.
+SATELLITE_IRK_ALLOWLIST=""
+```
+
+**Satellite-Seite** (`satellite.yaml` → `server.enrollment_token`, oder Env
+`RENFIELD_ENROLLMENT_TOKEN`; bare-metal: gitignored host_var
+`satellite_enrollment_token`; k8s: per-Pod-Secret). PSK ausstellen mit
+`bin/enroll_satellite.py <satellite_id>` oder über die Admin-UI
+(`/api/satellite-enrollment/enroll`, ADMIN-gated; Token wird genau **einmal**
+angezeigt). Rollout gestaffelt: dark → Flotte einschreiben → `…_ENABLED=true`
+(PERMISSIVE) → alle Sats authentifiziert (`GET /api/satellite-enrollment/status`)
+→ `…_AUTOFLIP_ENABLED=true` → ENFORCING verriegelt. Break-glass: `…_ENABLED=false`.
+
+**Endpunkte (alle ADMIN-gated):**
+- `GET /api/satellite-enrollment` — eingeschriebene Satelliten + Status (nie das Token)
+- `GET /api/satellite-enrollment/status` — Flotten-Readiness für den Rollout-Gate
+- `POST /api/satellite-enrollment/enroll` — PSK ausstellen/rotieren (Token einmalig)
+- `DELETE /api/satellite-enrollment/{satellite_id}` — Enrollment widerrufen
+
+---
+
 ### Media Follow Me
 
 ```bash
