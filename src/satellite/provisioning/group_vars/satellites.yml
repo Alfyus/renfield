@@ -53,6 +53,27 @@ vad_silence_duration_ms: 1200
 vad_max_recording_seconds: 20
 vad_silero_threshold: 0.5
 
+# WM8960 codec ALC (Automatic Level Control) — hardware AGC applied INSIDE the
+# codec, before audio ever reaches the wake-word model. openWakeWord's predict()
+# does NO loudness normalization (raw int16 → melspectrogram), so its score is a
+# direct function of input amplitude: quiet/normal-volume speech under-scores and
+# only a raised voice crosses threshold. ALC dynamically lifts quiet/far-field
+# speech toward a target level — the same gain-staging wyoming-satellite does in
+# software (WebRTC AGC) and HA Voice PE does with gain_factor. The codec ships
+# with ALC Function=Off, which is the root cause of "must raise voice".
+# WM8960-based hats only (whisplay, 2mic, 2mic-v2). Disabled by default; enable
+# per-host. Validated on Arbeitszimmer/whisplay 2026-06-24 (normal-voice scores
+# 59-77% with ALC vs 11-45% without). Persisted via `alsactl store` →
+# /var/lib/alsa/asound.state, restored on boot by alsa-restore.service.
+wm8960_alc_enabled: false
+wm8960_alsa_card: "wm8960soundcard"   # `amixer -c` target (whisplay; 2mic = seeed2micvoicec)
+wm8960_alc_function: "Stereo"          # Off | Right | Left | Stereo
+wm8960_alc_target: 6                   # 0-15, higher = louder normalized target level
+wm8960_alc_max_gain: 7                 # 0-7, caps PGA so ALC can't run away into noise
+wm8960_alc_min_gain: 0                 # 0-7
+wm8960_noise_gate_enabled: true        # stops ALC pumping/pulling up idle hiss between utterances
+wm8960_noise_gate_threshold: 5         # 0-31 (1.5dB steps), a few steps above the room's idle floor
+
 # LED
 led_brightness: 20
 led_night_brightness: 5

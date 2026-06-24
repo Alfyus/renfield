@@ -12,6 +12,13 @@ audio_channels: 2
 beamforming_enabled: true
 beamforming_mic_spacing: 0.040   # ~40mm estimated MEMS spacing
 
+# WM8960 ALC (hardware AGC) — fixes conversational-volume wake-word detection.
+# openWakeWord scores on raw input amplitude; without ALC, normal speech here
+# scored 11-45% (below the 0.5 threshold) and only a raised voice fired. With
+# ALC enabled, normal voice scores 59-77%. Confirmed live 2026-06-24.
+# Tunables (target / max-gain / noise-gate) inherit from group_vars/satellites.yml.
+wm8960_alc_enabled: true
+
 # Whisplay GPIO RGB LED (not APA102)
 led_type: "gpio_rgb"
 led_gpio_red: 25
