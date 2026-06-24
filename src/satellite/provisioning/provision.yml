@@ -621,6 +621,13 @@
     # journal, so the cause of any crash/reboot was wiped on restart and was
     # undiagnosable. Persist the journal (size-capped to bound SD-card wear) so a
     # post-mortem is possible. Mirrors the fix applied to the Esszimmer satellite.
+    - name: Ensure journald.conf.d drop-in directory exists
+      tags: [config, journald]
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: "0755"
+
     - name: Enable persistent journald
       tags: [config, journald]
       ansible.builtin.copy:
