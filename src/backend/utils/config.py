@@ -767,6 +767,21 @@ class Settings(BaseSettings):
     # credential so a rogue LAN device can't register as a satellite at all.
     satellite_irk_allowlist: str = ""
 
+    # Security (review H1, full fix): per-satellite enrollment credential. When
+    # enabled, a satellite must present its enrollment PSK in the register frame
+    # (verified constant-time against the bcrypt hash in the `satellites` table).
+    # Effective-mode state machine (see docs/private/security/satellite-trust-design.md):
+    #   - enabled=False (default): legacy — no PSK checks, byte-identical behavior.
+    #   - enabled=True, not enforcing (PERMISSIVE/soak): a presented PSK is
+    #     verified (wrong/unknown/revoked → reject); no PSK → allowed but logged
+    #     unenrolled; IRKs pushed ONLY to verified-enrolled satellites.
+    #   - ENFORCING (auto-flip latched): no valid PSK → reject.
+    satellite_enrollment_enabled: bool = False
+    # Auto-flip PERMISSIVE→ENFORCING once EVERY enrolled satellite row has
+    # authenticated at least once (not just currently-connected ones), then
+    # latch it persistently. Default off until the fleet is fully enrolled.
+    satellite_enrollment_autoflip_enabled: bool = False
+
     # WebSocket Rate Limiting
     # Note: Audio streaming sends ~12.5 chunks/second, so limits must accommodate this
     ws_rate_limit_enabled: bool = True

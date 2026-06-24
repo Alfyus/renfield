@@ -183,6 +183,36 @@ async def satellite_websocket(
                 capabilities = data.get("capabilities", {})
                 language = data.get("language", settings.default_language)
                 version = data.get("version", "unknown")
+                enrollment_psk = data.get("token")
+
+                # Per-satellite enrollment gate (security review H1). Verify the
+                # enrollment PSK against the `satellites` table. On a DB error we
+                # fail OPEN for the CONNECTION (don't drop the fleet over a
+                # transient blip) but fail CLOSED for the IRK push (satellite_authenticated
+                # stays False → no location-tracking keys handed out). When
+                # enrollment is disabled (default) this whole block is skipped, so
+                # the legacy register path is byte-identical.
+                satellite_authenticated = False
+                if settings.satellite_enrollment_enabled:
+                    try:
+                        from ha_glue.services.satellite_enrollment_service import authorize_register
+
+                        async with AsyncSessionLocal() as enroll_db:
+                            authz = await authorize_register(enroll_db, satellite_id, enrollment_psk)
+                        satellite_authenticated = authz.authenticated
+                        if authz.reject:
+                            logger.warning(
+                                f"🚫 Satellite register rejected for '{satellite_id}': {authz.reason}"
+                            )
+                            await send_ws_error(
+                                websocket, WSErrorCode.UNAUTHORIZED, authz.reason
+                            )
+                            await websocket.close(
+                                code=WSAuthError.UNAUTHORIZED, reason=authz.reason
+                            )
+                            return
+                    except Exception as e:
+                        logger.error(f"⚠️ Satellite enrollment check failed (fail-open connect): {e}")
 
                 # Update connection limiter with actual satellite_id
                 connection_limiter.add_connection(ip_address, satellite_id)
@@ -193,8 +223,20 @@ async def satellite_websocket(
                     websocket=websocket,
                     capabilities=capabilities,
                     language=language,
-                    version=version
+                    version=version,
+                    authenticated=satellite_authenticated,
                 )
+                if not success:
+                    # register() refused (e.g. an unauthenticated connection
+                    # tried to evict an enrolled incumbent). Close out.
+                    logger.warning(f"🚫 Satellite registration refused for '{satellite_id}'")
+                    await send_ws_error(
+                        websocket, WSErrorCode.UNAUTHORIZED, "registration-refused"
+                    )
+                    await websocket.close(
+                        code=WSAuthError.UNAUTHORIZED, reason="registration-refused"
+                    )
+                    return
 
                 # Persist room assignment to database
                 room_id = None
@@ -265,10 +307,13 @@ async def satellite_websocket(
                                 "devices": list(classic_macs),
                             })
                         # Per-person IRKs for resolving rotating RPAs (iPhones).
-                        # Allowlist-gated per satellite (review H1) — IRKs are
-                        # location-tracking keys; don't hand them to any device
-                        # that registers.
-                        irks = presence_svc.irks_for_satellite(satellite_id)
+                        # IRKs are location-tracking keys; gated per satellite
+                        # (review H1). When enrollment is on, only a satellite
+                        # that presented a valid PSK gets them; otherwise the
+                        # legacy allowlist applies.
+                        irks = presence_svc.irks_for_satellite(
+                            satellite_id, is_enrolled_authenticated=satellite_authenticated
+                        )
                         if irks:
                             await websocket.send_json({
                                 "type": "ble_known_irks",

@@ -629,6 +629,16 @@ async def ha_glue_register_routes(*, app: Any) -> None:
                 "ha_glue.bootstrap: satellites router mount failed"
             )
 
+        # --- Satellite enrollment admin router (security review H1) ---
+        try:
+            from ha_glue.api.routes.satellite_enrollment import router as sat_enroll_router
+            app.include_router(sat_enroll_router, tags=["Satellites"])
+            logger.info("✅ ha_glue: mounted /api/satellite-enrollment")
+        except Exception:  # noqa: BLE001
+            logger.opt(exception=True).warning(
+                "ha_glue.bootstrap: satellite_enrollment router mount failed"
+            )
+
     # --- Rooms REST router ---
     try:
         from ha_glue.api.routes.rooms import router as rooms_router
