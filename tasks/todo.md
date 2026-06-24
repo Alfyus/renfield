@@ -37,12 +37,15 @@ Ship DARK behind `satellite_enrollment_enabled` (default off → byte-identical)
 - [ ] **Remaining validation**: run the migration up/down on a throwaway PG DB (mechanically trivial; mirrors
       the proven `pc20260619` pattern; tables already exercised via `create_all` in the 36 tests).
 
-## PR-B — satellite + provisioning
-- [ ] satellite `config.py` — `satellite.enrollment_token` + `RENFIELD_ENROLLMENT_TOKEN`.
-- [ ] `network/websocket_client.py::_register()` — include `"token"` when present.
-- [ ] `satellite.yaml.j2` + host_vars templating; k8s per-pod secret → env.
-- [ ] `bin/enroll_satellite.py` — server-side mint+seed, print PSK once (UI + Ansible share it).
-- [ ] satellite tests: register frame carries token; config loads enrollment_token.
+## PR-B — satellite + provisioning — IMPLEMENTED (same branch)
+- [x] satellite `config.py` — `ServerConfig.enrollment_token` + YAML load (blank→None) + `RENFIELD_ENROLLMENT_TOKEN` env.
+- [x] `network/websocket_client.py` — `enrollment_token` ctor param; `_register()` includes `"token"` only when set
+      (legacy frame shape preserved); wired through in `satellite.py`.
+- [x] `satellite.yaml.j2` — `enrollment_token: "{{ satellite_enrollment_token | default('') }}"`; group_vars default `""`
+      + comment (real token in gitignored host_vars); k8s per-pod `secretKeyRef` (`optional: true` so the pod still boots dark).
+- [x] `bin/enroll_satellite.py` — server-side mint/rotate, prints PSK to stdout once (UI + Ansible share the service path).
+- [x] satellite tests `tests/satellite/test_enrollment_token.py` — config (default/YAML/blank/env) + register frame include/omit.
+- [x] **Validated on .159**: `34 passed` (6 new + 28 existing config/websocket regression). k8s manifest parses. Box restored.
 
 ## PR-C — UI (fast-follow)
 - [ ] `components/satellites/SatelliteEnrollment.tsx` (ADMIN), patterned on `IrkPairing.tsx`.

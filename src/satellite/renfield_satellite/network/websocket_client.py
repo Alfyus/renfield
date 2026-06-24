@@ -72,6 +72,7 @@ class WebSocketClient:
         ping_interval: int = 15,
         ping_timeout: int = 8,
         register_timeout: float = 15.0,
+        enrollment_token: Optional[str] = None,
     ):
         """
         Initialize WebSocket client.
@@ -101,6 +102,9 @@ class WebSocketClient:
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
         self._register_timeout = register_timeout
+        # Per-satellite enrollment PSK (security H1); sent in the register frame
+        # when set, verified server-side against the `satellites` table.
+        self._enrollment_token = enrollment_token
 
         self._ws: Optional["WebSocketClientProtocol"] = None
         self._state = ConnectionState.DISCONNECTED
@@ -377,6 +381,10 @@ class WebSocketClient:
             },
             "protocol_version": self._protocol_version
         }
+        # Carry the enrollment PSK only when provisioned, so a non-enrolled
+        # satellite's frame is unchanged (server treats absent token as legacy).
+        if self._enrollment_token:
+            message["token"] = self._enrollment_token
 
         await self._send(message)
 

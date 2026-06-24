@@ -43,6 +43,11 @@ class ServerConfig:
     # Authentication (required when server has WS_AUTH_ENABLED=true)
     auth_enabled: bool = False  # Whether to fetch and use auth token
     auth_token: Optional[str] = None  # Pre-configured token (optional)
+    # Per-satellite enrollment PSK (security review H1). Provisioned out-of-band
+    # (Ansible host_vars / k8s secret), presented in the register frame and
+    # verified server-side against the `satellites` table. Independent of
+    # auth_enabled (the WS-JWT path); empty = not enrolled (legacy behavior).
+    enrollment_token: Optional[str] = None
     # TLS verification (set False only for self-signed certificates)
     verify_tls: bool = True
 
@@ -266,6 +271,10 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.server.verify_tls = srv.get("verify_tls", config.server.verify_tls)
         if "auth_token" in srv:
             config.server.auth_token = srv["auth_token"]
+        if "enrollment_token" in srv:
+            # Treat a blank template value ("") as "not enrolled" so the
+            # register frame omits the token rather than sending an empty one.
+            config.server.enrollment_token = srv["enrollment_token"] or None
 
     if "audio" in config_data:
         aud = config_data["audio"]
@@ -378,6 +387,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.server.auth_enabled = os.environ["RENFIELD_AUTH_ENABLED"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_AUTH_TOKEN"):
         config.server.auth_token = os.environ["RENFIELD_AUTH_TOKEN"]
+    if os.environ.get("RENFIELD_ENROLLMENT_TOKEN"):
+        config.server.enrollment_token = os.environ["RENFIELD_ENROLLMENT_TOKEN"] or None
     if os.environ.get("RENFIELD_VERIFY_TLS"):
         config.server.verify_tls = os.environ["RENFIELD_VERIFY_TLS"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_BLE_ENABLED"):

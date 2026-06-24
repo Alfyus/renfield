@@ -18,6 +18,9 @@ server:
   max_disconnected_seconds: {{ server_max_disconnected_seconds | default(300) }}
   auth_enabled: {{ server_auth_enabled | lower }}
   verify_tls: {{ server_verify_tls | lower }}
+  # Per-satellite enrollment PSK (security H1). Set per host in the gitignored
+  # host_vars/satellite-<name>.yml; empty = not enrolled (legacy behavior).
+  enrollment_token: "{{ satellite_enrollment_token | default('') }}"
 
 audio:
   sample_rate: 16000
