@@ -89,6 +89,16 @@ class WakeWordConfig:
     models_path: str = "/opt/renfield-satellite/models"
     refractory_seconds: float = 2.0  # Cooldown before re-triggering
     stop_words: List[str] = field(default_factory=list)  # Words to cancel interaction
+    # VAD-gating: only run (expensive) wake-word inference when the VAD reports
+    # speech, freeing CPU headroom so audio frames are not dropped under load.
+    # OFF by default: with a high vad_silero_threshold this can SUPPRESS quiet
+    # speech (the VAD never opens the gate), so it must be paired with a low VAD
+    # threshold and validated per-room before enabling. The real cure for
+    # amplitude-sensitive scoring is input-level AGC (e.g. the WM8960 ALC), not
+    # this optimization. Opt-in via `wakeword.vad_gated: true`.
+    vad_gated: bool = False
+    vad_gate_preroll_chunks: int = 4   # chunks of context fed at speech onset (~320ms)
+    vad_gate_tail_chunks: int = 15     # chunks to keep running after last speech (~1.2s)
 
 
 @dataclass
@@ -281,6 +291,9 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.wakeword.threshold = ww.get("threshold", config.wakeword.threshold)
         config.wakeword.models_path = ww.get("models_path", config.wakeword.models_path)
         config.wakeword.refractory_seconds = ww.get("refractory_seconds", config.wakeword.refractory_seconds)
+        config.wakeword.vad_gated = ww.get("vad_gated", config.wakeword.vad_gated)
+        config.wakeword.vad_gate_preroll_chunks = ww.get("vad_gate_preroll_chunks", config.wakeword.vad_gate_preroll_chunks)
+        config.wakeword.vad_gate_tail_chunks = ww.get("vad_gate_tail_chunks", config.wakeword.vad_gate_tail_chunks)
         if "stop_words" in ww:
             config.wakeword.stop_words = ww["stop_words"]
 
