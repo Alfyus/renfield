@@ -47,8 +47,18 @@ Ship DARK behind `satellite_enrollment_enabled` (default off → byte-identical)
 - [x] satellite tests `tests/satellite/test_enrollment_token.py` — config (default/YAML/blank/env) + register frame include/omit.
 - [x] **Validated on .159**: `34 passed` (6 new + 28 existing config/websocket regression). k8s manifest parses. Box restored.
 
-## PR-C — UI (fast-follow)
-- [ ] `components/satellites/SatelliteEnrollment.tsx` (ADMIN), patterned on `IrkPairing.tsx`.
+## PR-C — UI — IMPLEMENTED (same branch)
+- [x] `api/resources/satelliteEnrollment.ts` — list/status/enroll/revoke hooks (+ `keys.satellites.enrollment*`).
+- [x] `components/satellites/SatelliteEnrollment.tsx` — status badges (enabled/enforcing/permissive/pending),
+      enroll form (id datalist of connected sats + room), **one-time token reveal** (copy), enrolled list
+      (connected dot + last-auth + rotate + revoke). Patterned on `IrkPairing.tsx`.
+- [x] Wired into `SatellitesPage.tsx` (section after the satellite list).
+- [x] i18n: 26 keys under `satellites.enrollment.*` in de.json + en.json (minimal-diff insert).
+- [x] MSW default handlers for `/api/satellite-enrollment[/status]` (empty/disabled fleet).
+- [x] Tests: `tests/frontend/react/components/SatelliteEnrollment.test.tsx` (mint+reveal / list+revoke / enforcing badge).
+- [x] **Validated**: vitest 6/6 (3 new + 3 existing SatellitesPage regression — fixed a datalist room-text
+      collision); `tsc --noEmit` clean for my files (2 errors pre-existing, unrelated); eslint clean for my
+      files (2 errors pre-existing in SatellitesPage transcription line).
 
 ## Rollout (ops, post-merge, staged)
 - [ ] enroll fleet → write PSKs to host_vars / k8s secrets → re-provision → flip

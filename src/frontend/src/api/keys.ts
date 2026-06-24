@@ -70,6 +70,8 @@ export const keys = {
     all: ['satellites'] as const,
     list: () => ['satellites', 'list'] as const,
     detail: (id: number) => ['satellites', 'detail', id] as const,
+    enrollment: () => ['satellites', 'enrollment'] as const,
+    enrollmentStatus: () => ['satellites', 'enrollment', 'status'] as const,
   },
   presence: {
     all: ['presence'] as const,

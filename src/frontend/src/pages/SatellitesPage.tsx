@@ -22,6 +22,7 @@ import {
   type SatState,
   type SatelliteData,
 } from '../api/resources/satellites';
+import SatelliteEnrollment from '../components/satellites/SatelliteEnrollment';
 import { extractApiError } from '../utils/axios';
 
 interface AudioLevelMeterProps {
@@ -554,6 +555,9 @@ export default function SatellitesPage() {
           ))}
         </div>
       )}
+
+      {/* Per-satellite enrollment credentials (security H1) */}
+      <SatelliteEnrollment />
     </div>
   );
 }
