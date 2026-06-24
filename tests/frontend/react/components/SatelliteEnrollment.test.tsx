@@ -39,6 +39,25 @@ describe('SatelliteEnrollment', () => {
     expect(screen.getByText('Schlüssel für sat-wohnzimmer erstellt')).toBeInTheDocument();
   });
 
+  it('maps a 409 to the actionable "use Rotate" hint', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/satellites`, () =>
+        HttpResponse.json({ satellites: [], latest_version: '' }),
+      ),
+      http.post(`${BASE_URL}/api/satellite-enrollment/enroll`, () =>
+        HttpResponse.json({ detail: 'already enrolled' }, { status: 409 }),
+      ),
+    );
+
+    renderWithProviders(<SatelliteEnrollment />);
+    await userEvent.type(screen.getByLabelText('Satelliten-ID'), 'sat-x');
+    await userEvent.click(screen.getByRole('button', { name: 'Einschreiben' }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Neu ausstellen/)).toBeInTheDocument();
+    });
+  });
+
   it('lists enrolled satellites with a revoke action', async () => {
     server.use(
       http.get(`${BASE_URL}/api/satellites`, () =>

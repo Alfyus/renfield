@@ -72,8 +72,10 @@ async def enroll_satellite(
     token_hash = pwd_context.hash(token)
 
     if existing is not None:
-        active = existing.is_enabled and existing.revoked_at is None
-        if active and not rotate:
+        # Any existing row (active OR revoked) requires an explicit rotate to be
+        # mutated — so a plain enroll can never silently re-enable a deliberately
+        # revoked satellite (review finding).
+        if not rotate:
             return None
         # Rotate / re-activate: issue a fresh PSK, reset auth state so the
         # satellite must re-authenticate (and the auto-flip latch reflects it).
@@ -181,12 +183,21 @@ async def maybe_autoflip(db: AsyncSession) -> bool:
     ``satellite_enrollment_autoflip_enabled`` is on AND there is ≥1 enrolled
     satellite AND none of them has a NULL ``last_authenticated_at``. Returns
     True if it flipped on this call.
+
+    Reads first and only mutates on the actual flip — so the common no-flip
+    call touches no rows (no INSERT/flush churn) and the latch is an UPDATE of
+    the migration-seeded singleton (race-safe vs. a concurrent INSERT).
     """
     if not (enrollment_enabled() and settings.satellite_enrollment_autoflip_enabled):
         return False
 
-    state = await _get_or_create_fleet_state(db)
-    if state.enrollment_enforced_at is not None:
+    # Cheap read: already latched? (no row creation)
+    state = (
+        await db.execute(
+            select(SatelliteFleetState).where(SatelliteFleetState.id == _FLEET_STATE_ID)
+        )
+    ).scalar_one_or_none()
+    if state is not None and state.enrollment_enforced_at is not None:
         return False  # already latched
 
     # Count active (non-revoked) enrolled satellites and how many have never
@@ -214,6 +225,10 @@ async def maybe_autoflip(db: AsyncSession) -> bool:
     if pending:
         return False
 
+    # Flip: UPDATE the seeded singleton (create only as a fallback for an
+    # un-migrated DB, e.g. the sqlite test harness).
+    if state is None:
+        state = await _get_or_create_fleet_state(db)
     state.enrollment_enforced_at = _utcnow()
     await db.commit()
     logger.warning(

@@ -92,6 +92,18 @@ class TestEnrollRotation:
         new = await svc.enroll_satellite(db_session, "sat-x", rotate=True)
         assert await svc.evaluate_credential(db_session, "sat-x", new) == svc.VERDICT_OK
 
+    async def test_plain_enroll_does_not_resurrect_revoked(self, db_session: AsyncSession):
+        # A revoked satellite must NOT be silently re-enabled by a plain enroll;
+        # resurrection requires an explicit rotate (review finding).
+        await svc.enroll_satellite(db_session, "sat-x")
+        await svc.revoke_satellite(db_session, "sat-x")
+        assert await svc.enroll_satellite(db_session, "sat-x") is None  # no rotate → refused
+        # Still revoked: even the (now-unknown) caller can't authenticate.
+        row = (
+            await db_session.execute(select(Satellite).where(Satellite.satellite_id == "sat-x"))
+        ).scalar_one()
+        assert row.is_enabled is False and row.revoked_at is not None
+
 
 @pytest.mark.backend
 @pytest.mark.database

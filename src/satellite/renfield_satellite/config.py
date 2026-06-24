@@ -4,10 +4,13 @@ Configuration management for Renfield Satellite
 Loads configuration from YAML file and environment variables.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 # Type alias for list default factory
@@ -275,6 +278,17 @@ def load_config(config_path: Optional[str] = None) -> Config:
             # Treat a blank template value ("") as "not enrolled" so the
             # register frame omits the token rather than sending an empty one.
             config.server.enrollment_token = srv["enrollment_token"] or None
+            if not config.server.enrollment_token:
+                # The key is present but resolved blank — likely a provisioning
+                # miss (un-rendered host_var / empty secret). Warn loudly: this
+                # satellite registers UNENROLLED and will be rejected once the
+                # fleet enforces. (Silent degrade hid the cryptography no-op bug.)
+                logger.warning(
+                    "server.enrollment_token is present but BLANK — registering "
+                    "UNENROLLED. Provision satellite_enrollment_token (host_vars) "
+                    "or RENFIELD_ENROLLMENT_TOKEN, or the satellite will be "
+                    "rejected once enrollment enforcement is on."
+                )
 
     if "audio" in config_data:
         aud = config_data["audio"]

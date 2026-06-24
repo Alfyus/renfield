@@ -186,14 +186,20 @@ async def satellite_websocket(
                 enrollment_psk = data.get("token")
 
                 # Per-satellite enrollment gate (security review H1). Verify the
-                # enrollment PSK against the `satellites` table. On a DB error we
-                # fail OPEN for the CONNECTION (don't drop the fleet over a
-                # transient blip) but fail CLOSED for the IRK push (satellite_authenticated
-                # stays False → no location-tracking keys handed out). When
-                # enrollment is disabled (default) this whole block is skipped, so
-                # the legacy register path is byte-identical.
+                # enrollment PSK against the `satellites` table. When enrollment is
+                # disabled (default) this whole block is skipped, so the legacy
+                # register path is byte-identical.
+                #
+                # FAIL CLOSED: if the authorization check raises (e.g. the DB is
+                # unreachable / the pool is exhausted), we cannot prove this
+                # connection is authorized AND cannot even read whether the fleet
+                # is enforcing — so we REJECT rather than admit an unauthenticated
+                # satellite. A fail-open here would let an attacker bypass
+                # ENFORCING by inducing a DB error (review finding). Transient
+                # blips are recoverable: the satellite's reconnect loop retries.
                 satellite_authenticated = False
                 if settings.satellite_enrollment_enabled:
+                    reject_reason: str | None = None
                     try:
                         from ha_glue.services.satellite_enrollment_service import authorize_register
 
@@ -201,18 +207,20 @@ async def satellite_websocket(
                             authz = await authorize_register(enroll_db, satellite_id, enrollment_psk)
                         satellite_authenticated = authz.authenticated
                         if authz.reject:
-                            logger.warning(
-                                f"🚫 Satellite register rejected for '{satellite_id}': {authz.reason}"
-                            )
-                            await send_ws_error(
-                                websocket, WSErrorCode.UNAUTHORIZED, authz.reason
-                            )
-                            await websocket.close(
-                                code=WSAuthError.UNAUTHORIZED, reason=authz.reason
-                            )
-                            return
+                            reject_reason = authz.reason
                     except Exception as e:
-                        logger.error(f"⚠️ Satellite enrollment check failed (fail-open connect): {e}")
+                        logger.error(f"⚠️ Satellite enrollment check errored (fail-closed): {e}")
+                        satellite_authenticated = False
+                        reject_reason = "enrollment-unavailable"
+                    if reject_reason:
+                        logger.warning(
+                            f"🚫 Satellite register rejected for '{satellite_id}': {reject_reason}"
+                        )
+                        await send_ws_error(websocket, WSErrorCode.UNAUTHORIZED, reject_reason)
+                        await websocket.close(
+                            code=WSAuthError.UNAUTHORIZED, reason=reject_reason
+                        )
+                        return
 
                 # Update connection limiter with actual satellite_id
                 connection_limiter.add_connection(ip_address, satellite_id)

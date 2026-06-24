@@ -973,7 +973,9 @@
       "offline": "Offline",
       "revoked": "widerrufen",
       "revoke": "Widerrufen",
-      "rotate": "Neu ausstellen"
+      "rotate": "Neu ausstellen",
+      "alreadyEnrolled": "Bereits eingeschrieben — nutze „Neu ausstellen\", um ein frisches Token zu erzeugen.",
+      "copyFailed": "Kopieren fehlgeschlagen — Token manuell markieren und kopieren (wird nur einmal angezeigt)."
     }
   },
   "presence": {

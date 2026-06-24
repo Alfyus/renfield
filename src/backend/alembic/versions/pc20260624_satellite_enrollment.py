@@ -50,6 +50,10 @@ def upgrade() -> None:
         sa.Column("enrollment_enforced_at", sa.DateTime(), nullable=True),
         sa.Column("updated_at", sa.DateTime(), nullable=True),
     )
+    # Pre-seed the singleton row so the runtime never races to INSERT id=1
+    # (two satellites authenticating concurrently across pods would otherwise
+    # both INSERT → IntegrityError). The latch starts un-set (NULL).
+    op.execute("INSERT INTO satellite_fleet_state (id, enrollment_enforced_at) VALUES (1, NULL)")
 
 
 def downgrade() -> None:

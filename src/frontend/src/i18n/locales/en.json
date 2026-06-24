@@ -973,7 +973,9 @@
       "offline": "Offline",
       "revoked": "revoked",
       "revoke": "Revoke",
-      "rotate": "Rotate"
+      "rotate": "Rotate",
+      "alreadyEnrolled": "Already enrolled — use “Rotate” to issue a fresh token.",
+      "copyFailed": "Copy failed — select the token manually (it is shown only once)."
     }
   },
   "presence": {

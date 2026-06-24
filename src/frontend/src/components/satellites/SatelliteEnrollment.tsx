@@ -36,6 +36,7 @@ export default function SatelliteEnrollment() {
   const [room, setRoom] = useState('');
   const [minted, setMinted] = useState<EnrollResult | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const enrolledIds = new Set(enrollments.map((e) => e.satellite_id));
@@ -45,6 +46,7 @@ export default function SatelliteEnrollment() {
     setError(null);
     setMinted(null);
     setCopied(false);
+    setCopyFailed(false);
     try {
       const result = await enroll.mutateAsync({
         satellite_id: satelliteId.trim(),
@@ -56,8 +58,15 @@ export default function SatelliteEnrollment() {
         setSatelliteId('');
         setRoom('');
       }
-    } catch {
-      setError(t('satellites.enrollment.enrollFailed'));
+    } catch (e) {
+      // 409 = already enrolled → point the admin at Rotate instead of a
+      // generic failure (the backend computed this actionable next step).
+      const status = (e as { response?: { status?: number } })?.response?.status;
+      setError(
+        status === 409
+          ? t('satellites.enrollment.alreadyEnrolled')
+          : t('satellites.enrollment.enrollFailed'),
+      );
     }
   };
 
@@ -66,8 +75,12 @@ export default function SatelliteEnrollment() {
     try {
       await navigator.clipboard.writeText(minted.token);
       setCopied(true);
+      setCopyFailed(false);
     } catch {
+      // The token is shown ONCE — a silently-failed copy could lose it. Tell
+      // the user to select it manually instead of leaving the button inert.
       setCopied(false);
+      setCopyFailed(true);
     }
   };
 
@@ -177,6 +190,11 @@ export default function SatelliteEnrollment() {
               {copied ? t('satellites.enrollment.copied') : t('satellites.enrollment.copy')}
             </button>
           </div>
+          {copyFailed && (
+            <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+              {t('satellites.enrollment.copyFailed')}
+            </p>
+          )}
         </div>
       )}
 
