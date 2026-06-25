@@ -200,6 +200,17 @@ class EnviroConfig:
 
 
 @dataclass
+class UpdateConfig:
+    """OTA update authenticity settings (security H6)."""
+    # Pinned Ed25519 release public keys (64-hex each); the signed release
+    # manifest is verified against these. Multiple = key rotation. Safe in git.
+    release_pubkeys: List[str] = field(default_factory=list)
+    # When True, reject an OTA update that has no valid signed manifest
+    # (fail closed). Default False = verify-if-present.
+    require_signature: bool = False
+
+
+@dataclass
 class Config:
     """Main configuration container"""
     satellite: SatelliteConfig = field(default_factory=SatelliteConfig)
@@ -213,6 +224,7 @@ class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     ble: BLEConfig = field(default_factory=BLEConfig)
     enviro: EnviroConfig = field(default_factory=EnviroConfig)
+    update: UpdateConfig = field(default_factory=UpdateConfig)
 
 
 def load_config(config_path: Optional[str] = None) -> Config:
@@ -383,6 +395,17 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.enviro.enabled = env.get("enabled", config.enviro.enabled)
         config.enviro.read_interval = env.get("read_interval", config.enviro.read_interval)
 
+    if "update" in config_data:
+        upd = config_data["update"]
+        pubkeys = upd.get("release_pubkeys", config.update.release_pubkeys)
+        # Tolerate a single string or a list; drop blanks.
+        if isinstance(pubkeys, str):
+            pubkeys = [pubkeys]
+        config.update.release_pubkeys = [str(k).strip() for k in (pubkeys or []) if str(k).strip()]
+        config.update.require_signature = bool(
+            upd.get("require_signature", config.update.require_signature)
+        )
+
     # Environment variable overrides
     if os.environ.get("RENFIELD_SATELLITE_ID"):
         config.satellite.id = os.environ["RENFIELD_SATELLITE_ID"]
@@ -401,6 +424,12 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.server.auth_enabled = os.environ["RENFIELD_AUTH_ENABLED"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_AUTH_TOKEN"):
         config.server.auth_token = os.environ["RENFIELD_AUTH_TOKEN"]
+    if os.environ.get("RENFIELD_RELEASE_PUBKEYS"):
+        config.update.release_pubkeys = [
+            k.strip() for k in os.environ["RENFIELD_RELEASE_PUBKEYS"].split(",") if k.strip()
+        ]
+    if os.environ.get("RENFIELD_OTA_REQUIRE_SIGNATURE"):
+        config.update.require_signature = os.environ["RENFIELD_OTA_REQUIRE_SIGNATURE"].lower() in ("true", "1", "yes")
     if "RENFIELD_ENROLLMENT_TOKEN" in os.environ:
         # Presence check (not truthiness) so an env-set-but-BLANK token (e.g. a
         # k8s Secret with an empty value) gets the same loud warning as the YAML

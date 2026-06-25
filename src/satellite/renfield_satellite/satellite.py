@@ -253,6 +253,8 @@ class Satellite:
         # policy as the WS/auth paths (review H6).
         self.update_manager = UpdateManager(
             verify_tls=self.config.server.verify_tls,
+            release_pubkeys=self.config.update.release_pubkeys,
+            require_signature=self.config.update.require_signature,
         )
 
         # BLE Scanner (optional, for presence detection)
@@ -1390,7 +1392,15 @@ class Satellite:
             pass
         print("Classic BT scan loop stopped")
 
-    def _on_update_request(self, target_version: str, package_url: str, checksum: str, size_bytes: int):
+    def _on_update_request(
+        self,
+        target_version: str,
+        package_url: str,
+        checksum: str,
+        size_bytes: int,
+        manifest: str | None = None,
+        signature: str | None = None,
+    ):
         """
         Handle OTA update request from server.
 
@@ -1399,6 +1409,7 @@ class Satellite:
             package_url: URL path to download package
             checksum: Expected checksum (sha256:hexdigest)
             size_bytes: Expected package size
+            manifest/signature: signed release manifest (H6), verified before install
         """
         print(f"📦 OTA Update requested: v{target_version}")
 
@@ -1413,9 +1424,22 @@ class Satellite:
             return
 
         # Start update asynchronously
-        self._schedule_async(self._start_update(target_version, package_url, checksum, size_bytes, base_url))
+        self._schedule_async(
+            self._start_update(
+                target_version, package_url, checksum, size_bytes, base_url, manifest, signature
+            )
+        )
 
-    async def _start_update(self, target_version: str, package_url: str, checksum: str, size_bytes: int, base_url: str):
+    async def _start_update(
+        self,
+        target_version: str,
+        package_url: str,
+        checksum: str,
+        size_bytes: int,
+        base_url: str,
+        manifest: str | None = None,
+        signature: str | None = None,
+    ):
         """Start the OTA update process"""
         from . import __version__
         old_version = __version__
@@ -1427,7 +1451,9 @@ class Satellite:
             package_url=package_url,
             checksum=checksum,
             size_bytes=size_bytes,
-            base_url=base_url
+            base_url=base_url,
+            manifest=manifest,
+            signature=signature,
         )
 
         if success:

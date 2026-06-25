@@ -63,6 +63,11 @@ class UpdateRequest:
     package_url: str
     checksum: str  # Format: "sha256:hexdigest"
     size_bytes: int
+    # Signed release manifest (security H6). manifest = the canonical JSON bytes
+    # the offline release key signed; signature = base64 Ed25519 over them.
+    # Absent on unsigned/legacy releases (verified only when present, or required).
+    manifest: str | None = None
+    signature: str | None = None
 
 
 class UpdateManager:
@@ -79,6 +84,8 @@ class UpdateManager:
         backup_path: Optional[str] = None,
         service_name: str = "renfield-satellite",
         verify_tls: bool = True,
+        release_pubkeys: Optional[list] = None,
+        require_signature: bool = False,
     ):
         """
         Initialize UpdateManager.
@@ -92,8 +99,15 @@ class UpdateManager:
                 code-delivery path and must not silently disable verification.
                 Tied to the same config.server.verify_tls as the WS/auth paths;
                 set False only for a self-signed local backend.
+            release_pubkeys: Pinned Ed25519 release public keys (64-hex each) the
+                signed manifest is verified against (security H6). N keys → rotation.
+            require_signature: When True, an update with no valid signed manifest
+                is REJECTED (fail closed). Default False = verify-if-present
+                (legacy/unsigned releases still install on the checksum alone).
         """
         self.verify_tls = verify_tls
+        self.release_pubkeys = [k for k in (release_pubkeys or []) if k]
+        self.require_signature = require_signature
         # Default paths
         if install_path:
             self.install_path = Path(install_path)
@@ -193,7 +207,9 @@ class UpdateManager:
         package_url: str,
         checksum: str,
         size_bytes: int,
-        base_url: str = ""
+        base_url: str = "",
+        manifest: Optional[str] = None,
+        signature: Optional[str] = None,
     ) -> bool:
         """
         Start the update process.
@@ -225,7 +241,9 @@ class UpdateManager:
             target_version=target_version,
             package_url=full_url,
             checksum=checksum,
-            size_bytes=size_bytes
+            size_bytes=size_bytes,
+            manifest=manifest,
+            signature=signature,
         )
 
         try:
@@ -244,6 +262,11 @@ class UpdateManager:
 
             # 4. Extract package (55-70%)
             extract_path = self._extract_package(package_path)
+
+            # 4b. Verify the signed release manifest BEFORE installing (H6):
+            # authenticity, not just integrity. Aborts (no install) on any
+            # tamper/mismatch, or when a signature is required but absent.
+            self._verify_signature(extract_path, request)
 
             # 5. Install (70-90%)
             self._install_package(extract_path)
@@ -390,6 +413,69 @@ class UpdateManager:
             raise
         except Exception as e:
             raise UpdateError(UpdateStage.VERIFYING, str(e))
+
+    def _verify_signature(self, extract_path: Path, request: "UpdateRequest"):
+        """Verify the signed release manifest against the extracted tree (H6).
+
+        Fail-closed when ``require_signature`` is set; otherwise verify only when
+        a signature is present (an unsigned/legacy release still installs on the
+        checksum alone, but a present-but-INVALID signature always aborts).
+        """
+        import json as _json
+
+        has_sig = bool(request.manifest and request.signature)
+
+        if not has_sig:
+            if self.require_signature:
+                raise UpdateError(
+                    UpdateStage.VERIFYING,
+                    "release signature required but the update is unsigned — refusing to install",
+                )
+            logger.warning(
+                "OTA package is UNSIGNED (no release manifest) — installing on the "
+                "checksum alone. Set require_signature once the fleet has release keys."
+            )
+            return
+
+        # A signature is present → it MUST verify (even when not required).
+        from renfield_satellite.update.release_manifest import (
+            verify_extracted,
+            verify_signature,
+        )
+
+        self._report_progress(UpdateStage.VERIFYING, 50, "Verifying release signature...")
+        manifest_bytes = request.manifest.encode("utf-8")
+
+        if not self.release_pubkeys:
+            raise UpdateError(
+                UpdateStage.VERIFYING,
+                "update is signed but no release public keys are pinned on this satellite",
+            )
+        if not verify_signature(manifest_bytes, request.signature, self.release_pubkeys):
+            raise UpdateError(
+                UpdateStage.VERIFYING,
+                "release manifest signature does not verify against any pinned key",
+            )
+
+        try:
+            manifest = _json.loads(manifest_bytes)
+        except Exception as e:
+            raise UpdateError(UpdateStage.VERIFYING, f"malformed release manifest: {e}")
+
+        if manifest.get("version") != request.target_version:
+            raise UpdateError(
+                UpdateStage.VERIFYING,
+                f"manifest version {manifest.get('version')!r} != target {request.target_version!r}",
+            )
+
+        problems = verify_extracted(extract_path, manifest)
+        if problems:
+            raise UpdateError(
+                UpdateStage.VERIFYING,
+                f"package contents do not match the signed manifest: {problems[:3]}",
+            )
+
+        self._report_progress(UpdateStage.VERIFYING, 55, "Release signature verified")
 
     def _create_backup(self):
         """Back up only the parts of the install the update will replace.
