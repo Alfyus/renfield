@@ -130,7 +130,7 @@ class WebSocketClient:
         self._on_disconnected: Optional[Callable[[], None]] = None
         self._on_error: Optional[Callable[[str], None]] = None
         self._on_config_update: Optional[Callable[[ServerConfig], None]] = None
-        self._on_update_request: Optional[Callable[[str, str, str, int], None]] = None  # version, url, checksum, size
+        self._on_update_request: Optional[Callable[..., None]] = None  # version, url, checksum, size, manifest, signature
         self._on_ble_known_devices: Optional[Callable[[List[str]], None]] = None
         self._on_classic_bt_known_devices: Optional[Callable[[List[str]], None]] = None
         self._on_ble_irks: Optional[Callable[[List[Dict[str, Any]]], None]] = None
@@ -222,7 +222,7 @@ class WebSocketClient:
         """Register callback for server config updates (wake word settings)"""
         self._on_config_update = callback
 
-    def on_update_request(self, callback: Callable[[str, str, str, int], None]):
+    def on_update_request(self, callback: Callable[..., None]):
         """Register callback for OTA update requests (version, url, checksum, size)"""
         self._on_update_request = callback
 
@@ -592,9 +592,14 @@ class WebSocketClient:
             package_url = data.get("package_url", "")
             checksum = data.get("checksum", "")
             size_bytes = data.get("size_bytes", 0)
+            # Signed release manifest (H6) — None on unsigned/legacy releases.
+            manifest = data.get("manifest")
+            signature = data.get("signature")
             print(f"📥 Update request received: v{target_version}")
             if self._on_update_request:
-                self._on_update_request(target_version, package_url, checksum, size_bytes)
+                self._on_update_request(
+                    target_version, package_url, checksum, size_bytes, manifest, signature
+                )
 
         elif msg_type == "ble_known_devices":
             # Server pushed list of known BLE MAC addresses

@@ -608,6 +608,45 @@ angezeigt). Rollout gestaffelt: dark → Flotte einschreiben → `…_ENABLED=tr
 
 ---
 
+### Signierte OTA-Pakete (Security Review H6)
+
+Code-Authentizität unabhängig von Transport/Backend: ein Release wird über ein
+**signiertes Quell-Manifest** (Version + sortierte Pro-Datei-SHA256) abgesichert,
+das **offline** mit einem Ed25519-Release-Key signiert wird. Das Backend
+**leitet** Manifest+Signatur nur weiter (kann nicht signieren); der Satellit
+prüft Signatur (gegen gepinnte Public Keys) + Datei-Hashes + Version **vor** dem
+Install.
+
+```bash
+# Backend: signiertes OTA erzwingen (fail-closed) — Default aus, bis die
+# Signing-Pipeline + Public Keys auf der Flotte sind.
+SATELLITE_OTA_REQUIRE_SIGNATURE=false
+```
+
+**Satellite-Seite** (`satellite.yaml` → `update:`, Public Keys sind git-safe):
+```yaml
+update:
+  require_signature: false      # fail-closed wenn true (auch Env RENFIELD_OTA_REQUIRE_SIGNATURE)
+  release_pubkeys:              # hex Ed25519 Public Keys (mehrere = Rotation;
+    - ""                        # auch Env RENFIELD_RELEASE_PUBKEYS, kommagetrennt)
+```
+
+**Release-Signing (offline, manuell):**
+- `bin/sign_satellite_release.py --gen-key --out <keyfile>` — Keypair erzeugen,
+  Public-Key-Hex in group_vars `satellite_release_pubkeys` eintragen.
+- `bin/sign_satellite_release.py --sign --key <keyfile>` — schreibt
+  `src/satellite/RELEASE_MANIFEST.json` + `.sig` (committen; ins Backend-Image
+  gebacken). Privater Key bleibt OFFLINE (nie auf Build-Box/Backend).
+- `bin/sign_satellite_release.py --verify --pubkey <hex>` — CI/Pre-Build-Check
+  (Manifest == aktuelle Quelle + Signatur gültig).
+
+**Dark by default:** kein committetes Manifest + `require_signature=false`
+→ Backend leitet `None` weiter, Satellit prüft nur Checksum (Legacy). Rollout:
+gen-key → Public Key in group_vars → sign + Image bauen → re-provisionieren →
+`require_signature` flippen.
+
+---
+
 ### Media Follow Me
 
 ```bash

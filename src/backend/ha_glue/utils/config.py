@@ -133,6 +133,11 @@ class HaGlueSettings(BaseSettings):
     # SATELLITE_LATEST_VERSION env) is used only when the source isn't bundled.
     satellite_latest_version: str = "1.4.0"  # Fallback latest satellite version
     satellite_package_cache_ttl: int = Field(default=300, ge=10, le=86400)
+    # Security H6: require a valid offline-signed release manifest before pushing
+    # an OTA update. Default off (verify-if-present) until the release-signing
+    # pipeline + per-satellite pinned public keys are in place; flip to fail-closed
+    # once the fleet has the release pubkeys.
+    satellite_ota_require_signature: bool = False
 
     # === Rooms ===
     rooms_auto_create_from_satellite: bool = True  # Auto-create rooms when satellites register

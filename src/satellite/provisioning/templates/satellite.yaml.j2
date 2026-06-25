@@ -22,6 +22,16 @@ server:
   # host_vars/satellite-<name>.yml; empty = not enrolled (legacy behavior).
   enrollment_token: "{{ satellite_enrollment_token | default('') }}"
 
+# OTA release signing (security H6) — pinned public keys verify the signed
+# release manifest before install. require_signature=false until the signing
+# pipeline is live (then fail-closed).
+update:
+  require_signature: {{ satellite_ota_require_signature | default(false) | lower }}
+  release_pubkeys:
+{% for key in satellite_release_pubkeys | default([]) %}
+    - "{{ key }}"
+{% endfor %}
+
 audio:
   sample_rate: 16000
   chunk_size: 1280

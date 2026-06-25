@@ -26,6 +26,13 @@ server_verify_tls: false
 # the printed token here, re-provision with --tags config. Empty = not enrolled
 # (the backend treats an absent token as legacy until enrollment is enforced).
 satellite_enrollment_token: ""
+
+# OTA release signing (security review H6). PUBLIC keys are safe in git — add the
+# hex public key(s) printed by `bin/sign_satellite_release.py --gen-key`. Multiple
+# entries = key rotation (the satellite accepts any). require_signature stays
+# false until the release-signing pipeline is live, then flip to fail-closed.
+satellite_release_pubkeys: []
+satellite_ota_require_signature: false
 # Connection robustness (Pi Zero 2 W 2.4GHz WiFi is marginal — detect dead links
 # fast and self-heal instead of wedging). See docs/SATELLITE_CONNECTIVITY.md.
 server_ping_interval: 15          # WS keepalive cadence (s)

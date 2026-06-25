@@ -84,6 +84,26 @@ rsync -avz --delete \
   src/satellite/ evdb@192.168.1.159:/tmp/renfield-build-vX.Y.Z/src/backend/satellite/
 ```
 
+#### Optional pre-step — sign the OTA release (security H6)
+
+If signed OTA is in use (the fleet has `release_pubkeys` pinned), sign the
+release BEFORE rsyncing the satellite source, on the **operator workstation**
+(the private Ed25519 key must NEVER touch .159 or the backend):
+
+```bash
+# Re-sign whenever the satellite source changed since the last release.
+python bin/sign_satellite_release.py --sign --key ~/.renfield/ota_release_key
+python bin/sign_satellite_release.py --verify --pubkey <hex>   # manifest == source + sig OK
+git add src/satellite/RELEASE_MANIFEST.json src/satellite/RELEASE_MANIFEST.json.sig
+```
+
+The committed `RELEASE_MANIFEST.json` + `.sig` ride along in the `src/satellite/`
+rsync above and get baked into the backend image; the backend forwards them, the
+satellite verifies before install. Skip this step while signed OTA is dark (no
+manifest committed → backend forwards `None` → satellites use checksum-only).
+First-time setup: `--gen-key`, then add the printed public-key hex to group_vars
+`satellite_release_pubkeys` and re-provision the fleet (`--tags config`).
+
 ### Step 2 — On .159, build + push
 
 ```bash
