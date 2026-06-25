@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 
 import aiofiles
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,7 +25,8 @@ from models.database import (
     Conversation,
     KnowledgeBase,
 )
-from services.auth_service import get_optional_user
+from models.permissions import Permission
+from services.auth_service import get_optional_user, require_permission
 from services.database import AsyncSessionLocal, get_db
 from services.document_processor import DocumentProcessor
 from utils.config import settings
@@ -584,10 +585,16 @@ async def _cleanup_uploads(db: AsyncSession, days: int) -> tuple[int, int]:
 
 @router.delete("/upload/cleanup", response_model=CleanupResponse)
 async def cleanup_old_uploads(
-    days: int = 30,
+    days: int = Query(30, ge=1, le=3650),
     db: AsyncSession = Depends(get_db),
+    user=Depends(require_permission(Permission.SETTINGS_MANAGE)),
 ):
-    """Delete old non-indexed chat uploads."""
+    """Delete old non-indexed chat uploads (admin only).
+
+    Security (review M2): was unauthenticated, and a negative ``days`` pushed the
+    cutoff into the future so it matched + deleted EVERY non-indexed upload across
+    all users. Now SETTINGS_MANAGE-gated with ``days`` floored at 1.
+    """
     deleted_count, deleted_files = await _cleanup_uploads(db, days)
     return CleanupResponse(
         success=True,

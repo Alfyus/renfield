@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -54,6 +54,30 @@ class Settings(BaseSettings):
     piper_default_voice_de: str = "de_DE-thorsten-medium"
     piper_default_voice_en: str = "en_US-amy-medium"
     piper_use_cuda: bool = True
+
+    # Max concurrent /ws/voice sessions (review M4) — bounds GPU STT/TTS abuse.
+    max_concurrent_sessions: int = 16
+
+    @model_validator(mode="after")
+    def _fail_closed_on_default_key(self) -> "Settings":
+        """Security (review M4): refuse to start when local JWT auth is enforced
+        but the signing key is still the public placeholder default. Otherwise an
+        attacker could forge a valid voice token (and harvest the returned
+        speaker_embedding voiceprint). auth_required=False (cluster-internal) and
+        auth_mode=callback are unaffected.
+        """
+        if self.auth_required and self.auth_mode == "local":
+            placeholder = type(self).model_fields["secret_key"].default
+            if isinstance(placeholder, SecretStr):
+                placeholder = placeholder.get_secret_value()
+            if self.secret_key.get_secret_value() == placeholder:
+                raise ValueError(
+                    "VOICE secret_key is the placeholder default while "
+                    "auth_required=true and auth_mode=local — refusing to start. "
+                    "Set a strong random SECRET_KEY (or auth_required=false for "
+                    "cluster-internal deployments)."
+                )
+        return self
 
 
 settings = Settings()

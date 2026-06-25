@@ -17,6 +17,34 @@ from utils.config import settings
 from ha_glue.utils.config import ha_glue_settings
 
 
+# Security (review H1): IRKs permanently de-anonymize a resident's rotating BLE
+# address. Only push them to allowlisted satellites. Track which satellites we've
+# already warned about (when the allowlist is empty) so the warning fires once.
+_irk_ungated_warned: set[str] = set()
+
+
+def irk_push_allowed(satellite_id: str) -> bool:
+    """Whether ``satellite_id`` may receive per-person BLE IRKs.
+
+    Driven by ``settings.satellite_irk_allowlist`` (comma-separated). Non-empty
+    → allow only listed ids. Empty → ungated (legacy) but log a one-shot warning
+    per satellite so the exposure is visible and operators can lock it down.
+    """
+    raw = (settings.satellite_irk_allowlist or "").strip()
+    if raw:
+        allow = {s.strip() for s in raw.split(",") if s.strip()}
+        return satellite_id in allow
+    if satellite_id not in _irk_ungated_warned:
+        _irk_ungated_warned.add(satellite_id)
+        logger.warning(
+            f"⚠️ IRK push to satellite '{satellite_id}' is UNGATED "
+            f"(SATELLITE_IRK_ALLOWLIST empty) — any device registering as a "
+            f"satellite receives household IRKs (location-tracking keys). Set "
+            f"SATELLITE_IRK_ALLOWLIST to the known satellite ids to close this."
+        )
+    return True
+
+
 @dataclass
 class DeviceSighting:
     """A single BLE scan result from a satellite."""
@@ -549,6 +577,16 @@ class PresenceService:
         IRK hex is decrypted in memory; only ever leaves over the WS link."""
         return [{"name": label, "irk": irk} for label, irk in getattr(self, "_irks_hex", {}).items()]
 
+    def irks_for_satellite(self, satellite_id: str) -> list[dict]:
+        """IRK list to push to ``satellite_id``, gated by the allowlist (H1).
+
+        Returns the IRKs only when the satellite is permitted; an empty list
+        otherwise (so the caller's ``if irks:`` guard naturally skips the send).
+        """
+        if not irk_push_allowed(satellite_id):
+            return []
+        return self.get_ble_irks()
+
     async def push_macs_to_satellites(self):
         """Push current known MACs + IRKs to all connected satellites."""
         from ha_glue.services.satellite_manager import get_satellite_manager
@@ -556,9 +594,9 @@ class PresenceService:
         manager = get_satellite_manager()
         ble_macs = list(self.get_ble_macs())
         classic_macs = list(self.get_classic_bt_macs())
-        irks = self.get_ble_irks()
+        all_irks = self.get_ble_irks()
 
-        if not ble_macs and not classic_macs and not irks:
+        if not ble_macs and not classic_macs and not all_irks:
             return
 
         for sat_id, sat_info in manager.satellites.items():
@@ -573,6 +611,8 @@ class PresenceService:
                         "type": "classic_bt_known_devices",
                         "devices": classic_macs,
                     })
+                # IRKs are allowlist-gated per satellite (H1).
+                irks = all_irks if irk_push_allowed(sat_id) else []
                 if irks:
                     await sat_info.websocket.send_json({
                         "type": "ble_known_irks",

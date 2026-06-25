@@ -12,6 +12,13 @@ audio_channels: 2
 beamforming_enabled: true
 beamforming_mic_spacing: 0.058
 
+# WM8960 ALC (hardware AGC) — same conversational-volume wake-word fix as
+# Arbeitszimmer. The 2-Mic V1 HAT is WM8960-based and exposes the ALC controls
+# (verified 2026-06-24). NOTE: this HAT's ALSA card is `seeed2micvoicec`, not the
+# whisplay default. Tunables inherit from group_vars/satellites.yml.
+wm8960_alc_enabled: true
+wm8960_alsa_card: "seeed2micvoicec"
+
 # LEDs (2-Mic HAT: 3 LEDs on SPI 0:0, no power pin)
 led_num: 3
 led_spi_device: 0

@@ -39,6 +39,11 @@
       ansible.builtin.systemd:
         daemon_reexec: true
 
+    - name: restart journald
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted
+
   tasks:
     # =========================================================================
     # SYSTEM — System preparation
@@ -375,6 +380,43 @@
       ansible.builtin.debug:
         var: asound_cards.stdout_lines
 
+    # --- WM8960 ALC: hardware AGC in front of the wake-word model ---
+    # openWakeWord scores on raw input amplitude (its predict() does no loudness
+    # normalization), so without upstream gain-leveling, quiet/normal speech
+    # under-scores and only a raised voice fires. The WM8960 codec ships with
+    # ALC Function=Off; enabling its ALC dynamically lifts quiet/far-field speech
+    # toward a target level. Tagged `audio` so it can be (re)applied on an
+    # existing satellite in isolation — without redeploying satellite.yaml or
+    # rebooting: `ansible-playbook ... --tags audio --limit <host>`.
+    - name: Configure WM8960 ALC hardware AGC for wake-word reliability
+      tags: [driver, config, audio]
+      when: wm8960_alc_enabled | default(false)
+      block:
+        - name: Apply WM8960 ALC + noise-gate mixer controls
+          ansible.builtin.command:
+            argv:
+              - amixer
+              - -c
+              - "{{ wm8960_alsa_card }}"
+              - sset
+              - "{{ item.ctl }}"
+              - "{{ item.val }}"
+          loop:
+            - { ctl: "ALC Function",         val: "{{ wm8960_alc_function }}" }
+            - { ctl: "ALC Max Gain",         val: "{{ wm8960_alc_max_gain | string }}" }
+            - { ctl: "ALC Min Gain",         val: "{{ wm8960_alc_min_gain | string }}" }
+            - { ctl: "ALC Target",           val: "{{ wm8960_alc_target | string }}" }
+            - { ctl: "Noise Gate Threshold", val: "{{ wm8960_noise_gate_threshold | string }}" }
+            - { ctl: "Noise Gate",           val: "{{ 'on' if wm8960_noise_gate_enabled else 'off' }}" }
+          loop_control:
+            label: "{{ item.ctl }} = {{ item.val }}"
+          changed_when: true
+
+        - name: Persist ALSA mixer state (restored on boot by alsa-restore.service)
+          ansible.builtin.command:
+            argv: [alsactl, store]
+          changed_when: true
+
     # =========================================================================
     # PYTHON — Python virtual environment
     # =========================================================================
@@ -534,21 +576,78 @@
         group: root
         mode: "0644"
 
-    - name: Disable WiFi power save (Pi Zero 2 W firmware bug)
-      tags: [config]
+    # WiFi power save causes periodic ~30-50s WebSocket disconnects on the
+    # Pi Zero 2 W brcmfmac: power-save latency makes the satellite miss the
+    # backend's keepalive ping, so the server drops the connection → endless
+    # reconnect loop (measured 98 reconnects / 30 min on Arbeitszimmer until
+    # disabled — looked like "reboots" via the backend's connection-uptime but
+    # the board never restarted). The previous modprobe options did NOT disable
+    # power save (`roamoff` = roaming; `8192cu` = a different Realtek chip) and
+    # /etc/rc.local is not reliably run on Bookworm. NetworkManager also
+    # re-enables power save on every reconnect, so a dispatcher that runs on
+    # each wlan0 `up` is the only robust fix.
+    - name: Install NetworkManager dispatcher to disable WiFi power save
+      tags: [config, wifi]
       ansible.builtin.copy:
-        content: "options brcmfmac roamoff=1\noptions 8192cu rtw_power_mgnt=0 rtw_enusbss=0\n"
-        dest: /etc/modprobe.d/wifi-powersave.conf
-        mode: "0644"
-
-    - name: Add WiFi power save disable to rc.local
-      tags: [config]
-      ansible.builtin.lineinfile:
-        path: /etc/rc.local
-        line: "iw dev wlan0 set power_save off || true"
-        insertbefore: "^exit 0"
-        create: true
+        dest: /etc/NetworkManager/dispatcher.d/50-renfield-wifi-powersave
         mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible — disable WiFi power save whenever wlan0 comes up
+          # (prevents periodic WebSocket disconnects on Pi Zero 2 W brcmfmac).
+          [ "$1" = "wlan0" ] && [ "$2" = "up" ] && /usr/sbin/iw dev wlan0 set power_save off
+          exit 0
+
+    - name: Disable WiFi power save on the active NM connection (persists in profile)
+      tags: [config, wifi]
+      ansible.builtin.shell: |
+        set -o pipefail
+        con=$(nmcli -t -f DEVICE,NAME connection show --active | sed -n 's/^wlan0://p' | head -1)
+        if [ -n "$con" ]; then
+          nmcli connection modify "$con" 802-11-wireless.powersave 2
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+      failed_when: false
+
+    - name: Disable WiFi power save immediately (no reboot/reconnect needed)
+      tags: [config, wifi]
+      ansible.builtin.command: iw dev wlan0 set power_save off
+      changed_when: true
+      failed_when: false
+
+    # Persistent journald: the satellites have no RTC and shipped with a volatile
+    # journal, so the cause of any crash/reboot was wiped on restart and was
+    # undiagnosable. Persist the journal (size-capped to bound SD-card wear) so a
+    # post-mortem is possible. Mirrors the fix applied to the Esszimmer satellite.
+    - name: Ensure journald.conf.d drop-in directory exists
+      tags: [config, journald]
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: Enable persistent journald
+      tags: [config, journald]
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/10-renfield-persistent.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible — persist the journal across reboots for diagnosis.
+          [Journal]
+          Storage=persistent
+          SystemMaxUse=200M
+          SystemMaxFileSize=50M
+      notify: restart journald
+
+    - name: Ensure persistent journal directory exists
+      tags: [config, journald]
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: directory
+        mode: "2755"
+      notify: restart journald
 
     # =========================================================================
     # MODELS — Wake word and VAD models

@@ -758,6 +758,15 @@ class Settings(BaseSettings):
     ws_auth_enabled: bool = False  # Enable WebSocket authentication (set True in production)
     ws_token_expire_minutes: int = 60  # WebSocket token expiration
 
+    # Security (review H1): comma-separated allowlist of satellite_ids permitted
+    # to receive per-person BLE IRKs (which permanently de-anonymize a resident's
+    # rotating BLE address — a location-tracking key). When non-empty, IRKs are
+    # pushed ONLY to listed satellites; when empty (default) the push is ungated
+    # for backward compatibility but logs a loud one-shot warning per satellite.
+    # NOTE: this is a stop-gap — the full fix is a per-satellite enrollment
+    # credential so a rogue LAN device can't register as a satellite at all.
+    satellite_irk_allowlist: str = ""
+
     # WebSocket Rate Limiting
     # Note: Audio streaming sends ~12.5 chunks/second, so limits must accommodate this
     ws_rate_limit_enabled: bool = True
@@ -999,6 +1008,38 @@ class Settings(BaseSettings):
                 f"default: {', '.join(offenders)}. Set them via env vars "
                 "(POSTGRES_PASSWORD, SECRET_KEY, DEFAULT_ADMIN_PASSWORD) or "
                 "Docker Secrets."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def fail_closed_on_insecure_jwt_key(self) -> "Settings":
+        """Security (review M1): refuse to boot when JWT auth is enabled but the
+        signing key is still the in-repo placeholder default.
+
+        A WARNING is insufficient for this case: the placeholder is public (it
+        ships in the repo), so with AUTH_ENABLED=true anyone can forge a valid
+        admin JWT (HS256 over the known key) — a full auth bypass. This check is
+        independent of RENFIELD_ENV (closing the "forgot to set it" gap) and only
+        fires when auth is actually on, so AUTH_ENABLED=false single-user /
+        household deployments and dev/test are unaffected.
+        """
+        if not self.auth_enabled:
+            return self
+        field_info = type(self).model_fields.get("secret_key")
+        placeholder = field_info.default if field_info else None
+        if isinstance(placeholder, SecretStr):
+            placeholder = placeholder.get_secret_value()
+        current = (
+            self.secret_key.get_secret_value()
+            if isinstance(self.secret_key, SecretStr)
+            else self.secret_key
+        )
+        if placeholder is not None and current == placeholder:
+            raise ValueError(
+                "SECRET_KEY is still the placeholder default while "
+                "AUTH_ENABLED=true — refusing to start. The default key is public "
+                "(it ships in the repo), so anyone could forge an admin JWT. Set "
+                "SECRET_KEY to a strong random value (env var or Docker secret)."
             )
         return self
 

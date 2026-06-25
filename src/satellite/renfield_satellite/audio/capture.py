@@ -127,6 +127,12 @@ class AudioCapture:
         self._mic = None
         self._recorder = None
 
+        # Optional per-chunk transform applied in the CONSUMER thread (never the
+        # capture read loop). The PyAudio backend uses this to run stereo->mono
+        # beamforming off the read thread, so heavy numpy work can never delay
+        # stream.read() (an I2S buffer overflow can crash the kernel on Pi Zero 2 W).
+        self._consumer_transform: Optional[Callable[[bytes], bytes]] = None
+
         # Beamformer (lazy initialization)
         self._beamformer: Optional["BeamformerDAS"] = None
         self._mic_spacing = mic_spacing
@@ -379,6 +385,9 @@ class AudioCapture:
             device_info = self._pyaudio.get_device_info_by_index(device_index)
             print(f"Audio capture started: {device_info['name']} (S16_LE/{self.channels}ch)")
 
+            # Beamforming/mono-downmix runs in the consumer thread, off the read loop.
+            self._consumer_transform = self._stereo_to_mono
+
             # Start capture thread (reads audio as fast as possible)
             self._thread = threading.Thread(target=self._pyaudio_capture_loop, daemon=True)
             self._thread.start()
@@ -405,18 +414,13 @@ class AudioCapture:
         try:
             while self._running and self._stream:
                 try:
+                    # Read ONLY — no beamforming/numpy here. Stereo->mono is done
+                    # in the consumer thread via self._consumer_transform so any
+                    # delay between reads (which can overflow the I2S kernel buffer
+                    # and crash the kernel on Pi Zero 2 W) is avoided.
                     audio_bytes = self._stream.read(self.chunk_size, exception_on_overflow=False)
 
-                    if self.channels > 1:
-                        if self._beamformer:
-                            # Beamforming: stereo -> enhanced mono
-                            audio_bytes = self._beamformer.process_bytes(audio_bytes)
-                        else:
-                            # No beamforming: extract channel 0 from interleaved S16_LE
-                            # Per official ReSpeaker 4-mic HAT examples
-                            audio_bytes = np.frombuffer(audio_bytes, dtype=np.int16)[::self.channels].tobytes()
-
-                    # Queue for consumer thread (never block the read loop)
+                    # Queue raw (possibly multi-channel) audio for the consumer thread.
                     try:
                         self._audio_queue.put_nowait(audio_bytes)
                     except queue.Full:
@@ -429,15 +433,31 @@ class AudioCapture:
         finally:
             pass
 
+    def _stereo_to_mono(self, audio_bytes: bytes) -> bytes:
+        """Convert interleaved multi-channel S16_LE to mono.
+
+        Runs in the CONSUMER thread (via self._consumer_transform), never in the
+        capture read loop. Applies DAS beamforming when a beamformer is configured,
+        otherwise extracts channel 0 (per the official ReSpeaker HAT examples).
+        """
+        if self.channels <= 1:
+            return audio_bytes
+        if self._beamformer:
+            return self._beamformer.process_bytes(audio_bytes)
+        return np.frombuffer(audio_bytes, dtype=np.int16)[::self.channels].tobytes()
+
     def _audio_consumer_loop(self):
         """Consumer thread — processes queued audio and calls callback.
 
         Runs separately from the capture thread so that slow callback
-        processing (wake word inference, VAD) doesn't delay reads.
+        processing (wake word inference, VAD) AND the stereo->mono transform
+        don't delay reads.
         """
         while self._running:
             try:
                 audio_bytes = self._audio_queue.get(timeout=0.5)
+                if self._consumer_transform is not None and audio_bytes:
+                    audio_bytes = self._consumer_transform(audio_bytes)
                 if self._callback and audio_bytes:
                     self._callback(audio_bytes)
             except queue.Empty:

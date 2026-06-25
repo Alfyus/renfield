@@ -18,6 +18,7 @@ On any failure after backup creation, the backup is restored automatically.
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -29,6 +30,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 import urllib.request
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateStage(str, Enum):
@@ -74,7 +77,8 @@ class UpdateManager:
         self,
         install_path: Optional[str] = None,
         backup_path: Optional[str] = None,
-        service_name: str = "renfield-satellite"
+        service_name: str = "renfield-satellite",
+        verify_tls: bool = True,
     ):
         """
         Initialize UpdateManager.
@@ -83,7 +87,13 @@ class UpdateManager:
             install_path: Path where satellite is installed
             backup_path: Path for backup during update
             service_name: Name of systemd service to restart
+            verify_tls: Verify the TLS certificate when downloading the update
+                package (review H6). Defaults True — the OTA download is a
+                code-delivery path and must not silently disable verification.
+                Tied to the same config.server.verify_tls as the WS/auth paths;
+                set False only for a self-signed local backend.
         """
+        self.verify_tls = verify_tls
         # Default paths
         if install_path:
             self.install_path = Path(install_path)
@@ -296,12 +306,19 @@ class UpdateManager:
                         f"Downloading... ({count * block_size // 1024}KB / {total_size // 1024}KB)"
                     )
 
-            # Run download in thread pool to avoid blocking
-            # Use unverified SSL context for self-signed certs on local network
+            # Run download in thread pool to avoid blocking.
+            # TLS verification on the code-delivery path (review H6): a verifying
+            # context by default; only disabled when verify_tls is explicitly
+            # False (self-signed local backend), matching the WS/auth policy.
             import ssl
             ssl_ctx = ssl.create_default_context()
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
+            if not self.verify_tls:
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                logger.warning(
+                    "OTA download TLS verification is DISABLED (verify_tls=False) "
+                    "— update authenticity relies on the checksum only."
+                )
 
             def _download():
                 req = urllib.request.Request(request.package_url)

@@ -124,6 +124,11 @@ def _accumulated_seconds(state: SessionState) -> float:
 # two *concurrent* drains.
 _ws_send_locks: "weakref.WeakKeyDictionary[WebSocket, asyncio.Lock]" = weakref.WeakKeyDictionary()
 
+# Concurrent /ws/voice session count (review M4) — bounds GPU STT/TTS abuse.
+# Plain int is safe under the single-threaded event loop (no await between the
+# capacity check, increment, and decrement).
+_active_sessions = 0
+
 
 def _send_lock_for(ws: WebSocket) -> asyncio.Lock:
     lock = _ws_send_locks.get(ws)
@@ -394,17 +399,36 @@ async def ws_voice(websocket: WebSocket, token: str | None = Query(default=None)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=str(e))
         return
 
+    # Concurrency cap (review M4): reject when at capacity rather than letting
+    # unbounded parallel sessions exhaust GPU STT/TTS.
+    global _active_sessions
+    if _active_sessions >= settings.max_concurrent_sessions:
+        await websocket.accept()
+        # 1013 = "Try Again Later" (avoid relying on a starlette constant name).
+        await websocket.close(code=1013, reason="server at capacity")
+        logger.warning(
+            "voice session rejected: at capacity (%d)", _active_sessions
+        )
+        return
+
     user_id = str(payload.get("sub") or payload.get("user_id") or "unknown")
     await websocket.accept()
-    logger.info("voice session opened user=%s", user_id)
-
-    stt: STTService = websocket.app.state.stt
-    tts: TTSService = websocket.app.state.tts
-    speaker: SpeakerService = websocket.app.state.speaker
-
+    # SessionState is a plain dataclass (no I/O), so build it BEFORE bumping the
+    # counter — the finally references it, and this guarantees it's bound.
     state = SessionState(user_id=user_id, started_at=time.monotonic())
+    _active_sessions += 1
+    logger.info("voice session opened user=%s (active=%d)", user_id, _active_sessions)
 
     try:
+        # Resolve services INSIDE the try (review M4 follow-up): the counter is
+        # already incremented, so any setup failure here (e.g. an app.state attr
+        # not yet initialized) must still reach the finally that decrements it —
+        # otherwise the slot leaks permanently and the cap eventually wedges the
+        # server into rejecting every session.
+        stt: STTService = websocket.app.state.stt
+        tts: TTSService = websocket.app.state.tts
+        speaker: SpeakerService = websocket.app.state.speaker
+
         while True:
             msg = await websocket.receive()
             if msg["type"] == "websocket.disconnect":
@@ -541,3 +565,4 @@ async def ws_voice(websocket: WebSocket, token: str | None = Query(default=None)
         if state.tts_tasks:
             await asyncio.gather(*state.tts_tasks.values(), return_exceptions=True)
         await _close_decoder(state)
+        _active_sessions -= 1

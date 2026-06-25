@@ -308,7 +308,9 @@ class ConversationService:
     async def load_context(
         self,
         session_id: str,
-        max_messages: int = 20
+        max_messages: int = 20,
+        user_id: int | None = None,
+        enforce_ownership: bool = False,
     ) -> list[dict[str, str]]:
         """
         Lade Konversationskontext aus der Datenbank.
@@ -316,6 +318,12 @@ class ConversationService:
         Args:
             session_id: Session ID der Konversation
             max_messages: Maximale Anzahl zu ladender Nachrichten
+            user_id: Authenticated caller identity (for the ownership check).
+            enforce_ownership: When True (auth-enabled deployments), a conversation
+                owned by a DIFFERENT user is treated as not-found and yields an empty
+                context — closing the cross-user history-read IDOR on the WS path
+                (session_ids are identifiers, not secrets). Defaults False so the
+                voice/household and other internal callers stay byte-identical.
 
         Returns:
             Liste von Nachrichten im Format [{"role": "user|assistant", "content": "..."}]
@@ -329,6 +337,21 @@ class ConversationService:
 
             if not conversation:
                 logger.debug(f"Keine Konversation gefunden für session_id: {session_id}")
+                return []
+
+            # Cross-user IDOR guard: REST endpoints already scope by owner; the WS
+            # path must too. A foreign-owned conversation reads as empty (no history
+            # leak). Ownerless conversations (user_id is None — single-user/household
+            # mode) are not gated here.
+            if (
+                enforce_ownership
+                and conversation.user_id is not None
+                and conversation.user_id != user_id
+            ):
+                logger.warning(
+                    f"🚫 Refused cross-user conversation load: session={session_id} "
+                    f"owner={conversation.user_id} caller={user_id}"
+                )
                 return []
 
             # Chat branching (Phase 1): the agent's conversation_history must
@@ -391,6 +414,7 @@ class ConversationService:
         metadata: dict | None = None,
         user_id: int | None = None,
         parent_message_id: int | None = None,
+        enforce_ownership: bool = False,
     ) -> Message:
         """
         Speichere eine einzelne Nachricht.
@@ -441,6 +465,19 @@ class ConversationService:
                 # orphaned (invisible to any JOIN-based history or
                 # message-count query).
                 await self.db.flush()
+            elif (
+                enforce_ownership
+                and conversation.user_id is not None
+                and conversation.user_id != user_id
+            ):
+                # Cross-user IDOR guard (write side): never append into a
+                # conversation owned by another user. Raised so the WS handler
+                # can skip persistence without corrupting the victim's thread.
+                logger.warning(
+                    f"🚫 Refused cross-user message write: session={session_id} "
+                    f"owner={conversation.user_id} caller={user_id}"
+                )
+                raise PermissionError("conversation owned by another user")
             elif user_id and conversation.user_id is None:
                 conversation.user_id = user_id
                 await self.db.flush()

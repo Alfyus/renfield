@@ -14,6 +14,7 @@ import math
 import os
 import struct
 import time
+from collections import deque
 from enum import Enum
 from typing import Optional, Dict, Any
 
@@ -82,6 +83,12 @@ class Satellite:
         self._processing_timeout: float = 60.0  # Max time to wait for server response (vision models need more time)
         self._reconnecting: bool = False  # Prevent duplicate reconnection attempts
         self._wakeword_pending: bool = False  # Prevent duplicate wakeword processing
+        # VAD-gated wake-word state: openwakeword is ~4x more expensive than the
+        # VAD, so in idle we run the VAD continuously and only spend wake-word
+        # inference when speech is present. Pre-roll keeps openwakeword's streaming
+        # context warm so the start of the wake word is never clipped.
+        self._ww_preroll: deque = deque(maxlen=1)  # sized from config in _setup_components
+        self._ww_gate_remaining: int = 0  # chunks left to run wake-word after last speech
         self._pending_snapshot: Optional[asyncio.Task] = None  # Background camera capture
         self._reconnect_task: Optional[asyncio.Task] = None  # Startup-failure reconnect loop (kept referenced so asyncio doesn't GC it)
 
@@ -151,6 +158,9 @@ class Satellite:
             stop_words=self.config.wakeword.stop_words,
             refractory_seconds=self.config.wakeword.refractory_seconds,
         )
+        # Size the wake-word pre-roll buffer from config (keep >=1 so the
+        # current chunk always has a slot even when pre-roll is disabled).
+        self._ww_preroll = deque(maxlen=max(1, self.config.wakeword.vad_gate_preroll_chunks))
 
         # LED controller (select based on type)
         if self.config.led.type == "gpio_rgb":
@@ -238,8 +248,11 @@ class Satellite:
         # Service discovery for auto-finding server
         self.discovery = ServiceDiscovery()
 
-        # OTA Update manager
-        self.update_manager = UpdateManager()
+        # OTA Update manager — verify TLS on the package download per the same
+        # policy as the WS/auth paths (review H6).
+        self.update_manager = UpdateManager(
+            verify_tls=self.config.server.verify_tls,
+        )
 
         # BLE Scanner (optional, for presence detection)
         self.ble_scanner: Optional[BLEScanner] = None
@@ -760,11 +773,7 @@ class Satellite:
 
         # Process for wake word in IDLE state
         if self._state == SatelliteState.IDLE and not self._wakeword_pending:
-            detection = self.wakeword.process_audio(audio_bytes)
-            if detection and not detection.is_stop_word:
-                # Set flag immediately to prevent duplicate detection
-                self._wakeword_pending = True
-                self._schedule_async(self._on_wakeword_detected(detection.keyword, detection.confidence))
+            self._process_wakeword_idle(audio_bytes)
             return
 
         # Check for stop words during LISTENING or PROCESSING (only if stop words configured)
@@ -806,6 +815,44 @@ class Satellite:
             # Check max recording length
             if len(self._audio_buffer) * self.config.audio.chunk_size / self.config.audio.sample_rate > self.config.vad.max_recording_seconds:
                 self._schedule_async(self._end_listening("timeout"))
+
+    def _process_wakeword_idle(self, audio_bytes: bytes):
+        """Run wake-word detection in IDLE, gated by the VAD to save CPU.
+
+        openwakeword is ~4x the cost of the VAD, so when ``vad_gated`` is on we
+        only spend wake-word inference while the VAD reports speech (plus a short
+        pre-roll/tail to keep openwakeword's streaming context warm). This frees
+        idle CPU headroom so audio frames are not silently dropped under load —
+        the root cause of marginal wake-word scores. With ``vad_gated`` off the
+        behaviour is identical to running the detector on every chunk.
+        """
+        if not self.config.wakeword.vad_gated:
+            self._dispatch_wakeword(audio_bytes)
+            return
+
+        # Always keep a rolling pre-roll of the most recent raw chunks.
+        self._ww_preroll.append(audio_bytes)
+
+        if self.vad.is_speech(audio_bytes):
+            if self._ww_gate_remaining <= 0:
+                # Speech onset — warm openwakeword with the buffered pre-roll
+                # (all but the current chunk, dispatched below) so the leading
+                # edge of the wake word is not lost.
+                for chunk in list(self._ww_preroll)[:-1]:
+                    self.wakeword.process_audio(chunk)
+            self._ww_gate_remaining = self.config.wakeword.vad_gate_tail_chunks
+
+        if self._ww_gate_remaining > 0:
+            self._ww_gate_remaining -= 1
+            self._dispatch_wakeword(audio_bytes)
+
+    def _dispatch_wakeword(self, audio_bytes: bytes):
+        """Feed one chunk to the wake-word detector and act on a detection."""
+        detection = self.wakeword.process_audio(audio_bytes)
+        if detection and not detection.is_stop_word:
+            # Set flag immediately to prevent duplicate detection
+            self._wakeword_pending = True
+            self._schedule_async(self._on_wakeword_detected(detection.keyword, detection.confidence))
 
     async def _on_wakeword_detected(self, keyword: str, confidence: float):
         """Handle wake word detection"""

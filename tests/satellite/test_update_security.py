@@ -17,6 +17,7 @@ from unittest.mock import patch, MagicMock
 from renfield_satellite.update.update_manager import (
     UpdateError,
     UpdateManager,
+    UpdateRequest,
 )
 
 
@@ -384,3 +385,68 @@ class TestDefaultBackupPathWritable:
         # Parent must exist and be writable by THIS process (the bug was a
         # non-writable parent), not assumed-writable.
         assert bp.parent.exists() and os.access(bp.parent, os.W_OK)
+
+
+@pytest.mark.satellite
+@pytest.mark.unit
+class TestOtaDownloadTlsVerification:
+    """Review H6: the OTA download (a code-delivery path) must verify TLS by
+    default; CERT_NONE only on an explicit verify_tls=False opt-out."""
+
+    def _mgr(self, tmp_path, *, verify_tls):
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+        (install_path / "renfield_satellite").mkdir()
+        return UpdateManager(
+            install_path=str(install_path),
+            backup_path=str(tmp_path / "backup"),
+            verify_tls=verify_tls,
+        )
+
+    @staticmethod
+    def _capture_download_context(mgr) -> "ssl.SSLContext":
+        """Drive _download_package with urlopen mocked; return the SSL context
+        it built. Sync (asyncio.run) so it needs no pytest-asyncio plugin."""
+        import asyncio
+
+        captured = {}
+
+        class _Resp:
+            headers = {"Content-Length": "0"}
+
+            def read(self, _n):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def _fake_urlopen(req, context=None):
+            captured["context"] = context
+            return _Resp()
+
+        req = UpdateRequest(
+            target_version="9.9.9",
+            package_url="https://renfield.local/pkg.tar.gz",
+            checksum="sha256:00",
+            size_bytes=0,
+        )
+        with patch("urllib.request.urlopen", _fake_urlopen):
+            asyncio.run(mgr._download_package(req))
+        return captured["context"]
+
+    def test_default_is_secure(self, tmp_path):
+        assert self._mgr(tmp_path, verify_tls=True).verify_tls is True
+
+    def test_download_uses_verifying_context_by_default(self, tmp_path):
+        import ssl
+        ctx = self._capture_download_context(self._mgr(tmp_path, verify_tls=True))
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+        assert ctx.check_hostname is True
+
+    def test_download_disables_verification_only_on_opt_out(self, tmp_path):
+        import ssl
+        ctx = self._capture_download_context(self._mgr(tmp_path, verify_tls=False))
+        assert ctx.verify_mode == ssl.CERT_NONE

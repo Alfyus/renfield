@@ -1121,9 +1121,22 @@ async def websocket_endpoint(
                     session_state.db_session_id = msg_session_id
                     register_ws_connection(msg_session_id, websocket)
                     try:
+                        # Cross-user IDOR guard: scope the history load to the
+                        # authenticated (JWT) caller when auth is enabled. The
+                        # established `user_id` is computed further down (and may be
+                        # voice-promoted), but the security identity for the
+                        # ownership boundary is the JWT one, available here.
+                        _auth_user_id = (
+                            auth_result.get("user_id")
+                            if isinstance(auth_result, dict)
+                            else None
+                        )
                         async with AsyncSessionLocal() as db_session:
                             db_history = await ollama.load_conversation_context(
-                                msg_session_id, db_session, max_messages=settings.agent_conv_context_messages
+                                msg_session_id, db_session,
+                                max_messages=settings.agent_conv_context_messages,
+                                user_id=_auth_user_id,
+                                enforce_ownership=settings.auth_enabled,
                             )
                             if db_history:
                                 session_state.conversation_history = db_history
@@ -2248,6 +2261,7 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                                 metadata=user_metadata if user_metadata else None,
                                 user_id=user_id,
                                 parent_message_id=fork_from_message_id,
+                                enforce_ownership=settings.auth_enabled,
                             )
                             saved_user_message_id = _user_msg.id
                             # Assistant chains onto the just-saved user message
@@ -2261,6 +2275,7 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                             metadata=assistant_metadata,
                             user_id=user_id,
                             parent_message_id=assistant_parent_id,
+                            enforce_ownership=settings.auth_enabled,
                         )
                         saved_assistant_message_id = _asst_msg.id
                         logger.debug(f"💾 Messages saved to DB: session_id={msg_session_id}, user_id={user_id}")
