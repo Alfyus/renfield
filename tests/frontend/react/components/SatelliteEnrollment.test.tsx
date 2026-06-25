@@ -89,6 +89,45 @@ describe('SatelliteEnrollment', () => {
     expect(screen.getByText(/nie/)).toBeInTheDocument();
   });
 
+  it('Rotate sends the ROW id, not stale form input', async () => {
+    let captured: { satellite_id?: string; rotate?: boolean } = {};
+    server.use(
+      http.get(`${BASE_URL}/api/satellites`, () =>
+        HttpResponse.json({ satellites: [], latest_version: '' }),
+      ),
+      http.get(`${BASE_URL}/api/satellite-enrollment`, () =>
+        HttpResponse.json([
+          {
+            id: 1,
+            satellite_id: 'sat-esszimmer',
+            room: 'Esszimmer',
+            is_enabled: true,
+            enrolled_at: '2026-06-24T10:00:00',
+            last_authenticated_at: null,
+            revoked_at: null,
+            connected: true,
+          },
+        ]),
+      ),
+      http.post(`${BASE_URL}/api/satellite-enrollment/enroll`, async ({ request }) => {
+        captured = (await request.json()) as { satellite_id?: string; rotate?: boolean };
+        return HttpResponse.json(
+          { satellite_id: captured.satellite_id, token: 't', rotated: true },
+          { status: 201 },
+        );
+      }),
+    );
+
+    renderWithProviders(<SatelliteEnrollment />);
+    // Admin has a DIFFERENT id typed in the form than the row being rotated.
+    await userEvent.type(screen.getByLabelText('Satelliten-ID'), 'sat-typed-something-else');
+    await waitFor(() => expect(screen.getByText(/sat-esszimmer/)).toBeInTheDocument());
+    await userEvent.click(screen.getByRole('button', { name: 'Neu ausstellen' }));
+
+    await waitFor(() => expect(captured.satellite_id).toBe('sat-esszimmer'));
+    expect(captured.rotate).toBe(true);
+  });
+
   it('shows the enforcing status badge when the fleet is enforcing', async () => {
     server.use(
       http.get(`${BASE_URL}/api/satellites`, () =>

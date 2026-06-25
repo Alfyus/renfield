@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 
 from loguru import logger
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.database import Satellite, SatelliteFleetState
@@ -101,7 +102,15 @@ async def enroll_satellite(
         is_enabled=True,
     )
     db.add(row)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Concurrent enroll for the same satellite_id: the unique index rejected
+        # the duplicate. Converge to the same outcome as the deterministic
+        # already-enrolled path (caller maps None → 409 "pass rotate=true")
+        # instead of surfacing a 500.
+        await db.rollback()
+        return None
     logger.info(f"🔐 Satellite enrolled: {satellite_id}")
     return token
 

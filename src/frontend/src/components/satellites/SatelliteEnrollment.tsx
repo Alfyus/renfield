@@ -42,15 +42,24 @@ export default function SatelliteEnrollment() {
   const enrolledIds = new Set(enrollments.map((e) => e.satellite_id));
   const canEnroll = satelliteId.trim().length > 0 && !enroll.isPending;
 
-  const doEnroll = async (rotate: boolean) => {
+  // `override` lets the per-row Rotate action pass the row's id/room directly —
+  // state setters only queue a re-render, so reading `satelliteId`/`room` from
+  // the closure in the same tick would send STALE form values (wrong satellite
+  // or a phantom enroll). The form-driven Enroll path passes no override.
+  const doEnroll = async (
+    rotate: boolean,
+    override?: { satelliteId: string; room: string },
+  ) => {
     setError(null);
     setMinted(null);
     setCopied(false);
     setCopyFailed(false);
+    const sid = (override?.satelliteId ?? satelliteId).trim();
+    const rm = (override?.room ?? room).trim();
     try {
       const result = await enroll.mutateAsync({
-        satellite_id: satelliteId.trim(),
-        room: room.trim() || null,
+        satellite_id: sid,
+        room: rm || null,
         rotate,
       });
       setMinted(result);
@@ -59,13 +68,15 @@ export default function SatelliteEnrollment() {
         setRoom('');
       }
     } catch (e) {
-      // 409 = already enrolled → point the admin at Rotate instead of a
-      // generic failure (the backend computed this actionable next step).
       const status = (e as { response?: { status?: number } })?.response?.status;
       setError(
+        // 409 = already enrolled → point the admin at Rotate. 422 = malformed
+        // satellite_id → tell them it's an input-format problem, not a server error.
         status === 409
           ? t('satellites.enrollment.alreadyEnrolled')
-          : t('satellites.enrollment.enrollFailed'),
+          : status === 422
+            ? t('satellites.enrollment.invalidIdFormat')
+            : t('satellites.enrollment.enrollFailed'),
       );
     }
   };
@@ -228,11 +239,9 @@ export default function SatelliteEnrollment() {
               <div className="flex items-center gap-2">
                 <button
                   className="btn-secondary text-sm"
-                  onClick={() => {
-                    setSatelliteId(e.satellite_id);
-                    setRoom(e.room ?? '');
-                    void doEnroll(true);
-                  }}
+                  onClick={() =>
+                    void doEnroll(true, { satelliteId: e.satellite_id, room: e.room ?? '' })
+                  }
                   disabled={enroll.isPending}
                 >
                   {t('satellites.enrollment.rotate')}

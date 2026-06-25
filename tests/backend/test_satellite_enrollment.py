@@ -92,6 +92,20 @@ class TestEnrollRotation:
         new = await svc.enroll_satellite(db_session, "sat-x", rotate=True)
         assert await svc.evaluate_credential(db_session, "sat-x", new) == svc.VERDICT_OK
 
+    async def test_concurrent_enroll_integrityerror_converges_to_none(
+        self, db_session: AsyncSession, monkeypatch
+    ):
+        # Simulate the unique-index race: a concurrent enroll committed first, so
+        # this INSERT commit raises IntegrityError. The service must converge to
+        # None (→ the route's 409) instead of letting a 500 escape.
+        from sqlalchemy.exc import IntegrityError
+
+        async def boom():
+            raise IntegrityError("INSERT", {}, Exception("duplicate key"))
+
+        monkeypatch.setattr(db_session, "commit", boom)
+        assert await svc.enroll_satellite(db_session, "sat-race") is None
+
     async def test_plain_enroll_does_not_resurrect_revoked(self, db_session: AsyncSession):
         # A revoked satellite must NOT be silently re-enabled by a plain enroll;
         # resurrection requires an explicit rotate (review finding).

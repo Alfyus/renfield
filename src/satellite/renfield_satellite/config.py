@@ -401,8 +401,19 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.server.auth_enabled = os.environ["RENFIELD_AUTH_ENABLED"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_AUTH_TOKEN"):
         config.server.auth_token = os.environ["RENFIELD_AUTH_TOKEN"]
-    if os.environ.get("RENFIELD_ENROLLMENT_TOKEN"):
+    if "RENFIELD_ENROLLMENT_TOKEN" in os.environ:
+        # Presence check (not truthiness) so an env-set-but-BLANK token (e.g. a
+        # k8s Secret with an empty value) gets the same loud warning as the YAML
+        # path. In the k8s topology the ConfigMap omits enrollment_token, so the
+        # env var is the ONLY place this warning can fire. (Secret absent
+        # entirely + optional:true stays silent — that is the dark-boot path.)
         config.server.enrollment_token = os.environ["RENFIELD_ENROLLMENT_TOKEN"] or None
+        if not config.server.enrollment_token:
+            logger.warning(
+                "RENFIELD_ENROLLMENT_TOKEN is set but BLANK — registering "
+                "UNENROLLED. Provision the k8s Secret / env var with a valid PSK, "
+                "or the satellite will be rejected once enrollment enforces."
+            )
     if os.environ.get("RENFIELD_VERIFY_TLS"):
         config.server.verify_tls = os.environ["RENFIELD_VERIFY_TLS"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_BLE_ENABLED"):

@@ -975,7 +975,8 @@
       "revoke": "Revoke",
       "rotate": "Rotate",
       "alreadyEnrolled": "Already enrolled — use “Rotate” to issue a fresh token.",
-      "copyFailed": "Copy failed — select the token manually (it is shown only once)."
+      "copyFailed": "Copy failed — select the token manually (it is shown only once).",
+      "invalidIdFormat": "Invalid satellite ID format — only letters, digits and . _ - allowed."
     }
   },
   "presence": {
