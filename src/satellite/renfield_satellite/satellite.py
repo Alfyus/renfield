@@ -1464,11 +1464,13 @@ class Satellite:
                 new_version=target_version
             )
         else:
-            # Send failure message
+            # Send the REAL failure reason (e.g. "release manifest signature does
+            # not verify…") + the real rollback state, so a security rejection is
+            # distinguishable from a benign failure instead of a generic message.
             await self.ws_client.send_update_failed(
                 stage=self.update_manager.current_stage.value,
-                error="Update failed - check satellite logs",
-                rolled_back=True
+                error=self.update_manager.last_error or "Update failed - check satellite logs",
+                rolled_back=self.update_manager.rolled_back,
             )
 
     def _on_update_progress(self, stage: UpdateStage, progress: int, message: str):

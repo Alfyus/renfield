@@ -244,19 +244,32 @@ class SatelliteUpdateService:
         The backend only forwards these bytes — it never signs (the private key
         lives offline). Filenames mirror renfield_satellite.update.release_manifest.
         """
-        try:
-            manifest_path = self.satellite_source_path / "RELEASE_MANIFEST.json"
-            sig_path = self.satellite_source_path / "RELEASE_MANIFEST.json.sig"
-            if not (manifest_path.exists() and sig_path.exists()):
-                return None, None
-            # Forward the manifest VERBATIM (the satellite verifies the signature
-            # over these exact bytes — do not re-serialize).
-            manifest = manifest_path.read_text(encoding="utf-8")
-            signature = sig_path.read_text(encoding="utf-8").strip()
-            return manifest, signature
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to load release signature: {e}")
+        manifest_path = self.satellite_source_path / "RELEASE_MANIFEST.json"
+        sig_path = self.satellite_source_path / "RELEASE_MANIFEST.json.sig"
+        m_exists, s_exists = manifest_path.exists(), sig_path.exists()
+
+        # Genuinely unsigned release (neither file shipped) — the legitimate
+        # dark/legacy path.
+        if not m_exists and not s_exists:
             return None, None
+
+        # A half-signed release (one file present, the other missing) is a
+        # packaging error, NOT "unsigned" — fail loud rather than silently drop
+        # signing for the whole fleet.
+        if m_exists != s_exists:
+            raise RuntimeError(
+                f"Incomplete release signing: manifest={m_exists} signature={s_exists} "
+                f"— refusing to serve an OTA package with a half-present signature."
+            )
+
+        # Both present: a read error here is a real fault. Do NOT swallow it into
+        # "unsigned" (that would silently disarm signature verification fleet-wide
+        # and get cached). Let it propagate so build_update_package fails loudly.
+        # Forward the manifest VERBATIM (the satellite verifies the signature over
+        # these exact bytes — do not re-serialize).
+        manifest = manifest_path.read_text(encoding="utf-8")
+        signature = sig_path.read_text(encoding="utf-8").strip()
+        return manifest, signature
 
     def get_package_info(self) -> dict[str, Any] | None:
         """

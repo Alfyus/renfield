@@ -108,6 +108,23 @@ class UpdateManager:
         self.verify_tls = verify_tls
         self.release_pubkeys = [k for k in (release_pubkeys or []) if k]
         self.require_signature = require_signature
+        # Last-failure detail for an accurate terminal status (vs. a generic
+        # "check logs") — see start_update / the satellite's send_update_failed.
+        self._last_error: Optional[str] = None
+        self._rolled_back = False
+        # Probe cryptography at startup if signature verification is configured,
+        # so a missing crypto stack is loud NOW rather than only when an OTA is
+        # attempted (the documented IRK silent-no-op trap).
+        if self.require_signature or self.release_pubkeys:
+            try:
+                import cryptography  # noqa: F401
+            except Exception:
+                logger.error(
+                    "OTA signature verification is configured (require_signature=%s, "
+                    "%d pinned key(s)) but `cryptography` is NOT installed — every "
+                    "signed update will be REJECTED. Install cryptography on this satellite.",
+                    self.require_signature, len(self.release_pubkeys),
+                )
         # Default paths
         if install_path:
             self.install_path = Path(install_path)
@@ -246,6 +263,9 @@ class UpdateManager:
             signature=signature,
         )
 
+        self._last_error = None
+        self._rolled_back = False
+
         try:
             # Store current version for rollback message
             from renfield_satellite import __version__
@@ -257,21 +277,22 @@ class UpdateManager:
             # 2. Verify checksum (40-45%)
             self._verify_checksum(package_path, request.checksum)
 
-            # 3. Create backup (45-55%)
-            self._create_backup()
-
-            # 4. Extract package (55-70%)
+            # 3. Extract package (55-70%)
             extract_path = self._extract_package(package_path)
 
-            # 4b. Verify the signed release manifest BEFORE installing (H6):
-            # authenticity, not just integrity. Aborts (no install) on any
-            # tamper/mismatch, or when a signature is required but absent.
+            # 4. Verify the signed release manifest (H6): authenticity, not just
+            # integrity. Done BEFORE the backup + install so a rejection aborts
+            # without touching the installed code (no needless rollback). Aborts
+            # on any tamper/mismatch, or when a signature is required but absent.
             self._verify_signature(extract_path, request)
 
-            # 5. Install (70-90%)
+            # 5. Create backup (only now that the package is authenticated)
+            self._create_backup()
+
+            # 6. Install (70-90%)
             self._install_package(extract_path)
 
-            # 6. Restart service (90-100%)
+            # 7. Restart service (90-100%)
             self._report_progress(UpdateStage.RESTARTING, 90, "Restarting service...")
 
             # Report success before restart (we won't be able to after)
@@ -284,12 +305,15 @@ class UpdateManager:
 
         except UpdateError as e:
             print(f"[Update] Error: {e}")
+            self._last_error = e.message
             self._report_progress(UpdateStage.FAILED, 0, str(e.message))
 
-            # Attempt rollback if backup was created
+            # Attempt rollback if backup was created (a pre-backup failure — e.g.
+            # a rejected signature — leaves the install untouched, no rollback).
             if self._backup_created:
                 try:
                     self._rollback()
+                    self._rolled_back = True
                 except Exception as rollback_error:
                     print(f"[Update] Rollback failed: {rollback_error}")
 
@@ -297,11 +321,13 @@ class UpdateManager:
 
         except Exception as e:
             print(f"[Update] Unexpected error: {e}")
+            self._last_error = str(e)
             self._report_progress(UpdateStage.FAILED, 0, str(e))
 
             if self._backup_created:
                 try:
                     self._rollback()
+                    self._rolled_back = True
                 except Exception as rollback_error:
                     print(f"[Update] Rollback failed: {rollback_error}")
 
@@ -309,6 +335,18 @@ class UpdateManager:
 
         finally:
             self._is_updating = False
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """Detail of the most recent update failure (e.g. a signature rejection),
+        for an accurate terminal status instead of a generic 'check logs'."""
+        return self._last_error
+
+    @property
+    def rolled_back(self) -> bool:
+        """Whether the most recent failure actually rolled back (a pre-install
+        abort such as a rejected signature does not)."""
+        return self._rolled_back
 
     async def _download_package(self, request: UpdateRequest) -> Path:
         """Download the update package"""
@@ -570,8 +608,13 @@ class UpdateManager:
             if target_satellite_dir.exists():
                 shutil.rmtree(target_satellite_dir)
 
-            # Copy new files
-            shutil.copytree(satellite_dir, target_satellite_dir)
+            # Copy new files — strip bytecode so only verified .py source is
+            # installed (defense in depth for the H6 .pyc-injection guard;
+            # CPython recompiles fresh from the trusted .py).
+            shutil.copytree(
+                satellite_dir, target_satellite_dir,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
             self._report_progress(UpdateStage.INSTALLING, 80, "Files copied")
 
             # Copy requirements.txt if present

@@ -26,8 +26,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_FILENAME = "RELEASE_MANIFEST.json"
 SIGNATURE_FILENAME = "RELEASE_MANIFEST.json.sig"
@@ -55,22 +58,30 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _collect_package_files(source_root: Path) -> dict[str, str]:
+def _collect_package_files(source_root: Path, *, include_bytecode: bool = False) -> dict[str, str]:
     """relpath -> sha256 for every package source file under ``source_root``.
 
-    Deterministic (sorted keys via dict insertion below the caller's
-    canonicalization); excludes __pycache__/*.pyc.
+    ``include_bytecode=False`` (manifest/signer side) excludes __pycache__/*.pyc
+    so the signed manifest is pure source. ``include_bytecode=True`` (verify side,
+    over the EXTRACTED tree) includes them — since the manifest never lists a
+    .pyc, any bytecode in the package then surfaces as an "unexpected file" in
+    verify_extracted. This is the H6 .pyc-injection guard: an attacker forwarding
+    a genuine signed manifest but smuggling a forged-header .pyc that shadows a
+    trusted .py cannot pass (and _install_package strips bytecode anyway).
     """
     files: dict[str, str] = {}
     code_dir = source_root / _CODE_DIR
     if code_dir.is_dir():
         for root, dirs, names in os.walk(code_dir):
-            # Prune cache dirs so os.walk doesn't descend into them.
-            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+            if include_bytecode:
+                dirs[:] = sorted(dirs)
+            else:
+                # Prune cache dirs so os.walk doesn't descend into them.
+                dirs[:] = sorted(d for d in dirs if d != "__pycache__")
             for name in sorted(names):
                 full = Path(root) / name
                 rel = full.relative_to(source_root).as_posix()
-                if _is_excluded(rel):
+                if not include_bytecode and _is_excluded(rel):
                     continue
                 files[rel] = _sha256_file(full)
     for top in _TOP_LEVEL_FILES:
@@ -99,7 +110,9 @@ def verify_extracted(extract_root: Path, manifest: dict) -> list[str]:
     """
     problems: list[str] = []
     expected: dict[str, str] = manifest.get("files", {})
-    actual = _collect_package_files(extract_root)
+    # Include bytecode on the verify side so an injected/forged .pyc (which the
+    # signed manifest never lists) is caught as an "unexpected file" below.
+    actual = _collect_package_files(extract_root, include_bytecode=True)
 
     for rel, want in expected.items():
         got = actual.get(rel)
@@ -121,18 +134,32 @@ def verify_signature(manifest_bytes: bytes, signature_b64: str, pubkeys_hex: lis
         from cryptography.hazmat.primitives.asymmetric import ed25519
     except Exception:
         # cryptography missing → cannot verify. Treat as not-verified (the caller
-        # fails closed when a signature is required).
+        # fails closed when a signature is required) but log LOUDLY — a silent
+        # skip is the documented IRK "cryptography no-ops invisibly" trap.
+        logger.error(
+            "cryptography is NOT installed — OTA signature CANNOT be verified; "
+            "rejecting. Install cryptography on this satellite."
+        )
         return False
     try:
         sig = base64.b64decode(signature_b64, validate=True)
     except Exception:
+        logger.warning("OTA release signature is not valid base64 — rejecting")
         return False
     for hexkey in pubkeys_hex:
+        # Distinguish a MALFORMED pinned key (operator misconfiguration) from a
+        # valid key that simply didn't sign this manifest (expected during
+        # rotation). A silently-skipped bad key makes a config typo look exactly
+        # like a signature failure.
         try:
             raw = bytes.fromhex(hexkey.strip())
             pub = ed25519.Ed25519PublicKey.from_public_bytes(raw)
+        except Exception as e:
+            logger.warning("Ignoring malformed release pubkey %r: %s", hexkey[:12], e)
+            continue
+        try:
             pub.verify(sig, manifest_bytes)
             return True
         except Exception:
-            continue
+            continue  # valid key, not the signer — normal during rotation
     return False

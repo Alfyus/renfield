@@ -34,13 +34,18 @@ def _keypair():
 
 
 def _make_source(root: Path, version="9.9.9"):
+    """A clean, bytecode-free source tree (as the backend's stripped tarball)."""
     (root / "renfield_satellite").mkdir(parents=True)
     (root / "renfield_satellite" / "__init__.py").write_text(f'__version__ = "{version}"\n')
     (root / "renfield_satellite" / "foo.py").write_text("x = 1\n")
-    # bytecode must be ignored by the manifest + verification
-    (root / "renfield_satellite" / "__pycache__").mkdir()
-    (root / "renfield_satellite" / "__pycache__" / "foo.pyc").write_bytes(b"junk")
     (root / "requirements.txt").write_text("websockets\n")
+
+
+def _add_pyc(root: Path):
+    """Inject compiled bytecode (the .pyc-shadowing attack / a stray build)."""
+    pc = root / "renfield_satellite" / "__pycache__"
+    pc.mkdir(exist_ok=True)
+    (pc / "foo.cpython-311.pyc").write_bytes(b"\x00malicious-bytecode")
 
 
 @pytest.mark.satellite
@@ -48,10 +53,12 @@ class TestManifestAndSignature:
     def test_manifest_excludes_pyc_includes_source(self):
         root = Path(tempfile.mkdtemp())
         _make_source(root)
+        _add_pyc(root)  # bytecode present in the tree...
         m = build_manifest(root, "9.9.9")
         assert "renfield_satellite/__init__.py" in m["files"]
         assert "renfield_satellite/foo.py" in m["files"]
         assert "requirements.txt" in m["files"]
+        # ...but the manifest never lists it.
         assert not any("pyc" in k or "__pycache__" in k for k in m["files"])
 
     def test_signature_roundtrip_and_rotation(self):
@@ -82,6 +89,16 @@ class TestManifestAndSignature:
         (root / "renfield_satellite" / "evil.py").write_text("backdoor()\n")
         probs = verify_extracted(root, m)
         assert any("evil.py" in p and "unexpected" in p for p in probs)
+
+    def test_verify_extracted_flags_injected_pyc(self):
+        # P0 guard: a forged/injected .pyc (which the manifest never lists, but
+        # CPython could load over a trusted .py) must surface as unexpected.
+        root = Path(tempfile.mkdtemp())
+        _make_source(root)
+        m = build_manifest(root, "9.9.9")  # clean, pyc-free → signed
+        _add_pyc(root)                      # attacker smuggles bytecode in the tarball
+        probs = verify_extracted(root, m)
+        assert any(".pyc" in p and "unexpected" in p for p in probs)
 
 
 @pytest.mark.satellite
@@ -155,6 +172,19 @@ class TestUpdateManagerVerify:
         manifest, sig, pub = self._signed(root)
         # tamper AFTER signing
         (root / "renfield_satellite" / "foo.py").write_text("x = 666\n")
+        m = self._mgr([pub], require=True)
+        req = UpdateRequest("9.9.9", "u", "sha256:x", 1, manifest=manifest, signature=sig)
+        with pytest.raises(UpdateError):
+            m._verify_signature(root, req)
+
+    def test_injected_pyc_rejected(self):
+        # P0: genuine signed manifest forwarded, but a malicious .pyc smuggled
+        # into the extracted tree → must abort (every .py matches, the manifest
+        # has no .pyc, so the injected bytecode is the only discrepancy).
+        root = Path(tempfile.mkdtemp())
+        _make_source(root)
+        manifest, sig, pub = self._signed(root)
+        _add_pyc(root)
         m = self._mgr([pub], require=True)
         req = UpdateRequest("9.9.9", "u", "sha256:x", 1, manifest=manifest, signature=sig)
         with pytest.raises(UpdateError):
