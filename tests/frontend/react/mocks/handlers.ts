@@ -581,6 +581,18 @@ export const handlers: HttpHandler[] = [
     }
     return HttpResponse.json({ message: 'Session deleted successfully' });
   }),
+
+  // --- Satellite enrollment (security H1) — default empty/disabled fleet ---
+  http.get(`${BASE_URL}/api/satellite-enrollment`, () => HttpResponse.json([])),
+  http.get(`${BASE_URL}/api/satellite-enrollment/status`, () =>
+    HttpResponse.json({
+      enabled: false,
+      autoflip_enabled: false,
+      enforcing: false,
+      total_enrolled: 0,
+      pending_first_auth: 0,
+    }),
+  ),
 ];
 
 // Export BASE_URL and mock fixtures for use in tests that need to override handlers.

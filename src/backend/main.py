@@ -421,6 +421,13 @@ async def create_ws_token(
             "expires_in": None
         }
 
+    # Security review H1: this endpoint historically minted a device token to
+    # ANY caller (it declared `current_user` but never checked it). When WS auth
+    # is on, require an authenticated user — satellites authenticate with their
+    # enrollment PSK on the register frame, not via this faucet.
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
     token_store = get_token_store()
     token = token_store.create_token(
         device_id=device_id,

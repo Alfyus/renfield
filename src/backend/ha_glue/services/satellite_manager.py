@@ -92,6 +92,10 @@ class SatelliteInfo:
     last_heartbeat: float = field(default_factory=time.time)
     current_session_id: str | None = None
     room_id: int | None = None  # Database room ID (populated after DB sync)
+    # Whether this connection presented a valid enrollment PSK (security H1).
+    # Gates the IRK push and protects an enrolled incumbent from eviction by an
+    # unauthenticated newcomer.
+    authenticated: bool = False
     language: str = "de"  # Language code for STT/TTS (e.g., 'de', 'en')
     metrics: dict[str, Any] = field(default_factory=dict)  # Live metrics from heartbeat
     # Version and update tracking
@@ -155,7 +159,8 @@ class SatelliteManager:
         websocket: WebSocket,
         capabilities: dict[str, Any],
         language: str = "de",
-        version: str = "unknown"
+        version: str = "unknown",
+        authenticated: bool = False,
     ) -> bool:
         """
         Register a new satellite connection.
@@ -167,14 +172,26 @@ class SatelliteManager:
             capabilities: Hardware capabilities dict
             language: Language code for STT/TTS (e.g., 'de', 'en')
             version: Satellite software version
+            authenticated: True if the connection presented a valid enrollment
+                PSK (security H1). An enrolled incumbent is NOT evicted by an
+                unauthenticated newcomer — that blocks the room-hijack path even
+                during the PERMISSIVE soak window.
 
         Returns:
-            True if registration successful
+            True if registration successful, False if refused (e.g. an
+            unauthenticated connection tried to evict an authenticated incumbent)
         """
         async with self._lock:
             # Check if satellite already connected (reconnection)
             if satellite_id in self.satellites:
                 old_sat = self.satellites[satellite_id]
+                if old_sat.authenticated and not authenticated:
+                    logger.warning(
+                        f"🚫 Refusing to evict authenticated satellite "
+                        f"'{satellite_id}' with an UNAUTHENTICATED connection "
+                        f"(possible hijack attempt)."
+                    )
+                    return False
                 logger.info(f"📡 Satellite {satellite_id} reconnecting (was in room: {old_sat.room})")
                 # Close old connection if still open
                 try:
@@ -202,7 +219,8 @@ class SatelliteManager:
                 websocket=websocket,
                 capabilities=caps,
                 language=language,
-                version=version
+                version=version,
+                authenticated=authenticated,
             )
 
             logger.info(f"✅ Satellite registered: {satellite_id} in {room} (v{version})")
@@ -692,6 +710,10 @@ class SatelliteManager:
     def get_satellite(self, satellite_id: str) -> SatelliteInfo | None:
         """Get satellite info by ID"""
         return self.satellites.get(satellite_id)
+
+    def is_connected(self, satellite_id: str) -> bool:
+        """Whether a satellite currently has a live WS connection (this pod)."""
+        return satellite_id in self.satellites
 
     def get_camera_satellite_for_room(self, room_id: int) -> SatelliteInfo | None:
         """Return a connected satellite in this room that has a camera, if any."""

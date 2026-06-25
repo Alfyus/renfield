@@ -835,6 +835,11 @@ def _ensure_ha_glue_routes(app):
             {"prefix": "/api/satellites"},
             "/api/satellites",
         ),
+        (
+            "ha_glue.api.routes.satellite_enrollment",
+            {},
+            "/api/satellite-enrollment",
+        ),
         ("ha_glue.api.routes.rooms", {"prefix": "/api/rooms"}, "/api/rooms"),
         ("ha_glue.api.routes.presence", {}, None),
         ("ha_glue.api.routes.paperless_audit", {}, None),

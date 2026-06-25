@@ -2593,6 +2593,8 @@ _HA_GLUE_REEXPORT_NAMES = frozenset({
     "RoomDevice",
     "RoomOutputDevice",
     "RoomSatellite",
+    "Satellite",
+    "SatelliteFleetState",
     "UserBleDevice",
     "UserBleIrk",
 })

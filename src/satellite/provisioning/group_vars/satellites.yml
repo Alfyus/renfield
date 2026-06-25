@@ -20,6 +20,12 @@ server_url: "wss://renfield.local/ws/satellite"
 server_auto_discover: true
 server_auth_enabled: false
 server_verify_tls: false
+# Per-satellite enrollment PSK (security review H1). MUST be set per host in the
+# gitignored host_vars/satellite-<name>.yml (never here — group_vars is in git).
+# Mint it with `bin/enroll_satellite.py <satellite_id>` (or the admin UI), paste
+# the printed token here, re-provision with --tags config. Empty = not enrolled
+# (the backend treats an absent token as legacy until enrollment is enforced).
+satellite_enrollment_token: ""
 # Connection robustness (Pi Zero 2 W 2.4GHz WiFi is marginal — detect dead links
 # fast and self-heal instead of wedging). See docs/SATELLITE_CONNECTIVITY.md.
 server_ping_interval: 15          # WS keepalive cadence (s)

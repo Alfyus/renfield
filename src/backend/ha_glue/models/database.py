@@ -411,6 +411,65 @@ class UserBleIrk(Base):
     user = relationship("User", backref="ble_irks")
 
 
+class Satellite(Base):
+    """Per-satellite enrollment credential (PSK) for the /ws/satellite path.
+
+    Closes the assertion-based-trust hole (security review H1): a satellite
+    today *claims* a ``satellite_id`` in its register frame with no proof, so
+    any LAN device can register as ``sat-wohnzimmer``, evict the incumbent, and
+    harvest the IRK push. Each enrolled satellite holds a random 256-bit token,
+    stored here ONLY as a bcrypt hash; the satellite presents the plaintext in
+    the register frame's ``token`` field and the backend verifies it
+    constant-time. See docs/private/security/satellite-trust-design.md.
+
+    The plaintext token is shown exactly once (at enrollment) and is never
+    stored or returned afterwards — same posture as the folder/email ingest
+    push tokens.
+    """
+
+    __tablename__ = "satellites"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # The asserted identity the satellite registers under; the token is bound
+    # to this id, so a register frame whose satellite_id ≠ the token's id fails.
+    satellite_id = Column(String(100), unique=True, nullable=False, index=True)
+    # bcrypt hash of the enrollment PSK — never the plaintext.
+    token_hash = Column(String(255), nullable=False)
+    # Cosmetic; the runtime room still comes from the register frame.
+    room = Column(String(100), nullable=True)
+    # Audit: which admin enrolled it (NULL for Ansible/bin-script seeding).
+    enrolled_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    enrolled_at = Column(DateTime, default=_utcnow)
+    # Set on every successful PSK verification — drives the auto-flip readiness
+    # check (the fleet only enforces once EVERY enrolled row has connected once).
+    last_authenticated_at = Column(DateTime, nullable=True)
+    # Revocation: a revoked or disabled row never authenticates.
+    revoked_at = Column(DateTime, nullable=True)
+    is_enabled = Column(Boolean, default=True, nullable=False)
+
+    enrolled_by = relationship("User")
+
+
+class SatelliteFleetState(Base):
+    """Singleton row holding the enrollment-enforcement latch.
+
+    Auto-flip (security review decision ③) transitions the fleet from PERMISSIVE
+    to ENFORCING once every enrolled satellite has authenticated at least once.
+    The transition is LATCHED here (``enrollment_enforced_at`` set once, never
+    cleared automatically) so a later UI-enrolled-but-not-yet-connected
+    satellite — whose row has a NULL ``last_authenticated_at`` — cannot silently
+    re-open the fleet to unauthenticated registration. Break-glass: clear the
+    latch (or flip ``satellite_enrollment_enabled=False``).
+    """
+
+    __tablename__ = "satellite_fleet_state"
+
+    # Always id=1 — enforced by the service (single fleet per backend).
+    id = Column(Integer, primary_key=True)
+    enrollment_enforced_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class PresenceEvent(Base):
     """Persisted presence event for analytics (heatmap, predictions)."""
 

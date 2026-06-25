@@ -225,6 +225,7 @@ class Satellite:
             ping_interval=self.config.server.ping_interval,
             ping_timeout=self.config.server.ping_timeout,
             register_timeout=self.config.server.register_timeout,
+            enrollment_token=self.config.server.enrollment_token,
             language=self.config.satellite.language,
             # Real hardware capabilities so the fleet page reflects THIS
             # device, not a hardcoded "3 LEDs" for every satellite.

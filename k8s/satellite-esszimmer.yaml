@@ -136,6 +136,17 @@ spec:
               value: "false"
             - name: RENFIELD_AUTO_DISCOVER
               value: "false"
+            # Per-satellite enrollment PSK (security H1). Held in a Secret kept
+            # out of git; optional so the pod still starts before enrollment is
+            # provisioned (PERMISSIVE soak). Create with:
+            #   kubectl -n renfield create secret generic satellite-esszimmer-secret \
+            #     --from-literal=enrollment-token="$(bin/enroll_satellite.py sat-esszimmer ...)"
+            - name: RENFIELD_ENROLLMENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: satellite-esszimmer-secret
+                  key: enrollment-token
+                  optional: true
           volumeMounts:
             - name: config
               mountPath: /opt/renfield-satellite/config

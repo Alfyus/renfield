@@ -1,67 +1,70 @@
-# Plan — Command palette (chat-ui roadmap item 4)
+# Plan — H1 per-satellite enrollment credential (PSK)
 
-Source: blueprint from feature-dev:code-architect agent (2026-06-15). `/` in the
-composer (or a touch button) opens an action+navigation palette. Dark-flagged.
+Full design + rationale: `docs/private/security/satellite-trust-design.md` (RESOLVED
+decisions + implementation plan). Closes H1 root cause (no per-satellite identity).
+Ship DARK behind `satellite_enrollment_enabled` (default off → byte-identical).
 
-## Locked decisions (with user)
-- Tool actions **stage into the composer** (no auto-send); user reviews + sends.
-  Navigate = immediate client nav. Set-role = stage a next-turn role hint.
-- Role hint = **next-turn only**, auto-clears on `done` (dismissible badge).
-- **Build now, dark** behind `command_palette_enabled` (frontend flag; backend
-  `role_hint` is always-present no-op when absent → flip needs no backend redeploy).
+## Locked decisions
+- Credential = **PSK** (bcrypt-hashed server-side), carried in the **register
+  first-frame** (`token` field) — smallest satellite transport change.
+- Enrollment = **Ansible + UI**; issuance endpoint **ADMIN-gated**.
+- Rollout = **auto-flip with persisted latch** ("all `satellites` rows seen
+  authenticated", not just connected) behind `satellite_enrollment_autoflip_enabled`.
+- Effective-mode state machine: OFF (legacy default) → PERMISSIVE (soak) → ENFORCING.
 
-## Authz model
-- **Display** (frontend, UX courtesy): `usePaletteActions` filters the static
-  registry by `AuthContext.hasPermission/hasAnyPermission` + `isFeatureEnabled`.
-- **Execute** (real gate, server-side, unchanged): tool actions dispatch as
-  natural language via `sendMessage` → `agent_router` → `agent_roles.yaml` tool
-  gating → `require_permission`. The palette adds NO new dispatch path.
-- `AUTH_ENABLED=false` (prod) → hasPermission returns true → all actions visible.
+## PR-A — backend core (dark) — IMPLEMENTED (branch `security/satellite-enrollment-h1`)
+- [x] `ha_glue/models/database.py` — `Satellite` + `SatelliteFleetState` models (+ re-export in `models/database.py`).
+- [x] migration `pc20260624_satellite_enrollment` (down_revision = `pc20260619_ble_irk_store`,
+      the real head; apply TARGETED); `satellites` + singleton `satellite_fleet_state`.
+- [x] `ha_glue/services/satellite_enrollment_service.py` — enroll/rotate / verify (constant-time +
+      dummy_verify) / revoke / is_enforcing / maybe_autoflip (latch) / authorize_register (state machine).
+- [x] `ha_glue/api/websocket/satellite_handler.py` — register-handler PSK verify + reject + mode;
+      passes `authenticated` to register + `is_enrolled_authenticated` to the IRK push. Flag-off skips the block.
+- [x] `ha_glue/services/satellite_manager.py` — `SatelliteInfo.authenticated` + eviction guard
+      (unauth newcomer cannot evict an authenticated incumbent) + `is_connected()`.
+- [x] `ha_glue/services/presence_service.py` — BOTH IRK push paths (`irks_for_satellite` +
+      `push_macs_to_satellites`) keyed on enrollment-auth when enabled; allowlist = OFF fallback.
+- [x] `main.py` `/api/ws/token` — 401 when unauthenticated + WS auth on (inert in prod; ws_auth_enabled=False).
+- [x] `utils/config.py` — `satellite_enrollment_enabled` + `_autoflip_enabled` (both False).
+- [x] admin API (own prefix `/api/satellite-enrollment` to avoid the `/api/satellites/{id}` wildcard):
+      `POST /enroll` (PSK once, rotate) · `GET ""` (list, no token) · `GET /status` · `DELETE /{id}`. Mounted in bootstrap.
+- [x] tests authored (run on .159): `test_satellite_enrollment.py` (service + state machine + latch +
+      both IRK gates) + `test_satellite_enrollment_routes.py` (routes + `/api/ws/token` 401 + eviction guard).
+      Conftest route-mount spec added.
+- [x] **Validated on .159**: `36 passed` (25 `test_satellite_enrollment.py` + 11 `test_satellite_enrollment_routes.py`).
+      The only blocker was pre-existing box drift (`rag_service` missing `DuplicateDocumentError` on the stale
+      `wip/lane-c` tree) — overlaid to confirm, box restored after. Local env lacks backend deps.
+- [ ] **Remaining validation**: run the migration up/down on a throwaway PG DB (mechanically trivial; mirrors
+      the proven `pc20260619` pattern; tables already exercised via `create_all` in the 36 tests).
 
-## Backend
-- [ ] `utils/config.py` + `api/routes/config.py` (FeatureFlags) — `command_palette_enabled: bool = False`.
-- [ ] chat WS handler — accept optional `role_hint` on the `text` message; validate
-  against `agent_roles.yaml` role keys; pass as a soft routing hint to the router;
-  drop silently if unknown. Always present (no flag). Unit test.
+## PR-B — satellite + provisioning — IMPLEMENTED (same branch)
+- [x] satellite `config.py` — `ServerConfig.enrollment_token` + YAML load (blank→None) + `RENFIELD_ENROLLMENT_TOKEN` env.
+- [x] `network/websocket_client.py` — `enrollment_token` ctor param; `_register()` includes `"token"` only when set
+      (legacy frame shape preserved); wired through in `satellite.py`.
+- [x] `satellite.yaml.j2` — `enrollment_token: "{{ satellite_enrollment_token | default('') }}"`; group_vars default `""`
+      + comment (real token in gitignored host_vars); k8s per-pod `secretKeyRef` (`optional: true` so the pod still boots dark).
+- [x] `bin/enroll_satellite.py` — server-side mint/rotate, prints PSK to stdout once (UI + Ansible share the service path).
+- [x] satellite tests `tests/satellite/test_enrollment_token.py` — config (default/YAML/blank/env) + register frame include/omit.
+- [x] **Validated on .159**: `34 passed` (6 new + 28 existing config/websocket regression). k8s manifest parses. Box restored.
 
-## Frontend
-- [ ] `components/chat/palette/paletteActions.ts` (NEW) — static `PaletteAction[]`.
-- [ ] `components/chat/palette/usePaletteActions.ts` (NEW) — filter by perms + flag + query.
-- [ ] `components/chat/palette/PaletteContext.tsx` (NEW) — open state + pendingRoleHint.
-- [ ] `components/chat/palette/CommandPalette.tsx` (NEW) — dialog overlay (portal),
-  search + grouped listbox, Arrow/Enter/Esc, focus trap+restore, warm empty state,
-  44px, dark + i18n. Navigate→useNavigate; tool→setInput (stage); set-role→hint.
-- [ ] `ChatInput.tsx` — `/`-key when empty + touch trigger button + role-hint badge.
-- [ ] `ChatPage/index.tsx` — PaletteProvider + mount CommandPalette portal (flag-gated).
-- [ ] `ChatContext.tsx` — inject `role_hint` from pendingRoleHint into the WS message; clear on `done`.
-- [ ] i18n de+en — `chat.palette.*`.
+## PR-C — UI — IMPLEMENTED (same branch)
+- [x] `api/resources/satelliteEnrollment.ts` — list/status/enroll/revoke hooks (+ `keys.satellites.enrollment*`).
+- [x] `components/satellites/SatelliteEnrollment.tsx` — status badges (enabled/enforcing/permissive/pending),
+      enroll form (id datalist of connected sats + room), **one-time token reveal** (copy), enrolled list
+      (connected dot + last-auth + rotate + revoke). Patterned on `IrkPairing.tsx`.
+- [x] Wired into `SatellitesPage.tsx` (section after the satellite list).
+- [x] i18n: 26 keys under `satellites.enrollment.*` in de.json + en.json (minimal-diff insert).
+- [x] MSW default handlers for `/api/satellite-enrollment[/status]` (empty/disabled fleet).
+- [x] Tests: `tests/frontend/react/components/SatelliteEnrollment.test.tsx` (mint+reveal / list+revoke / enforcing badge).
+- [x] **Validated**: vitest 6/6 (3 new + 3 existing SatellitesPage regression — fixed a datalist room-text
+      collision); `tsc --noEmit` clean for my files (2 errors pre-existing, unrelated); eslint clean for my
+      files (2 errors pre-existing in SatellitesPage transcription line).
 
-## Tests
-- [ ] Backend unit: role_hint accepted (valid) / dropped (unknown) / None passes.
-- [ ] Frontend RTL `usePaletteActions.test.tsx` + `CommandPalette.test.tsx`.
+## Rollout (ops, post-merge, staged)
+- [ ] enroll fleet → write PSKs to host_vars / k8s secrets → re-provision → flip
+      `enabled=True` (PERMISSIVE) → verify all rows `last_authenticated_at` → flip
+      `autoflip_enabled=True` → latch enforces. Break-glass: `enabled=False`.
 
-## Out of scope (v1)
-- localStorage recents; per-user customisation; direct mcp.* dispatch; voice-trigger;
-  admin-management actions; multi-step-input actions.
-
-## Status: IMPLEMENTED
-- Backend: `command_palette_enabled` flag (config + FeatureFlags route); `role_hint`
-  on WSChatMessage → `classify_with_context` Layer-0 short-circuit (valid role) →
-  passed from chat_handler. Always-present (no flag); unknown hint falls through.
-- Frontend: palette state folded into ChatContext (open + pendingRoleHint, role_hint
-  injected on the WS frame + consumed next-turn); `paletteActions.ts` registry +
-  `usePaletteActions` perm/flag/query filter + `CommandPalette.tsx` overlay (portal,
-  search, arrow/enter nav, document-level Escape, focus restore, 44px, dark+i18n);
-  ChatInput `/`-trigger + touch button + role badge; mounted in ChatPage; i18n de+en.
-- Tool actions STAGE into composer (no auto-send); role hint next-turn-only; UI gated by flag.
-
-## Review
-- Authz: display filter is frontend UX (hasPermission); real gate stays server-side
-  (NL command → agent_router → agent_roles.yaml tool gating). No new dispatch path.
-- Improved on blueprint: palette state lives IN ChatContext (a nested PaletteContext
-  couldn't feed role_hint into ChatContext.sendMessageInternal). Escape made
-  document-level (robust modal close, not focus-dependent).
-- Tests: backend role_hint short-circuit (passed; 3 config-loading failures are
-  PRE-EXISTING — they read the ConfigMap-served agent_roles.yaml absent from the
-  build-box image). Frontend 18/18 (palette 7 + usePaletteActions 4 + chips 7). tsc clean.
-- Pending: `npm run build` (prod Tailwind) + `/review`.
+## Open sub-decision (confirm during build)
+- Enforcing-latch storage: recommend a tiny singleton `satellite_fleet_state` row
+  (boolean + timestamp) in the same migration vs. overloading a generic settings table.

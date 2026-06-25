@@ -4,10 +4,13 @@ Configuration management for Renfield Satellite
 Loads configuration from YAML file and environment variables.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 # Type alias for list default factory
@@ -43,6 +46,11 @@ class ServerConfig:
     # Authentication (required when server has WS_AUTH_ENABLED=true)
     auth_enabled: bool = False  # Whether to fetch and use auth token
     auth_token: Optional[str] = None  # Pre-configured token (optional)
+    # Per-satellite enrollment PSK (security review H1). Provisioned out-of-band
+    # (Ansible host_vars / k8s secret), presented in the register frame and
+    # verified server-side against the `satellites` table. Independent of
+    # auth_enabled (the WS-JWT path); empty = not enrolled (legacy behavior).
+    enrollment_token: Optional[str] = None
     # TLS verification (set False only for self-signed certificates)
     verify_tls: bool = True
 
@@ -266,6 +274,21 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.server.verify_tls = srv.get("verify_tls", config.server.verify_tls)
         if "auth_token" in srv:
             config.server.auth_token = srv["auth_token"]
+        if "enrollment_token" in srv:
+            # Treat a blank template value ("") as "not enrolled" so the
+            # register frame omits the token rather than sending an empty one.
+            config.server.enrollment_token = srv["enrollment_token"] or None
+            if not config.server.enrollment_token:
+                # The key is present but resolved blank — likely a provisioning
+                # miss (un-rendered host_var / empty secret). Warn loudly: this
+                # satellite registers UNENROLLED and will be rejected once the
+                # fleet enforces. (Silent degrade hid the cryptography no-op bug.)
+                logger.warning(
+                    "server.enrollment_token is present but BLANK — registering "
+                    "UNENROLLED. Provision satellite_enrollment_token (host_vars) "
+                    "or RENFIELD_ENROLLMENT_TOKEN, or the satellite will be "
+                    "rejected once enrollment enforcement is on."
+                )
 
     if "audio" in config_data:
         aud = config_data["audio"]
@@ -378,6 +401,19 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.server.auth_enabled = os.environ["RENFIELD_AUTH_ENABLED"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_AUTH_TOKEN"):
         config.server.auth_token = os.environ["RENFIELD_AUTH_TOKEN"]
+    if "RENFIELD_ENROLLMENT_TOKEN" in os.environ:
+        # Presence check (not truthiness) so an env-set-but-BLANK token (e.g. a
+        # k8s Secret with an empty value) gets the same loud warning as the YAML
+        # path. In the k8s topology the ConfigMap omits enrollment_token, so the
+        # env var is the ONLY place this warning can fire. (Secret absent
+        # entirely + optional:true stays silent — that is the dark-boot path.)
+        config.server.enrollment_token = os.environ["RENFIELD_ENROLLMENT_TOKEN"] or None
+        if not config.server.enrollment_token:
+            logger.warning(
+                "RENFIELD_ENROLLMENT_TOKEN is set but BLANK — registering "
+                "UNENROLLED. Provision the k8s Secret / env var with a valid PSK, "
+                "or the satellite will be rejected once enrollment enforces."
+            )
     if os.environ.get("RENFIELD_VERIFY_TLS"):
         config.server.verify_tls = os.environ["RENFIELD_VERIFY_TLS"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_BLE_ENABLED"):

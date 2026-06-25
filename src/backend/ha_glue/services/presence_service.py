@@ -577,12 +577,22 @@ class PresenceService:
         IRK hex is decrypted in memory; only ever leaves over the WS link."""
         return [{"name": label, "irk": irk} for label, irk in getattr(self, "_irks_hex", {}).items()]
 
-    def irks_for_satellite(self, satellite_id: str) -> list[dict]:
-        """IRK list to push to ``satellite_id``, gated by the allowlist (H1).
+    def irks_for_satellite(
+        self, satellite_id: str, is_enrolled_authenticated: bool = False
+    ) -> list[dict]:
+        """IRK list to push to ``satellite_id`` (security H1).
 
-        Returns the IRKs only when the satellite is permitted; an empty list
-        otherwise (so the caller's ``if irks:`` guard naturally skips the send).
+        When per-satellite enrollment is enabled, the IRK push keys on whether
+        THIS connection presented a valid enrollment PSK — the allowlist
+        stop-gap is bypassed entirely (a verified satellite is a stronger
+        signal than a config string). When enrollment is disabled, fall back to
+        the legacy ``SATELLITE_IRK_ALLOWLIST`` gate.
+
+        Returns the IRKs only when permitted; an empty list otherwise (so the
+        caller's ``if irks:`` guard naturally skips the send).
         """
+        if settings.satellite_enrollment_enabled:
+            return self.get_ble_irks() if is_enrolled_authenticated else []
         if not irk_push_allowed(satellite_id):
             return []
         return self.get_ble_irks()
@@ -611,8 +621,13 @@ class PresenceService:
                         "type": "classic_bt_known_devices",
                         "devices": classic_macs,
                     })
-                # IRKs are allowlist-gated per satellite (H1).
-                irks = all_irks if irk_push_allowed(sat_id) else []
+                # IRKs are gated per satellite (H1): enrollment-auth when
+                # enrollment is on, else the legacy allowlist. Mirrors
+                # irks_for_satellite so the two push paths agree.
+                if settings.satellite_enrollment_enabled:
+                    irks = all_irks if getattr(sat_info, "authenticated", False) else []
+                else:
+                    irks = all_irks if irk_push_allowed(sat_id) else []
                 if irks:
                     await sat_info.websocket.send_json({
                         "type": "ble_known_irks",
