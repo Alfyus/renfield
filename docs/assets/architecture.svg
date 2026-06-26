@@ -148,43 +148,43 @@
   <line x1="780" y1="272" x2="820" y2="140" class="arrow" stroke="#C41E3A" opacity="0.6"/>
 
   <!-- MCP Servers (11) -->
-  <text x="830" y="195" class="section-label">MCP SERVERS (11)</text>
+  <text x="830" y="207" class="section-label">MCP SERVERS (11)</text>
 
-  <rect x="820" y="208" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="877" y="230" text-anchor="middle" class="box-label">Home Assist.</text>
+  <rect x="820" y="220" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="877" y="242" text-anchor="middle" class="box-label">Home Assist.</text>
 
-  <rect x="945" y="208" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="1002" y="230" text-anchor="middle" class="box-label">n8n</text>
+  <rect x="945" y="220" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="1002" y="242" text-anchor="middle" class="box-label">n8n</text>
 
-  <rect x="820" y="252" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="877" y="274" text-anchor="middle" class="box-label">Weather</text>
+  <rect x="820" y="264" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="877" y="286" text-anchor="middle" class="box-label">Weather</text>
 
-  <rect x="945" y="252" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="1002" y="274" text-anchor="middle" class="box-label">Search</text>
+  <rect x="945" y="264" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="1002" y="286" text-anchor="middle" class="box-label">Search</text>
 
-  <rect x="820" y="296" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="877" y="318" text-anchor="middle" class="box-label">News</text>
+  <rect x="820" y="308" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="877" y="330" text-anchor="middle" class="box-label">News</text>
 
-  <rect x="945" y="296" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="1002" y="318" text-anchor="middle" class="box-label">Jellyfin</text>
+  <rect x="945" y="308" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="1002" y="330" text-anchor="middle" class="box-label">Jellyfin</text>
 
-  <rect x="820" y="340" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="877" y="362" text-anchor="middle" class="box-label">Paperless</text>
+  <rect x="820" y="352" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="877" y="374" text-anchor="middle" class="box-label">Paperless</text>
 
-  <rect x="945" y="340" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="1002" y="362" text-anchor="middle" class="box-label">Email</text>
+  <rect x="945" y="352" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="1002" y="374" text-anchor="middle" class="box-label">Email</text>
 
-  <rect x="820" y="384" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="877" y="406" text-anchor="middle" class="box-label">Calendar</text>
+  <rect x="820" y="396" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="877" y="418" text-anchor="middle" class="box-label">Calendar</text>
 
-  <rect x="945" y="384" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="1002" y="406" text-anchor="middle" class="box-label">DLNA</text>
+  <rect x="945" y="396" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="1002" y="418" text-anchor="middle" class="box-label">DLNA</text>
 
-  <rect x="820" y="428" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
-  <text x="877" y="450" text-anchor="middle" class="box-label">Radio</text>
+  <rect x="820" y="440" width="115" height="36" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <text x="877" y="462" text-anchor="middle" class="box-label">Radio</text>
 
-  <line x1="780" y1="332" x2="820" y2="332" class="arrow"/>
-  <text x="795" y="325" text-anchor="middle" class="box-sub" style="font-size:9px">MCP</text>
+  <line x1="780" y1="344" x2="820" y2="344" class="arrow"/>
+  <text x="795" y="337" text-anchor="middle" class="box-sub" style="font-size:9px">MCP</text>
 
   <!-- ═══════════ SATELLITE FLOW ═══════════ -->
   <text x="830" y="486" class="section-label">SATELLITE FLOW</text>
