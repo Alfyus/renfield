@@ -149,7 +149,7 @@ Open **http://localhost:3000** and start chatting.
 
 ## Architecture
 
-<p align="center"><img src="docs/assets/architecture.svg" width="900" alt="Renfield Architecture"></p>
+<p align="center"><img src="docs/assets/architecture.png" width="900" alt="Renfield Architecture"></p>
 
 ## Configuration
 
