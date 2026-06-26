@@ -241,6 +241,16 @@ AGENT_MODEL=                      # Optional: Agent-Modell
 AGENT_OLLAMA_URL=                 # Optional: Separate Ollama-Instanz
 ```
 
+**Pluggable Inferenz — es läuft nicht alles auf Ollama.** Der LLM-Tier spricht ein OpenAI-kompatibles Protokoll, sodass jede Aufgabe an ein anderes Backend geroutet werden kann (`LLM_OPENAI_FOR_*`). Ollama ist der einfache Default; die Referenz-Installation verteilt die Inferenz auf dedizierte GPU-Server:
+
+| Tier | Server | Modell |
+|------|--------|--------|
+| Chat · Agent · RAG · Intent · KG · Memory | **llama.cpp** | Qwen3.6-35B-A3B (MoE) |
+| Embeddings | **llama.cpp** | Qwen3-Embedding-4B |
+| Vision | **Ollama** | qwen3-vl |
+
+**Voice läuft auf einem eigenen Server.** Speech-to-Text (Whisper), Text-to-Speech (Piper) und Sprechererkennung (ECAPA-TDNN) laufen in einem dedizierten, GPU-residenten **`voice-server`**-Microservice über einen Streaming-WebSocket — mit `VOICE_SERVER_URL` aktivieren (sonst in-process für lokale Entwicklung).
+
 ### Integrationen (MCP)
 
 ```env
