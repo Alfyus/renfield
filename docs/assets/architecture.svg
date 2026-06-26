@@ -91,21 +91,21 @@
   <text x="435" y="330" text-anchor="middle" class="box-label">Media Follow</text>
   <text x="435" y="343" text-anchor="middle" class="box-sub">Music Follows User</text>
 
-  <rect x="515" y="310" width="130" height="44" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <rect x="515" y="310" width="130" height="44" rx="6" fill="#1E1E2A" stroke="#00FFD0" stroke-width="1.2"/>
   <text x="580" y="330" text-anchor="middle" class="box-label">Speaker Recog.</text>
-  <text x="580" y="343" text-anchor="middle" class="box-sub">SpeechBrain</text>
+  <text x="580" y="343" text-anchor="middle" class="box-sub">voice-server · ECAPA</text>
 
   <rect x="660" y="310" width="105" height="44" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
   <text x="712" y="330" text-anchor="middle" class="box-label">Auth (RPBAC)</text>
   <text x="712" y="343" text-anchor="middle" class="box-sub">JWT + Roles</text>
 
-  <rect x="80" y="370" width="130" height="44" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <rect x="80" y="370" width="130" height="44" rx="6" fill="#1E1E2A" stroke="#00FFD0" stroke-width="1.2"/>
   <text x="145" y="390" text-anchor="middle" class="box-label">Whisper STT</text>
-  <text x="145" y="403" text-anchor="middle" class="box-sub">Speech-to-Text</text>
+  <text x="145" y="403" text-anchor="middle" class="box-sub">voice-server (GPU)</text>
 
-  <rect x="225" y="370" width="130" height="44" rx="6" fill="#1E1E2A" stroke="#444" stroke-width="1"/>
+  <rect x="225" y="370" width="130" height="44" rx="6" fill="#1E1E2A" stroke="#00FFD0" stroke-width="1.2"/>
   <text x="290" y="390" text-anchor="middle" class="box-label">Piper TTS</text>
-  <text x="290" y="403" text-anchor="middle" class="box-sub">Text-to-Speech</text>
+  <text x="290" y="403" text-anchor="middle" class="box-sub">voice-server (GPU)</text>
 
   <rect x="370" y="370" width="130" height="44" rx="6" fill="#1E1E2A" stroke="#2ea44f" stroke-width="1"/>
   <text x="435" y="390" text-anchor="middle" class="box-label">Presence</text>
@@ -131,11 +131,19 @@
   <line x1="420" y1="495" x2="420" y2="510" class="arrow"/>
 
   <!-- ═══════════ EXTERNAL SERVICES ═══════════ -->
-  <text x="830" y="100" class="section-label">EXTERNAL SERVICES</text>
+  <text x="830" y="100" class="section-label">INFERENCE (GPU)</text>
 
-  <rect x="820" y="112" width="240" height="52" rx="8" fill="#1E1E2A" stroke="#C41E3A" stroke-width="1.5"/>
-  <text x="940" y="135" text-anchor="middle" class="box-label">Ollama (Local LLM)</text>
-  <text x="940" y="150" text-anchor="middle" class="box-sub">Chat · Intent · RAG · Agent · Embeddings</text>
+  <rect x="820" y="112" width="240" height="36" rx="8" fill="#1E1E2A" stroke="#C41E3A" stroke-width="1.5"/>
+  <text x="940" y="128" text-anchor="middle" class="box-label">LLM Server — llama.cpp</text>
+  <text x="940" y="141" text-anchor="middle" class="box-sub">Qwen3.6-35B-A3B · chat·agent·RAG·intent</text>
+
+  <rect x="820" y="152" width="116" height="36" rx="8" fill="#1E1E2A" stroke="#C41E3A" stroke-width="1.2"/>
+  <text x="878" y="169" text-anchor="middle" class="box-label">Embeddings</text>
+  <text x="878" y="181" text-anchor="middle" class="box-sub">llama.cpp</text>
+
+  <rect x="944" y="152" width="116" height="36" rx="8" fill="#1E1E2A" stroke="#C41E3A" stroke-width="1.2"/>
+  <text x="1002" y="169" text-anchor="middle" class="box-label">Vision</text>
+  <text x="1002" y="181" text-anchor="middle" class="box-sub">Ollama · qwen3-vl</text>
 
   <line x1="780" y1="272" x2="820" y2="140" class="arrow" stroke="#C41E3A" opacity="0.6"/>
 
@@ -195,6 +203,6 @@
 
   <!-- ═══════════ FOOTER ═══════════ -->
   <text x="550" y="740" text-anchor="middle" class="box-sub" style="font-size:11px; fill:#555">
-    Python 3.11 · FastAPI · React 18 · PostgreSQL 16 · pgvector · Redis 7 · Ollama · Docker Compose
+    Python 3.11 · FastAPI · React 18 · PostgreSQL 16 · pgvector · Redis 7 · llama.cpp · Ollama · voice-server · Docker Compose
   </text>
 </svg>

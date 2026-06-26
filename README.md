@@ -167,6 +167,16 @@ OLLAMA_RAG_MODEL=qwen3:14b        # RAG answers
 OLLAMA_EMBED_MODEL=nomic-embed-text  # embeddings (768 dim)
 ```
 
+**Pluggable inference — not everything runs on Ollama.** The LLM tier speaks an OpenAI-compatible protocol, so each task can route to a different backend (`LLM_OPENAI_FOR_*`). Ollama is the simple default; the reference deployment splits inference across dedicated GPU servers:
+
+| Tier | Server | Model |
+|------|--------|-------|
+| Chat · Agent · RAG · Intent · KG · Memory | **llama.cpp** | Qwen3.6-35B-A3B (MoE) |
+| Embeddings | **llama.cpp** | Qwen3-Embedding-4B |
+| Vision | **Ollama** | qwen3-vl |
+
+**Voice runs on its own server.** Speech-to-text (Whisper), text-to-speech (Piper), and speaker recognition (ECAPA-TDNN) run in a dedicated, GPU-resident **`voice-server`** microservice over a streaming WebSocket — set `VOICE_SERVER_URL` to use it (they run in-process for local dev otherwise).
+
 ### Key Settings
 
 ```env
