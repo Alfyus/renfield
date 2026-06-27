@@ -8,8 +8,8 @@ from sqlalchemy import select
 
 from models.database import Conversation, Message
 from services.conversation_handoff import (
-    _DEBOUNCE_SECONDS,
     _last_handoff,
+    emit_continued_handoff_frame,
     try_handoff_context,
 )
 
@@ -274,6 +274,95 @@ async def test_handoff_auth_disabled_speaker_only(db_session):
     assert target.speaker_id == 5
     assert target.user_id is None
     assert target.context_vars == {"topic": "no-auth"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_continued_frame_emitted_when_enabled():
+    """Flag on + room → broadcast a media_handoff/continued frame to that room."""
+    dm = MagicMock()
+    dm.broadcast_to_room = AsyncMock()
+    with patch("services.conversation_handoff.settings") as mock_settings, \
+         patch("ha_glue.services.device_manager.get_device_manager", return_value=dm):
+        mock_settings.room_handoff_enabled = True
+        await emit_continued_handoff_frame("Wohnzimmer")
+
+    dm.broadcast_to_room.assert_awaited_once()
+    room, frame = dm.broadcast_to_room.await_args.args
+    assert room == "Wohnzimmer"
+    assert frame == {
+        "type": "media_handoff",
+        "kind": "continued",
+        "room": "Wohnzimmer",
+        "title": "",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_continued_frame_dark_when_flag_off():
+    """Flag off → no frame (feature ships dark)."""
+    dm = MagicMock()
+    dm.broadcast_to_room = AsyncMock()
+    with patch("services.conversation_handoff.settings") as mock_settings, \
+         patch("ha_glue.services.device_manager.get_device_manager", return_value=dm):
+        mock_settings.room_handoff_enabled = False
+        await emit_continued_handoff_frame("Wohnzimmer")
+
+    dm.broadcast_to_room.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_continued_frame_skipped_without_room():
+    """No room name → nothing to target, no frame (even with flag on)."""
+    dm = MagicMock()
+    dm.broadcast_to_room = AsyncMock()
+    with patch("services.conversation_handoff.settings") as mock_settings, \
+         patch("ha_glue.services.device_manager.get_device_manager", return_value=dm):
+        mock_settings.room_handoff_enabled = True
+        await emit_continued_handoff_frame(None)
+
+    dm.broadcast_to_room.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_continued_frame_only_on_successful_handoff():
+    """on_presence_enter_room emits the chip only when ITS context copy succeeds.
+
+    The chip fires from whichever of the two call sites wins the shared debounce.
+    When this (presence) path loses — try_handoff_context returns False because
+    the satellite speak-path already copied within the 10s window — the speak-path
+    emits instead, so this path must NOT also emit (no duplicate)."""
+    from services.conversation_handoff import on_presence_enter_room
+
+    user = MagicMock()
+    user.scalar_one_or_none = MagicMock(return_value=7)  # speaker_id
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=user)
+    db.__aenter__ = AsyncMock(return_value=db)
+    db.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("services.database.AsyncSessionLocal", return_value=db), \
+         patch("services.conversation_handoff.try_handoff_context",
+               new=AsyncMock(return_value=True)) as mock_handoff, \
+         patch("services.conversation_handoff.emit_continued_handoff_frame",
+               new=AsyncMock()) as mock_emit:
+        await on_presence_enter_room(user_id=10, satellite_id=3, room_name="Küche")
+
+    mock_handoff.assert_awaited_once()
+    mock_emit.assert_awaited_once_with("Küche")
+
+    # And NOT emitted when the handoff is a no-op (debounced / no source).
+    with patch("services.database.AsyncSessionLocal", return_value=db), \
+         patch("services.conversation_handoff.try_handoff_context",
+               new=AsyncMock(return_value=False)), \
+         patch("services.conversation_handoff.emit_continued_handoff_frame",
+               new=AsyncMock()) as mock_emit2:
+        await on_presence_enter_room(user_id=10, satellite_id=3, room_name="Küche")
+
+    mock_emit2.assert_not_awaited()
 
 
 @pytest.mark.unit
