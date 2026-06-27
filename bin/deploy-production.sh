@@ -153,7 +153,7 @@ fi
 log "cleanup + image prune on $BUILD_HOST"
 on_build "rm -rf $STAGING; \
   for repo in backend frontend; do \
-    docker images \"$REGISTRY/\$repo\" --format '{{.Repository}}:{{.Tag}}' | awk 'NR>3' | xargs -r -n1 docker rmi 2>/dev/null || true; \
+    docker images \"$REGISTRY/\$repo\" --format '{{.Repository}}:{{.Tag}}' | tail -n +4 | xargs -r -n1 docker rmi 2>/dev/null || true; \
   done; \
   docker image prune -f >/dev/null 2>&1; docker builder prune -f --keep-storage 10GB >/dev/null 2>&1; \
   df -h / | tail -1"
