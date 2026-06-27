@@ -8,9 +8,8 @@ from sqlalchemy import select
 
 from models.database import Conversation, Message
 from services.conversation_handoff import (
-    _DEBOUNCE_SECONDS,
-    _emit_continued_frame,
     _last_handoff,
+    emit_continued_handoff_frame,
     try_handoff_context,
 )
 
@@ -286,7 +285,7 @@ async def test_continued_frame_emitted_when_enabled():
     with patch("services.conversation_handoff.settings") as mock_settings, \
          patch("ha_glue.services.device_manager.get_device_manager", return_value=dm):
         mock_settings.room_handoff_enabled = True
-        await _emit_continued_frame("Wohnzimmer")
+        await emit_continued_handoff_frame("Wohnzimmer")
 
     dm.broadcast_to_room.assert_awaited_once()
     room, frame = dm.broadcast_to_room.await_args.args
@@ -308,7 +307,7 @@ async def test_continued_frame_dark_when_flag_off():
     with patch("services.conversation_handoff.settings") as mock_settings, \
          patch("ha_glue.services.device_manager.get_device_manager", return_value=dm):
         mock_settings.room_handoff_enabled = False
-        await _emit_continued_frame("Wohnzimmer")
+        await emit_continued_handoff_frame("Wohnzimmer")
 
     dm.broadcast_to_room.assert_not_awaited()
 
@@ -322,7 +321,7 @@ async def test_continued_frame_skipped_without_room():
     with patch("services.conversation_handoff.settings") as mock_settings, \
          patch("ha_glue.services.device_manager.get_device_manager", return_value=dm):
         mock_settings.room_handoff_enabled = True
-        await _emit_continued_frame(None)
+        await emit_continued_handoff_frame(None)
 
     dm.broadcast_to_room.assert_not_awaited()
 
@@ -330,7 +329,12 @@ async def test_continued_frame_skipped_without_room():
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_continued_frame_only_on_successful_handoff():
-    """on_presence_enter_room emits the chip only when the context copy succeeds."""
+    """on_presence_enter_room emits the chip only when ITS context copy succeeds.
+
+    The chip fires from whichever of the two call sites wins the shared debounce.
+    When this (presence) path loses — try_handoff_context returns False because
+    the satellite speak-path already copied within the 10s window — the speak-path
+    emits instead, so this path must NOT also emit (no duplicate)."""
     from services.conversation_handoff import on_presence_enter_room
 
     user = MagicMock()
@@ -343,7 +347,7 @@ async def test_continued_frame_only_on_successful_handoff():
     with patch("services.database.AsyncSessionLocal", return_value=db), \
          patch("services.conversation_handoff.try_handoff_context",
                new=AsyncMock(return_value=True)) as mock_handoff, \
-         patch("services.conversation_handoff._emit_continued_frame",
+         patch("services.conversation_handoff.emit_continued_handoff_frame",
                new=AsyncMock()) as mock_emit:
         await on_presence_enter_room(user_id=10, satellite_id=3, room_name="Küche")
 
@@ -354,7 +358,7 @@ async def test_continued_frame_only_on_successful_handoff():
     with patch("services.database.AsyncSessionLocal", return_value=db), \
          patch("services.conversation_handoff.try_handoff_context",
                new=AsyncMock(return_value=False)), \
-         patch("services.conversation_handoff._emit_continued_frame",
+         patch("services.conversation_handoff.emit_continued_handoff_frame",
                new=AsyncMock()) as mock_emit2:
         await on_presence_enter_room(user_id=10, satellite_id=3, room_name="Küche")
 

@@ -530,13 +530,20 @@ async def satellite_websocket(
                     # Conversation handoff: copy context from another satellite if speaker moved
                     if spk and satellite_db_session_id and not satellite_history_loaded:
                         try:
-                            from services.conversation_handoff import try_handoff_context
+                            from services.conversation_handoff import (
+                                emit_continued_handoff_frame,
+                                try_handoff_context,
+                            )
                             async with AsyncSessionLocal() as handoff_db:
                                 handed_off = await try_handoff_context(
                                     spk.id, satellite_db_session_id, handoff_db
                                 )
                                 if handed_off:
                                     logger.info(f"🔄 Conversation handoff for speaker {speaker_name} to {satellite_db_session_id}")
+                                    # Surface the "continued in {room}" chip in this room
+                                    # (the speak-path usually wins the debounce on move-and-talk).
+                                    _sat = satellite_manager.get_satellite(satellite_id)
+                                    await emit_continued_handoff_frame(_sat.room if _sat else None)
                         except Exception as e:
                             logger.warning(f"⚠️ Conversation handoff failed: {e}")
 

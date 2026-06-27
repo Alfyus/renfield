@@ -138,7 +138,7 @@ async def try_handoff_context(
         return False
 
 
-async def _emit_continued_frame(room_name: str | None) -> None:
+async def emit_continued_handoff_frame(room_name: str | None) -> None:
     """Emit the transient "conversation continued in {room}" chat affordance.
 
     The symmetric half of media-follow's handoff chip (chat-UI item 8): mirrors
@@ -148,6 +148,12 @@ async def _emit_continued_frame(room_name: str | None) -> None:
     only when ``ROOM_HANDOFF_ENABLED`` so the feature ships dark; transient,
     never persisted. The frontend renders only ``room`` for this kind (``title``
     is unused). Non-critical: a notification failure must not break the handoff.
+
+    Called from BOTH handoff call sites (the presence-enter hook below and the
+    satellite WS speak-path in ``satellite_handler``) — each guarded by its own
+    ``try_handoff_context`` success. The shared 10s speaker debounce lets exactly
+    ONE of them perform the copy, so the chip is emitted exactly once per move
+    regardless of whether the user moved-then-spoke or merely moved.
     """
     if not settings.room_handoff_enabled or not room_name:
         return
@@ -197,6 +203,6 @@ async def on_presence_enter_room(**kwargs) -> None:
             handed = await try_handoff_context(speaker_id, target_session_id, db)
             if handed:
                 # Surface the "continued in {room}" chip in the user's new room.
-                await _emit_continued_frame(kwargs.get("room_name"))
+                await emit_continued_handoff_frame(kwargs.get("room_name"))
     except Exception as e:
         logger.warning(f"Handoff hook failed: {e}")

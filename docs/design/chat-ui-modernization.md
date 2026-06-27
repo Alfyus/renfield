@@ -215,9 +215,11 @@ trap of optimizing for "what Open WebUI has." None of these should be deferred.
    conversation or media follows the user across rooms (presence + Media Follow).
    This is the payoff of having satellites — make it visible.
    - Media half: `media_follow_service` emits `media_handoff`/`kind:"media_followed"`.
-   - Conversation half: `conversation_handoff.on_presence_enter_room` emits the same
-     frame with `kind:"continued"` after a successful context handoff
-     (`_emit_continued_frame`). Both gated on `ROOM_HANDOFF_ENABLED` (dark),
+   - Conversation half: `conversation_handoff.emit_continued_handoff_frame` emits the
+     same frame with `kind:"continued"` after a successful context handoff. Called
+     from BOTH handoff sites (the `presence_enter_room` hook and the satellite
+     speak-path in `satellite_handler`); the shared 10s speaker debounce makes it
+     exactly-once. Both halves gated on `ROOM_HANDOFF_ENABLED` (dark by default),
      room-scoped to the user's new location, transient (never persisted).
 
 9. **Household-shared vs private conversation surfacing.**
