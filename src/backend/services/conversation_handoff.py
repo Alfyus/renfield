@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.database import Conversation, Message
+from utils.config import settings
 
 # Debounce: track last handoff time per speaker to avoid rapid-fire copies
 _last_handoff: dict[int, float] = {}
@@ -137,6 +138,32 @@ async def try_handoff_context(
         return False
 
 
+async def _emit_continued_frame(room_name: str | None) -> None:
+    """Emit the transient "conversation continued in {room}" chat affordance.
+
+    The symmetric half of media-follow's handoff chip (chat-UI item 8): mirrors
+    ``media_follow_service._notify_user`` — a room-scoped ``media_handoff`` frame
+    with ``kind="continued"``, broadcast ONLY to the room the speaker just
+    entered (their own location — no other user's location is exposed). Emitted
+    only when ``ROOM_HANDOFF_ENABLED`` so the feature ships dark; transient,
+    never persisted. The frontend renders only ``room`` for this kind (``title``
+    is unused). Non-critical: a notification failure must not break the handoff.
+    """
+    if not settings.room_handoff_enabled or not room_name:
+        return
+    try:
+        from ha_glue.services.device_manager import get_device_manager
+
+        await get_device_manager().broadcast_to_room(room_name, {
+            "type": "media_handoff",
+            "kind": "continued",
+            "room": room_name,
+            "title": "",
+        })
+    except Exception:
+        logger.debug(f"Could not emit 'continued' handoff frame for room {room_name}")
+
+
 async def on_presence_enter_room(**kwargs) -> None:
     """Hook listener for presence_enter_room — triggers handoff when speaker moves rooms."""
     from datetime import date
@@ -167,6 +194,9 @@ async def on_presence_enter_room(**kwargs) -> None:
                 return
 
             target_session_id = f"satellite-{satellite_id}-{date.today().isoformat()}"
-            await try_handoff_context(speaker_id, target_session_id, db)
+            handed = await try_handoff_context(speaker_id, target_session_id, db)
+            if handed:
+                # Surface the "continued in {room}" chip in the user's new room.
+                await _emit_continued_frame(kwargs.get("room_name"))
     except Exception as e:
         logger.warning(f"Handoff hook failed: {e}")

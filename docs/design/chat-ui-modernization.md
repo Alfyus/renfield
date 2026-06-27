@@ -210,10 +210,15 @@ trap of optimizing for "what Open WebUI has." None of these should be deferred.
 
 ### Tier 3 — Renfield-unique, no survey project can copy these
 
-8. **Room-aware conversation handoff in the UI.**
+8. **Room-aware conversation handoff in the UI.** ✅ **SHIPPED (both halves).**
    Show "continued in Wohnzimmer" / "now playing in Küche" inline when a
    conversation or media follows the user across rooms (presence + Media Follow).
    This is the payoff of having satellites — make it visible.
+   - Media half: `media_follow_service` emits `media_handoff`/`kind:"media_followed"`.
+   - Conversation half: `conversation_handoff.on_presence_enter_room` emits the same
+     frame with `kind:"continued"` after a successful context handoff
+     (`_emit_continued_frame`). Both gated on `ROOM_HANDOFF_ENABLED` (dark),
+     room-scoped to the user's new location, transient (never persisted).
 
 9. **Household-shared vs private conversation surfacing.**
    Circles already gate retrieval; the chat list could show which conversations
