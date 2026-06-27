@@ -1783,5 +1783,23 @@
       "openInDocs": "Open in Documents",
       "openInGraph": "Open in Graph"
     }
+  },
+  "commandCenter": {
+    "title": "Command Center",
+    "subtitle": "Live constellation of the running system",
+    "idle": "idle",
+    "srSummary": "{{roles}} agent roles, {{tools}} tools, {{rooms}} rooms. Active role: {{active}}.",
+    "ring": {
+      "roles": "Agent roles",
+      "tools": "Tools & integrations",
+      "rooms": "Rooms & satellites",
+      "peers": "Federation peers"
+    },
+    "legend": {
+      "healthy": "Healthy",
+      "degraded": "Degraded",
+      "down": "Down",
+      "unknown": "Unknown"
+    }
   }
 }
