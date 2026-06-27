@@ -35,6 +35,14 @@ _(WICHTIG sweep complete. W10 closed via #487 on 2026-04-27. `tasks/audit-findin
 
 ## P2 — Scheduled follow-ups
 
+### `bin/deploy-production.sh` — kill the `on_build`/`run` nested-quoting foot-gun
+Origin: `/review` of PR #865 (2026-06-27). #865 hot-fixed the symptom (the prune step's `awk 'NR>3'` broke the `ssh '…'` wrapper → `eval` parsed `>3` as a redirect → spurious `exit 1` on every deploy's final cleanup); this is the **root-cause** follow-up.
+- **WHAT:** Replace the hand-quoted double-eval remote-exec helpers — `run() { eval "$@"; }` + `on_build() { run "ssh $BUILD_HOST '$*'"; }` — with a form that doesn't manually wrap the payload in single quotes, e.g. `ssh "$BUILD_HOST" bash -s <<<"$*"` (heredoc, no nested quoting) or `ssh "$BUILD_HOST" "$(printf '%q' "$*")"`, and drop the `eval` in `run`.
+- **WHY:** ANY single quote in ANY `on_build` payload currently breaks out of the wrapper. The `awk` fix only removed the one offending quote; the next `'…'` payload (or a `--format` string that gains a space/special char) silently reintroduces the same class of bug. The adjacent `--format '{{.Repository}}:{{.Tag}}'` already breaks out today and survives only because its token has no shell-special characters (lurking trap, P2 in the #865 review).
+- **PROS:** removes the whole bug class; future `on_build` payloads can contain quotes freely. **CONS:** touches every `on_build`/`run` call site in the script → needs a careful `--dry-run` + a real (or replicated) `.159` round-trip to verify each remote command still parses (the script has no test harness; CI is non-functional). Verify build+push+rollout+prune all still work end-to-end.
+- **CONTEXT:** `bin/deploy-production.sh:64-65` (the helpers). Pre-existing latent issues from the same review also worth a glance: `docker rmi 2>/dev/null || true` masks real rmi failures (acceptable for best-effort prune). Detail: [[reference_deploy_script_prune_bug]].
+- **DEPENDS ON:** nothing; standalone build-infra hygiene.
+
 ### Chat-UI modernization roadmap — progress ledger
 Origin: `/plan-eng-review` 2026-06-15 on `docs/design/chat-ui-modernization.md` (survey + 3-tier
 roadmap + Tier 0 cross-cutting a11y/mobile/voice-transcript/offline). Tiers: **T1** = branching(1)
