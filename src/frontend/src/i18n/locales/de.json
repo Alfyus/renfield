@@ -1783,5 +1783,23 @@
       "openInDocs": "In Dokumenten öffnen",
       "openInGraph": "Im Graph öffnen"
     }
+  },
+  "commandCenter": {
+    "title": "Kommandozentrale",
+    "subtitle": "Live-Konstellation des laufenden Systems",
+    "idle": "inaktiv",
+    "srSummary": "{{roles}} Agenten-Rollen, {{tools}} Werkzeuge, {{rooms}} Räume. Aktive Rolle: {{active}}.",
+    "ring": {
+      "roles": "Agenten-Rollen",
+      "tools": "Werkzeuge & Integrationen",
+      "rooms": "Räume & Satelliten",
+      "peers": "Föderations-Instanzen"
+    },
+    "legend": {
+      "healthy": "Gesund",
+      "degraded": "Eingeschränkt",
+      "down": "Ausgefallen",
+      "unknown": "Unbekannt"
+    }
   }
 }

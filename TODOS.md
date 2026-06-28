@@ -280,6 +280,15 @@ The hybrid extractor (deterministic Steuernummer/IBAN with whitespace normalizat
 
 ## P3 — Conditional / on signal
 
+### Command Center — live constellation of the running system
+Origin: 2026-06-27, sparked by the "Apex" (Reznikov Engineering) radial mission-control UI. Design doc + on-brand React prototype landed on `docs/command-center`; cinematic video mockups in `renfield-video/`. **Primary source: `docs/design/command-center.md`.**
+- **WHAT:** A single read-first "mission control" page (`/admin/command-center`) that unifies what's today scattered across six admin pages (`/admin/routing`, `tool-health`, `trajectories`, `satellites`, `presence`, `integrations`) into one live radial board: a core (active agent role, live off the chat WS `done` frame) → ring of agent roles → ring of MCP tools coloured by health → ring of satellites/rooms coloured by presence → federation peers. Read-only, every node drills into its existing admin page.
+- **WHY:** All the data already exists and is emitted; nothing surfaces it together or *live*. Replaces "open six tabs to understand the system" with one at-a-glance board; reuses role-surfacing's `agent_role` for the live pulse + `presence_map` data for the rooms ring.
+- **PROS:** Mostly frontend composition over existing endpoints + the WS pulse — no new inference, no new endpoints, no schema change. Phase-3 payoff (a circle-aware household **kiosk**, "what's the house doing") is genuinely Renfield-unique — no other chat UI has satellites/rooms to show.
+- **CONS:** Ring crowding at mobile widths (needs a collapsed/list fallback); the kiosk projection needs real circle-aware authz (a non-admin, content-free view) — that's the costly part, deliberately out of v1. The "stunning"/glowing-orb video aesthetic deliberately BREAKS DESIGN.md and must NOT bleed into the product component (`AgentConstellation.tsx` stays restrained, motion only where motivated — see the cinematic mockups for the marketing-only look).
+- **CONTEXT:** Prototype = `src/frontend/src/components/command-center/AgentConstellation.tsx` (+ `types.ts`/`demoData.ts`, `commandCenter.*` i18n), not yet routed. Phase 1 = assemble the live `CommandCenterModel` from the six endpoints + wire the WS pulse + add the `<AdminRoute>` page.
+- **DEPENDS ON:** strategic green-light (same premise gate as the chat-UI roadmap — is an ops board / kiosk worth the build for a voice-first household?). Standalone otherwise.
+
 ### Self-Learning — gated on burn-in data
 Both items below were surfaced by outside voice during the 2026-05-26 `/plan-eng-review` of the admin console PR. Build only when the gate fires.
 
