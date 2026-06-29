@@ -28,7 +28,8 @@
     "continue": "Continua",
     "back": "Indietro",
     "done": "Fatto",
-    "clear": "Svuota"
+    "clear": "Svuota",
+    "daysShort": "{{days}}g"
   },
   "nav": {
     "chat": "Chat",
@@ -771,7 +772,57 @@
     "selectAll": "Seleziona tutto",
     "clear": "Pulisci",
     "systemRole": "Ruolo di sistema",
-    "systemRoleInfo": "Questo è un ruolo di sistema. Puoi modificarne le autorizzazioni ma non rinominarlo o eliminarlo."
+    "systemRoleInfo": "Questo è un ruolo di sistema. Puoi modificarne le autorizzazioni ma non rinominarlo o eliminarlo.",
+    "categories": {
+      "knowledgeBases": {
+        "name": "Basi di conoscenza",
+        "description": "Accesso ai documenti della base di conoscenza"
+      },
+      "homeAssistant": {
+        "name": "Home Assistant",
+        "description": "Controllo dei dispositivi smart home"
+      },
+      "cameras": {
+        "name": "Telecamere",
+        "description": "Accesso a telecamere e video"
+      },
+      "conversations": {
+        "name": "Conversazioni",
+        "description": "Accesso alla cronologia chat"
+      },
+      "roomsDevices": {
+        "name": "Stanze e dispositivi",
+        "description": "Gestione di stanze e dispositivi"
+      },
+      "speakers": {
+        "name": "Speaker",
+        "description": "Gestione dei profili vocali"
+      },
+      "administration": {
+        "name": "Amministrazione",
+        "description": "Amministrazione del sistema"
+      }
+    },
+    "permDesc": {
+      "kb_none": "Nessun accesso alle basi di conoscenza",
+      "kb_own": "Accesso solo alle proprie basi di conoscenza",
+      "kb_shared": "Accesso alle basi di conoscenza proprie e condivise",
+      "kb_all": "Accesso completo a tutte le basi di conoscenza",
+      "ha_none": "Nessun accesso a Home Assistant",
+      "ha_read": "Visualizza solo lo stato dei dispositivi",
+      "ha_control": "Controlla i dispositivi (on/off)",
+      "ha_full": "Controllo completo, inclusi i servizi",
+      "cam_none": "Nessun accesso alle telecamere",
+      "cam_view": "Visualizza eventi della telecamera",
+      "cam_full": "Accesso completo alle telecamere, inclusi gli snapshot",
+      "chat_own": "Accesso solo alle proprie conversazioni",
+      "chat_all": "Accesso a tutte le conversazioni",
+      "rooms_read": "Visualizza stanze e dispositivi",
+      "rooms_manage": "Gestisci stanze e dispositivi",
+      "speakers_own": "Gestisci il proprio profilo vocale",
+      "speakers_all": "Gestisci tutti i profili vocali",
+      "admin": "Amministrazione completa del sistema"
+    }
   },
   "integrations": {
     "title": "Integrazioni",
@@ -1800,6 +1851,21 @@
       "degraded": "Degradato",
       "down": "Non attivo",
       "unknown": "Sconosciuto"
+    }
+  },
+  "routing": {
+    "title": "Pannello di routing",
+    "subtitle": "Decisioni di routing recenti su tutti i canali",
+    "classificationLayers": "Livelli di classificazione",
+    "empty": "Nessuna traccia di routing trovata",
+    "col": {
+      "time": "Ora",
+      "message": "Messaggio",
+      "domain": "Dominio",
+      "layer": "Livello",
+      "confidence": "Affidabilità",
+      "entities": "Entità",
+      "feedback": "Feedback"
     }
   }
 }
