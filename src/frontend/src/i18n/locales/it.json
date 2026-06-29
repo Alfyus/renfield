@@ -27,7 +27,8 @@
     "noResults": "Nessun risultato trovato",
     "continue": "Continua",
     "back": "Indietro",
-    "done": "Fatto"
+    "done": "Fatto",
+    "clear": "Svuota"
   },
   "nav": {
     "chat": "Chat",
@@ -47,6 +48,7 @@
     "memory": "Memorie",
     "brain": "Secondo Cervello",
     "brainReview": "Revisione",
+    "fristen": "Scadenze",
     "federationAudit": "Log di federazione",
     "circles": "Cerchie",
     "intents": "Intenti",
@@ -64,7 +66,8 @@
     "adminSkills": "Inbox competenze",
     "adminToolHealth": "Stato strumenti",
     "adminTrajectories": "Traiettorie",
-    "adminCurator": "Curatore"
+    "adminCurator": "Curatore",
+    "wissen": "Conoscenza"
   },
   "auth": {
     "login": "Accedi",
@@ -124,7 +127,115 @@
     "yourMessage": "Il tuo messaggio",
     "assistantResponse": "Risposta da {{appName}}",
     "readAloud": "Leggi ad alta voce",
+    "edit": "Modifica",
+    "editMessage": "Modifica messaggio",
+    "resubmit": "Invia di nuovo",
+    "regenerate": "Rigenera",
+    "branch": {
+      "group": "Navigazione tra i rami",
+      "previous": "Ramo precedente",
+      "next": "Ramo successivo",
+      "position": "{{current}}/{{total}}",
+      "delete": "Elimina questo ramo",
+      "deleteConfirm": "Eliminare questo ramo e tutte le sue risposte? L'operazione non può essere annullata."
+    },
     "albumArt": "Copertina album",
+    "mediaHandoff": {
+      "followed": "La riproduzione ti segue in {{room}}",
+      "followedUnknownRoom": "La riproduzione ti sta seguendo",
+      "continued": "Proseguita in {{room}}",
+      "continuedUnknownRoom": "Riproduzione proseguita",
+      "ariaLabel": "Avviso: la riproduzione multimediale ti ha seguito in un'altra stanza"
+    },
+    "sources": {
+      "label": "Fonti",
+      "more": "+{{count}} altre"
+    },
+    "followups": {
+      "label": "Domande di approfondimento"
+    },
+    "artifacts": {
+      "generated": "generato",
+      "loading": "Caricamento artefatto",
+      "regionLabel": "Artefatto generato: {{title}}",
+      "regionLabelUntitled": "Artefatto generato",
+      "fallbackNote": "non è stato possibile visualizzarlo come artefatto",
+      "emptyTable": "Nessuna riga",
+      "emptyList": "Nessuna voce",
+      "emptyKeyValue": "Nessuna voce",
+      "emptyChart": "Nessun dato",
+      "weather": {
+        "feelsLike": "Percepiti {{temp}}"
+      },
+      "deviceControl": {
+        "empty": "Nessun dispositivo controllabile trovato",
+        "run": "Esegui scenario {{name}}",
+        "runLabel": "Esegui",
+        "brightness": "Luminosità di {{name}}",
+        "tempDown": "Abbassa il setpoint di {{name}}",
+        "tempUp": "Alza il setpoint di {{name}}"
+      },
+      "presenceMap": {
+        "empty": "Al momento non risulta nessuno in casa",
+        "nobody": "vuoto"
+      },
+      "chartSummary": "{{type}} con {{count}} serie",
+      "chartType": {
+        "bar": "Grafico a barre",
+        "line": "Grafico a linee"
+      },
+      "seriesFallback": "Serie {{n}}"
+    },
+    "roleBadge": {
+      "pin": "Risposto da {{role}} · fissa per la prossima domanda",
+      "pinned": "{{role}} fissato per la prossima domanda"
+    },
+    "roles": {
+      "smart_home": "Smart Home",
+      "media": "Media",
+      "documents": "Documenti",
+      "research": "Ricerca",
+      "presence": "Presenza",
+      "workflow": "Automazione",
+      "general": "Generale",
+      "conversation": "Conversazione",
+      "knowledge": "Conoscenza",
+      "routine": "Routine"
+    },
+    "palette": {
+      "title": "Azioni",
+      "open": "Apri la palette delle azioni",
+      "search": "Cerca azioni…",
+      "noResults": "Nessuna azione trovata",
+      "roleActive": "Ruolo: {{role}}",
+      "clearRole": "Reimposta ruolo",
+      "categories": {
+        "navigate": "Navigazione",
+        "tool": "Azione",
+        "setRole": "Ruolo"
+      },
+      "actions": {
+        "knowledge": "Apri documenti",
+        "brain": "Apri la base di conoscenza",
+        "fristen": "Apri scadenze",
+        "memory": "Apri memorie",
+        "graph": "Apri grafo della conoscenza",
+        "circles": "Impostazioni Circles",
+        "homeassistant": "Apri Smart Home",
+        "cameras": "Apri telecamere",
+        "rooms": "Apri stanze",
+        "btScan": "Scansiona dispositivi Bluetooth",
+        "goodNight": "Avvia la routine della buonanotte",
+        "goodMorning": "Avvia la routine del buongiorno",
+        "presence": "Chi è in casa?",
+        "searchDocs": "Cerca nei documenti",
+        "roleSmartHome": "Ruolo: Smart Home",
+        "roleMedia": "Ruolo: Media",
+        "roleDocuments": "Ruolo: Documenti",
+        "roleResearch": "Ruolo: Ricerca",
+        "roleGeneral": "Ruolo: Generale"
+      }
+    },
     "intent": "Intento",
     "startConversation": "Inizia una conversazione con {{appName}}",
     "useTextOrMic": "Puoi digitare del testo o usare il microfono",
@@ -154,6 +265,7 @@
     "unsupportedFormat": "Formato file non supportato",
     "fileTooLarge": "File troppo grande (max. {{size}}MB)",
     "removeAttachment": "Rimuovi allegato",
+    "uploadProcessing": "in elaborazione …",
     "documentUploaded": "Documento caricato: {{filename}}",
     "documentAttached": "{{count}} documento/i allegato/i",
     "dropFileHere": "Trascina qui il file per allegarlo",
@@ -180,6 +292,22 @@
     "emailFailed": "Impossibile inviare l'email",
     "documentIndexing": "Indicizzazione nella KB...",
     "documentIndexed": "Indicizzato nella KB",
+    "paperlessConfirm": {
+      "title": "Archivia il documento in Paperless",
+      "decisionsHeading": "Scegli per ogni campo",
+      "confirm": "Archivia",
+      "abort": "Annulla",
+      "submitted": "Scelta inviata",
+      "createValueLabel": "Nuova voce",
+      "summaryFields": {
+        "title": "Titolo",
+        "correspondent": "Corrispondente",
+        "document_type": "Tipo di documento",
+        "tags": "Tag",
+        "storage_path": "Percorso di archiviazione",
+        "created_date": "Data di emissione"
+      }
+    },
     "agentThinking": "Pensando...",
     "agentStepsCount": "{{count}} passaggio completato",
     "agentStepsCount_other": "{{count}} passaggi completati",
@@ -193,7 +321,23 @@
     },
     "exampleWeather": "Com'è il tempo?",
     "exampleLight": "Accendi la luce del soggiorno",
-    "exampleMusic": "Riproduci un po' di musica jazz"
+    "exampleMusic": "Riproduci un po' di musica jazz",
+    "search": {
+      "placeholderGlobal": "Cerca nei messaggi…",
+      "placeholderInConversation": "Cerca in questa conversazione…",
+      "clear": "Svuota la ricerca",
+      "searching": "Ricerca in corso…",
+      "resultsLabel": "Risultati della ricerca",
+      "roleUser": "Tu",
+      "roleAssistant": "Renfield",
+      "moreResults": "Altri risultati disponibili – affina la ricerca",
+      "emptyTitle": "Nessun messaggio trovato per “{{query}}”",
+      "emptyHintGlobal": "Prova termini diversi o controlla l'ortografia.",
+      "emptyHintInConversation": "In questa conversazione non c'è alcun messaggio corrispondente.",
+      "noPermissionTitle": "Ricerca non disponibile",
+      "noPermissionHint": "Accedi per cercare nei tuoi messaggi.",
+      "error": "Ricerca non riuscita. Riprova."
+    }
   },
   "voice": {
     "startRecording": "Avvia registrazione vocale",
@@ -481,6 +625,20 @@
     "serverError": "Qualcosa è andato storto durante il caricamento.",
     "showDetails": "Mostra dettagli",
     "hideDetails": "Nascondi dettagli",
+    "facts": {
+      "toggle": "Fatti",
+      "title": "Fatti estratti",
+      "loadError": "Impossibile caricare i fatti.",
+      "extracting": "Estrazione dei fatti …",
+      "empty": "Nessun fatto trovato.",
+      "disabled": "L'estrazione dei fatti è disattivata.",
+      "disabledHint": "Può essere attivata nelle impostazioni.",
+      "group": {
+        "identifier": "Identificativi",
+        "universal": "Dati chiave",
+        "obligation": "Scadenze"
+      }
+    },
     "failedRetry": "Carica di nuovo",
     "pollingTimeout": "L'elaborazione di \"{{filename}}\" sta richiedendo più tempo del previsto. Aggiorna per vedere lo stato attuale."
   },
@@ -497,6 +655,8 @@
     "noMemories": "Nessuna memoria ancora",
     "count": "{{count}} memorie",
     "couldNotLoad": "Impossibile caricare le memorie",
+    "subjectLabel": "Riguardo: {{name}}",
+    "aboutThisEntity": "Memorie su questa entità",
     "content": "Contenuto",
     "importance": "Importanza",
     "accessCount": "Conteggio accessi",
@@ -786,9 +946,58 @@
       "completed": "Completato",
       "failed": "Fallito",
       "rolling_back": "Ripristino backup..."
+    },
+    "enrollment": {
+      "title": "Registrazione satellite",
+      "description": "Assegna a ogni satellite una chiave di registrazione univoca (PSK) con cui dimostra la propria identità al backend. La chiave viene mostrata UNA SOLA VOLTA — configurala poi sul satellite.",
+      "statusEnabled": "Registrazione attiva",
+      "statusDisabled": "Registrazione disattivata",
+      "statusEnforcing": "Obbligatoria",
+      "statusPermissive": "Fase di rodaggio",
+      "pendingCount": "{{count}} non ancora autenticati",
+      "satelliteId": "ID satellite",
+      "satelliteIdPlaceholder": "es. sat-wohnzimmer",
+      "room": "Stanza",
+      "roomPlaceholder": "Stanza (opzionale)",
+      "enroll": "Registra",
+      "enrolling": "Registrazione…",
+      "enrollFailed": "Registrazione non riuscita",
+      "tokenMinted": "Chiave generata per {{id}}",
+      "tokenRotated": "Chiave rigenerata per {{id}}",
+      "tokenOnceWarning": "Questa chiave viene mostrata una sola volta. Copiala ora e configurala sul satellite (host_vars o un Secret k8s).",
+      "copy": "Copia",
+      "copied": "Copiata",
+      "lastAuth": "Ultima autenticazione",
+      "never": "mai",
+      "connected": "Connesso",
+      "offline": "Offline",
+      "revoked": "revocata",
+      "revoke": "Revoca",
+      "rotate": "Rigenera",
+      "alreadyEnrolled": "Già registrato — usa “Rigenera” per emettere un nuovo token.",
+      "copyFailed": "Copia non riuscita — seleziona il token manualmente (viene mostrato una sola volta).",
+      "invalidIdFormat": "Formato ID satellite non valido — sono ammessi solo lettere, cifre e . _ -."
     }
   },
   "presence": {
+    "irk": {
+      "title": "Presenza del telefono (accoppiamento BLE)",
+      "description": "Accoppia un telefono una sola volta, così il suo indirizzo Bluetooth variabile viene associato a un'identità stabile per la presenza nelle stanze. Nessuna app necessaria.",
+      "user": "Utente",
+      "selectUser": "Seleziona utente…",
+      "satellite": "Satellite",
+      "selectSatellite": "Seleziona satellite…",
+      "label": "Etichetta",
+      "labelPlaceholder": "es. eduard-iphone",
+      "startPairing": "Avvia accoppiamento",
+      "waiting": "In attesa del telefono…",
+      "instructions": "Sul telefono: Impostazioni → Bluetooth → tocca “Renfield {{room}}”.",
+      "theSatellite": "il satellite",
+      "captured": "Accoppiato — la presenza del telefono ora viene rilevata.",
+      "failed": "Nessun telefono accoppiato in tempo. Riprova.",
+      "disabled": "disattivato",
+      "revoke": "Rimuovi"
+    },
     "title": "Presenza",
     "subtitle": "Chi è dove — presenza nelle stanze via BLE, voce e web",
     "roomOccupancy": "Occupazione stanze",
@@ -833,6 +1042,12 @@
     "tabLive": "Live",
     "tabAnalytics": "Analitica",
     "heatmapTitle": "Mappa di calore attività stanza",
+    "heatmapDescription": "Quanto spesso è stata usata ogni stanza, in base all'ora del giorno (ora locale). Più scuro = più spesso.",
+    "heatmapHourAxis": "Ora (ora del giorno)",
+    "heatmapRoomLabel": "Stanza",
+    "heatmapLegendLess": "meno",
+    "heatmapLegendMore": "più",
+    "heatmapCellTooltip": "{{room}} alle {{hour}}:00 — {{count}}×",
     "predictionsTitle": "Previsioni presenza",
     "dailySummaryTitle": "Attività giornaliera",
     "allUsers": "Tutti gli utenti",
@@ -886,6 +1101,7 @@
     "selectCorrectIntent": "Seleziona l'intento corretto:",
     "selectComplexity": "Seleziona la complessità corretta:",
     "correctionSaved": "Correzione salvata! {{appName}} imparerà da questo.",
+    "regenerate": "Rispondi di nuovo",
     "proactiveQuestion": "Era questa la classificazione giusta?",
     "intentConversation": "Conversazione generale",
     "intentKnowledge": "Base di conoscenza",
@@ -913,7 +1129,8 @@
     "forbidden": "Accesso negato",
     "serverError": "Errore del server",
     "validationError": "Errore di validazione",
-    "couldNotProcess": "Spiacente, si è verificato un errore nell'elaborazione della tua richiesta."
+    "couldNotProcess": "Spiacente, si è verificato un errore nell'elaborazione della tua richiesta.",
+    "connectionInterrupted": "La connessione si è interrotta durante la risposta. Riprova."
   },
   "errorBoundary": {
     "title": "Qualcosa è andato storto",
@@ -1029,6 +1246,7 @@
       "control": "Controllo Audit",
       "review": "Coda di revisione",
       "ocr": "Problemi OCR",
+      "lowquality": "Bassa qualità OCR",
       "completeness": "Completezza",
       "duplicates": "Duplicati",
       "correspondents": "Corrispondenti",
@@ -1075,6 +1293,16 @@
       "reocr": "Rielabora",
       "noIssues": "Nessun problema OCR trovato"
     },
+    "lowQuality": {
+      "title": "Documento",
+      "empty": "Nessun documento con OCR di bassa qualità trovato",
+      "failedBadge": "OCR non riuscito",
+      "droppedBadge": "{{pct}}% scartato",
+      "ignore": "Ignora",
+      "unignore": "Non ignorare più",
+      "ignored": "ignorato",
+      "reocr": "Ripeti OCR"
+    },
     "completeness": {
       "score": "Completezza",
       "issues": "Problemi",
@@ -1107,7 +1335,53 @@
     "notConfigured": "Paperless Audit non è configurato. Abilita PAPERLESS_AUDIT_ENABLED=true e assicurati che il server MCP Paperless sia connesso.",
     "error": "Impossibile caricare i dati di audit"
   },
+  "obligations": {
+    "title": "Scadenze",
+    "subtitle": "Prossimi obblighi dai tuoi documenti",
+    "loadError": "Impossibile caricare le scadenze.",
+    "confirmError": "Impossibile salvare la conferma.",
+    "exportIcs": "Esporta (.ics)",
+    "calendarSyncLabel": "Sincronizzazione calendario:",
+    "calendarSyncOff": "Disattivata",
+    "calendarError": "Impossibile caricare/salvare l'impostazione del calendario.",
+    "timeRangeLabel": "Intervallo",
+    "group": {
+      "overdue": "Scadute",
+      "thisWeek": "Questa settimana",
+      "later": "Più tardi"
+    },
+    "frist": {
+      "today": "oggi · {{date}}",
+      "future_one": "tra {{count}} giorno · {{date}}",
+      "future_other": "tra {{count}} giorni · {{date}}",
+      "overdue_one": "scaduta da {{count}} giorno · {{date}}",
+      "overdue_other": "scaduta da {{count}} giorni · {{date}}"
+    },
+    "kind": {
+      "zahlung": "Pagamento",
+      "widerspruch": "Opposizione",
+      "klagefrist": "Termine di ricorso",
+      "frist": "Scadenza"
+    },
+    "legal": "legale",
+    "legalAria": "Scadenza legale — richiede conferma",
+    "bestaetigen": "Conferma",
+    "rueckgaengig": "Annulla",
+    "wiederOeffnen": "Riapri",
+    "toastConfirmed": "Confermato",
+    "toastConfirmedAria": "Confermato — annulla entro 5 secondi",
+    "loadMore": "Carica altro",
+    "emptyTitle": "Nessun obbligo aperto.",
+    "emptyBody": "Tutte le scadenze dei tuoi documenti sono gestite o ancora lontane.",
+    "openSource": "Apri documento"
+  },
   "circles": {
+    "tierOverridden": "Visibilità personalizzata (diversa dal documento).",
+    "tierOverriddenShort": "personalizzata",
+    "resetTier": "Reimposta al livello del documento",
+    "filterLabel": "Filtra i risultati",
+    "filterAll": "Tutti",
+    "filterFactsOnly": "Solo fatti",
     "tier": {
       "0": "Privato",
       "1": "Fidati",
@@ -1134,6 +1408,24 @@
     "reviewDaysLabel": "Finestra",
     "reviewEmpty": "Nessun nuovo atomo da revisionare.",
     "reviewTierChanged": "Livello aggiornato.",
+    "mergeProposals": {
+      "sectionTitle": "Suggerimenti di unione",
+      "whySuggested": "Possibile duplicato · {{pct}}% di somiglianza",
+      "reason": {
+        "cross_tier": "visibilità diversa",
+        "gray_zone": "simile ma incerto"
+      },
+      "survivorLegend": "Quale entità deve rimanere?",
+      "keepThis": "Mantieni {{name}}",
+      "mentions_one": "{{count}} menzione",
+      "mentions_other": "{{count}} menzioni",
+      "willMerge": "viene unita in",
+      "visibilityWarning": "Attenzione: la visibilità cambia da {{from}} a {{to}}",
+      "merge": "Unisci",
+      "reject": "Rifiuta",
+      "merged": "Unito",
+      "undo": "Annulla"
+    },
     "settingsTitle": "Cerchie e Membri",
     "settingsSubtitle": "Gestisci i tuoi livelli e chi è invitato in ciascuno.",
     "defaultCaptureTier": "Livello di cattura predefinito",
@@ -1150,8 +1442,16 @@
       "kb_document": "Documento",
       "kg_node": "Entità",
       "kg_edge": "Relazione",
-      "conversation_memory": "Memoria"
+      "conversation_memory": "Memoria",
+      "document_fact": "Fatto"
     },
+    "source": {
+      "deterministic": "verificato",
+      "deterministicTitle": "Estratto in modo deterministico — affidabile",
+      "advisory": "suggerimento del modello",
+      "advisoryTitle": "Suggerito dal modello linguistico — verifica"
+    },
+    "lowConfidence": "(bassa affidabilità)",
     "couldNotLoad": "Impossibile caricare i dati.",
     "couldNotSave": "Impossibile salvare le modifiche.",
     "score": "Rilevanza",
@@ -1433,6 +1733,73 @@
         "staleArchived": "Archiviato obsoleto",
         "error": "Errore"
       }
+    }
+  },
+  "lens": {
+    "uebersicht": "Panoramica",
+    "dokumente": "Documenti",
+    "graph": "Grafo",
+    "erinnerungen": "Memorie",
+    "fristen": "Scadenze",
+    "pruefen": "Verifica",
+    "railLabel": "Viste della conoscenza",
+    "pickerLabel": "Scegli vista",
+    "searchAllPlaceholder": "Cerca ovunque…",
+    "scopeLabel": "Ambito di ricerca",
+    "scopeThis": "Questa vista",
+    "scopeAll": "Tutto",
+    "searchNoResults": "Nessun risultato per “{{query}}”",
+    "searchWidenHint": "Passa a “Tutto” per cercare nell'intera base di conoscenza.",
+    "overview": {
+      "title": "In sintesi",
+      "figDocs_one": "{{count}} documento",
+      "figDocs_other": "{{count}} documenti",
+      "figEntities_one": "{{count}} entità",
+      "figEntities_other": "{{count}} entità",
+      "figRelations_one": "{{count}} relazione",
+      "figRelations_other": "{{count}} relazioni",
+      "figMemories_one": "{{count}} memoria",
+      "figMemories_other": "{{count}} memorie",
+      "open": "Apri",
+      "fristen": "Prossime scadenze",
+      "fristenSoon_one": "{{count}} nei prossimi 7 giorni",
+      "fristenSoon_other": "{{count}} nei prossimi 7 giorni",
+      "overdueAccent_one": "{{count}} scaduta",
+      "overdueAccent_other": "{{count}} scadute",
+      "noFristen": "Nessuna scadenza nei prossimi 7 giorni.",
+      "review": "Da verificare",
+      "reviewNone": "Niente da verificare.",
+      "reviewShort_one": "{{count}} da verificare",
+      "reviewShort_other": "{{count}} da verificare",
+      "docsNone": "Ancora nessun documento.",
+      "graphNone": "Ancora nessuna entità.",
+      "memoriesNone": "Ancora nessuna memoria.",
+      "emptyTitle": "Il tuo secondo cervello è vuoto.",
+      "emptyCta": "Carica un documento"
+    },
+    "detail": {
+      "title": "Dettaglio",
+      "tier": "Visibilità",
+      "openInDocs": "Apri in Documenti",
+      "openInGraph": "Apri nel Grafo"
+    }
+  },
+  "commandCenter": {
+    "title": "Centro di comando",
+    "subtitle": "Costellazione in tempo reale del sistema in esecuzione",
+    "idle": "inattivo",
+    "srSummary": "{{roles}} ruoli agente, {{tools}} strumenti, {{rooms}} stanze. Ruolo attivo: {{active}}.",
+    "ring": {
+      "roles": "Ruoli agente",
+      "tools": "Strumenti e integrazioni",
+      "rooms": "Stanze e satelliti",
+      "peers": "Istanze federate"
+    },
+    "legend": {
+      "healthy": "In salute",
+      "degraded": "Degradato",
+      "down": "Non attivo",
+      "unknown": "Sconosciuto"
     }
   }
 }
