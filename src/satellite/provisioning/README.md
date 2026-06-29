@@ -63,6 +63,34 @@ Preview changes without applying:
 ansible-playbook -i inventory.yml provision.yml --limit satellite-fitnessraum --check -v
 ```
 
+## HiFiBerry DLNA Renderers (http TTS)
+
+The `hifiberry` inventory group + `provision-hifiberry.yml` are **separate from
+the satellites** — a HiFiBerry is a DLNA music renderer, not a Renfield
+satellite. The playbook pins `renfield.local` in `/etc/hosts` so the HiFiBerry's
+gstreamer can fetch backend-served **http** TTS audio (relay/announce). Without
+it, TTS to the HiFiBerry fails *silently* (the renderer reports `playing` but
+never fetches the URL).
+
+Why only the HiFiBerry: Linn/openHome renderers resolve `renfield.local` via DNS
+natively; the HiFiBerry's systemd-resolved hijacks `.local` as mDNS (NOTFOUND
+before DNS), so gstreamer's getaddrinfo can't resolve it. (TTS delivery is http,
+so no TLS/CA step is needed — that was removed when delivery moved off the
+self-signed https URL.) Full background: `docs/MESSAGE_RELAY.md` → "TTS audio
+delivery to renderers".
+
+```bash
+cd src/satellite/provisioning
+# Login user is root (HiFiBerryOS has no sudo) → --ask-pass (password: hifiberry)
+ansible-playbook -i inventory.yml provision-hifiberry.yml --ask-pass --limit hifiberry-arbeitszimmer
+
+# Dry run
+ansible-playbook -i inventory.yml provision-hifiberry.yml --ask-pass --check
+```
+
+Idempotent. Tags: `hosts`. **Re-run after a HiFiBerryOS update** — an OS update
+wipes the `/etc/hosts` edit.
+
 ## Adding a New Satellite
 
 1. Add the host to `inventory.yml`

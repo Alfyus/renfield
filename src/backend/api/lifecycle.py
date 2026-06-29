@@ -32,6 +32,7 @@ def _spawn_periodic_task(
     interval: int,
     work: Callable[[], Awaitable[None]],
     started_msg: str,
+    run_at_boot: bool = False,
 ) -> None:
     """Spawn a fire-and-forget background task that runs ``work`` every
     ``interval`` seconds.
@@ -46,12 +47,32 @@ def _spawn_periodic_task(
       - ``started_msg`` is logged at INFO on spawn so log aggregation
         sees the same "X scheduler started" line as before this helper
         existed.
+      - ``run_at_boot`` (opt-in): run one tick promptly after spawn,
+        BEFORE the first ``sleep(interval)``, then fall into the normal
+        cadence. Required for schedulers whose ``interval`` is on the
+        order of (or longer than) the pod's lifetime: the plain
+        sleep-then-work loop fires its first tick ``interval`` seconds
+        after boot and the timer resets on every restart, so a pod that
+        recycles more often than ``interval`` NEVER runs the work (#678).
+        Leave False for short-interval schedulers — they reach their
+        first real tick well within a normal pod lifetime.
 
     Gates (``settings.X_enabled``) are the caller's responsibility — they
     decide whether the scheduler runs AT ALL, distinct from the loop
     body which decides what work happens per tick.
     """
     async def _loop() -> None:
+        if run_at_boot:
+            try:
+                await work()
+            # CancelledError (BaseException, not Exception) is intentionally
+            # NOT caught here: a shutdown cancel during the boot tick should
+            # propagate so the task settles as cancelled, same as the loop
+            # below. Only a genuine work() failure is logged and swallowed,
+            # so a transient boot-run error still falls into the interval
+            # loop instead of disabling the scheduler.
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{name} failed (boot run): {e}")
         while True:
             try:
                 await asyncio.sleep(interval)
@@ -134,6 +155,51 @@ def _schedule_whisper_preload():
         logger.warning(f"⚠️  Whisper-Preloading fehlgeschlagen: {e}")
 
 
+# Last-seen daypart for the watcher loop. Module-level so the loop closure
+# carries state across ticks; `None` until the first tick (which always fires
+# the hook because there is no prior value to compare against).
+_daypart_watcher_state: dict[str, str | None] = {"last": None}
+
+
+def _schedule_daypart_watcher():
+    """Watch for day/evening/night transitions and fire the `daypart_changed`
+    hook so features (e.g. satellite LED dimming) can react.
+
+    Runs at boot (so the first tick establishes the current daypart) and then
+    every 5 minutes. Stateless apart from the module-level last-seen daypart.
+    """
+
+    async def _tick():
+        from services.daypart_service import get_daypart_info
+        from utils.hooks import run_hooks
+
+        info = get_daypart_info()
+        current = info["daypart"]
+        local_time = info["local_time"]
+        previous = _daypart_watcher_state["last"]
+
+        if current != previous:
+            # run_hooks never raises — handler exceptions are logged inside.
+            await run_hooks(
+                "daypart_changed",
+                previous=previous,
+                current=current,
+                local_time=local_time,
+            )
+            _daypart_watcher_state["last"] = current
+            logger.info(
+                f"🌓 Daypart transition: {previous} → {current} (local {local_time})"
+            )
+
+    _spawn_periodic_task(
+        name="Daypart watcher",
+        interval=300,
+        work=_tick,
+        started_msg="✅ Daypart Watcher gestartet (alle 5 Minuten)",
+        run_at_boot=True,
+    )
+
+
 def _schedule_notification_cleanup():
     """Schedule periodic cleanup of expired notifications."""
     if not settings.proactive_enabled:
@@ -176,9 +242,11 @@ def _schedule_reminder_checker():
 def _schedule_speaker_vocab_rebuild():
     """Periodically rebuild the per-user STT vocabulary table (Phase B-3 follow-up).
 
-    Sleep-first cadence — a freshly-restarted pod doesn't hammer the DB on
-    every boot. First rebuild happens after one interval; cold-start
-    callers see the platform default until then.
+    Runs at boot (``run_at_boot=True`` below), then every interval. The
+    daily interval is longer than a typical pod lifetime, so a sleep-first
+    cadence would mean the rebuild never runs on a pod that recycles
+    sooner (#678); the boot tick guarantees cold-start callers get a fresh
+    vocabulary instead of the platform default.
     """
     if not settings.speaker_vocab_capture_enabled:
         return
@@ -195,6 +263,7 @@ def _schedule_speaker_vocab_rebuild():
         interval=interval,
         work=_tick,
         started_msg=f"✅ Speaker vocab rebuild scheduled (interval={interval}s)",
+        run_at_boot=True,  # daily interval — see #678
     )
 
 
@@ -320,6 +389,7 @@ def _schedule_trajectory_cleanup():
             f"(interval={settings.trajectory_cleanup_interval}s, "
             f"retention={settings.trajectory_retention_days}d)"
         ),
+        run_at_boot=True,  # daily interval — see #678
     )
 
 
@@ -367,6 +437,176 @@ def _schedule_skill_curator():
             f"duplicate_threshold={settings.skill_curator_duplicate_threshold}, "
             f"stale_days={settings.skill_curator_stale_days})"
         ),
+        run_at_boot=True,  # daily interval — see #678
+    )
+
+
+def _schedule_kg_reconciler():
+    """Periodic KG entity reconciler (Structured Memory Phase 1, T5).
+
+    Per user: auto-merge same-tier high-confidence duplicate entities and queue
+    cross-tier / gray-zone pairs as kg_merge_proposals for owner review (D3).
+    Gated on ``kg_reconciler_enabled`` (opt-in).
+    """
+    if not settings.kg_reconciler_enabled:
+        return
+
+    async def _tick():
+        from services.kg_reconciler_service import KgReconcilerService
+
+        async with AsyncSessionLocal() as enum_session:
+            user_ids = await KgReconcilerService(enum_session).list_active_user_ids()
+
+        # Per-user session so a failure / aborted txn doesn't leak between users.
+        for uid in user_ids:
+            try:
+                async with AsyncSessionLocal() as per_user_db:
+                    await KgReconcilerService(per_user_db).run_for_user(uid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"KG reconciler failed for user {uid}: {e}")
+
+    _spawn_periodic_task(
+        name="KG reconciler",
+        interval=settings.kg_reconciler_interval,
+        work=_tick,
+        started_msg=(
+            f"KG Reconciler gestartet "
+            f"(interval={settings.kg_reconciler_interval}s, "
+            f"candidate>={settings.kg_reconciler_candidate_threshold}, "
+            f"auto>={settings.kg_reconciler_auto_merge_threshold})"
+        ),
+        run_at_boot=True,  # daily interval — see #678
+    )
+
+
+def _schedule_kg_conflation_monitor():
+    """Periodic KG conflation tripwire (read-only early warning).
+
+    Logs + gauges distinct-name same-type entity pairs that embed >= the monitor
+    threshold — a forming generic-centroid magnet / mis-embedding. NEVER mutates
+    (a genuine duplicate is the reconciler's job). Gated on
+    ``kg_conflation_monitor_enabled`` (opt-in). Expected count: 0.
+    """
+    if not settings.kg_conflation_monitor_enabled:
+        return
+
+    async def _tick():
+        from services.kg_conflation_monitor import KgConflationMonitor
+
+        async with AsyncSessionLocal() as db:
+            await KgConflationMonitor(db).scan_all()
+
+    _spawn_periodic_task(
+        name="KG conflation monitor",
+        interval=settings.kg_conflation_monitor_interval,
+        work=_tick,
+        started_msg=(
+            f"KG Conflation-Monitor gestartet "
+            f"(interval={settings.kg_conflation_monitor_interval}s, "
+            f"threshold>={settings.kg_conflation_monitor_threshold})"
+        ),
+        run_at_boot=True,  # daily interval — see #678
+    )
+
+
+def _schedule_obligation_deadline_notifier():
+    """Daily owner-targeted obligation-deadline notifier (Schicht A).
+
+    Scans dated ``document_facts`` obligations, fires the single current
+    lead-time milestone per obligation, and records it in the
+    ``obligation_acknowledgements`` ledger so a restart / re-run never re-fires
+    (the missed-deadline safety property).
+
+    Gated on BOTH ``obligation_notifier_enabled`` AND ``proactive_enabled``:
+    the notifier delivers via the proactive subsystem, so running it while
+    proactive delivery is off would consume each milestone in the ledger (the
+    scan records it) without ever delivering — the elapsed reminders would be
+    silently skipped once proactive is later enabled. Requiring both keeps the
+    ledger and delivery in lockstep.
+    """
+    if not (settings.obligation_notifier_enabled and settings.proactive_enabled):
+        return
+
+    async def _tick():
+        from services.obligation_deadline_notifier import scan_all_users
+
+        await scan_all_users()
+
+    _spawn_periodic_task(
+        name="Obligation deadline notifier",
+        interval=settings.obligation_notifier_interval,
+        work=_tick,
+        started_msg=(
+            f"Obligation Deadline Notifier gestartet "
+            f"(interval={settings.obligation_notifier_interval}s, "
+            f"overdue_grace={settings.obligation_notifier_overdue_grace_days}d)"
+        ),
+        run_at_boot=True,  # daily interval — must run on cold start (#678)
+    )
+
+
+def _schedule_obligation_digest():
+    """Weekly obligation digest (Schicht A) — the safety floor under the
+    per-milestone notifier.
+
+    One owner-targeted summary per ISO week of every OPEN obligation (no lower
+    date bound), so a late-extracted / very-overdue deadline the notifier's
+    grace window missed still surfaces. Dedup is a ``(user, week)`` row in
+    ``obligation_digest_log`` (restart-safe). Gated on both
+    ``obligation_digest_enabled`` AND ``proactive_enabled`` (delivery runs
+    through the proactive subsystem).
+    """
+    if not (settings.obligation_digest_enabled and settings.proactive_enabled):
+        return
+
+    async def _tick():
+        from services.obligation_digest import scan_all_users
+
+        await scan_all_users()
+
+    _spawn_periodic_task(
+        name="Obligation digest",
+        interval=settings.obligation_digest_interval,
+        work=_tick,
+        started_msg=(
+            f"Obligation Digest gestartet "
+            f"(interval={settings.obligation_digest_interval}s, "
+            f"horizon={settings.obligation_digest_horizon_days}d)"
+        ),
+        run_at_boot=True,  # weekly interval — must run on cold start (#678)
+    )
+
+
+def _schedule_obligation_calendar_sync(app):
+    """Daily obligation → calendar reconciler (Calendar MCP).
+
+    Mirrors each opted-in user's open obligations into their chosen calendar as
+    events (create/update/delete). Per-user opt-in via obligation_calendar_pref;
+    needs the calendar MCP reachable (degrades gracefully if not). Gated on
+    ``obligation_calendar_sync_enabled``.
+    """
+    if not settings.obligation_calendar_sync_enabled:
+        return
+
+    async def _tick():
+        from services.obligation_calendar_sync import reconcile_all_users
+
+        mgr = getattr(app.state, "mcp_manager", None)
+        if mgr is None:
+            logger.debug("Calendar sync: mcp_manager not ready; skipping tick")
+            return
+        await reconcile_all_users(mgr)
+
+    _spawn_periodic_task(
+        name="Obligation calendar sync",
+        interval=settings.obligation_calendar_sync_interval,
+        work=_tick,
+        started_msg=(
+            f"Obligation Calendar Sync gestartet "
+            f"(interval={settings.obligation_calendar_sync_interval}s, "
+            f"horizon={settings.obligation_calendar_horizon_days}d)"
+        ),
+        run_at_boot=True,  # daily — must run on cold start (#678)
     )
 
 
@@ -417,6 +657,7 @@ def _schedule_skill_shadow_log_cleanup():
             f"(interval={settings.skill_shadow_log_cleanup_interval}s, "
             f"retention={settings.skill_shadow_log_retention_days}d)"
         ),
+        run_at_boot=True,  # daily interval — see #678
     )
 
 
@@ -640,16 +881,13 @@ async def _cancel_startup_tasks():
 # to connected devices.
 
 
-async def _load_plugin_module():
-    """Load the plugin module specified in settings.plugin_module.
+async def _load_one_plugin(spec: str):
+    """Load and invoke a single plugin spec.
 
     Format: "package.module:callable" — the callable receives no args
     and is expected to call register_hook() for the events it cares about.
+    A failing plugin is logged and swallowed so it cannot crash startup.
     """
-    spec = settings.plugin_module
-    if not spec:
-        return
-
     try:
         import importlib
 
@@ -670,6 +908,27 @@ async def _load_plugin_module():
         logger.info(f"Plugin module loaded: {spec}")
     except Exception:
         logger.opt(exception=True).error(f"Failed to load plugin module: {spec}")
+
+
+async def _load_plugin_module():
+    """Load all configured startup plugins.
+
+    Sources, in order: settings.plugin_module (singular, backward-compat) then
+    settings.plugin_modules (a comma-separated list of "module:callable"
+    entries). Entries are deduped so the same spec is invoked only once even if
+    it appears in both. Each is loaded independently — one failing plugin is
+    logged and skipped, never crashing startup.
+    """
+    specs: list[str] = []
+    seen: set[str] = set()
+    for raw in [settings.plugin_module, *settings.plugin_modules.split(",")]:
+        spec = raw.strip()
+        if spec and spec not in seen:
+            seen.add(spec)
+            specs.append(spec)
+
+    for spec in specs:
+        await _load_one_plugin(spec)
 
 
 @asynccontextmanager
@@ -757,6 +1016,7 @@ async def lifespan(app: "FastAPI"):
     if settings.features["voice"]:
         _schedule_whisper_preload()
         _schedule_speaker_vocab_rebuild()
+    _schedule_daypart_watcher()
     _schedule_notification_cleanup()
     _schedule_reminder_checker()
     _schedule_notification_poller(app)
@@ -765,8 +1025,13 @@ async def lifespan(app: "FastAPI"):
     _schedule_federation_audit_cleanup()
     _schedule_trajectory_cleanup()
     _schedule_skill_curator()
+    _schedule_kg_reconciler()
+    _schedule_kg_conflation_monitor()
+    _schedule_obligation_deadline_notifier()
+    _schedule_obligation_digest()
     _schedule_skill_shadow_log_cleanup()
     _schedule_paperless_sweepers(app)
+    _schedule_obligation_calendar_sync(app)
 
     # Self-learning Phase 1: load bundled seed skills into the database.
     # Idempotent — seeds with a matching title are skipped, so re-running
@@ -788,10 +1053,9 @@ async def lifespan(app: "FastAPI"):
     # flag internally. ha_glue also handles its own shutdown cleanup via
     # `shutdown` and `shutdown_finalize` hook handlers.
 
-    # Knowledge Graph hooks
+    # Knowledge Graph message/context hooks (chat path, API-pod only).
     if settings.knowledge_graph_enabled:
         from services.knowledge_graph_service import (
-            kg_post_document_ingest_hook,
             kg_post_message_hook,
             kg_retrieve_context_hook,
         )
@@ -799,8 +1063,15 @@ async def lifespan(app: "FastAPI"):
 
         register_hook("post_message", kg_post_message_hook)
         register_hook("retrieve_context", kg_retrieve_context_hook)
-        register_hook("post_document_ingest", kg_post_document_ingest_hook)
-        logger.info("✅ Knowledge Graph hooks registered")
+        logger.info("✅ Knowledge Graph message/context hooks registered")
+
+    # post_document_ingest consumers (KG + Schicht A field extractor). Shared
+    # with the document-worker via services/document_ingest_hooks.py — the
+    # worker is the primary ingestion path and registers these in its own
+    # startup, so the registration logic lives in one place to avoid drift.
+    from services.document_ingest_hooks import register_document_ingest_hooks
+
+    register_document_ingest_hooks()
 
     # Whisper prompt cache invalidation — listen on household_graph_changed.
     from services.whisper_prompt_builder import whisper_prompt_household_changed

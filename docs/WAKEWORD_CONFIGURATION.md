@@ -243,6 +243,36 @@ case 'config_update':
   break;
 ```
 
+### Web Listening Recovery
+
+The browser wake-word engine (`useWakeWord` + onnxruntime WASM) runs **locally**
+on the mic and is independent of the backend chat WebSocket. It can still be left
+stranded paused (`isEnabled: true`, `isListening: false`, nothing detecting) in
+three ways, all of which previously needed a manual page reload:
+
+1. A **backend `Recreate` rollout** (deploy / ConfigMap reload) drops the chat WS
+   *mid-turn*. On wake-word detection the engine is paused for recording and only
+   resumes on the backend's `done` frame — which never arrives once the socket is
+   gone. This is the "doesn't listen any longer after a deploy" symptom.
+2. An **engine error** (audio pipeline disruption). `useWakeWord` now flips
+   `isListening: false` on error so the status dot is honest (yellow, not a lying
+   green) and recovery can fire.
+3. **Tab suspend / laptop sleep / network loss** stalling the engine.
+
+`ChatContext` re-arms the engine on three recovery triggers — chat-WS **reconnect**
+(edge-triggered on `wsConnected`), tab becoming **visible** (`visibilitychange`),
+and network coming back **online**. A pure `shouldRearmWakeWord` predicate
+(`pages/ChatPage/context/wakeWordRecovery.ts`) gates the resume: it skips the
+happy path (already listening), an active capture, and a live wake-word turn. An
+in-flight start latch in `useWakeWord` coalesces simultaneous triggers (e.g. a
+laptop wake firing all three at once) so the engine can't double-start.
+
+On reconnect, a chat turn that was streaming over the dropped WS is dead: the
+stuck "thinking" spinner is cleared, the half-streamed bubble is finalized, and an
+`errors.connectionInterrupted` message is shown. This is keyed on a
+streaming-turn flag (not raw `loading`) so a REST-fallback turn, which completes
+on its own, is never falsely interrupted.
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -288,3 +318,16 @@ make test-backend ARGS="tests/backend/test_wakeword_config.py -v"
 1. Verify backend has model files in `src/frontend/node_modules/openwakeword-wasm-browser/models/`
 2. Check network connectivity from satellite to backend
 3. Check available disk space on satellite
+
+### Web Wake Word Stops Listening (after a deploy / sleep)
+
+The browser engine auto-recovers on chat-WS reconnect, tab-visible, and
+network-online (see **Frontend Integration → Web Listening Recovery**). If it
+stays silent:
+
+1. Confirm the chat WS is connected (chat header shows "Verbunden"). A backend
+   `Recreate` rollout briefly drops it; recovery fires once it reconnects.
+2. Check the wake-word status dot: green pulse = listening, yellow = paused/errored.
+3. Verify mic permission is still granted and the `/wakeword-models/*.onnx` +
+   `/ort/*` assets load (200) — these are static, not `/api`.
+4. Last resort: hard-reload the page (Cmd+Shift+R).

@@ -13,12 +13,14 @@ resources:
   - ollama.yaml
   - searxng.yaml
   - dlna-mcp.yaml
+  - samsung-mcp.yaml
   - mdns-responder.yaml
   - backend.yaml
   - frontend.yaml
   - middleware-https-redirect.yaml
   - ingress.yaml
   - external-llm-ingress.yaml
+  - backend-tts-cache-route.yaml
   - shared-pvcs.yaml
   - document-worker.yaml
 

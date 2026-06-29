@@ -37,19 +37,34 @@ def _make_output_device(
     renfield_device_id=None,
     ha_entity_id=None,
     dlna_renderer_name=None,
+    output_provider=None,
+    output_target_id=None,
     tts_volume=0.5,
 ):
-    """Create a mock RoomOutputDevice."""
+    """Create a mock RoomOutputDevice.
+
+    Target identity is the generic ``(output_provider, output_target_id)`` pair
+    (the legacy brand columns were dropped). The legacy kwargs remain as
+    convenience inputs, mapped onto the pair; ``play_audio`` reads ``target_id``.
+    """
+    if not output_provider:
+        if renfield_device_id:
+            output_provider, output_target_id = "renfield", renfield_device_id
+        elif ha_entity_id:
+            output_provider, output_target_id = "homeassistant", ha_entity_id
+        elif dlna_renderer_name:
+            output_provider, output_target_id = "dlna", dlna_renderer_name
     dev = MagicMock()
-    dev.renfield_device_id = renfield_device_id
-    dev.ha_entity_id = ha_entity_id
-    dev.dlna_renderer_name = dlna_renderer_name
+    dev.output_provider = output_provider
+    dev.output_target_id = output_target_id
+    dev.target_id = output_target_id or ""
     dev.tts_volume = tts_volume
     # play_audio dispatches on these three flags. They must be real bools —
     # a bare MagicMock attribute is truthy, which would route every device
     # down the renfield/DLNA branch regardless of intent.
-    dev.is_renfield_device = renfield_device_id is not None
-    dev.is_dlna_device = dlna_renderer_name is not None
+    dev.is_renfield_device = output_provider == "renfield"
+    dev.is_dlna_device = output_provider == "dlna"
+    dev.is_ha_device = output_provider == "homeassistant"
     return dev
 
 
@@ -334,6 +349,7 @@ class TestBackendURL:
         mock_s = MagicMock()
         mock_s.advertise_host = "renfield.local"
         mock_s.advertise_port = 8000
+        mock_s.advertise_scheme = "http"
 
         with patch("ha_glue.services.audio_output_service.settings", mock_s), \
              patch("ha_glue.services.audio_output_service.HomeAssistantClient"):
@@ -341,6 +357,55 @@ class TestBackendURL:
             url = svc._get_backend_url()
 
         assert url == "http://renfield.local:8000"
+
+    def test_url_http_default_port_omitted(self):
+        """Port 80 is omitted for http."""
+        mock_s = MagicMock()
+        mock_s.advertise_host = "192.168.1.230"
+        mock_s.advertise_port = 80
+        mock_s.advertise_scheme = "http"
+
+        with patch("ha_glue.services.audio_output_service.settings", mock_s), \
+             patch("ha_glue.services.audio_output_service.HomeAssistantClient"):
+            svc = AudioOutputService()
+            assert svc._get_backend_url() == "http://192.168.1.230"
+
+    def test_url_https_scheme_omits_443(self):
+        """https scheme produces an https:// URL; the default 443 is omitted."""
+        mock_s = MagicMock()
+        mock_s.advertise_host = "renfield.local"
+        mock_s.advertise_port = 443
+        mock_s.advertise_scheme = "https"
+
+        with patch("ha_glue.services.audio_output_service.settings", mock_s), \
+             patch("ha_glue.services.audio_output_service.HomeAssistantClient"):
+            svc = AudioOutputService()
+            assert svc._get_backend_url() == "https://renfield.local"
+
+    def test_url_https_nonstandard_port_kept(self):
+        """A non-default port is kept for https."""
+        mock_s = MagicMock()
+        mock_s.advertise_host = "renfield.local"
+        mock_s.advertise_port = 8443
+        mock_s.advertise_scheme = "https"
+
+        with patch("ha_glue.services.audio_output_service.settings", mock_s), \
+             patch("ha_glue.services.audio_output_service.HomeAssistantClient"):
+            svc = AudioOutputService()
+            assert svc._get_backend_url() == "https://renfield.local:8443"
+
+    def test_url_https_with_leftover_port_80_omits_it(self):
+        """A standard port (80/443) is omitted regardless of scheme, so https left
+        with the http default port can't produce a broken https://host:80."""
+        mock_s = MagicMock()
+        mock_s.advertise_host = "renfield.local"
+        mock_s.advertise_port = 80
+        mock_s.advertise_scheme = "https"
+
+        with patch("ha_glue.services.audio_output_service.settings", mock_s), \
+             patch("ha_glue.services.audio_output_service.HomeAssistantClient"):
+            svc = AudioOutputService()
+            assert svc._get_backend_url() == "https://renfield.local"
 
     def test_url_falls_back_to_internal(self):
         """Falls back to backend_internal_url when advertise_host is None."""

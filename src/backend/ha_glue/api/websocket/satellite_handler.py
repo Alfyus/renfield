@@ -183,6 +183,44 @@ async def satellite_websocket(
                 capabilities = data.get("capabilities", {})
                 language = data.get("language", settings.default_language)
                 version = data.get("version", "unknown")
+                enrollment_psk = data.get("token")
+
+                # Per-satellite enrollment gate (security review H1). Verify the
+                # enrollment PSK against the `satellites` table. When enrollment is
+                # disabled (default) this whole block is skipped, so the legacy
+                # register path is byte-identical.
+                #
+                # FAIL CLOSED: if the authorization check raises (e.g. the DB is
+                # unreachable / the pool is exhausted), we cannot prove this
+                # connection is authorized AND cannot even read whether the fleet
+                # is enforcing — so we REJECT rather than admit an unauthenticated
+                # satellite. A fail-open here would let an attacker bypass
+                # ENFORCING by inducing a DB error (review finding). Transient
+                # blips are recoverable: the satellite's reconnect loop retries.
+                satellite_authenticated = False
+                if settings.satellite_enrollment_enabled:
+                    reject_reason: str | None = None
+                    try:
+                        from ha_glue.services.satellite_enrollment_service import authorize_register
+
+                        async with AsyncSessionLocal() as enroll_db:
+                            authz = await authorize_register(enroll_db, satellite_id, enrollment_psk)
+                        satellite_authenticated = authz.authenticated
+                        if authz.reject:
+                            reject_reason = authz.reason
+                    except Exception as e:
+                        logger.error(f"⚠️ Satellite enrollment check errored (fail-closed): {e}")
+                        satellite_authenticated = False
+                        reject_reason = "enrollment-unavailable"
+                    if reject_reason:
+                        logger.warning(
+                            f"🚫 Satellite register rejected for '{satellite_id}': {reject_reason}"
+                        )
+                        await send_ws_error(websocket, WSErrorCode.UNAUTHORIZED, reject_reason)
+                        await websocket.close(
+                            code=WSAuthError.UNAUTHORIZED, reason=reject_reason
+                        )
+                        return
 
                 # Update connection limiter with actual satellite_id
                 connection_limiter.add_connection(ip_address, satellite_id)
@@ -193,8 +231,20 @@ async def satellite_websocket(
                     websocket=websocket,
                     capabilities=capabilities,
                     language=language,
-                    version=version
+                    version=version,
+                    authenticated=satellite_authenticated,
                 )
+                if not success:
+                    # register() refused (e.g. an unauthenticated connection
+                    # tried to evict an enrolled incumbent). Close out.
+                    logger.warning(f"🚫 Satellite registration refused for '{satellite_id}'")
+                    await send_ws_error(
+                        websocket, WSErrorCode.UNAUTHORIZED, "registration-refused"
+                    )
+                    await websocket.close(
+                        code=WSAuthError.UNAUTHORIZED, reason="registration-refused"
+                    )
+                    return
 
                 # Persist room assignment to database
                 room_id = None
@@ -232,6 +282,10 @@ async def satellite_websocket(
                     device_type="satellite"
                 )
 
+                # Ride the current target LED brightness in the ack so a
+                # satellite reconnecting mid-night comes up already dimmed.
+                from ha_glue.services.led_dimming_service import get_led_dimming_service
+
                 await websocket.send_json({
                     "type": "register_ack",
                     "success": success,
@@ -239,6 +293,7 @@ async def satellite_websocket(
                     "room_id": room_id,
                     "protocol_version": settings.ws_protocol_version,
                     "model_download_url": "/api/settings/wakeword/models",
+                    "led_brightness": get_led_dimming_service().get_current_led_brightness(),
                 })
                 logger.info(f"📡 Satellite {satellite_id} registered from {room}")
 
@@ -259,11 +314,25 @@ async def satellite_websocket(
                                 "type": "classic_bt_known_devices",
                                 "devices": list(classic_macs),
                             })
+                        # Per-person IRKs for resolving rotating RPAs (iPhones).
+                        # IRKs are location-tracking keys; gated per satellite
+                        # (review H1). When enrollment is on, only a satellite
+                        # that presented a valid PSK gets them; otherwise the
+                        # legacy allowlist applies.
+                        irks = presence_svc.irks_for_satellite(
+                            satellite_id, is_enrolled_authenticated=satellite_authenticated
+                        )
+                        if irks:
+                            await websocket.send_json({
+                                "type": "ble_known_irks",
+                                "irks": irks,
+                            })
                         total = len(ble_macs) + len(classic_macs)
-                        if total:
-                            logger.debug(f"Pushed {len(ble_macs)} BLE + {len(classic_macs)} Classic BT MACs to {satellite_id}")
+                        if total or irks:
+                            logger.debug(f"Pushed {len(ble_macs)} BLE + {len(classic_macs)} Classic BT MACs "
+                                         f"+ {len(irks)} IRK(s) to {satellite_id}")
                     except Exception as e:
-                        logger.warning(f"Failed to push MACs: {e}")
+                        logger.warning(f"Failed to push MACs/IRKs: {e}")
 
             # Handle config acknowledgment from satellite
             elif msg_type == "config_ack":
@@ -461,13 +530,20 @@ async def satellite_websocket(
                     # Conversation handoff: copy context from another satellite if speaker moved
                     if spk and satellite_db_session_id and not satellite_history_loaded:
                         try:
-                            from services.conversation_handoff import try_handoff_context
+                            from services.conversation_handoff import (
+                                emit_continued_handoff_frame,
+                                try_handoff_context,
+                            )
                             async with AsyncSessionLocal() as handoff_db:
                                 handed_off = await try_handoff_context(
                                     spk.id, satellite_db_session_id, handoff_db
                                 )
                                 if handed_off:
                                     logger.info(f"🔄 Conversation handoff for speaker {speaker_name} to {satellite_db_session_id}")
+                                    # Surface the "continued in {room}" chip in this room
+                                    # (the speak-path usually wins the debounce on move-and-talk).
+                                    _sat = satellite_manager.get_satellite(satellite_id)
+                                    await emit_continued_handoff_frame(_sat.room if _sat else None)
                         except Exception as e:
                             logger.warning(f"⚠️ Conversation handoff failed: {e}")
 
@@ -690,6 +766,28 @@ Gib eine kurze, natürliche Antwort. KEIN JSON, nur Text."""
                     satellite_manager.update_heartbeat(satellite_id, metrics, version)
                     # Send heartbeat ack
                     await websocket.send_json({"type": "heartbeat_ack"})
+
+            # Reply to an on-demand camera snapshot request (announce privacy check)
+            elif msg_type == "snapshot_result":
+                satellite_manager.resolve_snapshot(
+                    data.get("request_id"), data.get("image")
+                )
+
+            # Reply to an on-demand Bluetooth discovery scan request
+            elif msg_type == "bt_scan_result":
+                satellite_manager.resolve_bt_scan(
+                    data.get("request_id"),
+                    data.get("devices", []),
+                    data.get("error"),
+                )
+
+            # Reply to an on-demand IRK pairing capture request
+            elif msg_type == "irk_capture_result":
+                satellite_manager.resolve_irk_capture(
+                    data.get("request_id"),
+                    data.get("result"),
+                    data.get("error"),
+                )
 
             # Handle BLE presence scan results
             elif msg_type == "ble_presence":

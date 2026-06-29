@@ -34,6 +34,13 @@ export interface AuditResult {
   ocr_issues?: string;
   content_completeness?: number;
   completeness_issues?: string;
+  // Low-quality OCR signal (resolved from the renfield Document; null/false
+  // for Paperless-only docs that were never ingested into the KB).
+  low_quality_ocr?: boolean;
+  chunks_dropped?: number | null;
+  chunks_total?: number | null;
+  quality_ignored?: boolean;
+  renfield_document_id?: number | null;
 }
 
 export interface AuditStats {
@@ -142,6 +149,10 @@ async function reOcrRequest(ids: number[]): Promise<void> {
   await apiClient.post('/api/admin/paperless-audit/re-ocr', { result_ids: ids });
 }
 
+async function markQualityIgnoredRequest(input: { result_ids: number[]; ignored: boolean }): Promise<void> {
+  await apiClient.post('/api/admin/paperless-audit/quality-ignore', input);
+}
+
 async function detectDuplicatesRequest(): Promise<void> {
   await apiClient.post('/api/admin/paperless-audit/detect-duplicates', {});
 }
@@ -160,6 +171,11 @@ export interface OcrFilter {
 }
 
 export interface CompletenessFilter {
+  page: number;
+  perPage: number;
+}
+
+export interface LowQualityFilter {
   page: number;
   perPage: number;
 }
@@ -215,6 +231,19 @@ export function useOcrResultsQuery(filter: OcrFilter, enabled: boolean) {
       queryKey: [...keys.paperlessAudit.results(), 'ocr', filter] as const,
       queryFn: () =>
         fetchResults({ ocr_quality_max: 2, per_page: filter.perPage, page: filter.page + 1 }),
+      staleTime: STALE.DEFAULT,
+      enabled,
+    },
+    'paperlessAudit.error',
+  );
+}
+
+export function useLowQualityResultsQuery(filter: LowQualityFilter, enabled: boolean) {
+  return useApiQuery(
+    {
+      queryKey: [...keys.paperlessAudit.results(), 'lowquality', filter] as const,
+      queryFn: () =>
+        fetchResults({ low_quality_only: true, per_page: filter.perPage, page: filter.page + 1 }),
       staleTime: STALE.DEFAULT,
       enabled,
     },
@@ -328,6 +357,17 @@ export function useReOcr() {
   return useApiMutation(
     {
       mutationFn: reOcrRequest,
+      onSuccess: () => invalidateAudit(queryClient),
+    },
+    'paperlessAudit.error',
+  );
+}
+
+export function useMarkQualityIgnored() {
+  const queryClient = useQueryClient();
+  return useApiMutation(
+    {
+      mutationFn: markQualityIgnoredRequest,
       onSuccess: () => invalidateAudit(queryClient),
     },
     'paperlessAudit.error',

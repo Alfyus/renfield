@@ -63,23 +63,26 @@ class AudioOutputService:
         Returns:
             True if audio was sent successfully
         """
+        # Target identity is the generic (output_provider, output_target_id) pair;
+        # target_id returns output_target_id (the device_id / renderer name /
+        # HA entity id, depending on the provider).
         if output_device.is_renfield_device:
             return await self._play_on_renfield_device(
                 audio_bytes=audio_bytes,
-                device_id=output_device.renfield_device_id,
+                device_id=output_device.target_id,
                 session_id=session_id
             )
         elif output_device.is_dlna_device:
             return await self._play_on_dlna_renderer(
                 audio_bytes=audio_bytes,
-                renderer_name=output_device.dlna_renderer_name,
+                renderer_name=output_device.target_id,
                 tts_volume=output_device.tts_volume,
                 session_id=session_id
             )
         else:
             return await self._play_on_ha_media_player(
                 audio_bytes=audio_bytes,
-                entity_id=output_device.ha_entity_id,
+                entity_id=output_device.target_id,
                 tts_volume=output_device.tts_volume,
                 session_id=session_id
             )
@@ -149,7 +152,12 @@ class AudioOutputService:
             return False
 
         base_url = self._get_backend_url()
-        audio_url = f"{base_url}/api/voice/tts-cache/{audio_id}"
+        # `.wav` extension + the audio/x-wav mime hint below: DLNA renderers
+        # (notably Samsung TVs) reject an extensionless / wrong-mime resource
+        # with UPnP 716. audio/x-wav is the WAV mime Samsung advertises in
+        # GetProtocolInfo (audio/wav is NOT). The tts-cache route strips the
+        # trailing .wav. See docs/MESSAGE_RELAY.md.
+        audio_url = f"{base_url}/api/voice/tts-cache/{audio_id}.wav"
 
         try:
             from main import app
@@ -158,7 +166,7 @@ class AudioOutputService:
                 logger.warning(f"MCP manager not available for DLNA playback on {renderer_name}")
                 return False
 
-            tracks = [{"url": audio_url, "title": "Renfield TTS"}]
+            tracks = [{"url": audio_url, "title": "Renfield TTS", "mime_type": "audio/x-wav"}]
             logger.info(f"🔊 DLNA play_tracks: renderer={renderer_name}, url={audio_url}")
             result = await mcp_manager.execute_tool(
                 "mcp.dlna.play_tracks",
@@ -210,9 +218,10 @@ class AudioOutputService:
             return False
 
         # Build the URL for HA to fetch the audio
-        # Use the backend's advertise host or fallback to localhost
+        # Use the backend's advertise host or fallback to localhost.
+        # `.wav` extension so renderers/HA see a recognizable media URL.
         base_url = self._get_backend_url()
-        audio_url = f"{base_url}/api/voice/tts-cache/{audio_id}"
+        audio_url = f"{base_url}/api/voice/tts-cache/{audio_id}.wav"
 
         # Store original volume for restoration (if we're changing it)
         original_volume = None
@@ -301,13 +310,20 @@ class AudioOutputService:
         Priority:
         1. ADVERTISE_HOST from settings (recommended for HA integration)
         2. BACKEND_INTERNAL_URL for Docker networking (default: http://backend:8000)
+
+        The scheme is ADVERTISE_SCHEME (http|https). https is only reachable by
+        renderers that can resolve ADVERTISE_HOST and trust its TLS cert — see
+        docs/MESSAGE_RELAY.md ("TTS audio delivery to renderers"). Standard ports
+        (80/443) are omitted regardless of scheme, so an ADVERTISE_PORT left at a
+        standard value can't mismatch the scheme.
         """
         if settings.advertise_host:
+            scheme = settings.advertise_scheme
             host = settings.advertise_host
             port = settings.advertise_port
-            if port and port != 80:
-                return f"http://{host}:{port}"
-            return f"http://{host}"
+            if port and port not in (80, 443):
+                return f"{scheme}://{host}:{port}"
+            return f"{scheme}://{host}"
 
         # Use internal Docker URL - works when HA and Renfield are on same Docker network
         logger.debug(f"Using internal backend URL: {settings.backend_internal_url}")

@@ -16,6 +16,7 @@ Routing Algorithm:
 4. If nothing available → return None
 """
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -25,6 +26,99 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ha_glue.integrations.homeassistant import HomeAssistantClient
 from models.database import OUTPUT_TYPE_AUDIO, OUTPUT_TYPE_VISUAL, RoomDevice, RoomOutputDevice
+
+# Provider preference when the SAME physical device is exposed by several
+# protocols (lower = preferred): dlna first (gapless album playback), then HA,
+# then renfield, then any MCP brand. Used by _dedupe_output_targets.
+_PROVIDER_RANK = {"dlna": 0, "homeassistant": 1, "renfield": 2}
+
+
+def _collapse_doubled_suffix(words: list[str]) -> list[str]:
+    """Drop a duplicated trailing phrase: HA friendly names double the room, which
+    may be one word ("Linn Wohnzimmer Wohnzimmer") or several
+    ("Linn Ben s Zimmer Ben s Zimmer"). Removes the largest repeated tail."""
+    n = len(words)
+    for k in range(n // 2, 0, -1):
+        if words[-k:] == words[-2 * k:-k]:
+            return words[:-k]
+    return words
+
+
+def _device_match_key(name: str) -> str:
+    """Normalize a target name so the same physical speaker exposed via different
+    protocols collapses to one key. Strips DLNA suffixes (``:UPnP AV`` / ``:UpnpAv``),
+    lowercases, drops non-alphanumerics, and collapses a doubled trailing room
+    phrase (HA friendly names repeat the room, single- or multi-word)."""
+    s = name.split(":", 1)[0].lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+    return " ".join(_collapse_doubled_suffix(s.split()))
+
+
+def _clean_display_name(name: str) -> str:
+    """Tidy a display name: strip the DLNA transport suffix + collapse the doubled
+    trailing room phrase, keeping original casing. Case-insensitive on the match."""
+    words = name.split(":", 1)[0].strip().split()
+    # Collapse on a lowercased copy but return the original-cased words.
+    lowered = [w.lower() for w in words]
+    keep = len(_collapse_doubled_suffix(lowered))
+    return " ".join(words[:keep]) or name
+
+
+def _short_id(target_id: str) -> str:
+    """A short distinguisher from a target id — the last dotted segment
+    (e.g. ``media_player.buro`` → ``buro``). Used to disambiguate two distinct
+    devices that share a display name."""
+    return target_id.rsplit(".", 1)[-1] or target_id
+
+
+def _dedupe_output_targets(targets: list[dict]) -> list[dict]:
+    """Collapse the SAME physical device exposed by MULTIPLE providers into one
+    entry (e.g. a Linn shows as both an HA media_player and a DLNA renderer).
+
+    Cross-provider only: two entries that share a normalized name but come from
+    the SAME provider are distinct devices (e.g. two HA "Soundbar" entities) and
+    are BOTH kept. For a real cross-provider duplicate, the preferred provider
+    (`_PROVIDER_RANK`) wins, its capabilities are unioned across the group, and
+    the display name is tidied. First-seen order is preserved.
+    """
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for t in targets:
+        k = _device_match_key(t["name"])
+        if k not in groups:
+            groups[k] = []
+            order.append(k)
+        groups[k].append(t)
+
+    deduped: list[dict] = []
+    for k in order:
+        group = groups[k]
+        providers = {t["provider"] for t in group}
+        if len(providers) <= 1:
+            # Same provider → distinct devices; keep all, but tidy each name
+            # (polish 1: strip the DLNA ":UPnP AV" suffix on singletons too).
+            deduped.extend({**t, "name": _clean_display_name(t["name"])} for t in group)
+            continue
+        # Same physical device on several protocols → keep the preferred provider's
+        # entry, union capabilities across the whole group, tidy the name.
+        winner_provider = min(providers, key=lambda p: _PROVIDER_RANK.get(p, 9))
+        winner = next(t for t in group if t["provider"] == winner_provider)
+        merged_caps = sorted({c for t in group for c in t.get("capabilities", [])})
+        deduped.append({**winner, "capabilities": merged_caps,
+                        "name": _clean_display_name(winner["name"])})
+
+    # Polish 2: disambiguate entries that still share a display name (two distinct
+    # devices both named e.g. "Soundbar") by appending a short id distinguisher.
+    name_counts: dict[str, int] = {}
+    for t in deduped:
+        name_counts[t["name"].casefold()] = name_counts.get(t["name"].casefold(), 0) + 1
+    result: list[dict] = []
+    for t in deduped:
+        if name_counts[t["name"].casefold()] > 1 and t["target_id"]:
+            result.append({**t, "name": f"{t['name']} ({_short_id(t['target_id'])})"})
+        else:
+            result.append(t)
+    return result
 
 
 class DeviceAvailability(str, Enum):
@@ -44,6 +138,30 @@ class OutputDecision:
     availability: DeviceAvailability
     fallback_to_input: bool
     reason: str
+
+
+# Audio-quality rank by device class, used ONLY as a tiebreak between devices of
+# equal `priority` (the user-set primary ordering always wins first). Higher =
+# better. External AV renderers (DLNA / Samsung / Sonos / any generic provider)
+# are dedicated audio/AV hardware → highest; an HA media_player (smart speaker)
+# is mid; a Renfield tablet/satellite built-in speaker is lowest. So when a room
+# has several audio devices and the user hasn't ordered them (all default
+# priority), the answer goes to the best-quality device automatically.
+# (Within the same rank, `priority` then `id` keep it deterministic.)
+_AUDIO_QUALITY_RANK: dict[str, int] = {
+    "renfield": 1,
+    "homeassistant": 2,
+    "dlna": 3,
+    "samsung": 3,
+    "sonos": 3,
+}
+# Unknown / future providers are assumed to be dedicated external renderers
+# (the only known lower-quality classes are renfield + homeassistant).
+_DEFAULT_QUALITY_RANK = 3
+
+
+def _audio_quality_rank(device: RoomOutputDevice) -> int:
+    return _AUDIO_QUALITY_RANK.get(device.target_type, _DEFAULT_QUALITY_RANK)
 
 
 class OutputRoutingService:
@@ -176,15 +294,22 @@ class OutputRoutingService:
         room_id: int,
         output_type: str
     ) -> list[RoomOutputDevice]:
-        """Get all configured output devices for a room, sorted by priority."""
+        """Configured output devices for a room, ordered by selection precedence.
+
+        Precedence: `priority` ASC (the user-set primary ordering — position #1
+        wins) THEN audio quality DESC as the tiebreak when devices share a
+        priority (e.g. all at the default), THEN `id` ASC for determinism. So a
+        room with an unordered HiFiBerry + a tablet auto-prefers the HiFiBerry.
+        """
         stmt = (
             select(RoomOutputDevice)
             .where(RoomOutputDevice.room_id == room_id)
             .where(RoomOutputDevice.output_type == output_type)
-            .order_by(RoomOutputDevice.priority)
         )
         result = await self.db.execute(stmt)
-        return list(result.scalars().all())
+        devices = list(result.scalars().all())
+        devices.sort(key=lambda d: (d.priority, -_audio_quality_rank(d), d.id))
+        return devices
 
     async def _check_device_availability(
         self,
@@ -193,14 +318,19 @@ class OutputRoutingService:
         """
         Check if an output device is available for playback.
         """
-        if output_device.is_renfield_device:
-            return await self._check_renfield_device_availability(output_device.renfield_device_id)
-        elif output_device.is_dlna_device:
-            # DLNA availability via SSDP probing is too expensive for routing checks.
-            # Assume available — playback will fail gracefully if renderer is off.
-            return DeviceAvailability.AVAILABLE
+        # Use the dual-read target_type so generic-provider rows (samsung/sonos/…
+        # with only the (output_provider, output_target_id) pair) resolve too.
+        target_type = output_device.target_type
+        if target_type == "renfield":
+            return await self._check_renfield_device_availability(output_device.target_id)
+        elif target_type == "homeassistant":
+            return await self._check_ha_device_availability(output_device.target_id)
         else:
-            return await self._check_ha_device_availability(output_device.ha_entity_id)
+            # dlna + any generic output provider (samsung, sonos, …). SSDP/network
+            # probing is too expensive for routing; assume available — playback
+            # (and the power-on poll for power-capable providers) verifies for real
+            # and fails gracefully / wakes the device at dispatch time.
+            return DeviceAvailability.AVAILABLE
 
     async def _check_renfield_device_availability(
         self,
@@ -282,6 +412,8 @@ class OutputRoutingService:
         renfield_device_id: str | None = None,
         ha_entity_id: str | None = None,
         dlna_renderer_name: str | None = None,
+        output_provider: str | None = None,
+        output_target_id: str | None = None,
         priority: int = 1,
         allow_interruption: bool = False,
         tts_volume: float | None = 0.5,
@@ -290,35 +422,72 @@ class OutputRoutingService:
         """
         Add a new output device to a room.
 
-        Exactly one of renfield_device_id, ha_entity_id, or dlna_renderer_name must be provided.
-        """
-        identifiers = [renfield_device_id, ha_entity_id, dlna_renderer_name]
-        set_count = sum(1 for v in identifiers if v)
-        if set_count == 0:
-            raise ValueError("One of renfield_device_id, ha_entity_id, or dlna_renderer_name must be provided")
-        if set_count > 1:
-            raise ValueError("Only one of renfield_device_id, ha_entity_id, or dlna_renderer_name can be provided")
+        Two ways to identify the target — both resolve to the generic
+        ``(output_provider, output_target_id)`` pair, the ONLY persisted target
+        identity since the legacy brand columns were dropped
+        (docs/design/output-providers.md):
 
-        # Auto-generate device name if not provided
-        if not device_name:
+        - **Generic pair** ``(output_provider, output_target_id)`` — for any
+          provider, incl. new brands (samsung/sonos) that never had a column.
+        - **Legacy kwargs** — exactly one of ``renfield_device_id`` /
+          ``ha_entity_id`` / ``dlna_renderer_name``. These are now pure INPUT
+          ADAPTERS (the legacy frontend picker + older callers still send them);
+          they are mapped onto the pair and NOT persisted as columns.
+        """
+        # Generic path: an explicit provider + target id.
+        if output_provider or output_target_id:
+            if not (output_provider and output_target_id):
+                raise ValueError(
+                    "output_provider and output_target_id must be provided together"
+                )
+            if any([renfield_device_id, ha_entity_id, dlna_renderer_name]):
+                raise ValueError(
+                    "Provide either the (output_provider, output_target_id) pair "
+                    "OR a single legacy id column, not both"
+                )
+            if not device_name:
+                device_name = output_target_id
+        else:
+            # Legacy-kwarg path: exactly one of the three identity inputs. Map it
+            # onto the (output_provider, output_target_id) pair — the legacy
+            # columns no longer exist on the model.
+            identifiers = [renfield_device_id, ha_entity_id, dlna_renderer_name]
+            set_count = sum(1 for v in identifiers if v)
+            if set_count == 0:
+                raise ValueError(
+                    "One of renfield_device_id, ha_entity_id, dlna_renderer_name, "
+                    "or the (output_provider, output_target_id) pair must be provided"
+                )
+            if set_count > 1:
+                raise ValueError("Only one of renfield_device_id, ha_entity_id, or dlna_renderer_name can be provided")
+
+            # Auto-generate device name if not provided
+            if not device_name:
+                if renfield_device_id:
+                    device_name = renfield_device_id
+                elif dlna_renderer_name:
+                    device_name = dlna_renderer_name
+                else:
+                    # Try to get friendly name from HA
+                    try:
+                        state = await self.ha_client.get_state(ha_entity_id)
+                        device_name = state.get("attributes", {}).get("friendly_name", ha_entity_id)
+                    except Exception:
+                        device_name = ha_entity_id  # Fallback if HA unavailable
+
+            # Map the legacy kwarg onto the generic pair.
             if renfield_device_id:
-                device_name = renfield_device_id
-            elif dlna_renderer_name:
-                device_name = dlna_renderer_name
+                output_provider, output_target_id = "renfield", renfield_device_id
+            elif ha_entity_id:
+                output_provider, output_target_id = "homeassistant", ha_entity_id
             else:
-                # Try to get friendly name from HA
-                try:
-                    state = await self.ha_client.get_state(ha_entity_id)
-                    device_name = state.get("attributes", {}).get("friendly_name", ha_entity_id)
-                except Exception:
-                    device_name = ha_entity_id  # Fallback if HA unavailable
+                output_provider, output_target_id = "dlna", dlna_renderer_name
 
         output_device = RoomOutputDevice(
             room_id=room_id,
             output_type=output_type,
-            renfield_device_id=renfield_device_id,
-            ha_entity_id=ha_entity_id,
-            dlna_renderer_name=dlna_renderer_name,
+            output_provider=output_provider,
+            output_target_id=output_target_id,
             priority=priority,
             allow_interruption=allow_interruption,
             tts_volume=tts_volume,
@@ -439,6 +608,79 @@ class OutputRoutingService:
 
         # Filter to devices with speaker capability
         return [d for d in devices if d.capabilities and d.capabilities.get("has_speaker", False)]
+
+    async def get_aggregated_outputs(self, room_id: int, mcp_manager) -> list[dict]:
+        """Capability-tagged union of every output target for a room, normalized to
+        ``{provider, target_id, name, capabilities[], room_hint, reachable}``.
+
+        Built-ins (renfield / homeassistant / dlna) come from the existing
+        per-source methods; MCP-declared providers (samsung, sonos, …) are
+        discovered in parallel with a per-provider timeout. A provider that times
+        out or errors is surfaced as a single DEGRADED entry (reachable=False),
+        never silently dropped — output discovery is a control surface, so a
+        missing-but-expected device is a silent failure.
+
+        Backs the flag-on ``available-outputs`` aggregation (docs/design/output-providers.md).
+        """
+        import asyncio
+
+        from utils.config import settings
+
+        targets: list[dict] = []
+
+        # --- built-ins (reuse the proven per-source methods) ---
+        for d in await self.get_available_renfield_devices(room_id):
+            targets.append({
+                "provider": "renfield", "target_id": d.device_id,
+                "name": d.device_name or d.device_id,
+                "capabilities": ["audio"], "room_hint": None, "reachable": True,
+            })
+        for m in await self.get_available_ha_media_players():
+            eid = m.get("entity_id", "")
+            targets.append({
+                "provider": "homeassistant", "target_id": eid,
+                "name": m.get("friendly_name") or eid,
+                "capabilities": ["audio", "video", "transport"], "room_hint": None,
+                "reachable": True,
+            })
+        for r in await self.get_available_dlna_renderers():
+            rid = r.get("name", "")
+            targets.append({
+                "provider": "dlna", "target_id": rid,
+                "name": r.get("friendly_name") or rid,
+                "capabilities": ["audio", "video", "transport"], "room_hint": None,
+                "reachable": True,
+            })
+
+        # --- MCP-declared providers (parallel discover, timeout, degraded-not-dropped) ---
+        if mcp_manager is not None:
+            from ha_glue.services.output_providers import (
+                OutputProviderError,
+                build_mcp_output_providers,
+            )
+
+            registry = build_mcp_output_providers(mcp_manager)
+            timeout = settings.output_provider_discover_timeout
+
+            async def _discover_one(provider) -> list[dict]:
+                try:
+                    found = await asyncio.wait_for(provider.discover(room_id), timeout=timeout)
+                    return [t.to_dict() for t in found]
+                except (OutputProviderError, asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
+                    logger.warning(f"output provider '{provider.key}' discover failed: {e}")
+                    return [{
+                        "provider": provider.key, "target_id": "",
+                        "name": f"{provider.key} (unreachable)",
+                        "capabilities": sorted(provider.capabilities),
+                        "room_hint": None, "reachable": False,
+                    }]
+
+            if registry:
+                results = await asyncio.gather(*[_discover_one(p) for p in registry.values()])
+                for r in results:
+                    targets.extend(r)
+
+        return _dedupe_output_targets(targets)
 
     async def get_available_dlna_renderers(self) -> list[dict]:
         """

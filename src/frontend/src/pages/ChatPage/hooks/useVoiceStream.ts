@@ -31,7 +31,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getWebSocketUrl } from '../../../utils/env';
 import { debug } from '../../../utils/debug';
-import { computeRms, detectBargeIn } from './voiceAudioUtils';
+import { computeRms, detectBargeIn, VOICE_MIC_CONSTRAINTS } from './voiceAudioUtils';
 
 const RFWA_MAGIC = new Uint8Array([0x52, 0x46, 0x57, 0x41]); // "RFWA"
 const HEADER_LEN = 24; // 4 magic + 16 uuid + 4 sequence
@@ -82,7 +82,18 @@ function vlog(stage: string, extra?: Record<string, unknown>): void {
 // streaming path's end-of-utterance UX matches what users learned with
 // the legacy hook. Server-side VAD also runs as a safety net (C.2).
 const VAD = {
-  SILENCE_THRESHOLD: 10,      // RMS below this counts as silence
+  // RMS below this counts as silence. Set above the measured ambient noise
+  // floor so steady background noise doesn't read as speech (which kept the
+  // recording open forever and fed Whisper garbage). Measured in a real noisy
+  // room WITH VOICE_MIC_CONSTRAINTS: suppressed floor median 12, p95 15, max 19
+  // — so 22 clears the floor with margin while staying well under speech
+  // (median ~40-54 on this scale). Sits just above BARGE_IN_RMS_THRESHOLD (20),
+  // the codebase's other "voiced" gate. Raising it further risks clipping soft
+  // speakers; a never-voiced session (soft/distant speaker, or a wedged mic) is
+  // finalized by the server VAD instead. NOTE: there is deliberately NO
+  // client-side max-duration cap — long-form capture (e.g. the diary use case)
+  // must be able to run well past any fixed limit.
+  SILENCE_THRESHOLD: 22,
   SILENCE_DURATION_MS: 1500,  // total silence before auto-stop
   MIN_RECORDING_MS: 800,      // ignore silence in the first ~800 ms
   FFT_SIZE: 512,
@@ -539,6 +550,14 @@ export function useVoiceStream({
     ws: WebSocket,
   ): Promise<void> => {
     streamRef.current = stream;
+    // Surface whether the mic constraints actually applied — some Android/WebView
+    // builds silently ignore `autoGainControl:false`, which lets AGC push the
+    // noise floor back to speech level and revives the noise-as-speech bug on
+    // exactly those devices. Logged so it's diagnosable instead of invisible.
+    try {
+      const s = stream.getAudioTracks()[0]?.getSettings?.();
+      if (s) debug.log('voice mic settings:', { autoGainControl: s.autoGainControl, noiseSuppression: s.noiseSuppression, echoCancellation: s.echoCancellation });
+    } catch { /* getSettings unsupported — ignore */ }
     const recorder = new MediaRecorder(stream, { mimeType: VOICE_CODEC });
     recorderRef.current = recorder;
 
@@ -680,7 +699,7 @@ export function useVoiceStream({
 
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia(VOICE_MIC_CONSTRAINTS);
     } catch (e) {
       onError?.('mic_denied', e instanceof Error ? e.message : String(e));
       return;
@@ -832,9 +851,7 @@ export function useVoiceStream({
     const open = async (): Promise<void> => {
       let stream: MediaStream;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
-        });
+        stream = await navigator.mediaDevices.getUserMedia(VOICE_MIC_CONSTRAINTS);
       } catch (e) {
         // Mic permission revoked between turns — degrade silently to
         // no-barge-in for this reply (finding 3B). Mic button + wake

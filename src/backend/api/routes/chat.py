@@ -31,6 +31,10 @@ class ChatResponse(BaseModel):
     session_id: str
     intent: dict | None = None
 
+class ActiveLeafRequest(BaseModel):
+    """Body for PUT /api/chat/{session_id}/active-leaf — switch active branch."""
+    message_id: int
+
 @router.post("/send", response_model=ChatResponse)
 @limiter.limit(settings.api_rate_limit_chat)
 async def send_message(
@@ -250,13 +254,35 @@ async def get_history(
         if not conversation:
             return {"messages": []}
 
-        result = await db.execute(
-            select(Message)
-            .where(Message.conversation_id == conversation.id)
-            .order_by(Message.timestamp.asc())
-            .limit(limit)
-        )
-        messages = result.scalars().all()
+        # Chat branching (Phase 1), seam 1: return the messages on the ACTIVE
+        # branch (recursive walk of parent_message_id up from
+        # active_leaf_message_id), NOT the flat conversation set — else an edited
+        # turn's abandoned sibling would still show. For a linear (un-forked,
+        # backfilled) conversation the active path == the flat timestamp-ASC
+        # order, so this is byte-identical to pre-branching. Empty path (null
+        # leaf / pre-backfill / sqlite) → flat fallback.
+        from services.conversation_service import ConversationService
+
+        _bsvc = ConversationService(db)
+        active_ids = await _bsvc.active_path_message_ids(conversation)
+        # Chat branching (Phase 2): per-message sibling info for the ‹n/m›
+        # switcher. Empty for a linear/sqlite conversation → no switchers shown.
+        branch_meta = await _bsvc.branch_metadata(conversation, active_ids)
+        if active_ids:
+            window_ids = active_ids[:limit]
+            result = await db.execute(
+                select(Message).where(Message.id.in_(window_ids))
+            )
+            by_id = {m.id: m for m in result.scalars().all()}
+            messages = [by_id[i] for i in window_ids if i in by_id]
+        else:
+            result = await db.execute(
+                select(Message)
+                .where(Message.conversation_id == conversation.id)
+                .order_by(Message.timestamp.asc())
+                .limit(limit)
+            )
+            messages = result.scalars().all()
 
         # Collect attachment IDs from user messages for bulk fetch
         all_attachment_ids = []
@@ -281,10 +307,14 @@ async def get_history(
         return {
             "messages": [
                 {
+                    "id": msg.id,  # chat branching: frontend carries it for edit/regen forks
                     "role": msg.role,
                     "content": msg.content,
                     "timestamp": msg.timestamp.isoformat(),
                     "metadata": msg.message_metadata,  # Spalte heißt message_metadata
+                    # Chat branching (Phase 2): {index,count,sibling_ids} when this
+                    # message has sibling branches; absent otherwise.
+                    **({"branch": branch_meta[msg.id]} if msg.id in branch_meta else {}),
                     **({"attachments": [
                         attachments_map[aid]
                         for aid in msg.message_metadata.get("attachment_ids", [])
@@ -424,6 +454,132 @@ async def search_conversations(
     except Exception as e:
         logger.error(f"❌ Fehler bei der Suche: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/messages/search")
+async def search_messages(
+    q: str,
+    session_id: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(get_current_user),
+):
+    """Full-text search over chat messages (roadmap item 3).
+
+    In-conversation when ``session_id`` is given, global (cross-conversation)
+    otherwise. Ranked by Postgres FTS (``ts_rank``), paginated, and scoped by
+    **conversation ownership** — a user only ever matches messages in their
+    own conversations (``Conversation.user_id``). Messages are NOT atoms, so
+    this deliberately does NOT route through ``circle_sql``; ownership is the
+    correct and only access rule here.
+
+    In single-user mode (AUTH_ENABLED=false → ``current_user is None``) all
+    conversations are in scope, mirroring the other chat endpoints.
+
+    Returns ``{query, results, count, has_more}``. Each result carries the
+    owning ``session_id``, a 0-based ``message_index`` (position in the
+    conversation's ``timestamp ASC`` history — what the client jumps to), the
+    matched ``role`` / ``content``, a ``<mark>``-highlighted ``snippet``, the
+    ``timestamp`` and the FTS ``rank``.
+    """
+    if not q or len(q.strip()) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Suchanfrage muss mindestens 2 Zeichen lang sein",
+        )
+
+    # Cap pagination to keep a single response bounded.
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+
+    try:
+        from services.conversation_service import ConversationService
+
+        service = ConversationService(db)
+        payload = await service.search_messages(
+            q.strip(),
+            user_id=current_user.id if current_user is not None else None,
+            session_id=session_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {"query": q, **payload}
+    except Exception as e:
+        logger.error(f"❌ Fehler bei der Message-Suche: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/{session_id}/active-leaf")
+async def set_active_leaf(
+    session_id: str,
+    body: ActiveLeafRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(get_current_user),
+):
+    """Switch a conversation's active branch (chat branching, Phase 1).
+
+    Repoints ``Conversation.active_leaf_message_id`` to the branch ending at
+    ``message_id`` — no generation. Ownership-gated like the other chat routes:
+    a missing/unowned conversation or a message that doesn't belong to it → 404
+    (no existence oracle). Phase 1 ships this endpoint so edit/regenerate can set
+    the leaf cleanly; the multi-sibling switcher UI is Phase 2.
+    """
+    try:
+        from services.conversation_service import ConversationService
+
+        ok = await ConversationService(db).set_active_leaf(
+            session_id,
+            body.message_id,
+            user_id=current_user.id if current_user is not None else None,
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="Konversation oder Nachricht nicht gefunden")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Fehler beim Setzen des aktiven Branch: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{session_id}/branch/{message_id}")
+async def delete_branch(
+    session_id: str,
+    message_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(get_current_user),
+):
+    """Delete a branch — ``message_id`` and its whole subtree (chat branching,
+    Phase 2).
+
+    Ownership-gated like the other chat routes. A missing/unowned conversation
+    or a message foreign to it → 404 (no existence oracle). A message on the
+    CURRENT active path → 409 (switch to another branch before deleting the one
+    you're viewing, so the active leaf can't be orphaned). Branch-local memories
+    are removed with the branch; KG-relation provenance is detached.
+    """
+    try:
+        from services.conversation_service import ConversationService
+
+        status = await ConversationService(db).delete_branch(
+            session_id,
+            message_id,
+            user_id=current_user.id if current_user is not None else None,
+        )
+        if status == "not_found":
+            raise HTTPException(status_code=404, detail="Konversation oder Nachricht nicht gefunden")
+        if status == "active":
+            raise HTTPException(
+                status_code=409,
+                detail="Aktiver Branch kann nicht gelöscht werden — wechsle zuerst zu einem anderen Branch",
+            )
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Fehler beim Löschen des Branch: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/stats")
 async def get_conversation_stats(

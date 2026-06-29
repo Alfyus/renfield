@@ -262,6 +262,112 @@ Der Agent Loop ermöglicht komplexe, mehrstufige Anfragen mit bedingter Logik un
 
 Einfache Anfragen ("Schalte das Licht ein") nutzen weiterhin den schnellen Single-Intent-Pfad.
 
+### Folgefragen-Chips (Follow-up Chips)
+
+```bash
+FOLLOWUP_CHIPS_ENABLED=false
+FOLLOWUP_CHIPS_MODEL=            # leer → OLLAMA_INTENT_MODEL (kleines/schnelles Modell)
+FOLLOWUP_CHIPS_COUNT=3           # 1-5
+FOLLOWUP_CHIPS_TIMEOUT_SECONDS=5.0  # 1-30; Best-Effort-Obergrenze
+```
+
+**Defaults:**
+- `FOLLOWUP_CHIPS_ENABLED`: `false` (Opt-in/dark)
+- `FOLLOWUP_CHIPS_MODEL`: `""` (fällt auf `OLLAMA_INTENT_MODEL` zurück)
+- `FOLLOWUP_CHIPS_COUNT`: `3`
+- `FOLLOWUP_CHIPS_TIMEOUT_SECONDS`: `5.0`
+
+**Wann aktivieren:** Schlägt nach jeder substanziellen Chat-Antwort 2-4 anklickbare
+Folgefragen vor (Tipp füllt das Eingabefeld, kein Auto-Senden). Erzeugt einen
+**zusätzlichen kleinen LLM-Aufruf pro Turn** — läuft im Hintergrund nach dem
+`done`-Frame, verzögert also Antwort/TTS/Wakeword nicht. Bei gesprochenen
+(TTS-)Antworten übersprungen (Chips sind nur visuell). Auf einer ausgelasteten
+gemeinsamen GPU die zusätzliche Inferenzlast bedenken.
+
+### Befehlspalette (Command Palette)
+
+```bash
+COMMAND_PALETTE_ENABLED=false
+```
+
+**Default:** `false` (Opt-in/dark). Rein Frontend-Gate (`/api/config/features`) — das
+backendseitige `role_hint`-Handling ist immer aktiv (No-op ohne Hint), daher braucht
+das Umschalten **kein** Backend-Redeploy.
+
+### Nachrichten-Branching (Edit-and-Fork)
+
+```bash
+CHAT_BRANCHING_ENABLED=false
+```
+
+**Default:** `false` (Opt-in/dark; Frontend-Gate via `/api/config/features`). Schaltet
+die Edit-/Regenerate-Affordances (Phase 1: letzte Nutzernachricht bearbeiten / letzten
+Assistenten-Turn neu generieren → Branch) frei. Das Konversationsbaum-**Schema** und die
+aktive-Pfad-CTE laufen **immer** (der einmalige Backfill macht den Flag-aus-Zustand
+byte-identisch), nur die Fork-Affordances/Endpunkte sind gegated. Design:
+`docs/design/chat-branching.md`.
+
+### Nachrichtensuche (Message Search)
+
+```bash
+MESSAGE_SEARCH_ENABLED=false
+```
+
+**Default:** `false` (Frontend-Gate via `/api/config/features`). Schaltet das
+Suchfeld in der Konversations-Seitenleiste frei. Der Backend-Endpunkt
+(`GET /api/chat/messages/search`) und die `messages.search_vector`-Spalte sind
+immer vorhanden (harmlos), daher braucht das Umschalten **kein** Backend-Redeploy —
+nur die Migration `pc20260617_messages_search_vector` muss angewendet sein. Suche ist
+strikt nach Konversations-Eigentümerschaft gefiltert (nicht über `circle_sql`).
+
+**Wann aktivieren:** Blendet im Chat eine `/`-getriggerte (bzw. per Touch-Button
+geöffnete) Aktions-/Navigations-Palette ein. Tool-Aktionen werden ins Eingabefeld
+**vorbereitet** (kein Auto-Senden); der Anzeige-Filter folgt den Berechtigungen, die
+echte Rechte-Prüfung bleibt serverseitig. Der „Rolle setzen"-Hint ist eine weiche
+Routing-Präferenz für den nächsten Turn (keine Rechte-Eskalation).
+
+### Chat-Artefakte (Artifacts — Lane A)
+
+```bash
+ARTIFACTS_TYPED_ENABLED=false        # Lane A: typed table/list/keyvalue/chart inline
+ARTIFACTS_HTML_SANDBOX_ENABLED=false # Lane B: free-form HTML/SVG — NICHT verdrahtet, NICHT aktivieren
+```
+
+**Default:** beide `false` (Opt-in/dark). `ARTIFACTS_TYPED_ENABLED` schaltet die
+**Lane-A**-Artefakte frei: generierte Tabellen/Listen/Key-Value/Charts werden inline
+im Chat-Turn als **typisierte JSON-Daten → echte React-Komponenten** gerendert (kein
+Modell-HTML, kein Modell-SVG — React's Escape-Boundary ist die gesamte
+Sicherheitsstory; siehe `docs/design/chat-artifacts-sandbox.md`). Gated sind **beide**
+Seiten: der Backend-`artifact`-WS-Frame-Emit (nur aus dem Hook-/Sub-Intent-/
+Orchestrierungs-Pfad, nie aus Agent-Freitext) **und** der Frontend-Renderer
+(`/api/config/features`). Ungültige/zu große Payloads fallen auf einen escapten
+Code-Block zurück (fail-closed). Umschalten braucht **kein** Backend-Redeploy.
+
+`ARTIFACTS_HTML_SANDBOX_ENABLED` ist ein **Platzhalter** für die zurückgestellte
+**Lane B** (free-form HTML/SVG in einer sandboxed iframe) — in dieser Auslieferung an
+nichts verdrahtet, erfordert ein eigenes Security-Review vor dem Bau. **Nicht
+aktivieren.**
+
+**Voraussetzung (Lane A):** Die baseline-CSP in `nginx.conf` ist enforcing (Frontend
+≥ v2.15.16) — gute Hygiene für Lane A, Pflicht für ein späteres Lane B.
+
+### Raum-Handoff-Hinweis (Chat-UI Item 8)
+
+```bash
+ROOM_HANDOFF_ENABLED=false
+```
+
+**Default:** `false` (Opt-in/dark). Schaltet die inline Chat-Anzeige frei, wenn die
+**Medienwiedergabe dem Nutzer in einen anderen Raum folgt** (Media-Follow): eine
+dezente Meta-Zeile "🔊 Wiedergabe folgt nach {Raum}" im Chat-Thread. Gated sind
+**beide** Seiten — der Backend-`media_handoff`-Frame (`media_follow_service`, emittiert
+NUR bei erfolgreichem Resume, **raum-scoped** an die Zielraum-Geräte = dieselbe
+Privacy-Reichweite wie der bestehende Info-Toast) **und** der Frontend-Renderer
+(`MediaHandoffIndicator`, `/api/config/features`). Transient (12 s TTL, max 3, nie in
+der Historie). Umschalten braucht **kein** Backend-Redeploy. (Der „conversation
+continued in {Raum}"-Fall ist als Frame-Kind `continued` reserviert, aber noch nicht
+backend-verdrahtet — Follow-up.)
+
 ---
 
 ### Proaktive Benachrichtigungen
@@ -343,6 +449,58 @@ PROACTIVE_REMINDER_CHECK_INTERVAL=15     # Prüfintervall in Sekunden
 - `GET /api/notifications/reminders` — Offene Erinnerungen
 - `DELETE /api/notifications/reminders/{id}` — Erinnerung stornieren
 
+#### Obligation-Deadline Notifier (Schicht A)
+
+```bash
+# Tägliche, besitzer-adressierte Fristen-Erinnerungen aus document_facts.
+# Benötigt zusätzlich PROACTIVE_ENABLED=true (Zustellung läuft über das
+# Proactive-Subsystem); sonst liefe der Scan ins Leere und würde Meilensteine
+# im Ledger verbrauchen, ohne zuzustellen.
+OBLIGATION_NOTIFIER_ENABLED=false
+OBLIGATION_NOTIFIER_INTERVAL=86400            # Scan-Intervall in Sekunden (täglich)
+OBLIGATION_NOTIFIER_OVERDUE_GRACE_DAYS=30     # wie weit zurück "überfällig" noch feuert
+```
+
+Ein Tages-Scan berechnet pro Verpflichtung den einen aktuellen Vorlauf-Meilenstein
+(`14d`/`7d`/`3d`/`1d`/`due`/`overdue`) und feuert ihn genau einmal (Ledger
+`obligation_acknowledgements`, restart-fest). Rechtliche Fristen werden gemeldet,
+aber human-gated (`/brain/review`), nie automatisch erledigt. Die Agenda-Bestätigung
+(`POST/DELETE /api/atoms/obligations/{id}/confirm`) nutzt dasselbe Ledger.
+
+```bash
+# Wöchentliches Sammel-Digest — das Sicherheitsnetz UNTER dem Notifier. Ein
+# besitzer-adressiertes Wochen-Digest ALLER offenen Verpflichtungen OHNE untere
+# Datumsgrenze, fängt also spät extrahierte / lange überfällige Fristen ab, die
+# das Scan-Fenster des Notifiers verpasst. Benötigt ebenfalls PROACTIVE_ENABLED.
+OBLIGATION_DIGEST_ENABLED=false
+OBLIGATION_DIGEST_INTERVAL=604800             # wöchentlich (Sekunden)
+OBLIGATION_DIGEST_HORIZON_DAYS=30             # kommende Fristen bis N Tage (überfällige immer dabei)
+```
+
+Dedup pro `(user, ISO-Woche)` über `obligation_digest_log` (restart-fest); die
+Kalenderwoche steht im Titel, damit zwei legitime Wochen-Digests nicht über die
+Content-Hash-Dedup kollidieren. Ein never-extracted Fall bleibt ungedeckt (muss
+upstream sichtbar bleiben).
+
+```bash
+# Obligation → Kalender-Auto-Push (Calendar MCP). Per-User opt-in: nur Nutzer
+# mit einer Kalender-Präferenz (GET/PUT /api/atoms/obligations/calendar-pref)
+# bekommen ihre offenen Fristen als Kalendereinträge gespiegelt (create/update/
+# delete-Reconciler). Benötigt das Calendar MCP (CALENDAR_ENABLED) erreichbar.
+OBLIGATION_CALENDAR_SYNC_ENABLED=false
+OBLIGATION_CALENDAR_SYNC_INTERVAL=86400        # täglich (Sekunden)
+OBLIGATION_CALENDAR_EVENT_HOUR=9               # Uhrzeit des (terminierten) Events; all-day vom MCP nicht unterstützt
+OBLIGATION_CALENDAR_HORIZON_DAYS=90            # Fristen bis N Tage voraus synchronisieren
+OBLIGATION_CALENDAR_RETAIN_PAST_DAYS=30        # vergangene Events so lange behalten
+OBLIGATION_CALENDAR_MAX_OPS_PER_RUN=100        # Cap der create/update-MCP-Aufrufe je Nutzer je Lauf
+```
+
+Reconciler-Ledger `obligation_calendar_events` (fact→event_id, FK ON DELETE SET
+NULL für Waisen-Bereinigung); besitzer-adressiert (MCP erzwingt Kalenderzugriff
+per user_id); restart-fest + advisory-locked. Bekannt: ohne Idempotenz-Key des
+MCP kann ein Crash zwischen erfolgreichem create und Ledger-Commit ein Duplikat
+hinterlassen (at-least-once; P2).
+
 #### Externe Scheduling-Templates
 
 Cron-basiertes Scheduling (z.B. Morgenbriefing) wird extern via **n8n-Workflows** oder **Home Assistant-Automationen** gelöst. Diese senden per Webhook an `POST /api/notifications/webhook`.
@@ -363,20 +521,39 @@ PRESENCE_STALE_TIMEOUT=120               # Sekunden bis Benutzer als abwesend ma
 PRESENCE_HYSTERESIS_SCANS=2              # Aufeinanderfolgende Scans vor Raumwechsel
 PRESENCE_RSSI_THRESHOLD=-80              # dBm, schwächere Signale werden für Raumzuweisung ignoriert
 PRESENCE_HOUSEHOLD_ROLES="Admin,Familie" # Rollen die als Haushaltsmitglieder gelten (für Privacy-TTS)
+PRESENCE_ANALYTICS_TIMEZONE="Europe/Berlin" # Lokale Zeitzone für Heatmap-/Prognose-Stunden+Tage (Events werden UTC gespeichert); ungültiger Wert => UTC
 
 # Presence Webhooks (Automation-Hooks)
 PRESENCE_WEBHOOK_URL=""                  # URL für Presence-Events (leer = deaktiviert). Unterstützt n8n Webhook-Trigger
 PRESENCE_WEBHOOK_SECRET=""               # Shared Secret als X-Webhook-Secret Header für Webhook-Authentifizierung
+
+# Nachricht ausrichten (internal.announce_in_room): Kamera-Belegungs-Check
+# Bei einer persönlichen Nachricht wird nach dem BLE-Gate (falls eine Kamera im
+# Raum ist) ein Snapshot gemacht und per Vision-Modell die Personenzahl gezählt,
+# um einen NICHT per BLE getrackten Anwesenden zu erkennen. Siehe docs/MESSAGE_RELAY.md.
+ANNOUNCE_CAMERA_OCCUPANCY_CHECK=true     # Kamera-Check nutzen, wenn eine Kamera im Raum ist
+ANNOUNCE_CAMERA_CHECK_FAIL_CLOSED=false  # Bei Snapshot-/Vision-Fehler: true=blockieren, false=auf BLE-Gate zurückfallen
+ANNOUNCE_SNAPSHOT_TIMEOUT=8.0            # Sekunden Timeout für Satelliten-Snapshot + Vision (jeweils)
 ```
 
 **Satellite-Konfiguration** (in `satellite.yaml`):
 ```yaml
 ble:
   enabled: true
-  scan_interval: 30        # Sekunden zwischen Scans
-  scan_duration: 5         # Sekunden pro Scan
-  rssi_threshold: -80      # Schwächere Signale ignorieren
+  scan_interval: 30          # Sekunden zwischen Scans
+  scan_duration: 5           # Sekunden pro Scan
+  rssi_threshold: -80        # Schwächere Signale ignorieren
+  classic_rssi: true         # Echtes Classic-BT-RSSI lesen (hcitool cc/rssi via sudo); false => synthetisch -50
+  classic_rssi_interval: 300 # Sekunden zwischen echten RSSI-Reads pro Gerät (begrenzt Verbindungs-Churn)
 ```
+
+> **Classic-BT-RSSI:** Classic-BT-Präsenz beruht auf `hcitool name` (binär an/aus) und lieferte
+> früher ein konstantes synthetisches `-50` von jedem Satelliten — bei zwei Satelliten gab das ein
+> Unentschieden und der Raum „flatterte". Mit `classic_rssi: true` liest der Satellit per kurzlebiger
+> ACL-Verbindung (`hcitool cc/rssi/dc` über passwortloses `sudo`) ein echtes RSSI, gedrosselt auf
+> einmal pro `classic_rssi_interval` (häufiges Verbinden lässt das Telefon sonst aufhören, auf
+> `name` zu antworten → Präsenz fällt auf „abwesend"). Schlägt der Read fehl, greift der synthetische
+> Fallback — Präsenz geht nie verloren.
 
 **Endpunkte:**
 - `GET /api/presence/rooms` — Alle Räume mit Anwesenden
@@ -385,6 +562,88 @@ ble:
 - `GET /api/presence/devices` — Registrierte BLE-Geräte (Admin)
 - `POST /api/presence/devices` — BLE-Gerät registrieren (Admin)
 - `DELETE /api/presence/devices/{id}` — BLE-Gerät entfernen (Admin)
+
+---
+
+### Satellite-Enrollment (Security Review H1)
+
+Per-Satellite-Identität: ein Satellit weist sich mit einem eigenen PSK
+(256-bit, server-seitig nur als bcrypt-Hash gespeichert) im register-Frame aus,
+statt eine `satellite_id` nur zu *behaupten*. Schließt die Wurzel von H1
+(IRK-Disclosure + Raum-Hijack durch ein beliebiges LAN-Gerät).
+
+```bash
+# Effektiv-Modus-Zustandsmaschine (siehe docs/private/security/satellite-trust-design.md):
+#   aus (Default)            → Legacy, keine PSK-Prüfung, register-Pfad byte-identisch
+#   an + nicht erzwingend    → PERMISSIVE/Soak: vorgelegter PSK wird geprüft
+#                              (falsch/unbekannt/widerrufen → abgelehnt), kein PSK →
+#                              erlaubt aber als unenrolled geloggt; IRKs nur an verifizierte Sats
+#   ENFORCING (Auto-Flip)    → kein gültiger PSK → abgelehnt
+SATELLITE_ENROLLMENT_ENABLED=false
+# Auto-Flip PERMISSIVE→ENFORCING, sobald JEDE eingeschriebene Zeile sich mindestens
+# einmal authentifiziert hat (nicht nur die aktuell verbundenen) — dann persistent
+# verriegelt. Default aus, bis die Flotte vollständig eingeschrieben ist.
+SATELLITE_ENROLLMENT_AUTOFLIP_ENABLED=false
+
+# Stop-gap aus der chirurgischen H1-Mitigation (greift nur wenn ENROLLMENT aus):
+# Komma-Liste der satellite_ids, die per-Person-IRKs empfangen dürfen. Leer =
+# ungated (Legacy) mit lauter Einmal-Warnung pro Satellit.
+SATELLITE_IRK_ALLOWLIST=""
+```
+
+**Satellite-Seite** (`satellite.yaml` → `server.enrollment_token`, oder Env
+`RENFIELD_ENROLLMENT_TOKEN`; bare-metal: gitignored host_var
+`satellite_enrollment_token`; k8s: per-Pod-Secret). PSK ausstellen mit
+`bin/enroll_satellite.py <satellite_id>` oder über die Admin-UI
+(`/api/satellite-enrollment/enroll`, ADMIN-gated; Token wird genau **einmal**
+angezeigt). Rollout gestaffelt: dark → Flotte einschreiben → `…_ENABLED=true`
+(PERMISSIVE) → alle Sats authentifiziert (`GET /api/satellite-enrollment/status`)
+→ `…_AUTOFLIP_ENABLED=true` → ENFORCING verriegelt. Break-glass: `…_ENABLED=false`.
+
+**Endpunkte (alle ADMIN-gated):**
+- `GET /api/satellite-enrollment` — eingeschriebene Satelliten + Status (nie das Token)
+- `GET /api/satellite-enrollment/status` — Flotten-Readiness für den Rollout-Gate
+- `POST /api/satellite-enrollment/enroll` — PSK ausstellen/rotieren (Token einmalig)
+- `DELETE /api/satellite-enrollment/{satellite_id}` — Enrollment widerrufen
+
+---
+
+### Signierte OTA-Pakete (Security Review H6)
+
+Code-Authentizität unabhängig von Transport/Backend: ein Release wird über ein
+**signiertes Quell-Manifest** (Version + sortierte Pro-Datei-SHA256) abgesichert,
+das **offline** mit einem Ed25519-Release-Key signiert wird. Das Backend
+**leitet** Manifest+Signatur nur weiter (kann nicht signieren); der Satellit
+prüft Signatur (gegen gepinnte Public Keys) + Datei-Hashes + Version **vor** dem
+Install.
+
+```bash
+# Backend: signiertes OTA erzwingen (fail-closed) — Default aus, bis die
+# Signing-Pipeline + Public Keys auf der Flotte sind.
+SATELLITE_OTA_REQUIRE_SIGNATURE=false
+```
+
+**Satellite-Seite** (`satellite.yaml` → `update:`, Public Keys sind git-safe):
+```yaml
+update:
+  require_signature: false      # fail-closed wenn true (auch Env RENFIELD_OTA_REQUIRE_SIGNATURE)
+  release_pubkeys:              # hex Ed25519 Public Keys (mehrere = Rotation;
+    - ""                        # auch Env RENFIELD_RELEASE_PUBKEYS, kommagetrennt)
+```
+
+**Release-Signing (offline, manuell):**
+- `bin/sign_satellite_release.py --gen-key --out <keyfile>` — Keypair erzeugen,
+  Public-Key-Hex in group_vars `satellite_release_pubkeys` eintragen.
+- `bin/sign_satellite_release.py --sign --key <keyfile>` — schreibt
+  `src/satellite/RELEASE_MANIFEST.json` + `.sig` (committen; ins Backend-Image
+  gebacken). Privater Key bleibt OFFLINE (nie auf Build-Box/Backend).
+- `bin/sign_satellite_release.py --verify --pubkey <hex>` — CI/Pre-Build-Check
+  (Manifest == aktuelle Quelle + Signatur gültig).
+
+**Dark by default:** kein committetes Manifest + `require_signature=false`
+→ Backend leitet `None` weiter, Satellit prüft nur Checksum (Legacy). Rollout:
+gen-key → Public Key in group_vars → sign + Image bauen → re-provisionieren →
+`require_signature` flippen.
 
 ---
 
@@ -460,6 +719,70 @@ Erweitert jeden Treffer-Chunk um benachbarte Chunks aus demselben Dokument für 
 
 ---
 
+### Folder Auto-Ingest (Watch-Folder → KB + Paperless)
+
+Ein dedizierter Filesystem-MCP-Server überwacht Ordner (lokal/SMB/NFS) und
+**PUSHT** neue Dateien per REST an `POST /api/folder-ingest/document` (Bearer).
+Das Backend mountet die Shares NICHT — die Bytes reisen im Multipart-Body. Siehe
+`docs/FOLDER_INGEST.md`. Off by default; flag-aus = byte-identisch.
+
+```bash
+FOLDER_INGEST_ENABLED=false           # Feature-Schalter (Push-Route + internal.ingest_file)
+FOLDER_INGEST_KB_NAME=Eingang         # Ziel-Knowledge-Base (wird bei Bedarf angelegt)
+FOLDER_INGEST_TARGET_USER=            # Owner der auto-abgelegten Dokumente (Username/ID; leer → Admin/erster User)
+FOLDER_INGEST_DEFAULT_TIER=0          # Circle-Tier beim Anlegen (0=self … 4=public)
+FOLDER_INGEST_TO_PAPERLESS=true       # zusätzlich in Paperless ablegen
+FOLDER_INGEST_NOTIFY_ON_FILED=true    # Bestätigungs-Notification nach Ablage
+```
+
+Wiederverwendet `MAX_FILE_SIZE_MB`, `ALLOWED_EXTENSIONS`, `UPLOAD_DIR` (siehe RAG/Upload).
+Der Bearer-Token liegt revozierbar in `SystemSetting` (nicht in `.env`) — per
+`POST /api/folder-ingest/token` (Admin, `settings.manage`) erzeugen/rotieren. Der
+MCP prüft die Konfig-Ausrichtung beim Start via `GET /api/folder-ingest/health`.
+
+**Defaults:**
+- `FOLDER_INGEST_ENABLED`: `false`
+- `FOLDER_INGEST_KB_NAME`: `Eingang`
+- `FOLDER_INGEST_TARGET_USER`: `""` (leer → Admin/erster User)
+- `FOLDER_INGEST_DEFAULT_TIER`: `0`
+- `FOLDER_INGEST_TO_PAPERLESS`: `true`
+- `FOLDER_INGEST_NOTIFY_ON_FILED`: `true`
+
+---
+
+### Email Auto-Ingest (Watch-Mailbox → KB + Paperless)
+
+Der dedizierte `renfield-mcp-email-ingest`-Watcher überwacht IMAP-Postfächer per
+**IMAP IDLE** (event-driven, KEIN Polling) und **PUSHT** die Anhänge neuer Mails
+per REST an `POST /api/email-ingest/document` (Bearer). Das Backend hält die
+IMAP-Credentials NICHT — der Watcher schickt nur eine Routing-`mailbox_id`, nie
+Tier/Owner. Das Backend löst pro Mailbox **server-autoritativ** `mailbox_id →
+owner/tier/kb` auf (ein geleakter Push-Token kann das Tier also nicht eskalieren).
+Siehe `docs/EMAIL_INGEST.md`. Off by default; flag-aus = byte-identisch.
+
+```bash
+EMAIL_INGEST_ENABLED=false            # Feature-Schalter (Push-Route)
+# Routing-Tabelle (server-autoritativ), JSON-String, ein Eintrag pro Mailbox.
+# id=Routing-Key (KEIN Credential), owner=Username/ID (leer → ownerless),
+# tier=Circle-Tier 0-4, kb=Ziel-Knowledge-Base (wird bei Bedarf angelegt).
+EMAIL_INGEST_MAILBOXES_JSON=          # z.B. [{"id":"buchhaltung","owner":"evdb","tier":0,"kb":"xidra"}]
+EMAIL_INGEST_TO_PAPERLESS=true        # Anhänge zusätzlich in Paperless ablegen
+```
+
+Wiederverwendet `MAX_FILE_SIZE_MB`, `ALLOWED_EXTENSIONS` (siehe RAG/Upload) und die
+gesamte folder-ingest-Bridge (`services/folder_ingest.py`). Der Bearer-Token liegt
+revozierbar in `SystemSetting` (eigener Key, getrennt vom folder-ingest-Token) —
+per `POST /api/email-ingest/token` (Admin, `settings.manage`) erzeugen/rotieren.
+Die IMAP-Zugangsdaten + die zu überwachenden Postfächer (`mailboxes.yaml`, nur
+Verbindung + Routing-`id`, KEIN owner/tier/kb) leben ausschließlich im Watcher.
+
+**Defaults:**
+- `EMAIL_INGEST_ENABLED`: `false`
+- `EMAIL_INGEST_MAILBOXES_JSON`: `""` (leer → keine Mailbox geroutet; unbekannte `mailbox_id` → `failed`)
+- `EMAIL_INGEST_TO_PAPERLESS`: `true`
+
+---
+
 ### Conversation Memory (Langzeitgedaechtnis)
 
 ```bash
@@ -480,7 +803,31 @@ MEMORY_EXTRACTION_ENABLED=false     # Fakten automatisch aus Dialogen extrahiere
 MEMORY_CONTRADICTION_RESOLUTION=false   # LLM-basierte Widerspruchserkennung aktivieren
 MEMORY_CONTRADICTION_THRESHOLD=0.6      # Similarity-Untergrenze fuer Vergleich (0.3-0.89)
 MEMORY_CONTRADICTION_TOP_K=5            # Max bestehende Erinnerungen zum Vergleich (1-10)
+
+# Memory→KG Bridge (Structured Memory Phase 3) — opt-in, dark by default
+MEMORY_KG_BRIDGE_ENABLED=false              # Memory-Subjekte an kanonische KG-Entitaeten binden (save-time + entity-augmentiertes Retrieval)
+MEMORY_RETRIEVAL_SUBJECT_UNION_LIMIT=5      # Max deterministische subjekt-verlinkte Memories pro Turn (1-50)
+MEMORY_SUBSUME_TO_KG=false                  # Phase 3-subsume: zerlegbare Fakten (category=fact + Subjekt) NUR im KG, kein flaches Duplikat. Aggressiv, opt-in.
 ```
+
+**Memory→KG Bridge (Phase 3):** Wenn `MEMORY_KG_BRIDGE_ENABLED=true`, verlinkt der
+Hintergrund-Extraktionspfad zerlegbare Memories (`fact`/`preference`) mit ihrer
+kanonischen KG-Entitaet (`conversation_memories.subject_entity_id`) — typ- und
+tier-bewusst (`resolve_entity(create_tier=memory.tier, match_entity_type=True)`),
+nie im synchronen Turn. Retrieval wird entity-augmentiert: im Query genannte
+Entitaeten (Exact+Surface-Form, kein LLM) ziehen ihre subjekt-verlinkten Memories
+deterministisch in die Embedding-Treffer (similarity-Floor, eigenes Limit,
+canonical_id-Tombstone-Chase) — **immer durch denselben `circle_sql`-Filter**.
+Bestandsdaten: `python bin/backfill_subject_entity_ids.py --dry-run` (Schaetzung,
+keine Writes) → `--commit`. Aus = Retrieval/Extraktion byte-identisch zu vorher.
+
+**Subsume (`MEMORY_SUBSUME_TO_KG`, Phase 3-subsume, aggressiv):** Wenn `true`, werden
+zerlegbare `fact`-Memories mit Subjekt **gar nicht** mehr flach gespeichert — sie
+leben nur noch im KG (Entitaeten + Relationen, die der KG-Hook im selben Turn
+extrahiert). Praeferenzen/Instruktionen/Kontext bleiben flach. **Risiko:** ein Fakt,
+dessen Objekt keine benannte Entitaet ist (z. B. „Anna ist müde"), wird ggf. nicht
+als KG-Relation erfasst und geht verloren. Erst aktivieren, wenn die Fakt-Erfassung
+der KG-Extraktion an echten Transkripten validiert ist. Aus (default) = unveraendert.
 
 **Defaults:**
 - `MEMORY_ENABLED`: `false`
@@ -626,6 +973,96 @@ Manueller Trigger: `POST /api/skills/curator/run` (admin-only). Optional `{"user
 
 ---
 
+### KG Entity Reconciler (Structured Memory)
+
+Periodischer Per-User-Lauf, der near-duplicate KG-Entitaeten zusammenfuehrt
+(das Pendant zum Skill-Curator, fuer den Knowledge Graph). Opt-in.
+
+```bash
+# Master-Schalter
+KG_RECONCILER_ENABLED=false
+
+# Scheduler
+KG_RECONCILER_INTERVAL=86400                  # Sekunden zwischen Laeufen (default 1d)
+
+# Kandidaten + Auto-Merge
+KG_RECONCILER_CANDIDATE_THRESHOLD=0.85        # Cosine ab wann ein Paar ueberhaupt betrachtet wird
+KG_RECONCILER_AUTO_MERGE_THRESHOLD=0.95       # Same-Tier-Auto-Merge-Schwelle (>= candidate)
+KG_RECONCILER_MAX_PER_RUN=50                  # Safety-Cap pro User pro Lauf
+KG_RECONCILER_EMBED_BACKFILL_PER_RUN=50       # Null-Embedding-Entitaeten pro Lauf nach-einbetten (0 deaktiviert)
+
+# KG-Konflations-Tripwire (read-only Fruehwarnung) — opt-in, mutiert NIE
+KG_CONFLATION_MONITOR_ENABLED=false           # Periodischer Scan: distinct-name same-type Paare >= Schwelle
+KG_CONFLATION_MONITOR_INTERVAL=86400          # Sekunden zwischen Scans (default 1d)
+KG_CONFLATION_MONITOR_THRESHOLD=0.85          # Cosine, ab der ein distinct-name same-type Paar gemeldet wird
+KG_CONFLATION_MONITOR_MAX_PAIRS=100           # Cap auf gemeldete Paare pro User pro Scan
+
+# Graph-Expansion-Retrieval (Phase 4, post-RRF) — opt-in, aus = byte-identisch
+GRAPH_EXPANSION_ENABLED=false                 # Nach RRF 1-2 Hops von den fused kg_node-Pivots laufen (PolymorphicAtomStore)
+GRAPH_EXPANSION_MAX_PIVOTS=8                   # Max fused kg_node-Pivots zum Expandieren
+GRAPH_EXPANSION_MAX_HOPS=2                     # Traversal-Tiefe (1-3)
+GRAPH_EXPANSION_MAX_EXPANDED=15               # Cap auf zusaetzliche Nachbar-Atome (Hub-Flood-Schutz)
+```
+
+**Graph-Expansion (Phase 4):** Wenn `GRAPH_EXPANSION_ENABLED=true`, expandiert
+`PolymorphicAtomStore.query` **nach** der RRF-Fusion die obersten `kg_node`-Pivots
+1-`GRAPH_EXPANSION_MAX_HOPS` Hops ueber `kg_relations` (level-synchrone BFS →
+korrekte Min-Hop-Distanz; Circle-Filter pro Hop; Frontier-Cap; **leak-sichere
+Kanten** nur wenn beide Endpunkte sichtbar; Decay = pivot/(1+hop); Cap
+`GRAPH_EXPANSION_MAX_EXPANDED`). Die zusaetzlichen Nachbar-Atome tragen
+`payload.expanded=true`+`hop`. Einzelner Insertion-Point (kein Doppel-Work), Decay
+ueberlebt. Aus (default) = `query` byte-identisch. (Der Agent-String-Pfad
+`get_relevant_context` profitiert erst, wenn er auf den fused-Pfad umgestellt wird
+— offener Follow-up in `TODOS.md`.)
+
+**KG-Konflations-Tripwire:** Wenn `KG_CONFLATION_MONITOR_ENABLED=true`, laeuft
+ein Background-Scan pro `KG_CONFLATION_MONITOR_INTERVAL` Sekunden und meldet
+(WARNING-Log + Gauge `renfield_kg_conflation_candidates`) **distinct-name,
+same-type, same-tier NICHT-Personen**-Paare, deren Cosine >=
+`KG_CONFLATION_MONITOR_THRESHOLD` ist — eine entstehende Generischer-Centroid-
+Magnet-/Fehl-Embedding-Situation in einem Typ, in dem `resolve_entity` noch
+embedding-matched. **Personen sind ausgeschlossen** (primaer ODER Multi-Typ):
+Personennamen clustern intrinsisch ≥ Schwelle (gemessen Jutta~Anna 0.894), und
+`resolve_entity` matched Personen ohnehin nicht per Embedding — ein nahes
+Personen-Paar kann nicht falten, ein Treffer waere Dauer-Rauschen. Der Scan
+**mutiert nie** (echte Dubletten sind Sache des Reconcilers); erwarteter Wert
+ist 0. On-demand ohne Scheduler: `python bin/scan_kg_conflation.py [--user-id N]
+[--threshold 0.9]`. Hintergrund: der Personen-Magnet-Bug (Entitaet #11, 127
+Mentions) entstand genau so. `services/kg_conflation_monitor.py`.
+
+**Verhalten:**
+Wenn `KG_RECONCILER_ENABLED=true`, iteriert ein Background-Scheduler pro
+`KG_RECONCILER_INTERVAL` Sekunden ueber alle User mit aktiven, kanonischen
+Entitaeten und ruft `KgReconcilerService.run_for_user(user_id)`. Jeder Lauf ist
+per-User durch einen nicht-blockierenden Advisory-Lock serialisiert (ein zweiter
+ueberlappender Lauf findet den Lock gehalten und endet als No-op). Zu Beginn
+werden bis zu `KG_RECONCILER_EMBED_BACKFILL_PER_RUN` aktive Entitaeten ohne
+Embedding nach-eingebettet — sonst blieben sie im Self-Join unsichtbar. Ein
+halfvec-Embedding-Self-Join findet dann Duplikat-Paare desselben Users (Cosine
+>= `KG_RECONCILER_CANDIDATE_THRESHOLD`); Winner = mehr Erwaehnungen, tie-break
+aelteres `first_seen_at`. Dann:
+
+1. **Same-Tier + Cosine >= `KG_RECONCILER_AUTO_MERGE_THRESHOLD`** → automatischer
+   Merge via `merge_entities` (absorbiert surface_forms/Multi-Typ, reparentiert
+   Relationen, Tier = MIN, tombstoned den Loser mit `canonical_id`).
+2. **Cross-Tier ODER Grauzone** (aehnlich, aber unter der Auto-Schwelle) →
+   ein `kg_merge_proposals`-Eintrag fuer die Owner-Review (`/brain/review`).
+   Wird NIE still gemergt — eine Verschmelzung darf Sichtbarkeit nie erhoehen.
+
+Idempotent: Paare mit bereits offenem Proposal werden ausgeschlossen
+(Partial-Unique auf `(loser, winner) WHERE status='pending'`). Wird ein
+Proposal genehmigt, dessen Gegenseite ein paralleles Approve schon verschmolzen
+hat, ist der Merge ein No-op und das Proposal schliesst als `superseded` (statt
+irrefuehrend `approved`).
+
+Manueller Trigger: `POST /api/knowledge-graph/reconciler/run` (KG_VIEW — wirkt
+nur auf den eigenen Graphen des Aufrufers).
+Review-Routen: `GET /api/knowledge-graph/merge-proposals`,
+`POST …/{id}/approve` (optional `{"winner_id": <id>}` als Survivor-Override),
+`POST …/{id}/reject`.
+
+---
+
 ### Satellite System
 
 ```bash
@@ -659,33 +1096,47 @@ ADVERTISE_IP=192.168.1.100
 
 ```bash
 # Hostname/IP die externe Dienste (HA Media Player, DLNA Renderer) erreichen können
-ADVERTISE_HOST=192.168.1.159
+ADVERTISE_HOST=renfield.local
 
-# Port für ADVERTISE_HOST (Default: 8000, setze 80 wenn über Nginx)
+# URL-Schema (http|https) für die TTS-Audio-URL, die Renderer abrufen
+ADVERTISE_SCHEME=http
+
+# Port für ADVERTISE_HOST (Standard-Ports 80/443 werden in der URL weggelassen)
 ADVERTISE_PORT=80
 ```
 
+`ADVERTISE_HOST`/`ADVERTISE_SCHEME`/`ADVERTISE_PORT` bauen die URL, die das
+Backend an DLNA-Renderer und HA Media Player übergibt, damit diese die
+TTS-Audiodatei (`/api/voice/tts-cache/{id}.wav`) abrufen
+(`AudioOutputService._get_backend_url()`).
+
 **Defaults:**
 - `ADVERTISE_HOST`: None (muss gesetzt werden für HA Media Player / DLNA Output)
+- `ADVERTISE_SCHEME`: `http` (Literal `http|https`; ein Tippfehler wird beim Start abgelehnt)
 - `ADVERTISE_PORT`: `8000`
 
-**Wann benötigt:**
-- Wenn TTS-Ausgabe auf Home Assistant Media Playern oder DLNA Renderern erfolgen soll
-- Der Wert muss eine Adresse sein, die Home Assistant erreichen kann (nicht `localhost`!)
+**Standard-Ports 80 und 443 werden in der URL immer weggelassen** — so kann ein
+`ADVERTISE_PORT`, das nicht zum Schema passt, keine kaputte URL erzeugen. Nur
+Nicht-Standard-Ports (8000, 8443) erscheinen.
 
-**Beispiele:**
-```bash
-ADVERTISE_HOST=192.168.1.159      # IP-Adresse (empfohlen für DLNA)
-ADVERTISE_HOST=renfield.local     # mDNS Hostname (funktioniert NICHT für DLNA Renderer)
-```
+**Produktion (k8s, aktuell):** `ADVERTISE_HOST=renfield.local`,
+`ADVERTISE_SCHEME=http`, `ADVERTISE_PORT=80` → `http://renfield.local/api/voice/tts-cache/{id}.wav`.
+Die `backend-tts-cache-http` IngressRoute (eigener `web`-Entrypoint-Route ohne
+`http→https`-Redirect) bedient diesen Pfad plain. **Bewusst http, nicht https:**
+Samsung-TVs akzeptieren das self-signed Zertifikat nicht; http funktioniert auf
+allen Renderern.
 
-**Wichtig:** DLNA-Renderer (z.B. HiFiBerry) können mDNS-Hostnamen (`.local`) oft
-nicht auflösen. **IP-Adresse verwenden** wenn DLNA-Ausgabe genutzt wird.
+**Pro-Renderer-Status (gemessen über http://renfield.local):**
+- **Linn / openHome + Samsung TV (Q60CA / 8 Series):** funktionieren nativ — lösen
+  `renfield.local` per Router-DNS auf, kein Geräte-Setup. (Samsung erst nach dem
+  DLNA-Compliance-Fix: HEAD-Support + `audio/x-wav` + `.wav` — vorher UPnP 716.)
+- **HiFiBerry (gmediarender/gstreamer):** braucht nur den `/etc/hosts`-Eintrag
+  `192.168.1.230 renfield.local` (systemd-resolved fängt `.local` als mDNS ab) —
+  via `provision-hifiberry.yml`. **Über http keine CA nötig** (die war nur für die
+  https-Episode da).
+- **55" Signage Flip:** eigener Quirk (404 im dlna-mcp-Confirm), separat.
 
-**Port 80 vs 8000:** Der Backend-Container exposed Port 8000 nur auf `127.0.0.1`.
-Für externe Zugriffe (DLNA, HA) muss der Traffic über Nginx (Port 80) laufen.
-Setze `ADVERTISE_PORT=80` in Produktion. Nginx leitet `/api/voice/tts-cache/`
-über plain HTTP (ohne HTTPS-Redirect) an den Backend weiter.
+Details + Messungen: `docs/MESSAGE_RELAY.md` → „TTS-Audio-Auslieferung an Renderer".
 
 **Ohne ADVERTISE_HOST:**
 - TTS wird nur auf Renfield-Geräten (Satellites, Web Panels) abgespielt
@@ -1062,6 +1513,22 @@ TUNEIN_PARTNER_ID=                     # Optional: TuneIn Partner ID für höher
 # DLNA (Media Renderer Control)
 DLNA_MCP_ENABLED=true
 
+# Samsung Smart TV (Tizen — websocket remote, Wake-on-LAN, DLNA media)
+# Agent-only: chat-driven TV control. Dedicated hostNetwork image (renfield-mcp-samsung).
+# Ships DARK: the k8s configmap sets this false; flip to true only AFTER the
+# samsung-mcp image is built and the one-time TV pairing is done.
+SAMSUNG_MCP_ENABLED=true
+
+# Generic output-provider registry for room media/control routing (opt-in/dark).
+# When on, room output discovery + dispatch route through the pluggable provider
+# registry (built-in renfield/HA + MCP-declared dlna/samsung/sonos via the
+# `output_provider:` stanza) instead of the hardcoded 3-source branches. Off =>
+# byte-identical legacy routing. See docs/OUTPUT_ROUTING.md + docs/design/output-providers.md.
+OUTPUT_PROVIDERS_ENABLED=false
+# Per-provider timeout (seconds) for the aggregated available-outputs discover
+# fan-out; a provider exceeding it shows DEGRADED (not dropped). Default 5.0.
+OUTPUT_PROVIDER_DISCOVER_TIMEOUT=5.0
+
 # n8n (Workflow Automation)
 N8N_MCP_ENABLED=true
 
@@ -1085,6 +1552,22 @@ EMAIL_MCP_ENABLED=true
 
 # Calendar (Google Calendar via n8n)
 CALENDAR_ENABLED=true
+
+# Parcel Tracking (Multi-Carrier, Direkt-APIs — kein Aggregator)
+# DHL/Deutsche Post (gratis, produktiv), UPS + FedEx (OAuth). DPD/Hermes/GLS
+# haben keine freie öffentliche API → Web-Deep-Link. Jeder Adapter deaktiviert
+# sich selbst ohne Keys (list_carriers zeigt den configured-Status).
+TRACKING_ENABLED=true
+DHL_API_KEY=                           # DHL Developer Portal App-Key (DHL-API-Key)
+UPS_CLIENT_ID=                         # UPS Developer App
+UPS_CLIENT_SECRET=
+FEDEX_CLIENT_ID=                       # FedEx Developer App
+FEDEX_CLIENT_SECRET=
+TRACKING_DEFAULT_CARRIER=dhl           # Fallback wenn Carrier nicht aus der Nummer erkennbar
+# Optional: API-Basis-URLs überschreiben (Test-Umgebungen)
+# DHL_TRACKING_BASE_URL=https://api-eu.dhl.com
+# UPS_TRACKING_BASE_URL=https://wwwcie.ups.com       # CIE-Testumgebung
+# FEDEX_TRACKING_BASE_URL=https://apis-sandbox.fedex.com
 ```
 
 **Defaults:** Alle `false`
@@ -1102,6 +1585,9 @@ CALENDAR_ENABLED=true
 | `HOME_ASSISTANT_TOKEN` | HA Long-Lived Access Token | `secrets/home_assistant_token` |
 | `PAPERLESS_API_TOKEN` | Paperless-NGX API Token | `secrets/paperless_api_token` |
 | `MAIL_PRIMARY_PASSWORD` | Email IMAP/SMTP Passwort (primary mail account from `mail_accounts.yaml`) | `secrets/mail_primary_password` |
+| `DHL_API_KEY` | DHL Shipment-Tracking-Unified API-Key (read-only) | `secrets/dhl_api_key` |
+| `UPS_CLIENT_SECRET` | UPS OAuth Client Secret (read-only Tracking) | `secrets/ups_client_secret` |
+| `FEDEX_CLIENT_SECRET` | FedEx OAuth Client Secret (read-only Tracking) | `secrets/fedex_client_secret` |
 | `PRESENCE_WEBHOOK_SECRET` | Shared-Secret für `X-Webhook-Secret` Header bei ausgehenden Presence-Webhooks | `secrets/presence_webhook_secret` |
 
 > Die kanonische Liste inkl. Consumer-Mapping und Upgrade-Hinweise liegt in [`docs/SECRETS_MANAGEMENT.md`](SECRETS_MANAGEMENT.md). Optionale Integration-Secrets (alles ausser den drei Core-Secrets) dürfen als leere Placeholder-Datei existieren — der Stack bleibt startfähig, das Feature deaktiviert sich einfach.
@@ -1115,6 +1601,15 @@ HOME_ASSISTANT_URL=http://homeassistant.local:8123
 # DLNA MCP Server URL (läuft als Host-Service, nicht im Docker)
 # Default: http://host.docker.internal:9091/mcp
 DLNA_MCP_URL=http://host.docker.internal:9091/mcp
+
+# Samsung TV MCP Server URL (dediziertes hostNetwork-Image, nicht im Backend)
+# Default: http://host.docker.internal:9092/mcp ; in k8s: http://samsung-mcp:9092/mcp
+SAMSUNG_MCP_URL=http://host.docker.internal:9092/mcp
+# Optional: feste TV-IP (überspringt SSDP) + Identität im Pairing-Popup
+# SAMSUNG_TV_HOST=192.168.1.47
+# SAMSUNG_CLIENT_NAME=Renfield
+# Pairing-Token-Persistenz (in k8s: PVC samsung-mcp-state an /state gemountet)
+# RENFIELD_STATE_DIR=/state
 
 # n8n Base URL
 N8N_BASE_URL=http://192.168.1.78:5678
@@ -1169,24 +1664,71 @@ EVOLUTION_API_URL=http://evolution-api:8080
 
 ## Hook / Extension System
 
-Das Hook-System ermöglicht externen Paketen (z.B. `renfield-twin`) sich an definierten Lifecycle-Stellen einzuhängen, ohne dass renfield eine Abhängigkeit zum Plugin hat.
+Das Hook-System ermöglicht externen Paketen, sich an definierten Lifecycle-Stellen einzuhängen, ohne dass renfield eine Abhängigkeit zum Plugin hat.
 
 ```bash
-# Entry-Point für Hook-basierte Extensions
-# Format: "package.module:callable" — wird beim Startup aufgerufen
-# Leer = deaktiviert (Standard)
+# Entry-Point für eine Hook-basierte Extension.
+# Format: "package.module:callable" — wird beim Startup aufgerufen.
+# Leer = deaktiviert (Standard).
 PLUGIN_MODULE=
 
-# Beispiel: renfield-twin Extension
-PLUGIN_MODULE=renfield_twin.hooks:register
+# Mehrere Extensions: komma-separierte Liste von "package.module:callable".
+# Wird nach PLUGIN_MODULE geladen und dedupliziert; ein fehlerhaftes Plugin
+# wird geloggt und übersprungen, bricht den Startup also nicht ab.
+PLUGIN_MODULES=
+
+# Beispiele
+PLUGIN_MODULE=example_pkg.plugin:register
+PLUGIN_MODULES=pkg_a.plugin:register,pkg_b.plugin:register
 ```
 
 **Defaults:**
 - `PLUGIN_MODULE`: `""` (deaktiviert)
+- `PLUGIN_MODULES`: `""` (deaktiviert)
 
 **Hook Events:** `startup`, `shutdown`, `register_routes`, `register_tools`, `post_message`, `retrieve_context`
 
 **Hinweis:** Das Hook-System ist der empfohlene Weg für tiefe Integrationen (Kontext-Injektion, Post-Processing, Custom Routes). Für einfache Tool-Integrationen sind MCP-Server weiterhin der bevorzugte Weg.
+
+---
+
+## Tageszeit, LED-Nachtdimmung, Präsenz-Historie & Bluetooth-Scan
+
+```bash
+# --- Tag/Nacht-Bewusstsein (services/daypart_service.py) ---
+# Der Agent bekommt in jedem Prompt eine ZEITKONTEXT-Zeile (Tageszeit + Wochentag);
+# ein 5-Minuten-Watcher feuert bei Übergängen den daypart_changed-Hook. Immer aktiv
+# (kein Flag) — die Uhrzeit zu kennen ist immer korrekt. Fenster sind HH:MM lokal.
+DAYPART_NIGHT_START=22:00      # Beginn "Nacht"
+DAYPART_NIGHT_END=07:00        # Ende "Nacht" (umschlagend über Mitternacht, wenn > start)
+DAYPART_EVENING_START=18:00    # Beginn "Abend"
+DAYPART_TIMEZONE=              # leer => nutzt PRESENCE_ANALYTICS_TIMEZONE (Default Europe/Berlin), sonst UTC
+
+# --- LED-Nachtdimmung (ha_glue/services/led_dimming_service.py) ---
+# Backend-getrieben: bei daypart_changed wird die Helligkeit an alle Satelliten
+# über WS gepusht (led_config). register_ack trägt die aktuelle Helligkeit, damit
+# ein nachts neu verbindender Satellit gedimmt hochkommt. Symmetrisch: jeder
+# Übergang AUS der Nacht stellt LED_DAY_BRIGHTNESS wieder her. Werte 0-31.
+LED_DAY_BRIGHTNESS=20
+LED_NIGHT_BRIGHTNESS=5
+
+# --- Persistente Präsenz-Historie ---
+# presence_events bekommt eine satellite_id-Spalte (Migration pc20260616) + Timeline-
+# Routen unter /api/presence/analytics/ + das internal.presence_history Chat-Tool
+# ("Wo war X", "Wer war in Raum Y"). Fremduser-Abfragen brauchen ROOMS_MANAGE.
+# Die in-memory Live-Präsenz bleibt unberührt. Additiv → Default an.
+PRESENCE_HISTORY_ENABLED=true
+
+# --- Bluetooth-Geräte-Scan aus dem Chat ---
+# "Scanne die Bluetooth-Geräte" → internal.bluetooth_scan fächert eine Discovery
+# an alle Satelliten aus (neues bt_scan_request/bt_scan_result WS-Protokoll, wie
+# capture_snapshot). Jeder Satellit: Classic-BT-Inquiry (hcitool scan) + BLE
+# (BleakScanner). Backend dedupliziert per MAC, stärkstes RSSI, pro Raum, OUI→Hersteller.
+# Nur sichtbare/advertisende Geräte; ~15-30 s. Privacy: zählt alle Geräte im Haus auf
+# → Opt-in (Default aus). Das Tool muss in config/agent_roles.yaml der smart_home-Rolle
+# stehen (ConfigMap renfield-mcp-config, nicht im Image).
+BT_SCAN_ENABLED=false
+```
 
 ---
 

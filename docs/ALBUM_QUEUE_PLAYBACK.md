@@ -8,6 +8,8 @@
 
 Wenn ein Benutzer "Spiel das Album X im Arbeitszimmer" sagt, spielt Renfield nur den ersten Track. Der Agent-Loop erkennt das Album korrekt, ruft `get_album_tracks` auf, erhaelt alle Tracks — aber `internal.play_in_room` kann nur **eine einzelne URL** an Home Assistant senden.
 
+> **Update (v2.12.2):** `internal.play_in_room` ist nicht mehr HA-only — es verzweigt jetzt bei `target_type == "dlna"` auf `_play_url_on_dlna()` (`mcp.dlna.play_tracks`, Ein-Track-Queue) statt auf `media_player.play_media`. Vorher führte ein DLNA-Raum dort zu `KeyError: 'entity_id'`. Mehrere Tracks (Album-Queue) laufen weiterhin über `internal.play_album_on_dlna` (Option H unten).
+
 Ziel: Alle Tracks eines Albums sequentiell abspielen, ueber beliebige Wiedergabegeraete.
 
 ## Architektur-Kontext
@@ -387,7 +389,25 @@ Eigenstaendiger MCP-Server der als UPnP/DLNA **Control Point** agiert. Nutzt `as
 | `pause` / `resume` | Pause/Fortsetzen |
 | `next` / `previous` | Naechster/vorheriger Track in der Queue |
 | `get_status` | Aktueller Track, Position, Queue-Inhalt, Renderer-State |
-| `set_volume` | Lautstaerke setzen |
+| `set_volume` | Lautstaerke setzen (0-100). Geht **direkt** ueber RenderingControl `SetVolume` mit rohen 0-100-Werten (NICHT `DmrDevice.async_set_volume_level`, das bei Renderern mit absurder Range — Linn meldet 2^31-1 — auf volle Lautstaerke springt). Sane advertised Range wird respektiert, bogus Range als 0-100 behandelt. |
+| `get_volume` | Aktuelle Lautstaerke lesen (0-100, `None` falls Renderer sie nicht meldet) — direkt via RenderingControl `GetVolume`; cached aus Events/`set_volume`. Backt die relative Lautstaerke (`internal.media_control` mit `volume_step`). |
+| `set_mute` | Stummschalten (`mute=true`) / aufheben (`mute=false`) via nativem RenderingControl `SetMute` — Renderer stellt die vorige Lautstaerke beim Unmute selbst wieder her (kein gespeicherter Wert). Capability via Action-Presence (nicht `has_volume_mute`). |
+| `get_mute` | Mute-Status lesen (subsumiert in `get_status`). |
+| `seek` | Zu `position_seconds` im aktuellen Track springen. |
+| `set_play_mode` | Wiederhol-/Zufallsmodus: `normal`/`repeat_one`/`repeat_all`/`shuffle`/`random` (capability-gated). |
+
+**MediaServer (Content-Libraries / NAS):**
+
+| Tool | Funktion |
+|---|---|
+| `list_servers` | DLNA MediaServers (ContentDirectory) im Netzwerk entdecken |
+| `browse_server` | Container-Inhalt auflisten (paginiert; `object_id="0"` = Root) |
+| `search_server` | Library nach Titel durchsuchen (capability-gated) |
+| `play_from_server` | Library-Objekt (Album/Playlist/Track) aufloesen + auf einem Renderer abspielen — keine URLs noetig |
+
+> **`internal.media_control` (Renfield-Backend, raumbasiert)** kapselt die Renderer-Tools: `action` = `stop`/`pause`/`resume`/`next`/`previous`/`volume` (absolut `volume=0-100` oder relativ `volume_step=±N` Prozentpunkte)/`mute`/`unmute`/`status`/`seek` (`position_seconds`)/`play_mode` (`mode`). Der Agent nutzt IMMER `internal.media_control` mit `room_name` (Raumaufloesung + HA-vs-DLNA-Branch); `mcp.dlna.set_volume` ist nicht mehr LLM-facing. `status` liefert den aktuellen Track/State (DLNA: `get_status`; HA: `media_player`-State).
+>
+> **MediaServer-Wiedergabe:** der Agent ruft `mcp.dlna.list_servers` + `browse_server`/`search_server` direkt (read-only) und spielt via **`internal.play_from_server(server_name, object_id, room_name)`** (raumaufgeloest auf den DLNA-Renderer).
 
 **Queue State Machine (pro Renderer):**
 
@@ -413,7 +433,34 @@ Eigenstaendiger MCP-Server der als UPnP/DLNA **Control Point** agiert. Nutzt `as
               └──────────┘
 ```
 
-Event-basiert via UPnP SUBSCRIBE (`LAST_CHANGE`) — **kein Polling**.
+Event-basiert via UPnP SUBSCRIBE (`LAST_CHANGE`) — kein Polling im Normalbetrieb.
+
+**`LAST_CHANGE`-Parsing-Fix + GetTransportInfo-Poll-Backstop (v2.12.6).**
+`async-upnp-client` liefert den `LAST_CHANGE`-Callback eine **Liste** von
+`UpnpStateVariable`-Objekten (je `.name`/`.value`), keinen Dict. Der Handler rief
+`.get()` darauf auf und warf bei **jedem** Event `AttributeError` — der gecachte
+`_transport_state` wurde nie gesetzt. Folgen (vor v2.12.6 still kaputt):
+
+- `get_status` meldete dauerhaft `unknown` (z. B. am Arbeitszimmer-HiFiBerry — der
+  Renderer ist **nicht** event-still, der Handler ist nur immer abgestürzt).
+- Die Gapless-/Auto-Advance-Erkennung im Handler lief nie → Alben über mehrere
+  Tracks luden den übernächsten Track nicht vor bzw. sprangen auf Nicht-SetNext-
+  Renderern nicht weiter.
+
+Fix: Liste in eine `name→value`-Map falten. Zusätzlich abgesichert, weil der Fix
+die zuvor toten `STOPPED`-Zweige scharf schaltet — Track-Ende/Queue-Ende werden
+nur gewertet, wenn der Renderer **vorher tatsächlich `PLAYING`** erreicht hat
+(ein transientes `STOPPED`/`NO_MEDIA_PRESENT` in der Anlaufphase darf Track 1
+nicht überspringen oder eine Single-Track-Session vorzeitig abräumen); doppelte
+`STOPPED`-Events werden per `_advancing`-Flag entprellt.
+
+**GetTransportInfo-Poll als Backstop:** `get_status` ruft vor dem Status-Mapping
+einen per `asyncio.wait_for` auf 3 s budgetierten `GetTransportInfo`-Poll auf und
+liest danach den von der Library gepflegten `transport_state` (auch wenn der
+aktive Refresh scheitert — das Event-Abo hält den Wert frisch). So liefert
+`get_status` auch dann einen echten State, falls ein Renderer wider Erwarten keine
+Events schickt. Das Budget verhindert, dass ein hängender Renderer das Tool
+zehnersekundenlang blockiert.
 
 | | |
 |---|---|

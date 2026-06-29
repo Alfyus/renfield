@@ -168,9 +168,11 @@ async def export_jsonl(
     # the audit lands even if the client disconnects mid-stream.
     if not require_redacted:
         client_host = request.client.host if request.client else "unknown"
+        # AUTH_ENABLED=false (single-user mode) yields admin=None — guard the deref.
         logger.warning(
             "🔓 Trajectory export with require_redacted=false: "
-            f"admin_user_id={admin.id} admin_username={admin.username!r} "
+            f"admin_user_id={admin.id if admin else None} "
+            f"admin_username={(admin.username if admin else None)!r} "
             f"remote={client_host} outcome={outcome!r} "
             f"since_days={since_days} flagged_only={flagged_only}"
         )

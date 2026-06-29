@@ -22,7 +22,7 @@ from models.permissions import Permission, has_permission
 from services.auth_service import get_optional_user
 from services.database import get_db
 from services.progress import DocumentProgress
-from services.rag_service import RAGService
+from services.rag_service import DuplicateDocumentError, RAGService
 from services.redis_client import get_redis
 from services.task_queue import DocumentTaskQueue
 from utils.config import settings
@@ -357,52 +357,28 @@ async def upload_document(
         )
 
     try:
-        doc = await rag.create_document_record(
+        # Shared race-safe create (D3): the uq_documents_file_hash_kb
+        # concurrent-insert race is handled in one place
+        # (rag.create_document_record_safe), reused by the folder-ingest
+        # bridge. A concurrent winner surfaces as DuplicateDocumentError.
+        doc = await rag.create_document_record_safe(
             file_path=str(file_path),
             knowledge_base_id=knowledge_base_id,
             filename=file.filename,
             file_hash=file_hash,
         )
-    except IntegrityError as ie:
-        # Distinguish the concurrent-upload race (unique-constraint
-        # violation on our uq_documents_file_hash_kb index) from other
-        # IntegrityErrors (FK, NOT NULL) which are genuinely 500-worthy
-        # — we don't want to paper over those with a misleading 409.
-        orig_err = str(ie.orig) if ie.orig else str(ie)
-        is_hash_race = "uq_documents_file_hash_kb" in orig_err
-        if not is_hash_race:
-            await rag.db.rollback()
-            if file_path.exists():
-                try:
-                    os.remove(file_path)
-                except OSError as cleanup_err:
-                    logger.warning(f"failed to clean up orphan upload {file_path}: {cleanup_err}")
-            logger.error(f"Unexpected IntegrityError on Document insert: {orig_err}")
-            raise HTTPException(status_code=500, detail="Database integrity error")
-
+    except DuplicateDocumentError as dup:
         # Concurrent-upload race: someone else committed the same
-        # (file_hash, knowledge_base_id) pair between our SELECT-based
-        # dup check and this INSERT. Convert to the same 409 response
-        # the pre-insert check produces so the frontend just opens the
-        # duplicate dialog either way. Clean up the orphan file and
-        # fetch the winning row for the payload.
+        # (file_hash, knowledge_base_id) pair between our SELECT-based dup
+        # check and the INSERT. Clean up the orphan file and return the same
+        # 409 the pre-insert check produces so the frontend opens the
+        # duplicate dialog either way.
         if file_path.exists():
             try:
                 os.remove(file_path)
             except OSError as cleanup_err:
                 logger.warning(f"failed to clean up orphan upload {file_path}: {cleanup_err}")
-        await rag.db.rollback()
-        winner_q = await rag.db.execute(
-            select(Document).where(
-                Document.file_hash == file_hash,
-                Document.knowledge_base_id == knowledge_base_id,
-            )
-        )
-        winner = winner_q.scalar_one_or_none()
-        logger.warning(
-            f"Concurrent duplicate upload detected for hash {file_hash[:16]}... "
-            f"(kb={knowledge_base_id}); returning 409 with winner id={winner.id if winner else 'unknown'}"
-        )
+        winner = dup.winner
         raise HTTPException(
             status_code=409,
             detail={
@@ -418,6 +394,16 @@ async def upload_document(
                 },
             },
         )
+    except IntegrityError:
+        # Non-hash-race integrity error (FK / NOT NULL): the helper already
+        # rolled back and re-raised. Keep the original opaque 500 — don't leak
+        # the failed INSERT statement + driver error in the response body.
+        if file_path.exists():
+            try:
+                os.remove(file_path)
+            except OSError as cleanup_err:
+                logger.warning(f"failed to clean up orphan upload {file_path}: {cleanup_err}")
+        raise HTTPException(status_code=500, detail="Database integrity error")
     except Exception as e:
         if file_path.exists():
             try:
@@ -509,6 +495,10 @@ def _doc_to_response_kwargs(doc: Document) -> dict:
         "id": doc.id,
         "filename": doc.filename,
         "title": doc.title,
+        # The UI display name: prefer the LLM-synthesized facts title, then the
+        # metadata title, then the filename — so the list never shows a bare
+        # scan-timestamp filename when we have something better.
+        "display_name": doc.generated_title or doc.title or doc.filename,
         "file_type": doc.file_type,
         "file_size": doc.file_size,
         "status": doc.status,
@@ -629,44 +619,95 @@ async def delete_document(
 @router.post("/documents/{document_id}/reindex", response_model=DocumentResponse)
 async def reindex_document(
     document_id: int,
+    response: Response,
+    force_ocr: bool = False,
     rag: RAGService = Depends(get_rag_service),
     user: User | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Re-indexiert ein Dokument (löscht alte Chunks und erstellt neue)"""
+    """Re-index a document **asynchronously** via the document-worker (#388).
+
+    Reindex used to run the full Docling/OCR pipeline INLINE in the request.
+    OCR is ~45 s/doc, well past the frontend's 30 s timeout, so the browser
+    errored while the backend kept working; repeat-clicks then spawned
+    OVERLAPPING reindexes that duplicated chunks and raced the Schicht-A fact
+    write-then-purge (observed: doc 43 → 36 chunks, 0 facts). Now it enqueues a
+    ``user_reindex`` task and returns 202. The worker is a single consumer, so
+    concurrent reindex requests for one doc are serialized — no timeout, no
+    overlap, double-clicks are harmless.
+    """
+    doc = await rag.get_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Dokument {document_id} nicht gefunden")
     if settings.auth_enabled:
         if not user:
             raise HTTPException(status_code=401, detail="Authentication required")
-        doc = await rag.get_document(document_id)
-        if doc and doc.knowledge_base_id:
+        if doc.knowledge_base_id:
             result = await db.execute(
                 select(KnowledgeBase).where(KnowledgeBase.id == doc.knowledge_base_id)
             )
             kb = result.scalar_one_or_none()
             if kb and not await check_kb_access(kb, user, "write", db):
                 raise HTTPException(status_code=403, detail="No write access to this document")
-    try:
-        document = await rag.reindex_document(document_id)
 
+    # Dedupe in-flight reindexes (/review finding): a double-click would enqueue
+    # a second user_reindex, and the worker would purge+rebuild twice — a wasted
+    # OCR pass and a second window where the doc has 0 chunks. If a reindex/ingest
+    # is already queued or running, return the in-flight doc so the client just
+    # tracks the existing run instead of starting another.
+    if doc.status in ("pending", "processing"):
+        response.status_code = 202
         return DocumentResponse(
-            id=document.id,
-            filename=document.filename,
-            title=document.title,
-            file_type=document.file_type,
-            file_size=document.file_size,
-            status=document.status,
-            error_message=document.error_message,
-            chunk_count=document.chunk_count or 0,
-            page_count=document.page_count,
-            knowledge_base_id=document.knowledge_base_id,
-            created_at=document.created_at.isoformat() if document.created_at else "",
-            processed_at=document.processed_at.isoformat() if document.processed_at else None
+            id=doc.id,
+            filename=doc.filename,
+            title=doc.title,
+            file_type=doc.file_type,
+            file_size=doc.file_size,
+            status=doc.status,
+            error_message=doc.error_message,
+            chunk_count=doc.chunk_count or 0,
+            page_count=doc.page_count,
+            knowledge_base_id=doc.knowledge_base_id,
+            created_at=doc.created_at.isoformat() if doc.created_at else "",
+            processed_at=doc.processed_at.isoformat() if doc.processed_at else None,
         )
 
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if not await _worker_is_alive():
+        raise HTTPException(
+            status_code=503,
+            detail="Dokument-Worker nicht verfügbar — bitte gleich erneut versuchen.",
+        )
+
+    # Flip to pending so the list/poll immediately shows it queued. The worker
+    # purges chunks + rebuilds (reindex_document) under the user_reindex trigger.
+    doc.status = "pending"
+    doc.error_message = None
+    await rag.db.commit()
+    await rag.db.refresh(doc)
+
+    queue = DocumentTaskQueue(redis_client=get_redis())
+    await queue.enqueue({
+        "document_id": doc.id,
+        "force_ocr": force_ocr,
+        "user_id": user.id if user else None,
+        "trigger": "user_reindex",
+    })
+
+    response.status_code = 202
+    return DocumentResponse(
+        id=doc.id,
+        filename=doc.filename,
+        title=doc.title,
+        file_type=doc.file_type,
+        file_size=doc.file_size,
+        status=doc.status,  # "pending"
+        error_message=None,
+        chunk_count=doc.chunk_count or 0,
+        page_count=doc.page_count,
+        knowledge_base_id=doc.knowledge_base_id,
+        created_at=doc.created_at.isoformat() if doc.created_at else "",
+        processed_at=None,
+    )
 
 
 @router.post("/documents/move")

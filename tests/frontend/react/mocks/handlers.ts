@@ -351,6 +351,19 @@ const mockPermissions: MockPermission[] = [
 ];
 
 export const handlers: HttpHandler[] = [
+  // Frontend-visible feature-flag allowlist (api/routes/config.py).
+  http.get(`${BASE_URL}/api/config/features`, () => {
+    return HttpResponse.json({
+      schicht_a_extraction_enabled: false,
+      wissen_workspace_enabled: false,
+      command_palette_enabled: false,
+      role_surfacing_enabled: false,
+      message_search_enabled: false,
+      artifacts_typed_enabled: false,
+      room_handoff_enabled: false,
+      chat_branching_enabled: false,
+    });
+  }),
   // MCP API
   http.get(`${BASE_URL}/api/mcp/status`, () => {
     return HttpResponse.json(mockMcpStatus);
@@ -568,6 +581,18 @@ export const handlers: HttpHandler[] = [
     }
     return HttpResponse.json({ message: 'Session deleted successfully' });
   }),
+
+  // --- Satellite enrollment (security H1) — default empty/disabled fleet ---
+  http.get(`${BASE_URL}/api/satellite-enrollment`, () => HttpResponse.json([])),
+  http.get(`${BASE_URL}/api/satellite-enrollment/status`, () =>
+    HttpResponse.json({
+      enabled: false,
+      autoflip_enabled: false,
+      enforcing: false,
+      total_enrolled: 0,
+      pending_first_auth: 0,
+    }),
+  ),
 ];
 
 // Export BASE_URL and mock fixtures for use in tests that need to override handlers.

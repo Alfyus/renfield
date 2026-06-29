@@ -74,6 +74,14 @@ class ActionExecutor:
             from services.knowledge_tool import knowledge_search
             return await knowledge_search(parameters)
 
+        # Platform-owned internal tool: enumerate the asker's own memories
+        # (no vector threshold) for broad self-knowledge queries. `user_id` is
+        # injected from the authenticated context — never from LLM params — so
+        # the tool only ever reads the current user's own memories.
+        if intent == "internal.list_my_memories":
+            from services.memory_list_tool import list_my_memories
+            return await list_my_memories(parameters, user_id=user_id)
+
         # Platform-owned internal tool: forward a chat attachment to Paperless.
         # The agent passes only the attachment_id; the tool reads real file
         # bytes from storage and calls mcp.paperless.upload_document under the
@@ -92,6 +100,19 @@ class ActionExecutor:
                 user_id=user_id,
             )
 
+        # Platform-owned internal tool: interactive folder-ingest. The agent
+        # passes a file ``path`` on a watched share; the tool pulls the bytes
+        # through the filesystem MCP (truncate=False) and runs them through the
+        # same ingest bridge as the REST push path. mcp_manager + the
+        # authenticated user_id (the file's owner) are injected here.
+        if intent == "internal.ingest_file":
+            from services.folder_ingest_tool import ingest_file
+            return await ingest_file(
+                parameters,
+                mcp_manager=self.mcp_manager,
+                user_id=user_id,
+            )
+
         # Paperless commit (second half of the two-tool confirm flow).
         # Reads a pending-confirm row created by forward_attachment_to_paperless
         # during the cold-start window (first N uploads) and finalises the
@@ -105,6 +126,22 @@ class ActionExecutor:
                 session_id=self.session_id,
                 user_id=user_id,
             )
+
+        # Platform-owned Gen-UI widget tools: the agent renders a table / list
+        # widget from data it computed, or a weather widget from the Open-Meteo
+        # MCP. Each returns data={"artifacts": [...]}, which the chat handler
+        # collects from the tool result and emits. weather_widget needs the MCP
+        # manager (injected here, like ingest_file); the render tools are pure
+        # validation.
+        if intent == "internal.render_table":
+            from services.widget_tools import render_table
+            return await render_table(parameters)
+        if intent == "internal.render_list":
+            from services.widget_tools import render_list
+            return await render_list(parameters)
+        if intent == "internal.weather_widget":
+            from services.widget_tools import weather_widget
+            return await weather_widget(parameters, mcp_manager=self.mcp_manager)
 
         # Other `internal.*` intents (room resolution, media playback,
         # presence, radio) live in ha_glue and are dispatched via the

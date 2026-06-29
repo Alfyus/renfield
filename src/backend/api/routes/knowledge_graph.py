@@ -4,7 +4,9 @@ Knowledge Graph API Routes — CRUD for entities and relations.
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from api.routes.knowledge_graph_schemas import (
     CircleTierInfo,
@@ -20,16 +22,27 @@ from api.routes.knowledge_graph_schemas import (
     KGStatsResponse,
     MergeDuplicatesResponse,
     MergeEntitiesRequest,
+    MergeProposalEntityBrief,
+    MergeProposalResponse,
+    ApproveMergeRequest,
+    MergeProposalsListResponse,
+    ReconcilerRunResponse,
     RelationCreate,
     RelationListResponse,
     RelationResponse,
     RelationUpdate,
 )
-from models.database import TIER_PUBLIC, User
+from models.database import (
+    KG_MERGE_PROPOSAL_PENDING,
+    TIER_PUBLIC,
+    KgMergeProposal,
+    User,
+)
 from models.permissions import Permission
 from services.api_rate_limiter import limiter
 from services.auth_service import require_permission
 from services.database import get_db
+from services.kg_reconciler_service import KgReconcilerService
 from services.knowledge_graph_service import KnowledgeGraphService
 from utils.config import settings
 
@@ -133,7 +146,13 @@ async def get_entity(
 ):
     """Get a single entity by ID."""
     svc = KnowledgeGraphService(db)
-    entity = await svc.get_entity(entity_id)
+    # Circle access (review H4): scope the read to the asker. An inaccessible
+    # entity returns 404 (indistinguishable from non-existent — no oracle).
+    entity = await svc.get_entity(
+        entity_id,
+        asker_id=user.id if user else None,
+        enforce_circle=True,
+    )
     if not entity:
         raise HTTPException(status_code=404, detail="Entity not found")
     return _entity_to_response(entity)
@@ -251,6 +270,8 @@ async def list_relations(
             entity_id=entity_id,
             page=page,
             size=size,
+            asker_id=user.id if user else None,
+            enforce_circle=True,
         )
         return RelationListResponse(
             relations=[
@@ -386,7 +407,11 @@ async def get_stats(
     """Get knowledge graph statistics."""
     try:
         svc = KnowledgeGraphService(db)
-        stats = await svc.get_stats(user_id=user_id)
+        stats = await svc.get_stats(
+            user_id=user_id,
+            asker_id=user.id if user else None,
+            enforce_circle=True,
+        )
         return KGStatsResponse(**stats)
     except Exception as e:
         logger.error(f"KG stats error: {e}")
@@ -470,3 +495,144 @@ async def merge_duplicate_clusters(
     except Exception as e:
         logger.error(f"KG merge duplicates error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================================================================
+# Merge-proposal review queue (Structured Memory Phase 1, T5/D3)
+# =========================================================================
+
+def _merge_brief(e) -> MergeProposalEntityBrief:
+    return MergeProposalEntityBrief(
+        id=e.id,
+        name=e.name,
+        entity_type=e.entity_type,
+        circle_tier=e.circle_tier or 0,
+        mention_count=e.mention_count or 1,
+        surface_forms=list(e.surface_forms or []),
+    )
+
+
+def _proposal_to_response(p: KgMergeProposal) -> MergeProposalResponse:
+    return MergeProposalResponse(
+        id=p.id,
+        similarity=p.similarity,
+        reason=p.reason,
+        status=p.status,
+        created_at=p.created_at.isoformat() if p.created_at else "",
+        loser=_merge_brief(p.loser),
+        winner=_merge_brief(p.winner),
+    )
+
+
+async def _owned_pending_proposal(db: AsyncSession, proposal_id: int, user: User | None) -> KgMergeProposal:
+    p = (await db.execute(
+        select(KgMergeProposal).where(KgMergeProposal.id == proposal_id)
+    )).scalar_one_or_none()
+    # uniform 404 for not-found AND not-owned (don't leak existence cross-user).
+    # Single-user mode (AUTH_ENABLED=false) → user is None and owns everything,
+    # so the ownership branch is skipped.
+    uid = user.id if user else None
+    if p is None or (uid is not None and p.user_id is not None and p.user_id != uid):
+        raise HTTPException(status_code=404, detail="Merge proposal not found")
+    return p
+
+
+@router.get("/merge-proposals", response_model=MergeProposalsListResponse)
+async def list_merge_proposals(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.KG_VIEW)),
+):
+    """Pending entity-merge proposals owned by the caller (D3 review queue).
+
+    Single-user mode (AUTH_ENABLED=false) → user is None and sees every pending
+    proposal (consistent with the circle filter short-circuit in that mode)."""
+    uid = user.id if user else None
+    q = (
+        select(KgMergeProposal)
+        .options(
+            selectinload(KgMergeProposal.loser),
+            selectinload(KgMergeProposal.winner),
+        )
+        .where(KgMergeProposal.status == KG_MERGE_PROPOSAL_PENDING)
+        .order_by(KgMergeProposal.similarity.desc(), KgMergeProposal.created_at.desc())
+    )
+    if uid is not None:
+        q = q.where(KgMergeProposal.user_id == uid)
+    rows = (await db.execute(q)).scalars().all()
+    proposals = [_proposal_to_response(p) for p in rows]
+    return MergeProposalsListResponse(proposals=proposals, total=len(proposals))
+
+
+@router.post("/merge-proposals/{proposal_id}/approve", response_model=EntityResponse)
+async def approve_merge_proposal(
+    proposal_id: int,
+    body: ApproveMergeRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.KG_VIEW)),
+):
+    """Approve a pending proposal: merge into the survivor (tier=MIN), mark
+    approved. Optional body.winner_id overrides which entity survives (D2).
+
+    KG_VIEW (not KG_MANAGE): proposals are the caller's OWN duplicates surfaced
+    in their /brain/review queue; ownership is enforced by _owned_pending_proposal.
+    KG_MANAGE (admin) would dead-end the queue for the household owners it serves."""
+    await _owned_pending_proposal(db, proposal_id, user)
+    survivor = await KgReconcilerService(db).approve_proposal(
+        proposal_id, resolved_by=user.id if user else None,
+        winner_id=body.winner_id if body else None,
+    )
+    if survivor is None:
+        raise HTTPException(status_code=409, detail="Proposal already resolved or merge was a no-op")
+    return _entity_to_response(survivor)
+
+
+@router.post("/merge-proposals/{proposal_id}/reject")
+async def reject_merge_proposal(
+    proposal_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.KG_VIEW)),
+):
+    """Reject a pending proposal (no merge; keeps both entities). KG_VIEW +
+    ownership (see approve) — the owner resolves their own review queue."""
+    await _owned_pending_proposal(db, proposal_id, user)
+    ok = await KgReconcilerService(db).reject_proposal(proposal_id, resolved_by=user.id if user else None)
+    if not ok:
+        raise HTTPException(status_code=409, detail="Proposal already resolved")
+    return {"status": "rejected", "proposal_id": proposal_id}
+
+
+@router.post("/reconciler/run", response_model=ReconcilerRunResponse)
+async def run_reconciler(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.KG_VIEW)),
+):
+    """Trigger a reconciler pass over the caller's own entities (auto-merge
+    same-tier high-confidence dupes; queue cross-tier/gray-zone for review).
+    KG_VIEW: acts only on the caller's own graph. Single-user mode
+    (AUTH_ENABLED=false) → user is None → reconcile every active user's graph,
+    aggregating the report (mirrors the boot scheduler)."""
+    svc = KgReconcilerService(db)
+    uid = user.id if user else None
+    if uid is not None:
+        report = await svc.run_for_user(uid)
+        candidates, auto_merged, proposed, backfilled, notes = (
+            report.candidates, report.auto_merged, report.proposed,
+            report.embedded_backfilled, report.notes,
+        )
+    else:
+        candidates = auto_merged = proposed = backfilled = 0
+        notes: list[str] = []
+        for active_uid in await svc.list_active_user_ids():
+            r = await svc.run_for_user(active_uid)
+            candidates += r.candidates
+            auto_merged += r.auto_merged
+            proposed += r.proposed
+            backfilled += r.embedded_backfilled
+            notes.extend(r.notes)
+    return ReconcilerRunResponse(
+        candidates=candidates,
+        auto_merged=auto_merged,
+        proposed=proposed,
+        embedded_backfilled=backfilled,
+        notes=notes,
+    )

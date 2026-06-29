@@ -139,6 +139,12 @@ export function useWakeWord({
   const unsubscribersRef = useRef<Array<() => void>>([]);
   const callbacksRef = useRef({ onWakeWordDetected, onSpeechStart, onSpeechEnd, onError, onReady });
   const isEnabledRef = useRef(false); // Ref to avoid stale closure in resume()
+  // In-flight guard around engine.start(). isListening only flips true AFTER
+  // the async start resolves, so without this two near-simultaneous resume()
+  // calls (e.g. tab-visible + network-online + WS-reconnect all firing on a
+  // laptop wake) would both pass the isListening check and start() the engine
+  // twice. Coalesces concurrent starts across both enable() and resume().
+  const isStartingRef = useRef(false);
 
   // Keep callbacks ref updated
   useEffect(() => {
@@ -176,10 +182,11 @@ export function useWakeWord({
 
   // Enable wake word listening
   const enable = useCallback(async () => {
-    if (isListening || isLoading) return;
+    if (isListening || isLoading || isStartingRef.current) return;
 
     setIsLoading(true);
     setError(null);
+    isStartingRef.current = true;
 
     try {
       // Lazy load the wake word engine module
@@ -226,6 +233,13 @@ export function useWakeWord({
 
       const unsubError = engine.on('error', (err: Error) => {
         setError(err);
+        // The engine errored — it is no longer detecting. Reflect that in
+        // isListening (it previously stayed stale-true, lying to the UI) so the
+        // status dot goes yellow AND the recovery triggers in ChatContext
+        // (WS-reconnect / tab-visible / network-online) can resume it: their
+        // guard requires !isListening. isEnabled stays true so the user's
+        // intent is preserved and the resume path stays open.
+        setIsListening(false);
         callbacksRef.current.onError?.(err);
       });
 
@@ -280,6 +294,7 @@ export function useWakeWord({
         callbacksRef.current.onError?.(error);
       }
     } finally {
+      isStartingRef.current = false;
       setIsLoading(false);
     }
   }, [isListening, isLoading, initEngine]);
@@ -358,8 +373,13 @@ export function useWakeWord({
       debug.log('⚠️ resume() skipped: no engine');
       return;
     }
+    if (isStartingRef.current) {
+      debug.log('⚠️ resume() skipped: a start is already in flight');
+      return;
+    }
 
     try {
+      isStartingRef.current = true;
       debug.log('▶️ Starting wake word engine...');
       await engineRef.current.start({
         gain: WAKEWORD_CONFIG.defaults.gain,
@@ -369,6 +389,8 @@ export function useWakeWord({
     } catch (err) {
       console.error('Failed to resume wake word:', err);
       setError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      isStartingRef.current = false;
     }
   }, [isListening]); // Removed isEnabled from deps since we use ref
 

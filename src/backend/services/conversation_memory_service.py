@@ -23,6 +23,8 @@ from models.database import (
     MEMORY_ACTION_DELETED,
     MEMORY_ACTION_UPDATED,
     MEMORY_CATEGORIES,
+    MEMORY_CATEGORY_FACT,
+    MEMORY_CATEGORY_PREFERENCE,
     MEMORY_CHANGED_BY_RESOLUTION,
     MEMORY_CHANGED_BY_SYSTEM,
     MEMORY_CHANGED_BY_USER,
@@ -145,9 +147,16 @@ class ConversationMemoryService:
         team_id: str | None = None,
         confidence: float = 1.0,
         trigger_pattern: str | None = None,
+        subject: str | None = None,
     ) -> ConversationMemory | None:
         """
         Save a memory with deduplication.
+
+        ``subject`` is the person/entity the fact is ABOUT (a named person), stored
+        in ``subject_name`` so retrieval can disambiguate per-subject instead of
+        relying on embedding neighborhood — this is the structural fix for the
+        cross-person conflation bug (D9). The KG-entity link (subject_entity_id)
+        is populated by the Phase-3 bridge, not here.
 
         If a semantically similar memory already exists (above dedup threshold),
         updates access_count and last_accessed_at instead of creating a duplicate.
@@ -214,6 +223,7 @@ class ConversationMemoryService:
             team_id=team_id,
             confidence=confidence,
             trigger_pattern=trigger_pattern,
+            subject_name=(subject.strip() or None) if subject else None,
             atom_id=atom_id,
             circle_tier=default_tier,
         )
@@ -301,6 +311,7 @@ class ConversationMemoryService:
         user_id: int | None = None,
         session_id: str | None = None,
         lang: str = "de",
+        captured_kg_subjects: set[str] | None = None,
     ) -> list[ConversationMemory]:
         """Dispatcher — routes to v1 or v2 based on settings flags.
 
@@ -319,6 +330,13 @@ class ConversationMemoryService:
         change. The v2 path's fallback uses the private `_extract_and_save_v1_impl`
         directly to avoid an infinite dispatcher recursion when
         v2_authoritative is on.
+
+        ``captured_kg_subjects`` (Phase 3-subsume per-fact fix): the lowercased
+        subject NAMES of relations the KG extractor saved for THIS turn, passed
+        by the chat handler after the `post_message` hook runs FIRST in the same
+        background coroutine. It is the per-fact subsume signal; only the v1 path
+        (the only path with a subsume gate) consumes it. None = legacy /
+        uncoordinated caller → fall back to the subject-level proxy guard.
         """
         if settings.memory_extraction_v2_authoritative:
             return await self.extract_and_save_v2(
@@ -341,6 +359,7 @@ class ConversationMemoryService:
             user_id=user_id,
             session_id=session_id,
             lang=lang,
+            captured_kg_subjects=captured_kg_subjects,
         )
         v1_latency = time.monotonic() - v1_started
 
@@ -495,11 +514,19 @@ class ConversationMemoryService:
         user_id: int | None = None,
         session_id: str | None = None,
         lang: str = "de",
+        captured_kg_subjects: set[str] | None = None,
     ) -> list[ConversationMemory]:
         """v1 extraction implementation. Called directly by:
           - the public extract_and_save() dispatcher when both v2 flags are off
           - extract_and_save_v2's fallback path on any v2 failure
         Do NOT add the v2 flag dispatch here — would recurse.
+
+        ``captured_kg_subjects`` (Phase 3-subsume per-fact fix): lowercased
+        subject NAMES of relations the KG extractor actually saved THIS turn (the
+        chat handler runs KG extraction first and threads the captured set here).
+        Used as the PRIMARY subsume gate: a fact is dropped-as-subsumed only when
+        its subject is in this set. None = no coordination available → fall back
+        to the subject-level proxy ``_subject_is_kg_representable``.
         """
         # Guard: Skip extraction for injection attempts and transactional queries
         if not self.should_extract_memories(user_message, assistant_response):
@@ -555,12 +582,57 @@ class ConversationMemoryService:
             category = item.get("category", "").strip().lower()
             importance = item.get("importance", 0.5)
             trigger_pattern = item.get("trigger_pattern")
+            subject = (item.get("subject") or "").strip() or None
 
             if not content:
                 continue
             if category not in MEMORY_CATEGORIES:
                 logger.debug(f"Skipping extracted memory with invalid category: {category}")
                 continue
+
+            # Phase 3-subsume (opt-in): a decomposable fact about a named subject
+            # lives in the KG (entities + relations, extracted by the KG hook on
+            # the SAME turn), so don't also store a flat duplicate. Preferences/
+            # instructions/context/procedural stay flat (their object is often not
+            # a named entity). Off (default) => unchanged.
+            #
+            # RECALL-LOSS GATE (memory_subsume_require_kg_relation, default on):
+            # the KG extraction only persists a relation when the fact's OBJECT
+            # is a named entity (a state/feeling — "müde", "krank", "gestresst" —
+            # yields no entity, no relation). Dropping the flat store for such a
+            # fact loses it silently and unrecoverably.
+            #
+            # PER-(SUBJECT, TURN) GATE (Phase 3-subsume coordination): when the
+            # chat handler coordinates the two background extractors (runs KG
+            # first and threads the saved-relation subjects in via
+            # `captured_kg_subjects`), we subsume a fact ONLY when its subject is
+            # among the subjects the KG actually captured a relation for THIS
+            # turn. That closes the CROSS-TURN residual the old subject-level
+            # proxy missed: a state-fact about an ALREADY-related person ("Anna
+            # ist müde" while Anna already lives somewhere in the KG) has subject
+            # NOT in `captured_kg_subjects` this turn → kept flat. A named-entity-
+            # object fact ("Anna wohnt in Bonn") whose relation IS saved this
+            # turn → subsumed.
+            #
+            # NOT truly per-fact (caveat): the signal is subject NAMES, not
+            # (subject, object) pairs. A same-turn, same-subject mix (one entity-
+            # object fact + one state fact) still subsumes the state fact — a
+            # narrower residual measured by the `mixed-same-subject-*` eval case.
+            #
+            # FALLBACK: `captured_kg_subjects is None` means an uncoordinated
+            # caller (legacy / non-chat path) — fall back to the subject-level
+            # proxy `_subject_is_kg_representable`. See tests/eval/
+            # subsume_recall_loss_eval.yaml for the measured loss surface.
+            if settings.memory_subsume_to_kg and category == MEMORY_CATEGORY_FACT and subject:
+                if await self._should_subsume_fact(
+                    subject, user_id, captured_kg_subjects
+                ):
+                    logger.debug(f"📥 Subsuming fact to KG (skip flat memory): subject={subject!r}")
+                    continue
+                logger.debug(
+                    f"🛟 Subsume gate: keeping fact flat — no KG relation captured "
+                    f"this turn for subject={subject!r}"
+                )
 
             # Clamp importance to valid range
             try:
@@ -592,11 +664,203 @@ class ConversationMemoryService:
                     importance=importance,
                     source_session_id=session_id,
                     trigger_pattern=trigger_pattern if category == "procedural" else None,
+                    subject=subject,
                 )
             if memory:
+                await self._bridge_subject_entity(memory, subject, category)
                 saved.append(memory)
 
         return saved
+
+    async def _bridge_subject_entity(
+        self,
+        memory: ConversationMemory,
+        subject: str | None,
+        category: str,
+    ) -> None:
+        """Phase 3 bridge: link a decomposable memory's subject to a canonical KG entity.
+
+        Runs only here, in the background extraction path (never the synchronous
+        turn). Decomposable facts/preferences are about a named subject (a person);
+        resolve that subject to the canonical entity — reusing whatever the turn's
+        KG extraction already created, since resolve_entity is name-idempotent — and
+        store its id in subject_entity_id so "Was weiß ich über X" becomes
+        deterministic. Non-decomposable categories (procedural/instruction/context)
+        stay flat.
+
+        Gated behind MEMORY_KG_BRIDGE_ENABLED (opt-in, dark by default). Best-effort:
+        a resolve failure leaves subject_entity_id NULL (backfill or the next mention
+        links it later). type-scoped + tier-pinned resolution (Phase 3a) prevents
+        wrong-type links and self-tier leaks.
+        """
+        if not settings.memory_kg_bridge_enabled:
+            return
+        if memory is None or memory.user_id is None:
+            return
+        if not subject or category not in (MEMORY_CATEGORY_FACT, MEMORY_CATEGORY_PREFERENCE):
+            return
+        if memory.subject_entity_id is not None:
+            return
+        try:
+            from services.knowledge_graph_service import KnowledgeGraphService
+            ent = await KnowledgeGraphService(self.db).resolve_entity(
+                subject, "person", memory.user_id,
+                create_tier=memory.circle_tier,
+                match_entity_type=True,
+                use_embedding=False,  # bare names embed-conflate across people (Jutta→Anna); exact/surface/create only
+            )
+            memory.subject_entity_id = ent.id
+            if not memory.subject_name:
+                memory.subject_name = subject
+            await self.db.commit()
+        except Exception as e:  # noqa: BLE001 — bridge is best-effort; never break extraction
+            await self.db.rollback()
+            logger.warning(
+                f"Memory KG bridge failed for memory #{getattr(memory, 'id', '?')} "
+                f"subject={subject!r}: {e}"
+            )
+
+    async def _should_subsume_fact(
+        self,
+        subject: str | None,
+        user_id: int | None,
+        captured_kg_subjects: set[str] | None,
+    ) -> bool:
+        """Per-SUBJECT-per-turn subsume decision (Phase 3-subsume coordination).
+
+        Returns True iff this fact may be dropped (its subject is demonstrably
+        represented in the KG this turn). The PRIMARY signal is per-turn:
+        ``captured_kg_subjects`` is the set of subject names the KG extractor
+        actually saved a relation for THIS turn (threaded in by the chat handler
+        after the `post_message` hook ran first in the same background
+        coroutine). A fact is subsumed only when its subject is in that set — so
+        a state/attribute fact about a subject for whom NO relation was saved
+        this turn ("Anna ist müde", even for an already-related Anna) is kept
+        flat. This closes the CROSS-TURN residual the subject-level proxy missed
+        (the proxy keyed on PRIOR relations; this keys on THIS turn's capture).
+
+        GRANULARITY CAVEAT — this is per-(subject, turn), NOT truly per-fact.
+        The set holds subject NAMES, not (subject, object) pairs. So a single
+        turn that yields TWO facts about the SAME subject — one with a named-
+        entity object (relation saved → subject in the set) and one a state/
+        attribute fact (no relation) — STILL subsumes the state fact, because
+        the subject is in the set. That same-turn, same-subject, mixed-object
+        case is a narrower residual loss that remains open (measured by the
+        ``mixed-same-subject-*`` eval case). Truly per-fact would need a
+        per-(subject, object) captured signal matched to each fact's object —
+        not built here.
+
+        Coordination invariants:
+          * KG extraction runs exactly once (in the hook); the set is reused, not
+            re-extracted.
+          * ``memory_subsume_require_kg_relation`` off → legacy unguarded subsume
+            (always True), unchanged.
+          * ``captured_kg_subjects is None`` (uncoordinated / legacy caller) →
+            fall back to the subject-level proxy ``_subject_is_kg_representable``
+            so the harm-reduction behavior is preserved when no per-turn signal
+            exists. The coordinated chat path always passes a set (possibly
+            empty), so the proxy is no longer the primary gate there.
+
+        MULTI-USER GAP (unchanged): subsume remains single-user only. The
+        captured set is name-based and the subject came verbatim from the memory
+        extractor; cross-user subject resolution + tier reach are NOT addressed
+        here (see TODOS.md). Do not enable ``memory_subsume_to_kg`` multi-user.
+        """
+        if not settings.memory_subsume_require_kg_relation:
+            return True  # legacy unguarded subsume
+        if not subject:
+            return False
+        if captured_kg_subjects is not None:
+            # Per-(subject, turn) signal (authoritative when coordination ran).
+            # NOT per-(subject, object): a same-turn same-subject state fact is
+            # still subsumed if any relation for the subject was saved (caveat
+            # in the docstring).
+            return subject.strip().lower() in captured_kg_subjects
+        # Uncoordinated caller — fall back to the subject-level proxy.
+        return await self._subject_is_kg_representable(subject, user_id)
+
+    async def _subject_is_kg_representable(
+        self, subject: str | None, user_id: int | None
+    ) -> bool:
+        """Subsume recall-loss guard: does the KG already hold a relation for this subject?
+
+        This is a loss-REDUCTION proxy, NOT a per-fact guarantee. Recall loss is
+        per-FACT: a state/feeling fact whose object is not a named entity ("Anna
+        ist müde") produces no KG relation and is lost when subsumed — even if
+        Anna is an already-related person, so this guard returns True and STILL
+        lets that fact be dropped. What the guard actually protects is the
+        common-case worst loss: a fact about a NEVER-BEFORE-RELATED subject
+        (the subject entity carries 0 relations). For those it keeps the fact
+        flat (recoverable) rather than subsuming on faith. The real per-fact fix
+        is a follow-up (TODOS.md): subsume only when THIS turn captured a
+        relation for the subject, which needs coordinating the currently
+        uncoordinated memory-extract and KG-extract async tasks.
+
+        Selection mirrors ``KnowledgeGraphService.resolve_entity``'s exact-name
+        step so the same row is chosen: live + canonical (``canonical_id IS
+        NULL``), own-or-unowned, restricted to ``entity_type == 'person'`` (the
+        subsume target is always a named person), ordered
+        ``circle_tier ASC, mention_count DESC`` so a same-name homonym /
+        wrong-tier row can't be picked arbitrarily and cause a wrong-entity
+        false-positive (which would subsume the wrong person's fact = loss).
+        Note we do NOT chase surface-forms here (the subject came verbatim from
+        the memory extractor, already an exact name); a surface-form-only miss
+        just keeps the fact flat = fail-safe.
+
+        Same-turn race is intentional: the KG extraction for THIS turn runs as a
+        separate concurrent task on its own session, so relations it creates this
+        turn are intentionally invisible here. Consequence: the first fact about
+        a brand-new subject whose object IS an entity gets a harmless flat
+        duplicate (recoverable), never a loss — the safe direction.
+
+        Fail-safe: any miss / error / resolve-failure → False (keep the fact flat).
+        Disabling ``memory_subsume_require_kg_relation`` reverts to the legacy
+        unguarded behavior (always subsume a fact+subject). This guard does NOT
+        make ``memory_subsume_to_kg`` safe for multi-user (see TODOS.md).
+        """
+        if not settings.memory_subsume_require_kg_relation:
+            return True  # legacy unguarded subsume
+        if not subject or user_id is None:
+            return False
+        try:
+            from sqlalchemy import or_
+
+            from models.database import KGEntity, KGRelation
+            # Resolve the subject to a canonical PERSON entity WITHOUT creating
+            # one — mirror resolve_entity's exact-name step (live + canonical,
+            # own-or-unowned, person-typed, deterministic order).
+            ent_row = await self.db.execute(
+                select(KGEntity.id, KGEntity.canonical_id)
+                .where(
+                    func.lower(KGEntity.name) == subject.strip().lower(),
+                    KGEntity.is_active == True,  # noqa: E712
+                    KGEntity.canonical_id.is_(None),
+                    KGEntity.entity_type == "person",
+                    or_(KGEntity.user_id == user_id, KGEntity.user_id.is_(None)),
+                )
+                .order_by(KGEntity.circle_tier.asc(), KGEntity.mention_count.desc())
+                .limit(1)
+            )
+            row = ent_row.first()
+            if row is None:
+                return False
+            # canonical_id IS NULL is filtered above, so row.id is the survivor;
+            # keep the tombstone-follow defensively in case the filter is relaxed.
+            entity_id = row.canonical_id or row.id
+            rel = await self.db.execute(
+                select(KGRelation.id)
+                .where(
+                    KGRelation.user_id == user_id,
+                    KGRelation.subject_id == entity_id,
+                )
+                .limit(1)
+            )
+            return rel.first() is not None
+        except Exception as e:  # noqa: BLE001 — guard is best-effort, fail-safe to flat
+            logger.warning(
+                f"Subsume KG-representability probe failed for subject={subject!r}: {e}"
+            )
+            return False
 
     @staticmethod
     def _parse_extraction_response(raw_text: str) -> list[dict]:
@@ -1385,6 +1649,8 @@ class ConversationMemoryService:
                 "access_count": m.access_count,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "last_accessed_at": m.last_accessed_at.isoformat() if m.last_accessed_at else None,
+                "subject_name": m.subject_name,
+                "subject_entity_id": m.subject_entity_id,
             }
             for m in memories
         ]

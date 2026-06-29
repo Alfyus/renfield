@@ -15,19 +15,70 @@
 roles:
   smart_home:
     description:
-      de: "Smart Home: Licht, Schalter, Sensoren, Heizung, Szenen steuern, Temperatur/Luftfeuchte in Raeumen abfragen (NICHT Musik/Medien, NICHT Aussenwetter)"
-      en: "Smart home: control lights, switches, sensors, heating, scenes, query temperature/humidity in rooms (NOT music/media, NOT outdoor weather)"
+      de: "Smart Home: Licht, Schalter, Sensoren, Heizung, Szenen steuern, Temperatur/Luftfeuchte in Raeumen abfragen, Bluetooth-Geraete in den Raeumen scannen (NICHT Musik/Medien, NICHT Aussenwetter)"
+      en: "Smart home: control lights, switches, sensors, heating, scenes, query temperature/humidity in rooms, scan for Bluetooth devices in the rooms (NOT music/media, NOT outdoor weather)"
     mcp_servers: [homeassistant]
-    internal_tools: [internal.resolve_room_player, internal.play_in_room]
+    # internal.media_control is the canonical room-volume path (HA media_players
+    # AND DLNA renderers). Volume commands ("lauter/leiser", "auf X% setzen")
+    # route here as smart_home/volume_control, so the role needs it — otherwise
+    # the agent has no working volume tool (HassSetVolume was removed because it
+    # can't target DLNA renderers and bypasses room routing).
+    # internal.bluetooth_scan: "scan all bluetooth devices" fans a discovery scan
+    # out to every satellite (gated by BT_SCAN_ENABLED).
+    internal_tools: [internal.resolve_room_player, internal.play_in_room, internal.media_control, internal.bluetooth_scan, internal.device_controls]
     max_steps: 4
     prompt_key: agent_prompt_smart_home
     model: "qwen3:8b"
+    # Sub-intent dispatch: four "read-only smart-home overview" requests are fully
+    # handled by ha_glue `dispatch_sub_intent` hooks, each returning prose + ONE
+    # typed Lane A artifact. Actuation commands ("mach das Licht an") match NONE of
+    # these keyword sets (no actuation verbs appear) and fall through to the normal
+    # agent loop. Every handler is inert when ARTIFACTS_TYPED_ENABLED is off
+    # (declines → agent answers).
+    # NOTE: each description string doubles as comma-separated keywords for the
+    # router's _infer_sub_intent fast-path (the sub-intent with the MOST keyword
+    # hits wins), so the keyword sets are kept disjoint per sub-intent:
+    #   status         → table    (full device inventory, room×device×state)
+    #   sensors        → keyvalue  (per-room temperature/humidity readings)
+    #   active_devices → list      (controllable devices currently on)
+    #   devices_per_room → chart   (bar: device count per room)
+    # "was ist an / was ist gerade an" deliberately lives ONLY on active_devices
+    # (its true meaning) so it never collides with the status overview.
+    sub_intents:
+      status:
+        de: "Status, Übersicht, Überblick, Zustand, wie ist der status im haus, smart-home-status, geräteübersicht, alle geräte anzeigen, gesamtüberblick"
+        en: "status, overview, summary, state of the house, smart home status, device overview, show all devices, whole house status"
+        dispatch:
+          type: handler
+          handler: smarthome_status
+      sensors:
+        de: "Sensorwerte, Temperaturen, Temperatur in den räumen, wie warm ist es, wie warm ist es in den räumen, luftfeuchte, luftfeuchtigkeit, raumtemperatur, messwerte"
+        en: "sensor readings, temperatures, temperature in the rooms, how warm is it, how warm is it in the rooms, humidity, air humidity, room temperature, measured values"
+        dispatch:
+          type: handler
+          handler: smarthome_sensors
+      active_devices:
+        de: "Was ist gerade an, was ist an, was läuft gerade, welche geräte sind eingeschaltet, was ist eingeschaltet, welche geräte laufen, was ist aktiv"
+        en: "what is on, what is currently on, what is running, which devices are switched on, which devices are on, which devices are running, what is active"
+        dispatch:
+          type: handler
+          handler: smarthome_active_devices
+      devices_per_room:
+        de: "Geräte pro Raum, wie viele geräte pro raum, anzahl geräte je raum, geräteverteilung, wie viele geräte gibt es pro raum, geräte je raum"
+        en: "devices per room, how many devices per room, device count per room, device distribution, how many devices are there per room, devices by room"
+        dispatch:
+          type: handler
+          handler: smarthome_devices_per_room
 
   research:
     description:
       de: "Recherche: Websuche, Nachrichten, Aussenwetter/Wettervorhersage (NICHT Raumtemperatur)"
       en: "Research: web search, news, outdoor weather/forecast (NOT room temperature)"
     mcp_servers: [search, news, weather]
+    # internal.weather_widget wraps mcp.weather.get_weather + renders a weather
+    # widget (prefer it over the raw MCP for weather questions). render_table/
+    # render_list let research answers come back as widgets.
+    internal_tools: [internal.weather_widget, internal.render_table, internal.render_list]
     max_steps: 6
     prompt_key: agent_prompt_research
 
@@ -36,7 +87,7 @@ roles:
       de: "Dokumente und E-Mail: Suche in Wissensdatenbank und Paperless, Download, Versand"
       en: "Documents and email: search knowledge base and Paperless, download, send"
     mcp_servers: [paperless, email]
-    internal_tools: [internal.knowledge_search, internal.forward_attachment_to_paperless]
+    internal_tools: [internal.knowledge_search, internal.forward_attachment_to_paperless, internal.render_table, internal.render_list]
     max_steps: 8
     prompt_key: agent_prompt_documents
 
@@ -44,7 +95,7 @@ roles:
     description:
       de: "Medien: Musik, Filme, Serien, Radio suchen und abspielen (auch in bestimmten Raeumen)"
       en: "Media: search and play music, movies, series, radio (also in specific rooms)"
-    mcp_servers: [jellyfin, dlna, radio]
+    mcp_servers: [jellyfin, dlna, radio, samsung]
     internal_tools: [internal.resolve_room_player, internal.play_in_room, internal.play_album_on_dlna, internal.play_video_on_dlna, internal.media_control, internal.play_radio, internal.save_radio_favorite, internal.list_radio_favorites, internal.remove_radio_favorite]
     max_steps: 6
     prompt_key: agent_prompt_media
@@ -52,27 +103,27 @@ roles:
 
   workflow:
     description:
-      de: "Automatisierungen: n8n Workflows erstellen, bearbeiten, verwalten, ausfuehren"
-      en: "Automations: create, edit, manage, execute n8n workflows"
+      de: "n8n-Automatisierung NUR: n8n-Workflows / Automations-Pipelines erstellen, bearbeiten, verwalten, ausfuehren. NICHT fuer das Verfassen/Erstellen von Texten, Dokumenten, Fragebögen, Checklisten, Konzepten oder Plänen (das ist 'conversation'/'general') — nicht hierher nur weil 'erstelle' oder 'Programm' vorkommt"
+      en: "n8n automation ONLY: create, edit, manage, execute n8n workflows / automation pipelines. NOT for writing/creating text, documents, questionnaires, checklists, concepts or plans (that is 'conversation'/'general') — not here just because the words 'create' or 'program' appear"
     mcp_servers: [n8n]
     max_steps: 10
     prompt_key: agent_prompt_workflow
 
   presence:
     description:
-      de: "Anwesenheit: Wo ist eine Person, wer ist zuhause, in welchem Raum ist jemand"
-      en: "Presence: where is a person, who is home, which room is someone in"
+      de: "Anwesenheit & Nachrichten ausrichten: Wo ist eine Person, wer ist zuhause, in welchem Raum ist jemand; einer Person etwas ausrichten/Bescheid sagen/ansagen ('sag ihm/ihr ...', 'richte X aus'); ODER eine Rundansage an ALLE im Haus ('Ansage an alle', 'sag allen Bescheid', 'ruf alle zum Essen', 'Durchsage')"
+      en: "Presence & relaying messages: where is a person, who is home, which room is someone in; relay/announce a message to a person ('tell him/her ...', 'let X know ...'); OR a house-wide announcement to EVERYONE ('announce to all', 'tell everyone', 'call everyone for dinner')"
     mcp_servers: []
-    internal_tools: [internal.get_user_location, internal.get_all_presence]
-    max_steps: 2
+    internal_tools: [internal.get_user_location, internal.get_all_presence, internal.announce_in_room, internal.broadcast_announcement, internal.presence_history, internal.presence_map]
+    max_steps: 5
     prompt_key: agent_prompt
 
   routine:
     description:
       de: "Routinen: Gute-Nacht-Routine, Guten-Morgen-Routine, Schlafenszeit, Aufstehen — mehrstufige Smart-Home-Ablaeufe mit Statusbericht"
       en: "Routines: good-night routine, good-morning routine, bedtime, waking up — multi-step smart home sequences with status briefing"
-    mcp_servers: [homeassistant, calendar, weather, jellyfin, dlna, radio]
-    internal_tools: [internal.get_all_presence, internal.get_user_location, internal.resolve_room_player, internal.media_control, internal.play_in_room, internal.play_radio]
+    mcp_servers: [homeassistant, calendar, weather, jellyfin, dlna, radio, samsung]
+    internal_tools: [internal.get_all_presence, internal.get_user_location, internal.resolve_room_player, internal.media_control, internal.play_in_room, internal.play_radio, internal.weather_widget]
     max_steps: 15
     prompt_key: agent_prompt_routine
 
@@ -84,8 +135,8 @@ roles:
 
   general:
     description:
-      de: "Allgemein: Komplexe oder domainuebergreifende Anfragen"
-      en: "General: complex or cross-domain queries"
+      de: "Allgemein: Komplexe oder domainuebergreifende Anfragen; AUCH wenn der Nutzer Daten oder Fakten ausdruecklich als LISTE oder TABELLE dargestellt haben moechte (z.B. 'liste ... auf', 'zeig mir eine Liste/Tabelle von ...', 'erstelle eine Tabelle mit/der ...', 'vergleiche ... als Tabelle')"
+      en: "General: complex or cross-domain queries; ALSO when the user explicitly wants data or facts shown as a LIST or TABLE (e.g. 'list ...', 'show me a list/table of ...', 'create a table of ...', 'compare ... as a table')"
     mcp_servers: null
     internal_tools: null
     max_steps: 12
@@ -93,6 +144,6 @@ roles:
 
   conversation:
     description:
-      de: "Konversation: Smalltalk, Allgemeinwissen, Meinungen, keine Aktion noetig"
-      en: "Conversation: smalltalk, general knowledge, opinions, no action needed"
+      de: "Konversation & Texterstellung: Smalltalk, Allgemeinwissen, Meinungen, sowie das Verfassen/Erstellen von Texten, Dokumenten, Fragebögen, Checklisten, Konzepten, Plänen, Vorlagen — KEINE Aktion und KEINE Weitergabe einer Nachricht an eine Person (eine Nachricht ausrichten gehoert zu 'presence'). NICHT hierher, wenn der Nutzer Daten/Fakten ausdruecklich als LISTE oder TABELLE dargestellt haben moechte (das gehoert zu 'general')"
+      en: "Conversation & writing: smalltalk, general knowledge, opinions, and writing/creating text, documents, questionnaires, checklists, concepts, plans, templates — NO action and NOT relaying a message to a person (relaying a message belongs to 'presence'). NOT here when the user explicitly wants data/facts shown as a LIST or TABLE (that belongs to 'general')"
     # No agent loop - direct LLM response

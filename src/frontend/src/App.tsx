@@ -5,6 +5,8 @@ import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 import Layout from './components/Layout';
 import ErrorBoundary from './components/ErrorBoundary';
 import ProtectedRoute, { AdminRoute } from './components/ProtectedRoute';
+import RedirectPreserving from './components/RedirectPreserving';
+import { useFeatureFlags } from './api/resources/brain';
 import ChatPage from './pages/ChatPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
@@ -35,6 +37,7 @@ const PaperlessAuditPage = lazy(() => import('./pages/PaperlessAuditPage'));
 const RoutingDashboardPage = lazy(() => import('./pages/RoutingDashboardPage'));
 const BrainPage = lazy(() => import('./pages/BrainPage'));
 const BrainReviewPage = lazy(() => import('./pages/BrainReviewPage'));
+const ObligationsPage = lazy(() => import('./pages/ObligationsPage'));
 // WissensbasisPage was the A-LANDING 2D composed page; superseded by
 // the unified 3D Wissensgraph (see /wissensbasis redirect below).
 const CirclesSettingsPage = lazy(() => import('./pages/CirclesSettingsPage'));
@@ -46,9 +49,16 @@ const BrainSkillsPage = lazy(() => import('./pages/BrainSkillsPage'));
 const AdminToolHealthPage = lazy(() => import('./pages/AdminToolHealthPage'));
 const AdminTrajectoriesPage = lazy(() => import('./pages/AdminTrajectoriesPage'));
 const AdminCuratorPage = lazy(() => import('./pages/AdminCuratorPage'));
+const WissenLayout = lazy(() => import('./pages/wissen/WissenLayout'));
+const OverviewLens = lazy(() => import('./pages/wissen/OverviewLens'));
 
 function AppRoutes() {
   const { isFeatureEnabled } = useAuth();
+  // D10: the unified workspace is gated by a runtime flag (/api/config/features).
+  // Until it resolves (or when off) we render the legacy flat corpus routes — the
+  // safe default, so a slow/failed flag fetch never breaks navigation.
+  const { data: featureFlags } = useFeatureFlags();
+  const wissenWorkspace = featureFlags?.wissen_workspace_enabled ?? false;
 
   return (
     <Routes>
@@ -91,34 +101,74 @@ function AppRoutes() {
                 <RoomsPage />
               </ProtectedRoute>
             } />
-            <Route path="/knowledge" element={
-              <ProtectedRoute permission={['kb.own', 'kb.shared', 'kb.all']} requireAny>
-                <KnowledgePage />
-              </ProtectedRoute>
-            } />
-            <Route path="/memory" element={<MemoryPage />} />
-            <Route path="/knowledge-graph" element={<KnowledgeGraphPage />} />
-            {/* /wissensbasis was the A-LANDING 2D composed page (A2+A4).
-                Replaced 2026-05-12 by the unified 3D Wissensgraph scene
-                with a built-in search overlay (driven from D23: "one
-                continuous 3D experience, not 3D→flat handoff"). All
-                ?focus= URLs continue to resolve via /knowledge-graph
-                which renders the same focus-mode scene the A4 panel
-                used to render in flat chips. */}
-            <Route path="/wissensbasis" element={
-              <Navigate to={`/knowledge-graph${window.location.search}`} replace />
-            } />
-            {/* Circles v1 — second brain, review queue, circles management */}
-            <Route path="/brain" element={
-              <ProtectedRoute>
-                <BrainPage />
-              </ProtectedRoute>
-            } />
-            <Route path="/brain/review" element={
-              <ProtectedRoute>
-                <BrainReviewPage />
-              </ProtectedRoute>
-            } />
+            {wissenWorkspace ? (
+              <>
+                {/* Unified Wissen workspace (D10 flag ON): one persistent shell,
+                    lenses in the Outlet, old corpus URLs redirect in. */}
+                <Route path="/wissen" element={
+                  <ProtectedRoute>
+                    <WissenLayout />
+                  </ProtectedRoute>
+                }>
+                  {/* Übersicht dashboard (PR2). */}
+                  <Route index element={<OverviewLens />} />
+                  <Route path="dokumente" element={
+                    <ProtectedRoute permission={['kb.own', 'kb.shared', 'kb.all']} requireAny>
+                      <KnowledgePage />
+                    </ProtectedRoute>
+                  } />
+                  {isFeatureEnabled('knowledge_graph') && (
+                    <Route path="graph" element={<KnowledgeGraphPage />} />
+                  )}
+                  <Route path="erinnerungen" element={<MemoryPage />} />
+                  <Route path="fristen" element={<ObligationsPage />} />
+                  <Route path="review" element={
+                    <ProtectedRoute>
+                      <BrainReviewPage />
+                    </ProtectedRoute>
+                  } />
+                </Route>
+                {/* Old corpus routes → workspace lenses (search + hash preserved). */}
+                <Route path="/knowledge" element={<RedirectPreserving to="/wissen/dokumente" />} />
+                <Route path="/memory" element={<RedirectPreserving to="/wissen/erinnerungen" />} />
+                <Route path="/knowledge-graph" element={<RedirectPreserving to="/wissen/graph" />} />
+                <Route path="/wissensbasis" element={<RedirectPreserving to="/wissen/graph" />} />
+                <Route path="/brain" element={<RedirectPreserving to="/wissen" />} />
+                <Route path="/brain/review" element={<RedirectPreserving to="/wissen/review" />} />
+                <Route path="/brain/fristen" element={<RedirectPreserving to="/wissen/fristen" />} />
+              </>
+            ) : (
+              <>
+                {/* Legacy flat corpus routes (D10 flag OFF — the safe default). */}
+                <Route path="/knowledge" element={
+                  <ProtectedRoute permission={['kb.own', 'kb.shared', 'kb.all']} requireAny>
+                    <KnowledgePage />
+                  </ProtectedRoute>
+                } />
+                <Route path="/memory" element={<MemoryPage />} />
+                <Route path="/knowledge-graph" element={<KnowledgeGraphPage />} />
+                {/* /wissensbasis: the A-LANDING 2D page, superseded 2026-05-12 by
+                    the unified 3D Wissensgraph; ?focus= URLs resolve there. */}
+                <Route path="/wissensbasis" element={
+                  <Navigate to={`/knowledge-graph${window.location.search}`} replace />
+                } />
+                <Route path="/brain" element={
+                  <ProtectedRoute>
+                    <BrainPage />
+                  </ProtectedRoute>
+                } />
+                <Route path="/brain/review" element={
+                  <ProtectedRoute>
+                    <BrainReviewPage />
+                  </ProtectedRoute>
+                } />
+                <Route path="/brain/fristen" element={
+                  <ProtectedRoute>
+                    <ObligationsPage />
+                  </ProtectedRoute>
+                } />
+              </>
+            )}
             <Route path="/brain/audit" element={
               <ProtectedRoute>
                 <FederationAuditPage />

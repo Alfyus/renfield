@@ -40,7 +40,11 @@ SAMPLE_CONFIG = {
                 "en": "Smart home: lights, switches, sensors",
             },
             "mcp_servers": ["homeassistant"],
-            "internal_tools": ["internal.resolve_room_player", "internal.play_in_room"],
+            "internal_tools": [
+                "internal.resolve_room_player",
+                "internal.play_in_room",
+                "internal.media_control",
+            ],
             "max_steps": 4,
             "prompt_key": "agent_prompt_smart_home",
         },
@@ -224,9 +228,33 @@ class TestParseRoles:
         assert role.name == "smart_home"
         assert role.mcp_servers == ["homeassistant"]
         assert "internal.resolve_room_player" in role.internal_tools
+        # Volume commands ("lauter/leiser", "auf X% setzen") route to smart_home,
+        # so the role MUST carry the canonical room-volume tool. Without it the
+        # agent has no working volume path (HassSetVolume was removed for being
+        # DLNA-incompatible) — the gap that shipped broken in v2.13.0-rc.13.
+        assert "internal.media_control" in role.internal_tools
         assert role.max_steps == 4
         assert role.prompt_key == "agent_prompt_smart_home"
         assert role.has_agent_loop is True
+
+    @pytest.mark.unit
+    def test_real_config_smart_home_has_media_control(self):
+        """Regression guard against the real config/agent_roles.yaml (not the
+        SAMPLE_CONFIG mock): the smart_home role must include internal.media_control
+        so volume commands routed there can actually adjust volume. Skips when the
+        repo config isn't present (e.g. the image-stripped test container)."""
+        from pathlib import Path
+
+        config_file = next(
+            (p / "config" / "agent_roles.yaml"
+             for p in Path(__file__).resolve().parents
+             if (p / "config" / "agent_roles.yaml").exists()),
+            None,
+        )
+        if config_file is None:
+            pytest.skip("config/agent_roles.yaml not present in this environment")
+        roles = _parse_roles(load_roles_config(str(config_file)))
+        assert "internal.media_control" in roles["smart_home"].internal_tools
 
     @pytest.mark.unit
     def test_conversation_role_no_agent_loop(self):
@@ -431,6 +459,49 @@ class TestAgentRouter:
         router = AgentRouter(SAMPLE_CONFIG)
         role = router.get_role("nonexistent")
         assert role.name == "general"
+
+    @pytest.mark.unit
+    async def test_role_hint_honored_short_circuits(self):
+        """A valid command-palette role_hint routes to that role immediately,
+        before any entity/continuity/LLM layer (ollama is never touched).
+        An unknown hint fails the `role_hint in self.roles` guard and falls
+        through to normal classification."""
+        router = AgentRouter(SAMPLE_CONFIG)
+        role = await router.classify_with_context(
+            "irgendeine Nachricht", None, None, role_hint="research",
+        )
+        assert role.name == "research"
+
+    @pytest.mark.unit
+    def test_role_for_intent_maps_corrected_intents(self):
+        """role_for_intent maps the strings the intent-correction dropdown
+        produces to the owning agent role (backs 'Korrigieren & neu beantworten').
+        Backend-owned because agent_roles.yaml is the single source of truth."""
+        router = AgentRouter(SAMPLE_CONFIG)
+        # mcp.<server>.<tool> -> role whose mcp_servers contains <server>
+        assert router.role_for_intent("mcp.homeassistant.turn_on") == "smart_home"
+        assert router.role_for_intent("mcp.jellyfin.play") == "media"
+        assert router.role_for_intent("mcp.paperless.search") == "documents"
+        # internal.<x> -> role whose internal_tools lists it
+        assert router.role_for_intent("internal.get_user_location") == "presence"
+        # core intents (the dropdown emits these two + mcp.* — never internal.*)
+        assert router.role_for_intent("knowledge.ask") == "documents"
+        assert router.role_for_intent("general.conversation") == "general"
+        # a bare role name resolves to itself (role-key precedence — "conversation"
+        # is a real role, so it wins over the general.* fallback)
+        assert router.role_for_intent("conversation") == "conversation"
+        assert router.role_for_intent("research") == "research"
+
+    @pytest.mark.unit
+    def test_role_for_intent_unmappable_returns_none(self):
+        """An empty/unknown/unowned intent returns None so the caller falls
+        back to normal routing (no forced role) — graceful degradation."""
+        router = AgentRouter(SAMPLE_CONFIG)
+        assert router.role_for_intent(None) is None
+        assert router.role_for_intent("") is None
+        assert router.role_for_intent("mcp.nonexistent.tool") is None
+        assert router.role_for_intent("internal.unknown_tool") is None
+        assert router.role_for_intent("totally.unknown") is None
 
     @pytest.mark.unit
     def test_role_descriptions_de(self):

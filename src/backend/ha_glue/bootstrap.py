@@ -87,6 +87,14 @@ def register() -> None:
             ha_deliver_notification,
             ha_get_connected_device_summary,
         )
+        from ha_glue.services.smarthome_status import (
+            ha_dispatch_smarthome_status,
+        )
+        from ha_glue.services.smarthome_artifacts import (
+            ha_dispatch_active_devices,
+            ha_dispatch_devices_per_room,
+            ha_dispatch_sensors,
+        )
 
         register_hook("intent_fallback_resolve", ha_intent_fallback)
         register_hook("build_entity_context", ha_build_entity_context)
@@ -100,6 +108,13 @@ def register() -> None:
         register_hook("fetch_tts_audio_cache", ha_fetch_tts_audio_cache)
         register_hook("get_connected_device_summary", ha_get_connected_device_summary)
         register_hook("deliver_notification", ha_deliver_notification)
+        register_hook("dispatch_sub_intent", ha_dispatch_smarthome_status)
+        # Three more Lane A artifact producers (keyvalue / list / chart). Each is
+        # its own dispatch_sub_intent handler that declines unless it owns the
+        # classified smart_home sub-intent — so all four coexist on the one hook.
+        register_hook("dispatch_sub_intent", ha_dispatch_sensors)
+        register_hook("dispatch_sub_intent", ha_dispatch_active_devices)
+        register_hook("dispatch_sub_intent", ha_dispatch_devices_per_room)
         register_hook("register_tools", ha_glue_register_tools)
         register_hook("execute_tool", ha_glue_execute_tool)
         register_hook("startup", ha_glue_on_startup)
@@ -107,7 +122,7 @@ def register() -> None:
         register_hook("shutdown_finalize", ha_glue_on_shutdown_finalize)
         register_hook("register_routes", ha_glue_register_routes)
         logger.info(
-            "ha_glue.bootstrap: registered 17 handlers across 17 events"
+            "ha_glue.bootstrap: registered 21 handlers across 18 events"
         )
     except Exception:  # noqa: BLE001 — startup must never break on plugin error
         logger.opt(exception=True).warning(
@@ -218,6 +233,18 @@ async def ha_glue_on_startup(*, app: Any) -> None:
     except Exception:  # noqa: BLE001
         logger.opt(exception=True).warning(
             "ha_glue.bootstrap: Zeroconf init failed"
+        )
+
+    # --- Satellite LED night-dimming (backend-driven brightness push) ---
+    # Seeds the current daypart brightness and registers the `daypart_changed`
+    # hook so night transitions push a dimmed LED brightness to all satellites.
+    try:
+        from ha_glue.services.led_dimming_service import get_led_dimming_service
+
+        await get_led_dimming_service().initialize()
+    except Exception:  # noqa: BLE001
+        logger.opt(exception=True).warning(
+            "ha_glue.bootstrap: LED dimming init failed"
         )
 
 
@@ -473,10 +500,21 @@ async def ha_glue_register_tools(*, registry: Any, **_: Any) -> None:
     logger.debug(f"ha_glue: registered {added} internal.* tools with agent registry")
 
 
+# Internal tools that speak TTS into room speakers — a house-wide control
+# action — and so are permission-gated on HA_CONTROL (mirrors the device_action
+# frame gate in chat_handler). announce_in_room targets one room, broadcast_
+# announcement fans out to every occupied room.
+_HA_CONTROL_GATED_TOOLS = frozenset({
+    "internal.announce_in_room",
+    "internal.broadcast_announcement",
+})
+
+
 async def ha_glue_execute_tool(
     *,
     intent: str,
     parameters: dict,
+    user_permissions: list[str] | None = None,
     **_: Any,
 ) -> dict | None:
     """Dispatch `internal.*` intents to the ha_glue InternalToolService.
@@ -494,6 +532,31 @@ async def ha_glue_execute_tool(
     if intent == "internal.knowledge_search":
         # Platform owns this tool — let the direct dispatch handle it.
         return None
+
+    # Permission gate (fail-closed) for the announce/broadcast tools. They route
+    # TTS into room speakers, so an authenticated user needs HA_CONTROL — the
+    # same permission the device_action frame gate requires. `user_permissions`
+    # is None ONLY in auth-disabled single-user mode OR an unidentified voice
+    # turn (no JWT / low-confidence speaker), where the agent actuates freely
+    # anyway and a spoken "Ansage an alle" must keep working; physical voice
+    # presence is its own authorization. When a permission list IS present (an
+    # authenticated user), HA_CONTROL is required — so a low-privilege account
+    # (e.g. a Gast with ha.read) cannot drive house-wide TTS.
+    if intent in _HA_CONTROL_GATED_TOOLS and user_permissions is not None:
+        from models.permissions import Permission, has_permission
+        if not has_permission(user_permissions, Permission.HA_CONTROL):
+            logger.warning(
+                f"🔒 Denied {intent}: user lacks HA_CONTROL "
+                f"(has {len(user_permissions)} permission(s))"
+            )
+            return {
+                "success": False,
+                "action_taken": False,
+                "message": (
+                    "Keine Berechtigung für Durchsagen/Ansagen "
+                    "(HA_CONTROL erforderlich)."
+                ),
+            }
 
     from ha_glue.services.internal_tools import InternalToolService
 
@@ -564,6 +627,16 @@ async def ha_glue_register_routes(*, app: Any) -> None:
         except Exception:  # noqa: BLE001
             logger.opt(exception=True).warning(
                 "ha_glue.bootstrap: satellites router mount failed"
+            )
+
+        # --- Satellite enrollment admin router (security review H1) ---
+        try:
+            from ha_glue.api.routes.satellite_enrollment import router as sat_enroll_router
+            app.include_router(sat_enroll_router, tags=["Satellites"])
+            logger.info("✅ ha_glue: mounted /api/satellite-enrollment")
+        except Exception:  # noqa: BLE001
+            logger.opt(exception=True).warning(
+                "ha_glue.bootstrap: satellite_enrollment router mount failed"
             )
 
     # --- Rooms REST router ---

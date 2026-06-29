@@ -54,6 +54,9 @@ export interface DocumentRow {
   page_count?: number;
   chunk_count?: number;
   title?: string;
+  // UI display name from the backend: LLM-synthesized facts title → metadata
+  // title → filename. Prefer this over title/filename when rendering.
+  display_name?: string;
   created_at?: string;
 }
 
@@ -113,8 +116,11 @@ async function deleteDocumentRequest(id: number): Promise<void> {
   await apiClient.delete(`/api/knowledge/documents/${id}`);
 }
 
-async function reindexDocumentRequest(id: number): Promise<void> {
-  await apiClient.post(`/api/knowledge/documents/${id}/reindex`);
+async function reindexDocumentRequest(id: number): Promise<DocumentRow> {
+  // Async since #async-reindex: returns 202 + the doc row in `pending` so the
+  // caller can poll it to completion (was a synchronous, timeout-prone call).
+  const response = await apiClient.post<DocumentRow>(`/api/knowledge/documents/${id}/reindex`);
+  return response.data;
 }
 
 interface MoveDocumentsInput {
@@ -130,12 +136,13 @@ async function moveDocumentsRequest({ documentIds, targetKbId }: MoveDocumentsIn
   return response.data;
 }
 
-export function useKnowledgeDocumentsQuery(filter: DocsFilter) {
+export function useKnowledgeDocumentsQuery(filter: DocsFilter, enabled = true) {
   return useApiQuery(
     {
       queryKey: [...keys.knowledge.list(), { filter }] as const,
       queryFn: () => fetchDocuments(filter),
       staleTime: STALE.DEFAULT,
+      enabled,
     },
     'common.error',
   );
@@ -152,12 +159,13 @@ export function useKnowledgeBasesQuery() {
   );
 }
 
-export function useKnowledgeStatsQuery() {
+export function useKnowledgeStatsQuery(enabled = true) {
   return useApiQuery(
     {
       queryKey: [...keys.knowledge.all, 'stats'] as const,
       queryFn: fetchStats,
       staleTime: STALE.DEFAULT,
+      enabled,
     },
     'common.error',
   );

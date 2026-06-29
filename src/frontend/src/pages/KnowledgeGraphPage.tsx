@@ -11,7 +11,9 @@ import Alert from '../components/Alert';
 import Badge from '../components/Badge';
 import type { BadgeColor } from '../components/Badge';
 import { useConfirmDialog } from '../components/ConfirmDialog';
+import { useSearchParams } from 'react-router';
 import { useTheme } from '../context/ThemeContext';
+import { useLensContext } from '../context/LensContext';
 import {
   useKgEntitiesQuery,
   useKgRelationsQuery,
@@ -56,12 +58,27 @@ export default function KnowledgeGraphPage() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
+  // Embedded as the Wissen Graph lens: the workspace omnisearch (?q=) is the
+  // single input (D9) — hide our own and drive the entity-table filter from it.
+  const { embedded } = useLensContext();
+  const [searchParams] = useSearchParams();
+
   // Entities state
   const [entitiesPage, setEntitiesPage] = useState(1);
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<EntityType | ''>('');
   const [tierFilter, setTierFilter] = useState<string>('all');
   const [tierMenuEntity, setTierMenuEntity] = useState<KgEntity | null>(null);
+
+  // D9 (embedded): mirror the workspace omnisearch `?q=` into the entity-table
+  // filter. At scope=everything the cross-corpus overlay owns the query.
+  const omniQ = searchParams.get('q') ?? '';
+  const omniScope = searchParams.get('scope');
+  useEffect(() => {
+    if (!embedded) return;
+    setSearchQuery(omniScope === 'everything' ? '' : omniQ.trim());
+    setEntitiesPage(1);
+  }, [embedded, omniQ, omniScope]);
 
   // Relations state
   const [relationsPage, setRelationsPage] = useState(1);
@@ -388,6 +405,8 @@ export default function KnowledgeGraphPage() {
         <div>
           {/* Controls */}
           <div className="flex flex-wrap items-center gap-3 mb-4">
+            {/* Embedded: the workspace omnisearch drives this filter (D9). */}
+            {!embedded && (
             <div className="relative flex-1 min-w-[200px]">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
               <input
@@ -398,6 +417,7 @@ export default function KnowledgeGraphPage() {
                 className="input pl-9 w-full"
               />
             </div>
+            )}
 
             <select
               value={typeFilter}

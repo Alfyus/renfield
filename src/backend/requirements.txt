@@ -22,9 +22,10 @@ openai>=1.55.0                # OpenAI-compatible client for llama-server / vLLM
 docling>=2.0.0                # IBM Docling for document parsing (includes docling-ibm-models)
 docling-core>=2.0.0           # Docling core functionality
 easyocr>=1.7.0                # EasyOCR for force_full_page_ocr on German/English PDFs
-transformers>=4.47.0          # Required for rt_detr_v2 model support
+transformers>=4.47.0,<5       # rt_detr_v2 support; cap <5 — transformers 5.x needs torch>=2.7 (torch.float8_e8m0fnu); prod torch is 2.6 (CPU). docling-ibm-models allows >=4.42
 pgvector>=0.2.4               # PostgreSQL vector extension for SQLAlchemy
 aiofiles>=23.2.0              # Async file operations
+langdetect>=1.0.9             # Pure-Python language detection (post_document_ingest lang routing)
 
 # Speech-to-Text (faster-whisper via CTranslate2)
 # Older comment claimed PyAV build issues; faster-whisper 1.x ships manylinux
@@ -85,15 +86,17 @@ jsonschema>=4.21.0            # JSON Schema validation for MCP tool inputs
 
 # MCP Servers (standalone packages)
 renfield-mcp-weather @ https://github.com/ebongard/renfield_mcp_weather/archive/refs/heads/main.tar.gz
-renfield-mcp-paperless @ https://github.com/ebongard/renfield-mcp-paperless/archive/refs/tags/v1.4.0.tar.gz
+renfield-mcp-paperless @ https://github.com/ebongard/renfield-mcp-paperless/archive/refs/tags/v1.8.0.tar.gz
 renfield-mcp-mail @ https://github.com/ebongard/renfield-mcp-mail/archive/refs/heads/main.tar.gz
 aiosmtplib>=3.0                  # Required by renfield-mcp-mail (not auto-resolved from archive installs)
 renfield-mcp-jellyfin @ https://github.com/ebongard/renfield-mcp-jellyfin/archive/refs/heads/main.tar.gz
 renfield-mcp-tunein @ https://github.com/ebongard/renfield-mcp-tunein/archive/refs/heads/main.tar.gz
 renfield-mcp-calendar @ https://github.com/ebongard/renfield-mcp-calendar/archive/refs/heads/main.tar.gz
-renfield-mcp-dlna @ https://github.com/ebongard/renfield-mcp-dlna/archive/refs/heads/main.tar.gz
-async-upnp-client>=0.40.0               # Required by renfield-mcp-dlna (UPnP device control)
-python-didl-lite>=1.4.0                  # Required by renfield-mcp-dlna (DIDL-Lite metadata)
+renfield-mcp-tracking @ https://github.com/ebongard/renfield-mcp-tracking/archive/refs/heads/main.tar.gz
+# renfield-mcp-dlna moved to a DEDICATED image (registry/renfield/dlna-mcp, see
+# renfield-mcp-dlna/Dockerfile). The backend reaches dlna over HTTP only (never
+# imports it), so the package + its deps (async-upnp-client, python-didl-lite)
+# are no longer installed here. Re-add ONLY if some backend code imports them.
 exchangelib>=5.4                     # Required by renfield-mcp-calendar (EWS backend)
 caldav>=1.4                          # Required by renfield-mcp-calendar (CalDAV backend)
 

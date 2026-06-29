@@ -304,6 +304,29 @@ class TestOutputDeviceEndpoints:
         assert data["renfield_device_id"] == test_device.device_id
 
     @pytest.mark.integration
+    async def test_add_output_device_generic_pair(
+        self, async_client: AsyncClient, test_room: Room
+    ):
+        """POST with the (output_provider, output_target_id) pair (unified picker /
+        samsung path) must NOT be rejected by a legacy-only route guard. Regression
+        for the 400 that broke the rooms-page 'Hinzufügen' button."""
+        response = await async_client.post(
+            f"/api/rooms/{test_room.id}/output-devices",
+            json={
+                "output_provider": "samsung",
+                "output_target_id": "192.168.1.47",
+                "output_type": "visual",
+                "priority": 1,
+            },
+        )
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["output_provider"] == "samsung"
+        assert data["output_target_id"] == "192.168.1.47"
+        # samsung has no legacy column → stays pair-only
+        assert data["renfield_device_id"] is None and data["ha_entity_id"] is None
+
+    @pytest.mark.integration
     async def test_update_output_device(
         self, async_client: AsyncClient, test_room: Room, db_session: AsyncSession
     ):
@@ -311,7 +334,8 @@ class TestOutputDeviceEndpoints:
         # Create output device
         output = RoomOutputDevice(
             room_id=test_room.id,
-            ha_entity_id="media_player.test",
+            output_provider="homeassistant",
+            output_target_id="media_player.test",
             priority=1
         )
         db_session.add(output)
@@ -341,7 +365,8 @@ class TestOutputDeviceEndpoints:
         # Create output device
         output = RoomOutputDevice(
             room_id=test_room.id,
-            ha_entity_id="media_player.to_delete",
+            output_provider="homeassistant",
+            output_target_id="media_player.to_delete",
             priority=1
         )
         db_session.add(output)
@@ -360,12 +385,14 @@ class TestOutputDeviceEndpoints:
         # Create multiple output devices
         output1 = RoomOutputDevice(
             room_id=test_room.id,
-            ha_entity_id="media_player.first",
+            output_provider="homeassistant",
+            output_target_id="media_player.first",
             priority=1
         )
         output2 = RoomOutputDevice(
             room_id=test_room.id,
-            ha_entity_id="media_player.second",
+            output_provider="homeassistant",
+            output_target_id="media_player.second",
             priority=2
         )
         db_session.add_all([output1, output2])

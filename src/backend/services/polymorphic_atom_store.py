@@ -82,6 +82,7 @@ class PolymorphicAtomStore:
         Until Lane C lands, query() returns un-filtered results from each
         source (legacy behavior preserved).
         """
+        from services.document_fact_retrieval import DocumentFactRetrieval
         from services.kg_retrieval import KGRetrieval
         from services.lexical_retrieval import LexicalRetrieval
         from services.memory_retrieval import MemoryRetrieval
@@ -91,7 +92,11 @@ class PolymorphicAtomStore:
         candidate_k = top_k * 3  # over-fetch for RRF fusion across sources
 
         rag_task = RAGRetrieval(self.db).search(query_text, top_k=candidate_k)
-        kg_task = KGRetrieval(self.db).get_relevant_context(query_text, user_id=asker_id)
+        # Structured per-entity/-relation KG atoms (not the aggregated string):
+        # each kg_node/kg_edge carries its source id so the detail drawer can
+        # render the entity + edit its tier. The agent path still uses the
+        # string form (get_relevant_context) elsewhere.
+        kg_task = KGRetrieval(self.db).get_relevant_atoms(query_text, user_id=asker_id)
         memory_task = MemoryRetrieval(self.db).retrieve(query_text, user_id=asker_id, limit=candidate_k)
         # Lexical retrievers — keyword / name fallback for queries the
         # vector path mis-ranks (single tokens like "Jutta", short
@@ -107,6 +112,13 @@ class PolymorphicAtomStore:
             query_text, asker_id=asker_id, top_k=candidate_k,
         )
         lexical_memories_task = lex.search_memories_lexical(
+            query_text, asker_id=asker_id, top_k=candidate_k,
+        )
+        # Schicht A document facts — a sixth source so structured facts
+        # (Steuernummer, issuer, obligation) surface in /brain search via the
+        # same RRF fusion. Keyword/identifier retrieval, not vector (facts are
+        # short structured strings; the parent chunk is already embedded).
+        document_fact_task = DocumentFactRetrieval(self.db).search(
             query_text, asker_id=asker_id, top_k=candidate_k,
         )
         # Self-learning Phase 1: procedural skills are atoms too — give
@@ -128,30 +140,50 @@ class PolymorphicAtomStore:
         # Removing the wrapper — exceptions in retrieval modules are converted to []
         # by the _wrap_* helpers, and any actual programmer error now bubbles to FastAPI.
         (
-            rag_results, kg_context, memory_results,
-            lexical_chunks, lexical_memories, skill_results,
+            rag_results, kg_atoms, memory_results,
+            lexical_chunks, lexical_memories, skill_results, document_fact_results,
         ) = await asyncio.gather(
             rag_task, kg_task, memory_task,
-            lexical_chunks_task, lexical_memories_task, skill_task,
+            lexical_chunks_task, lexical_memories_task, skill_task, document_fact_task,
             return_exceptions=True,
         )
 
         rag_matches = _wrap_rag_results(rag_results)
-        kg_matches = _wrap_kg_context(kg_context)
+        kg_matches = _wrap_kg_atoms(kg_atoms)
         memory_matches = _wrap_memory_results(memory_results)
         lexical_chunk_matches = _wrap_rag_results(lexical_chunks)
         lexical_memory_matches = _wrap_memory_results(lexical_memories)
         skill_matches = _wrap_skill_results(skill_results)
+        document_fact_matches = _wrap_document_fact_results(document_fact_results)
 
         merged = _rrf_merge(
             [
                 rag_matches, kg_matches, memory_matches,
                 lexical_chunk_matches, lexical_memory_matches,
-                skill_matches,
+                skill_matches, document_fact_matches,
             ],
             top_k=top_k,
             k=settings.rag_hybrid_rrf_k,
         )
+
+        # Phase 4: graph expansion (post-RRF). Walk 1-2 hops out from the fused
+        # kg_node pivots so the agent/UI sees the neighbourhood, not just the
+        # matched nodes. Circle-filtered per hop, leak-safe edges, decay-scored,
+        # provenance-marked. Flag-gated (off => merged unchanged). Single seam so
+        # the decay survives and it runs once.
+        if settings.graph_expansion_enabled:
+            from services.graph_expansion import expand_fused
+            extra = await expand_fused(
+                list(merged), asker_id, self.db,
+                max_pivots=settings.graph_expansion_max_pivots,
+                max_hops=settings.graph_expansion_max_hops,
+                max_expanded=settings.graph_expansion_max_expanded,
+            )
+            if extra:
+                have = {m.atom.atom_id for m in merged}
+                merged = list(merged) + [m for m in extra if m.atom.atom_id not in have]
+                merged.sort(key=lambda m: m.score, reverse=True)
+                merged = merged[: top_k + settings.graph_expansion_max_expanded]
         return merged
 
     async def get_atom(self, atom_id: str, *, asker_id: int) -> Atom | None:
@@ -238,33 +270,80 @@ def _wrap_rag_results(rag_results: Any) -> list[AtomMatch]:
     return list(seen_atoms.values())
 
 
-def _wrap_kg_context(kg_context: Any) -> list[AtomMatch]:
+def _wrap_kg_atoms(kg_atoms: Any) -> list[AtomMatch]:
     """
-    Convert KGRetrieval.get_relevant_context output (str or None) -> list[AtomMatch].
+    Convert KGRetrieval.get_relevant_atoms output -> list[AtomMatch].
 
-    KGRetrieval returns a formatted string today (per Lane A1). For PolymorphicAtomStore
-    we represent it as a single AtomMatch wrapping the formatted text. v2.5 KG retrieval
-    upgrade will return per-triple AtomMatch[] for proper RRF participation.
+    Emits ONE ``kg_node`` atom per matched entity and ONE ``kg_edge`` atom per
+    relation, each carrying its source id in the payload (``entity_id`` /
+    ``relation_id``) so the unified-search detail drawer can render the entity
+    and edit its circle tier via the KG int-id endpoint. Replaces the old single
+    ``kg_aggregated`` string blob (which had no id and couldn't be opened).
     """
-    if isinstance(kg_context, Exception) or not kg_context:
+    if isinstance(kg_atoms, Exception) or not kg_atoms:
         return []
+    entities = kg_atoms.get("entities") or []
+    relations = kg_atoms.get("relations") or []
+    if not entities and not relations:
+        return []
+
     now = _now()
-    return [
-        AtomMatch(
-            atom=Atom(
-                atom_id="kg_aggregated",  # placeholder; v2.5 returns per-triple atoms
-                atom_type="kg_node",
-                owner_user_id=0,
-                policy={"tier": 0},
-                created_at=now,
-                updated_at=now,
-                payload={"content": str(kg_context)},
-            ),
-            score=0.7,  # placeholder; v2.5 returns proper per-triple scores
-            snippet=str(kg_context)[:200],
-            rank=1,
+    matches: list[AtomMatch] = []
+    rank = 1
+    # Entities first (more relevant for a "tell me about X" search), then edges.
+    for e in entities:
+        eid = e.get("id")
+        matches.append(
+            AtomMatch(
+                atom=Atom(
+                    atom_id=f"kg_node:{eid}",
+                    atom_type="kg_node",
+                    owner_user_id=0,
+                    policy={"tier": int(e.get("circle_tier", 0) or 0)},
+                    created_at=now,
+                    updated_at=now,
+                    payload={
+                        "entity_id": eid,
+                        "name": e.get("name", ""),
+                        "entity_type": e.get("entity_type"),
+                    },
+                ),
+                score=float(e.get("similarity", 0.0) or 0.0),
+                snippet=str(e.get("name", ""))[:200],
+                rank=rank,
+            )
         )
-    ]
+        rank += 1
+    for r in relations:
+        rid = r.get("id")
+        subj = r.get("subject_name", "?")
+        pred = r.get("predicate", "")
+        obj = r.get("object_name", "?")
+        matches.append(
+            AtomMatch(
+                atom=Atom(
+                    atom_id=f"kg_edge:{rid}",
+                    atom_type="kg_edge",
+                    owner_user_id=0,
+                    policy={"tier": int(r.get("circle_tier", 0) or 0)},
+                    created_at=now,
+                    updated_at=now,
+                    payload={
+                        "relation_id": rid,
+                        "subject_id": r.get("subject_id"),
+                        "subject_name": subj,
+                        "predicate": pred,
+                        "object_id": r.get("object_id"),
+                        "object_name": obj,
+                    },
+                ),
+                score=0.5,  # relations rank below entities; RRF blends across sources
+                snippet=f"{subj} {pred} {obj}"[:200],
+                rank=rank,
+            )
+        )
+        rank += 1
+    return matches
 
 
 def _wrap_skill_results(skill_results: Any) -> list[AtomMatch]:
@@ -296,6 +375,58 @@ def _wrap_skill_results(skill_results: Any) -> list[AtomMatch]:
                 ),
                 score=float(s.get("similarity", 0.0)),
                 snippet=body[:200],
+                rank=rank,
+            )
+        )
+    return matches
+
+
+def _wrap_document_fact_results(fact_results: Any) -> list[AtomMatch]:
+    """Convert DocumentFactRetrieval.search output -> list[AtomMatch].
+
+    Each fact already carries its real ``atom_id`` (the document_fact atom),
+    so duplicates across sources fuse correctly in RRF. The snippet prefers the
+    fact ``value`` (the headline — a Steuernummer, issuer, summary) and falls
+    back to the excerpt. The payload carries the structured fields the /brain
+    UI and any obligation surface need (obligation_date ISO, amount, legal_gate,
+    source). Exceptions / empty -> [] (gather resilience).
+    """
+    if isinstance(fact_results, Exception) or not fact_results:
+        return []
+    matches: list[AtomMatch] = []
+    now = _now()
+    for rank, f in enumerate(fact_results, start=1):
+        atom_id = f.get("atom_id") or f"document_fact:{f.get('id', 0)}"
+        value = f.get("value") or ""
+        snippet = value or (f.get("excerpt") or "")
+        matches.append(
+            AtomMatch(
+                atom=Atom(
+                    atom_id=str(atom_id),
+                    atom_type="document_fact",
+                    owner_user_id=0,  # not exposed by search; not needed downstream
+                    policy={"tier": f.get("circle_tier", 0)},
+                    created_at=now,
+                    updated_at=now,
+                    payload={
+                        "fact_id": f.get("id"),
+                        "document_id": f.get("document_id"),
+                        "category": f.get("category"),
+                        "kind": f.get("kind"),
+                        "value": value,
+                        "normalized_value": f.get("normalized_value"),
+                        "excerpt": f.get("excerpt"),
+                        "obligation_date": f.get("obligation_date"),
+                        "amount_value": f.get("amount_value"),
+                        "amount_currency": f.get("amount_currency"),
+                        "legal_gate": f.get("legal_gate", False),
+                        "payment_method": f.get("payment_method"),
+                        "source": f.get("source"),
+                        "tier_overridden": f.get("tier_overridden", False),
+                    },
+                ),
+                score=float(f.get("similarity", 0.0)),
+                snippet=snippet[:200],
                 rank=rank,
             )
         )

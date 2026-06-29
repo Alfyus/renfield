@@ -98,6 +98,29 @@ export const defaultChatContextValue: ChatContextValue = {
   // Actions
   speakText: async () => {},
   handleFeedbackSubmit: async () => {},
+  regenerateWithCorrectedIntent: () => {},
+  // Chat branching (Phase 1)
+  editAndResubmit: () => {},
+  regenerateTurn: () => {},
+  // Chat branching (Phase 2)
+  switchBranch: async () => {},
+  deleteBranch: async () => {},
+  // Interactive device widget (Gen-UI)
+  sendDeviceAction: async () => ({ success: true }),
+
+  // Paperless confirm card
+  submitPaperlessConfirm: () => {},
+
+  // Command palette / role surfacing (chat-ui items 4 + 6)
+  paletteOpen: false,
+  openPalette: () => {},
+  closePalette: () => {},
+  pendingRoleHint: null,
+  setRoleHint: () => {},
+  clearRoleHint: () => {},
+  pendingScrollIndex: null,
+  jumpToMessage: async () => {},
+  clearPendingScroll: () => {},
 };
 
 /**

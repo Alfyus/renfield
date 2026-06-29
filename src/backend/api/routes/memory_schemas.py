@@ -41,6 +41,9 @@ class MemoryResponse(BaseModel):
     access_count: int
     created_at: str
     last_accessed_at: str | None
+    # Phase 3 bridge: WHO the memory is about + its canonical KG entity link.
+    subject_name: str | None = None
+    subject_entity_id: int | None = None
 
 
 class MemoryListResponse(BaseModel):

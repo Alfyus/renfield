@@ -82,20 +82,23 @@ def _mock_db_returning(upload, captured_query_holder: list | None = None):
 class TestForwardAttachmentToPaperless:
 
     @pytest.mark.unit
-    async def test_missing_attachment_id(self):
-        """Required attachment_id triggers a clear error, no DB/MCP access."""
+    async def test_no_id_no_session_returns_no_document(self):
+        """No attachment_id AND no session to fall back on → clear no-document
+        message, no DB/MCP access (nothing to resolve)."""
         result = await forward_attachment_to_paperless({}, mcp_manager=MagicMock())
         assert result["success"] is False
-        assert "attachment_id" in result["message"]
+        assert "dokument" in result["message"].lower()
 
     @pytest.mark.unit
-    async def test_non_integer_attachment_id(self):
-        """Non-integer attachment_id is rejected with a message including the bad value."""
+    async def test_non_integer_attachment_id_without_session(self):
+        """A non-integer id is treated as 'no usable id' (a hint, not a hard
+        requirement); with no session to fall back on, returns the no-document
+        message instead of a type error."""
         result = await forward_attachment_to_paperless(
             {"attachment_id": "not-a-number"}, mcp_manager=MagicMock()
         )
         assert result["success"] is False
-        assert "integer" in result["message"].lower()
+        assert "dokument" in result["message"].lower()
 
     @pytest.mark.unit
     async def test_missing_mcp_manager(self):
@@ -107,8 +110,9 @@ class TestForwardAttachmentToPaperless:
         assert "mcp" in result["message"].lower()
 
     @pytest.mark.unit
-    async def test_attachment_not_found(self):
-        """Unknown attachment_id returns a not-found error."""
+    async def test_unknown_id_and_empty_session_returns_no_document(self):
+        """Unknown id AND no completed upload in the session → clear no-document
+        message (no leak of the fabricated/guessed id)."""
         stubs = _stub_db_module()
         try:
             with patch(
@@ -117,12 +121,51 @@ class TestForwardAttachmentToPaperless:
                 create=True,
             ):
                 result = await forward_attachment_to_paperless(
-                    {"attachment_id": 999}, mcp_manager=AsyncMock()
+                    {"attachment_id": 999},
+                    mcp_manager=AsyncMock(),
+                    session_id="session-abc",
                 )
         finally:
             _teardown_stubs(stubs)
         assert result["success"] is False
-        assert "999" in result["message"]
+        assert "dokument" in result["message"].lower()
+
+    @pytest.mark.unit
+    async def test_session_fallback_resolves_latest_upload(self):
+        """No attachment_id in the message (agent forwards as a follow-up) → the
+        tool resolves the most recent completed upload in the session instead of
+        failing or making the agent guess an id."""
+        pdf_bytes = b"%PDF-1.4\n" + b"f" * 200
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bytes)
+            tmp_path = f.name
+        try:
+            upload = _make_upload(
+                file_path=tmp_path, filename="Fallback.pdf", session_id="session-abc"
+            )
+            mock_mcp = AsyncMock()
+            mock_mcp.execute_tool = AsyncMock(return_value={
+                "success": True,
+                "message": json.dumps({"task_id": "fb-1"}),
+            })
+            stubs = _stub_db_module()
+            try:
+                with patch(
+                    "services.database.AsyncSessionLocal",
+                    _mock_db_returning(upload),
+                    create=True,
+                ):
+                    result = await forward_attachment_to_paperless(
+                        {"skip_metadata": True},  # no attachment_id passed
+                        mcp_manager=mock_mcp,
+                        session_id="session-abc",
+                    )
+            finally:
+                _teardown_stubs(stubs)
+            assert result["success"] is True
+            assert result["data"]["attachment_id"] == 42
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     @pytest.mark.unit
     async def test_file_missing_on_disk(self):
@@ -412,3 +455,83 @@ def test_chat_upload_tools_declares_both_confirm_flow_steps():
     # confirm_token (required) and user_response_text.
     assert "confirm_token" in commit["parameters"]
     assert "user_response_text" in commit["parameters"]
+
+
+# ── cold-start confirm counter: single-user (AUTH-off) global key ──────────
+
+
+class TestColdStartConfirmCounter:
+    """In single-user mode (user_id=None) the 'trust after N' counter is tracked
+    in a global SystemSetting key instead of users.paperless_confirms_used, so
+    the confirm doesn't fire on every archive forever."""
+
+    @pytest.mark.unit
+    async def test_bump_singleuser_creates_then_increments_setting(self):
+        from types import SimpleNamespace
+
+        from services.chat_upload_tool import _SINGLEUSER_CONFIRMS_KEY, _bump_confirms_used
+
+        # No row yet → create with value 1.
+        db = MagicMock()
+        db.get = AsyncMock(return_value=None)
+        db.add = MagicMock()
+        db.execute = AsyncMock()
+        await _bump_confirms_used(db, None)
+        added = db.add.call_args.args[0]
+        assert added.key == _SINGLEUSER_CONFIRMS_KEY
+        assert json.loads(added.value) == 1
+        db.execute.assert_not_awaited()  # single-user path doesn't touch User
+
+        # Existing row → increment in place.
+        row = SimpleNamespace(key=_SINGLEUSER_CONFIRMS_KEY, value=json.dumps(4))
+        db2 = MagicMock()
+        db2.get = AsyncMock(return_value=row)
+        db2.add = MagicMock()
+        await _bump_confirms_used(db2, None)
+        assert json.loads(row.value) == 5
+        db2.add.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_bump_per_user_updates_user_row(self):
+        from services.chat_upload_tool import _bump_confirms_used
+
+        db = MagicMock()
+        db.execute = AsyncMock()
+        db.add = MagicMock()
+        db.get = AsyncMock()
+        await _bump_confirms_used(db, 7)
+        db.execute.assert_awaited_once()  # update(User)... issued
+        db.add.assert_not_called()
+        db.get.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_get_singleuser_reads_setting(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from services.chat_upload_tool import _SINGLEUSER_CONFIRMS_KEY, _get_confirms_used
+
+        db = MagicMock()
+        db.get = AsyncMock(return_value=SimpleNamespace(
+            key=_SINGLEUSER_CONFIRMS_KEY, value=json.dumps(9),
+        ))
+
+        @asynccontextmanager
+        async def _sess():
+            yield db
+
+        monkeypatch.setattr("services.database.AsyncSessionLocal", _sess, raising=False)
+        assert await _get_confirms_used(None) == 9
+
+    @pytest.mark.unit
+    async def test_get_singleuser_zero_when_no_setting(self, monkeypatch):
+        from services.chat_upload_tool import _get_confirms_used
+
+        db = MagicMock()
+        db.get = AsyncMock(return_value=None)
+
+        @asynccontextmanager
+        async def _sess():
+            yield db
+
+        monkeypatch.setattr("services.database.AsyncSessionLocal", _sess, raising=False)
+        assert await _get_confirms_used(None) == 0

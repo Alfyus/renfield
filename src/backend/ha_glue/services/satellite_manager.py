@@ -92,6 +92,10 @@ class SatelliteInfo:
     last_heartbeat: float = field(default_factory=time.time)
     current_session_id: str | None = None
     room_id: int | None = None  # Database room ID (populated after DB sync)
+    # Whether this connection presented a valid enrollment PSK (security H1).
+    # Gates the IRK push and protects an enrolled incumbent from eviction by an
+    # unauthenticated newcomer.
+    authenticated: bool = False
     language: str = "de"  # Language code for STT/TTS (e.g., 'de', 'en')
     metrics: dict[str, Any] = field(default_factory=dict)  # Live metrics from heartbeat
     # Version and update tracking
@@ -134,6 +138,10 @@ class SatelliteManager:
         self.satellites: dict[str, SatelliteInfo] = {}
         self.sessions: dict[str, SatelliteSession] = {}
         self._lock = asyncio.Lock()
+        # On-demand camera snapshot requests: request_id → Future[image_b64|None].
+        self._pending_snapshots: dict[str, asyncio.Future] = {}
+        self._pending_bt_scans: dict[str, asyncio.Future] = {}
+        self._pending_irk_captures: dict[str, asyncio.Future] = {}
 
         # Configuration - use settings from config
         from utils.config import settings
@@ -151,7 +159,8 @@ class SatelliteManager:
         websocket: WebSocket,
         capabilities: dict[str, Any],
         language: str = "de",
-        version: str = "unknown"
+        version: str = "unknown",
+        authenticated: bool = False,
     ) -> bool:
         """
         Register a new satellite connection.
@@ -163,14 +172,26 @@ class SatelliteManager:
             capabilities: Hardware capabilities dict
             language: Language code for STT/TTS (e.g., 'de', 'en')
             version: Satellite software version
+            authenticated: True if the connection presented a valid enrollment
+                PSK (security H1). An enrolled incumbent is NOT evicted by an
+                unauthenticated newcomer — that blocks the room-hijack path even
+                during the PERMISSIVE soak window.
 
         Returns:
-            True if registration successful
+            True if registration successful, False if refused (e.g. an
+            unauthenticated connection tried to evict an authenticated incumbent)
         """
         async with self._lock:
             # Check if satellite already connected (reconnection)
             if satellite_id in self.satellites:
                 old_sat = self.satellites[satellite_id]
+                if old_sat.authenticated and not authenticated:
+                    logger.warning(
+                        f"🚫 Refusing to evict authenticated satellite "
+                        f"'{satellite_id}' with an UNAUTHENTICATED connection "
+                        f"(possible hijack attempt)."
+                    )
+                    return False
                 logger.info(f"📡 Satellite {satellite_id} reconnecting (was in room: {old_sat.room})")
                 # Close old connection if still open
                 try:
@@ -198,7 +219,8 @@ class SatelliteManager:
                 websocket=websocket,
                 capabilities=caps,
                 language=language,
-                version=version
+                version=version,
+                authenticated=authenticated,
             )
 
             logger.info(f"✅ Satellite registered: {satellite_id} in {room} (v{version})")
@@ -688,6 +710,119 @@ class SatelliteManager:
     def get_satellite(self, satellite_id: str) -> SatelliteInfo | None:
         """Get satellite info by ID"""
         return self.satellites.get(satellite_id)
+
+    def is_connected(self, satellite_id: str) -> bool:
+        """Whether a satellite currently has a live WS connection (this pod)."""
+        return satellite_id in self.satellites
+
+    def get_camera_satellite_for_room(self, room_id: int) -> SatelliteInfo | None:
+        """Return a connected satellite in this room that has a camera, if any."""
+        if room_id is None:
+            return None
+        for sat in self.satellites.values():
+            if sat.room_id == room_id and sat.capabilities.has_camera:
+                return sat
+        return None
+
+    async def request_snapshot(self, satellite_id: str, timeout: float = 8.0) -> str | None:
+        """Ask a satellite to capture a camera snapshot NOW and return it (base64
+        JPEG), or None on no-camera/timeout/error. Backend→satellite request over
+        the WS; the reply arrives as a 'snapshot_result' message (resolved via
+        resolve_snapshot). The image is transient — never persisted."""
+        sat = self.satellites.get(satellite_id)
+        if sat is None or not sat.capabilities.has_camera:
+            return None
+        request_id = uuid.uuid4().hex
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_snapshots[request_id] = fut
+        try:
+            await sat.websocket.send_json({
+                "type": "capture_snapshot", "request_id": request_id,
+            })
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            return None
+        finally:
+            self._pending_snapshots.pop(request_id, None)
+
+    def resolve_snapshot(self, request_id: str, image_b64: str | None) -> None:
+        """Resolve a pending request_snapshot() future with the satellite's reply."""
+        fut = self._pending_snapshots.get(request_id)
+        if fut is not None and not fut.done():
+            fut.set_result(image_b64)
+
+    async def request_bt_scan(
+        self, satellite_id: str, params: dict | None = None, timeout: float = 30.0
+    ) -> list | None:
+        """Ask a satellite to run a broad Bluetooth discovery scan NOW and return
+        the discovered device list, or None on unknown-satellite/timeout/error.
+        Backend→satellite request over the WS; the reply arrives as a
+        'bt_scan_result' message (resolved via resolve_bt_scan). Mirrors
+        request_snapshot."""
+        sat = self.satellites.get(satellite_id)
+        if sat is None:
+            return None
+        request_id = uuid.uuid4().hex
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_bt_scans[request_id] = fut
+        try:
+            await sat.websocket.send_json({
+                "type": "bt_scan_request",
+                "request_id": request_id,
+                "params": params or {},
+            })
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            return None
+        finally:
+            self._pending_bt_scans.pop(request_id, None)
+
+    def resolve_bt_scan(
+        self, request_id: str, devices: list | None, error: str | None
+    ) -> None:
+        """Resolve a pending request_bt_scan() future with the satellite's reply.
+        On a satellite-side error the device list is treated as empty."""
+        fut = self._pending_bt_scans.get(request_id)
+        if fut is not None and not fut.done():
+            fut.set_result([] if error else (devices or []))
+
+    async def request_irk_capture(
+        self, satellite_id: str, label: str, window_seconds: int = 60,
+        timeout: float | None = None,
+    ) -> dict:
+        """Ask a satellite to open a one-time pairing window and capture a phone's
+        IRK. Returns {'irk','mac','name'} on success, {} on no-bond-in-window, or
+        {'error': ...} on failure/timeout. Mirrors request_bt_scan; the reply
+        arrives as an 'irk_capture_result' message (resolved via resolve_irk_capture)."""
+        sat = self.satellites.get(satellite_id)
+        if sat is None:
+            return {"error": "satellite not connected"}
+        if timeout is None:
+            timeout = window_seconds + 15.0
+        request_id = uuid.uuid4().hex
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_irk_captures[request_id] = fut
+        try:
+            await sat.websocket.send_json({
+                "type": "irk_capture_request",
+                "request_id": request_id,
+                "params": {"label": label, "window_seconds": window_seconds},
+            })
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"error": "timed out waiting for the satellite"}
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)}
+        finally:
+            self._pending_irk_captures.pop(request_id, None)
+
+    def resolve_irk_capture(
+        self, request_id: str, result: dict | None, error: str | None
+    ) -> None:
+        """Resolve a pending request_irk_capture() future with the satellite's reply."""
+        fut = self._pending_irk_captures.get(request_id)
+        if fut is not None and not fut.done():
+            fut.set_result({"error": error} if error else (result or {}))
 
     async def cleanup_stale(self):
         """Remove stale satellites and timed-out sessions"""

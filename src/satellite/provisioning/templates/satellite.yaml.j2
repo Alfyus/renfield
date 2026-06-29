@@ -12,8 +12,25 @@ server:
   discovery_timeout: 10
   reconnect_interval: 5
   heartbeat_interval: 30
+  ping_interval: {{ server_ping_interval | default(15) }}
+  ping_timeout: {{ server_ping_timeout | default(8) }}
+  register_timeout: {{ server_register_timeout | default(15) }}
+  max_disconnected_seconds: {{ server_max_disconnected_seconds | default(300) }}
   auth_enabled: {{ server_auth_enabled | lower }}
   verify_tls: {{ server_verify_tls | lower }}
+  # Per-satellite enrollment PSK (security H1). Set per host in the gitignored
+  # host_vars/satellite-<name>.yml; empty = not enrolled (legacy behavior).
+  enrollment_token: "{{ satellite_enrollment_token | default('') }}"
+
+# OTA release signing (security H6) — pinned public keys verify the signed
+# release manifest before install. require_signature=false until the signing
+# pipeline is live (then fail-closed).
+update:
+  require_signature: {{ satellite_ota_require_signature | default(false) | lower }}
+  release_pubkeys:
+{% for key in satellite_release_pubkeys | default([]) %}
+    - "{{ key }}"
+{% endfor %}
 
 audio:
   sample_rate: 16000
@@ -49,6 +66,9 @@ vad:
 led:
   type: "{{ led_type | default('apa102') }}"
   brightness: {{ led_brightness }}
+  # Local default only — the live night brightness is pushed by the backend
+  # (led_night_brightness) over the WebSocket; this just documents the fallback.
+  night_brightness: {{ led_night_brightness | default(5) }}
   idle_color: "{{ led_idle_color | default('blue') }}"
   # num_leds is emitted for EVERY led_type so the satellite's capability
   # report (sent to the fleet page) reflects this device. Pre-fix the
@@ -87,6 +107,9 @@ ble:
   scan_interval: {{ ble_scan_interval }}
   scan_duration: {{ ble_scan_duration }}
   rssi_threshold: {{ ble_rssi_threshold }}
+  continuous: {{ ble_continuous | default(false) | lower }}
+  smoothing_alpha: {{ ble_smoothing_alpha | default(0.4) }}
+  freshness_seconds: {{ ble_freshness_seconds | default(20.0) }}
 {% if enviro_phat_enabled | default(false) %}
 
 enviro:

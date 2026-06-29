@@ -69,6 +69,10 @@ class WebSocketClient:
         heartbeat_interval: int = 30,
         language: str = "de",
         capabilities: Optional[Dict[str, Any]] = None,
+        ping_interval: int = 15,
+        ping_timeout: int = 8,
+        register_timeout: float = 15.0,
+        enrollment_token: Optional[str] = None,
     ):
         """
         Initialize WebSocket client.
@@ -93,6 +97,14 @@ class WebSocketClient:
         self.heartbeat_interval = heartbeat_interval
         self.language = language
         self._capabilities = capabilities or {}
+        # Connection robustness knobs (see ServerConfig). Tighter ping = faster
+        # dead-link detection on lossy WiFi; register_timeout bounds the handshake.
+        self._ping_interval = ping_interval
+        self._ping_timeout = ping_timeout
+        self._register_timeout = register_timeout
+        # Per-satellite enrollment PSK (security H1); sent in the register frame
+        # when set, verified server-side against the `satellites` table.
+        self._enrollment_token = enrollment_token
 
         self._ws: Optional["WebSocketClientProtocol"] = None
         self._state = ConnectionState.DISCONNECTED
@@ -118,9 +130,19 @@ class WebSocketClient:
         self._on_disconnected: Optional[Callable[[], None]] = None
         self._on_error: Optional[Callable[[str], None]] = None
         self._on_config_update: Optional[Callable[[ServerConfig], None]] = None
-        self._on_update_request: Optional[Callable[[str, str, str, int], None]] = None  # version, url, checksum, size
+        self._on_update_request: Optional[Callable[..., None]] = None  # version, url, checksum, size, manifest, signature
         self._on_ble_known_devices: Optional[Callable[[List[str]], None]] = None
         self._on_classic_bt_known_devices: Optional[Callable[[List[str]], None]] = None
+        self._on_ble_irks: Optional[Callable[[List[Dict[str, Any]]], None]] = None
+        # Backend-pushed LED brightness (night-dimming). Carried both as a live
+        # `led_config` message and inside register_ack (mid-night reconnect).
+        self._on_led_config: Optional[Callable[[int], None]] = None
+        # Async callback returning JPEG bytes (or None) for an on-demand snapshot.
+        self._capture_snapshot: Optional[Callable[[], Any]] = None
+        # Async callback(params) -> list[dict] for an on-demand BT discovery scan.
+        self._on_bt_scan_request: Optional[Callable[[Dict[str, Any]], Any]] = None
+        # Async callback(params) -> dict for a backend-requested IRK pairing capture.
+        self._on_irk_capture: Optional[Callable[[Dict[str, Any]], Any]] = None
 
         # Tasks
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -200,7 +222,7 @@ class WebSocketClient:
         """Register callback for server config updates (wake word settings)"""
         self._on_config_update = callback
 
-    def on_update_request(self, callback: Callable[[str, str, str, int], None]):
+    def on_update_request(self, callback: Callable[..., None]):
         """Register callback for OTA update requests (version, url, checksum, size)"""
         self._on_update_request = callback
 
@@ -208,9 +230,27 @@ class WebSocketClient:
         """Register callback for BLE known devices list from server"""
         self._on_ble_known_devices = callback
 
+    def on_ble_irks(self, callback: Callable[[List[Dict[str, Any]]], None]):
+        """Register callback for backend-pushed per-person IRKs."""
+        self._on_ble_irks = callback
+
     def on_classic_bt_known_devices(self, callback: Callable[[List[str]], None]):
         """Register callback for Classic BT known devices list from server"""
         self._on_classic_bt_known_devices = callback
+
+    def on_led_config(self, callback: Callable[[int], None]):
+        """Register callback for backend-pushed LED brightness (0-31)"""
+        self._on_led_config = callback
+
+    def on_bt_scan_request(self, callback: Callable[[Dict[str, Any]], Any]):
+        """Register async callback(params)->list[dict] for a backend-requested
+        Bluetooth discovery scan. Returns the discovered device list."""
+        self._on_bt_scan_request = callback
+
+    def on_irk_capture(self, callback: Callable[[Dict[str, Any]], Any]):
+        """Register async callback(params)->dict for a backend-requested IRK
+        pairing capture. Returns {'irk': hex, 'mac': str, 'name': str} or {}."""
+        self._on_irk_capture = callback
 
     def set_metrics_callback(self, callback: Callable[[], Dict[str, Any]]):
         """Register callback to get current metrics for heartbeat"""
@@ -244,8 +284,8 @@ class WebSocketClient:
         try:
             # Build connection kwargs
             connect_kwargs = {
-                "ping_interval": 20,
-                "ping_timeout": 10,
+                "ping_interval": self._ping_interval,
+                "ping_timeout": self._ping_timeout,
             }
 
             # Pass auth token via header instead of URL query parameter
@@ -284,6 +324,14 @@ class WebSocketClient:
         except Exception as e:
             print(f"Connection failed: {e}")
             self._state = ConnectionState.DISCONNECTED
+            # Close any half-open socket (e.g. a register-timeout leaves the WS
+            # open) so it doesn't dangle until the next connect() cleanup.
+            if self._ws is not None:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
             if self._on_error:
                 self._on_error(str(e))
             return False
@@ -333,11 +381,23 @@ class WebSocketClient:
             },
             "protocol_version": self._protocol_version
         }
+        # Carry the enrollment PSK only when provisioned, so a non-enrolled
+        # satellite's frame is unchanged (server treats absent token as legacy).
+        if self._enrollment_token:
+            message["token"] = self._enrollment_token
 
         await self._send(message)
 
-        # Wait for ack
-        response = await self._ws.recv()
+        # Wait for ack — BOUNDED. Without a timeout a slow/hung backend (e.g.
+        # stuck creating the room row) would block this coroutine forever, wedging
+        # the satellite in CONNECTING with no reconnect ever firing. On timeout we
+        # raise, which propagates out of connect() → reconnect/backoff kicks in.
+        try:
+            response = await asyncio.wait_for(self._ws.recv(), timeout=self._register_timeout)
+        except asyncio.TimeoutError:
+            raise Exception(
+                f"register ack not received within {self._register_timeout}s"
+            )
         data = json.loads(response)
 
         if data.get("type") == "register_ack":
@@ -355,6 +415,14 @@ class WebSocketClient:
                 )
                 print(f"Registered successfully. Server protocol: {server_protocol}")
                 print(f"Config: wake_words={self._server_config.wake_words}, threshold={self._server_config.threshold}")
+
+                # Apply the backend's current LED brightness immediately so a
+                # satellite reconnecting mid-night comes up already dimmed.
+                if self._on_led_config and "led_brightness" in data:
+                    try:
+                        self._on_led_config(int(data["led_brightness"]))
+                    except (TypeError, ValueError) as e:
+                        print(f"Invalid register_ack led_brightness: {e}")
 
                 if self._on_connected:
                     self._on_connected(self._server_config)
@@ -524,9 +592,14 @@ class WebSocketClient:
             package_url = data.get("package_url", "")
             checksum = data.get("checksum", "")
             size_bytes = data.get("size_bytes", 0)
+            # Signed release manifest (H6) — None on unsigned/legacy releases.
+            manifest = data.get("manifest")
+            signature = data.get("signature")
             print(f"📥 Update request received: v{target_version}")
             if self._on_update_request:
-                self._on_update_request(target_version, package_url, checksum, size_bytes)
+                self._on_update_request(
+                    target_version, package_url, checksum, size_bytes, manifest, signature
+                )
 
         elif msg_type == "ble_known_devices":
             # Server pushed list of known BLE MAC addresses
@@ -541,6 +614,106 @@ class WebSocketClient:
             print(f"Classic BT known devices received: {len(devices)} MACs")
             if self._on_classic_bt_known_devices:
                 self._on_classic_bt_known_devices(devices)
+
+        elif msg_type == "ble_known_irks":
+            # Server pushed per-person IRKs ([{"name","irk"(hex)}]) for resolving
+            # rotating RPAs to a stable identity.
+            irks = data.get("irks", [])
+            print(f"BLE known IRKs received: {len(irks)}")
+            if self._on_ble_irks:
+                self._on_ble_irks(irks)
+
+        elif msg_type == "led_config":
+            # Backend pushed a new LED brightness (night-dimming). Guard a
+            # missing/garbage value so a malformed push can't crash the loop.
+            if self._on_led_config and "brightness" in data:
+                try:
+                    self._on_led_config(int(data["brightness"]))
+                except (TypeError, ValueError) as e:
+                    print(f"Invalid led_config brightness: {e}")
+
+        elif msg_type == "capture_snapshot":
+            # Backend asked for an on-demand camera snapshot (e.g. occupancy
+            # check before a private announcement). Reply asynchronously so we
+            # never block the receive loop on camera capture.
+            asyncio.create_task(self._handle_capture_snapshot(data.get("request_id")))
+
+        elif msg_type == "bt_scan_request":
+            # Backend asked for an on-demand Bluetooth discovery scan ("scan all
+            # bluetooth devices"). Reply asynchronously so the long BLE+Classic
+            # scan never blocks the receive loop.
+            asyncio.create_task(
+                self._handle_bt_scan(data.get("request_id"), data.get("params", {}))
+            )
+
+        elif msg_type == "irk_capture_request":
+            # Backend asked us to open a one-time pairing window and capture a
+            # phone's IRK. Async so the capture window never blocks receive.
+            asyncio.create_task(
+                self._handle_irk_capture(data.get("request_id"), data.get("params", {}))
+            )
+
+    async def _handle_irk_capture(self, request_id, params):
+        """Run the IRK pairing capture and send back an irk_capture_result.
+        Always replies (result=None + error on failure) so the backend never hangs."""
+        result = None
+        error = None
+        try:
+            if self._on_irk_capture is not None:
+                result = await self._on_irk_capture(params or {})
+            else:
+                error = "irk_capture not supported on this satellite"
+        except Exception as e:  # noqa: BLE001
+            error = str(e)
+            print(f"IRK capture failed: {e}")
+        try:
+            await self._send({
+                "type": "irk_capture_result",
+                "request_id": request_id,
+                "result": result,
+                "error": error,
+            })
+        except Exception as e:  # noqa: BLE001
+            print(f"Failed to send irk_capture_result: {e}")
+
+    async def _handle_bt_scan(self, request_id, params):
+        """Run the BT discovery scan and send back a bt_scan_result. Always
+        replies (devices=[] + error on failure) so the backend never hangs."""
+        devices: list = []
+        error = None
+        try:
+            if self._on_bt_scan_request is not None:
+                devices = await self._on_bt_scan_request(params or {})
+        except Exception as e:  # noqa: BLE001
+            error = str(e)
+            print(f"BT discovery scan failed: {e}")
+        try:
+            await self._send({
+                "type": "bt_scan_result",
+                "request_id": request_id,
+                "devices": devices,
+                "error": error,
+            })
+        except Exception as e:  # noqa: BLE001
+            print(f"Failed to send bt_scan_result: {e}")
+
+    async def _handle_capture_snapshot(self, request_id):
+        """Capture a snapshot and send it back as a snapshot_result. Always sends
+        a reply (image=None on failure / no camera) so the backend never hangs."""
+        image_b64 = None
+        try:
+            if self._capture_snapshot is not None:
+                jpeg = await self._capture_snapshot()
+                if jpeg:
+                    image_b64 = base64.b64encode(jpeg).decode("utf-8")
+        except Exception as e:  # noqa: BLE001
+            print(f"Snapshot capture failed: {e}")
+        try:
+            await self._send({
+                "type": "snapshot_result", "request_id": request_id, "image": image_b64,
+            })
+        except Exception as e:  # noqa: BLE001
+            print(f"Failed to send snapshot_result: {e}")
 
     async def _heartbeat_loop(self):
         """Background task sending periodic heartbeats with metrics"""
@@ -573,7 +746,18 @@ class WebSocketClient:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Heartbeat error: {e}")
+                # A failed heartbeat send means the link is already dead. Don't
+                # swallow + keep looping (the old behavior left a zombie until the
+                # WS ping timeout fired ~30s later) — surface it as a disconnect so
+                # the reconnect path starts immediately.
+                print(f"Heartbeat send failed, treating as disconnect: {e}")
+                self._state = ConnectionState.DISCONNECTED
+                if self._on_disconnected:
+                    try:
+                        self._on_disconnected()
+                    except Exception:
+                        pass
+                break
 
     async def send_wakeword_detected(
         self,

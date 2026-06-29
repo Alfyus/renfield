@@ -1,0 +1,128 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { GitMerge } from 'lucide-react';
+import MergeProposalCard from './MergeProposalCard';
+import {
+  useApproveMergeProposal,
+  useMergeProposalsQuery,
+  useRejectMergeProposal,
+  type MergeProposal,
+} from '../api/resources/knowledgeGraph';
+
+const UNDO_WINDOW_MS = 5000;
+
+interface PendingMerge {
+  id: number;
+  winnerId: number;
+}
+
+/**
+ * The "Zusammenführungs-Vorschläge" section at the top of /brain/review (D7).
+ * Owns the query + approve/reject mutations + the 5s undo toast (D3):
+ * clicking Zusammenführen optimistically removes the card and starts a 5s
+ * window; the actual merge fires only when the window closes (Undo = no-op,
+ * nothing is written). Reject fires immediately (non-destructive).
+ *
+ * Renders nothing when there are no pending proposals, so it never clutters the
+ * tier-review list below it.
+ */
+export default function MergeProposalsSection() {
+  const { t } = useTranslation();
+  const query = useMergeProposalsQuery();
+  const approve = useApproveMergeProposal();
+  const reject = useRejectMergeProposal();
+
+  const proposals: MergeProposal[] = query.data ?? [];
+  const [dismissedIds, setDismissedIds] = useState<Set<number>>(() => new Set());
+  const [pending, setPending] = useState<PendingMerge | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  // commit a pending merge immediately (used on window expiry or when a second
+  // merge is started before the first window closed).
+  const commit = useCallback((p: PendingMerge) => {
+    approve.mutate({ id: p.id, winnerId: p.winnerId });
+  }, [approve]);
+
+  const handleApprove = useCallback((proposal: MergeProposal, winnerId: number) => {
+    // flush any in-flight pending so we never silently drop one
+    if (pending) {
+      clearTimer();
+      commit(pending);
+    }
+    setDismissedIds((prev) => new Set(prev).add(proposal.id));
+    const next: PendingMerge = { id: proposal.id, winnerId };
+    setPending(next);
+    timerRef.current = setTimeout(() => {
+      commit(next);
+      setPending(null);
+      timerRef.current = null;
+    }, UNDO_WINDOW_MS);
+  }, [pending, clearTimer, commit]);
+
+  const handleUndo = useCallback(() => {
+    clearTimer();
+    if (pending) {
+      setDismissedIds((prev) => {
+        const n = new Set(prev);
+        n.delete(pending.id);
+        return n;
+      });
+    }
+    setPending(null);
+  }, [clearTimer, pending]);
+
+  const handleReject = useCallback((proposal: MergeProposal) => {
+    setDismissedIds((prev) => new Set(prev).add(proposal.id));
+    reject.mutate(proposal.id);
+  }, [reject]);
+
+  useEffect(() => clearTimer, [clearTimer]);
+
+  const visible = proposals.filter((p) => !dismissedIds.has(p.id));
+  if (visible.length === 0 && !pending) {
+    return null;
+  }
+
+  return (
+    <section aria-labelledby="merge-proposals-heading" className="space-y-3">
+      <h2
+        id="merge-proposals-heading"
+        className="flex items-center gap-2 text-sm font-medium text-gray-700 dark:text-gray-300"
+      >
+        <GitMerge className="w-4 h-4" aria-hidden="true" />
+        {t('circles.mergeProposals.sectionTitle')}
+      </h2>
+
+      <ul className="space-y-3 animate-stagger">
+        {visible.map((p) => (
+          <MergeProposalCard
+            key={p.id}
+            proposal={p}
+            onApprove={(winnerId) => handleApprove(p, winnerId)}
+            onReject={() => handleReject(p)}
+          />
+        ))}
+      </ul>
+
+      {pending && (
+        <div className="toast left-1/2 bottom-6 -translate-x-1/2" role="status" aria-live="polite">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-sm text-gray-800 dark:text-gray-100">
+              {t('circles.mergeProposals.merged')}
+            </span>
+            <button type="button" className="btn btn-ghost text-sm" onClick={handleUndo}>
+              {t('circles.mergeProposals.undo')}
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}

@@ -225,6 +225,69 @@ class AgentRouter:
         """Get a role by name, falling back to general."""
         return self.roles.get(name, GENERAL_ROLE)
 
+    def role_for_intent(self, intent: str | None) -> str | None:
+        """Map an intent / tool string to the agent role that owns it.
+
+        Backs the chat "Korrigieren & neu beantworten" affordance: the user
+        corrects a mis-classified intent and we re-run the turn forcing the
+        right role (reusing the `role_hint` Layer-0 path). The mapping lives
+        here because `agent_roles.yaml` (ConfigMap-served) is the single source
+        of truth for which role owns which server/tool — the frontend must not
+        duplicate it.
+
+        Recognises the strings the intent-correction dropdown produces:
+        - ``mcp.<server>.<tool>`` -> role whose ``mcp_servers`` contains <server>
+        - ``internal.<x>``        -> role whose ``internal_tools`` lists it
+        - ``knowledge.*``         -> ``documents`` (holds ``internal.knowledge_search``)
+        - ``general.*`` / ``conversation`` -> ``general``
+        - a bare role name        -> itself
+
+        Returns None when nothing matches — the caller then falls back to normal
+        routing (no forced role), so a stale/unknown correction degrades safely.
+        """
+        if not intent:
+            return None
+        # Already a role key (future-proofing / direct role corrections).
+        if intent in self.roles:
+            return intent
+
+        # When several roles share a server/tool (e.g. a broad `routine`
+        # catch-all also lists `jellyfin`), prefer the MOST SPECIFIC role —
+        # the one with the fewest servers/tools — so the catch-all never
+        # shadows the specialized role. Ties break on name for determinism;
+        # independent of YAML/dict ordering.
+        if intent.startswith("mcp."):
+            parts = intent.split(".")
+            if len(parts) >= 2:
+                server = parts[1]
+                candidates = [
+                    (name, role) for name, role in self.roles.items()
+                    if role.mcp_servers and server in role.mcp_servers
+                ]
+                if not candidates:
+                    return None
+                candidates.sort(key=lambda nr: (len(nr[1].mcp_servers), nr[0]))
+                return candidates[0][0]
+            return None
+
+        if intent.startswith("internal."):
+            candidates = [
+                (name, role) for name, role in self.roles.items()
+                if role.internal_tools and intent in role.internal_tools
+            ]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda nr: (len(nr[1].internal_tools), nr[0]))
+            return candidates[0][0]
+
+        if intent.startswith("knowledge."):
+            return "documents" if "documents" in self.roles else None
+
+        if intent.startswith("general.") or intent == "conversation":
+            return "general" if "general" in self.roles else None
+
+        return None
+
     def _build_role_descriptions(self, lang: str = "de") -> str:
         """Build compact role descriptions for the classification prompt."""
         lines = []
@@ -245,6 +308,7 @@ class AgentRouter:
         conversation_history: list[dict] | None = None,
         context_vars: dict | None = None,
         lang: str = "de",
+        role_hint: str | None = None,
     ) -> AgentRole:
         """Context-aware classification with entity pre-routing and continuity.
 
@@ -265,6 +329,17 @@ class AgentRouter:
         Returns:
             The classified AgentRole
         """
+        # Layer 0: explicit user role hint (command palette "switch role" action).
+        # A soft preference — honored only if the role exists; unknown hints fall
+        # through to normal classification. Sub-intent still inferred for the role.
+        if role_hint and role_hint in self.roles:
+            role = self.roles[role_hint]
+            sub_intent = self._infer_sub_intent(
+                message, role.sub_intent_definitions or {}, lang,
+            ) if role.sub_intent_definitions else None
+            logger.info(f"Router role-hint: '{message[:60]}' -> '{role_hint}'")
+            return replace(role, sub_intent=sub_intent)
+
         # Layer 1: Entity ID routing — highest confidence, instant
         if resolved and resolved.entity_matches and resolved.inferred_domain:
             domain = resolved.inferred_domain

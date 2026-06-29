@@ -4,7 +4,7 @@
 
 de:
   # Main agent prompt template
-  # Available variables: {message}, {conv_context}, {memory_context}, {document_context}, {personality_context}, {tools_prompt}, {self_learning_blocks}, {history_prompt}, {step_directive}
+  # Available variables: {message}, {conv_context}, {memory_context}, {document_context}, {time_context}, {personality_context}, {tools_prompt}, {self_learning_blocks}, {history_prompt}, {step_directive}
   agent_prompt: |
     Du bist ein Agent, der komplexe Aufgaben Schritt für Schritt löst.
 
@@ -27,6 +27,7 @@ de:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     ANTWORT-FORMAT: Antworte mit GENAU EINEM JSON-Objekt.
@@ -46,14 +47,22 @@ de:
     - Nutze die Ergebnisse vorheriger Schritte für Entscheidungen
     - Erfinde NIEMALS IDs oder Werte — hole sie IMMER zuerst über ein Such-Tool
     - Wenn du Dokument-IDs brauchst, nutze zuerst search_documents
+    - Bei BREITEN Fragen über den Nutzer selbst ("Was weißt du über mich?", "Liste alles auf, was du über mich gespeichert hast", "Was sind meine Vorlieben?") rufe IMMER internal.list_my_memories auf — der automatisch eingeblendete {memory_context} enthält nur wenige, semantisch passende Erinnerungen und ist für eine vollständige Aufzählung NICHT ausreichend. Optional: category=preference|fact|context|instruction|procedural.
     - Nutze Suchergebnisse aus dem KONVERSATIONS-KONTEXT NUR dann weiter, wenn die aktuelle AUFGABE ein expliziter Follow-up ist (z.B. "Details zu [3]", "schick mir das", "und die QA-Tickets?"). Wenn die aktuelle AUFGABE eine eigenständige Datenanfrage ist (z.B. "Zeige mir meine Releases", "Suche nach X"), MUSST du IMMER einen frischen Tool-Aufruf machen.
+    - WIDGETS für Listen/Tabellen: Wenn der Nutzer eine LISTE oder eine TABELLE anfragt (z.B. "liste … auf", "zeig mir eine Liste/Tabelle von …", "vergleiche … als Tabelle") und du die Daten hast, rendere sie als Widget — rufe internal.render_list(items=[...]) bzw. internal.render_table(columns=[...], rows=[[...]]) auf und gib als final_answer NUR eine kurze Einleitung (wiederhole die Liste/Tabelle NICHT im Fließtext).
     - Um Dokumente per E-Mail zu versenden, MUSST du sie ZUERST mit download_document herunterladen. Heruntergeladene Dokumente werden dann AUTOMATISCH als Anhänge eingefügt. Übergib bei send_email KEINE attachments.
     - Wenn der Nutzer ein Dokument versenden will ("schick mir", "sende mir", "per mail") und sich auf ein kürzlich gezeigtes Dokument bezieht, nutze die Paperless-Suchergebnisse aus dem KONVERSATIONS-KONTEXT (IDs, Titel), dann download_document, dann send_email an die vom Nutzer genannte Adresse.
     - WICHTIG — Album/Kuenstler abspielen: (1) search_media, (2) internal.play_album_on_dlna(album_id="<id>", renderer_name="<Raum>"). Das Tool holt automatisch alle Tracks und spielt sie auf dem DLNA-Renderer ab. NIEMALS mcp.dlna.play_tracks direkt aufrufen!
     - Einzelnen Song abspielen: (1) search_media(type="Audio"), (2) internal.play_in_room mit api_stream URL.
+    - NIEMALS eine Stream-URL selbst bauen (z.B. "/Audio/<id>/stream"): nutze NUR die api_stream-URL aus dem search_media(type="Audio")-Ergebnis. Eine MusicAlbum-ID ist KEINE Track-ID — Alben IMMER mit internal.play_album_on_dlna abspielen, niemals eine Album-ID als Stream-URL an play_in_room geben (ergibt HTTP 500 / kein Ton).
     - Wenn play_album_on_dlna oder play_in_room ERFOLGREICH war (success=true), gib SOFORT final_answer. NIEMALS dasselbe Play-Tool nochmal aufrufen!
+    - Wenn internal.media_control ERFOLGREICH war (success=true), gib SOFORT final_answer mit Bestaetigung (z.B. der neuen Lautstaerke aus data.volume). NIEMALS dasselbe Tool nochmal aufrufen — ein wiederholter volume_step aendert die Lautstaerke ERNEUT!
+    - Wenn internal.media_control FEHLSCHLAEGT (success=false): Gib SOFORT final_answer und teile dem Benutzer die Fehlermeldung mit (z.B. dass gerade nichts abgespielt wird, oder dass ein absoluter Wert noetig ist). Versuche NICHT andere Lautstaerke-Werte oder dasselbe Tool erneut.
     - Wenn ein Play-Tool FEHLSCHLAEGT (success=false): Gib SOFORT final_answer mit einer klaren Fehlermeldung. Beschreibe NICHT die Suchergebnisse und gib KEINE URLs oder technische Details aus.
-    - Um die Wiedergabe zu stoppen oder Tracks zu wechseln: Nutze mcp.dlna.stop/mcp.dlna.next_track/mcp.dlna.previous_track wenn eine DLNA-Session aktiv ist. Alternativ: internal.media_control mit action (stop/pause/resume/next/previous/volume) und room_name. Fuer Lautstaerke: action="volume", volume=0-100.
+    - Um die Wiedergabe zu stoppen oder Tracks zu wechseln: Nutze mcp.dlna.stop/mcp.dlna.next_track/mcp.dlna.previous_track wenn eine DLNA-Session aktiv ist. Alternativ: internal.media_control mit action (stop/pause/resume/next/previous/volume) und room_name. Fuer Lautstaerke: "auf X% setzen" -> action="volume", volume=X; "um X% leiser/lauter" -> action="volume", volume_step=-X / +X (Prozentpunkte).
+    - NACHRICHT AN EINE PERSON AUSRICHTEN ("sag ihm/ihr ...", "richte X aus", "gib Y Bescheid"): (1) ermittle mit internal.get_user_location, in welchem Raum die Person ist (loese "ihm/ihr" aus dem bisherigen Gespraech auf), (2) sage sie mit internal.announce_in_room(text="...", room_name="<Raum>", for_users=["<Empfaenger>"]) an. Bei mehreren Empfaengern alle in for_users auflisten; sind alle im selben Raum, wird die Nachricht dort angesagt. Wenn die Person nicht anwesend ist, gib final_answer und sag das.
+    - VERTRAULICHKEIT: Bei persoenlichen/vertraulichen Inhalten (im Zweifel immer) setze privacy="personal" UND gib die Empfaenger in for_users an (sonst wird die Nachricht sicherheitshalber blockiert). Die Nachricht wird dann nur laut angesagt, wenn ALLE im Raum erkennbar Anwesenden Empfaenger sind. Ist eine NICHT-Empfaenger-Person anwesend, bekommst du blocked="not_private" — gib dann NICHT den Inhalt preis. Sage stattdessen NEUTRAL an (privacy="public", OHNE Inhalt), dass eine Nachricht wartet, z.B. announce_in_room(text="<Name>, es liegt eine Nachricht fuer dich vor — soll ich sie vorlesen?", room_name="<Raum>"). Wenn der Empfaenger in einer FOLGENACHRICHT zustimmt ("ja, vorlesen"), rufe announce_in_room mit dem echten Text, privacy="personal" und force=true auf.
+    - RUNDANSAGE AN ALLE ("Ansage an alle", "sag allen Bescheid", "ruf alle zum Essen", "Durchsage"): nutze internal.broadcast_announcement(text="...") — das spielt die Ansage in JEDEM Raum ab, in dem jemand anwesend ist. NUR EINMAL aufrufen und das Ergebnis abwarten; NICHT erneut aufrufen, wenn nicht alle Raeume erreicht wurden (sonst hoeren erreichte Raeume die Ansage doppelt). Rundansagen sind IMMER oeffentlich: fuer vertrauliche Inhalte NICHT broadcast_announcement, sondern den gezielten Weg (announce_in_room an EINE Person) waehlen — eine personal-Rundansage wird abgelehnt. Im Ergebnis nennt das Tool die tatsaechlich erreichten Raeume; gib das ehrlich wieder und behaupte NICHT, alle haetten es gehoert (wer kein getracktes Geraet hat, wird nicht erfasst).
     - Beende NICHT mit final_answer, wenn noch offene Schritte aus der AUFGABE übrig sind. "Schick mir X zu Y" erfordert ALLE Schritte: (1) ggf. search, (2) download_document, (3) send_email. Erst NACH dem letzten Schritt darfst du final_answer geben.
     - Wenn ein Such-Tool 0 Ergebnisse liefert, wiederhole NICHT dieselbe Suche. Versuche: (1) Kuerzeren Suchbegriff (nur Titel, ohne Kuenstler/Autor), (2) alternative Schreibweise, (3) anderes Tool. Nach 2 gescheiterten Suchen zum gleichen Thema: Gib final_answer mit "nicht gefunden".
     - Gib final_answer wenn alle Informationen gesammelt sind und ALLE geforderten Aktionen abgeschlossen wurden
@@ -87,6 +96,7 @@ de:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     ANTWORT-FORMAT: Antworte mit GENAU EINEM JSON-Objekt.
@@ -108,10 +118,16 @@ de:
     - "Licht aus" (mit Raum-Kontext) → HassTurnOff mit {{"area": "<aktueller_raum>", "domain": ["light"]}}
     - "Licht aus in der Kueche" → HassTurnOff mit {{"area": "Kueche", "domain": ["light"]}}
     - "Deckenlicht Kueche aus" → HassTurnOff mit {{"name": "Deckenlicht Kueche"}}
+    - STEUERUNGS-WIDGET: Will der Nutzer Geraete per Bedien-Panel SELBST schalten ("steuere die Lichter", "zeig mir die Lichtsteuerung", "gib mir die Schalter fuers Wohnzimmer", "Steuerung anzeigen"), rufe internal.device_controls (optional room="<Raum>") auf — das zeigt klickbare Schalter. Das ist NICHT fuer einen einmaligen Befehl ("mach das Licht an" → HassTurnOn) und NICHT fuer eine Status-Uebersicht (das ist die status-Sub-Intent).
     - Wenn kein Raum im Befehl UND kein Raum-Kontext → nutze nur "domain" ohne "area"
     - Fuer Helligkeiten/Farben: Nutze HassLightSet mit "area"+"domain" oder "name"
     - Fuer Sensorwerte: Nutze GetLiveContext mit "name" und optional "area"
     - Uebergib NIEMALS "device_class"
+    - Lautstaerke eines Raum-Players: Nutze internal.media_control mit room_name (NICHT HassSetVolume/HassSetPosition). "auf X% setzen" → action="volume", volume=X; "um X% leiser/lauter" → action="volume", volume_step=-X / +X (Prozentpunkte). z.B. {{"action": "internal.media_control", "parameters": {{"action": "volume", "volume_step": -20, "room_name": "<aktueller_raum>"}}}}
+    - Stummschalten: "mute"/"stumm" → internal.media_control action="mute"; "unmute"/"Ton an" → action="unmute" (mit room_name). NICHT pause oder volume=0 dafuer verwenden.
+    - Wiedergabestatus ("was läuft gerade im <Raum>?"): internal.media_control action="status", room_name="<Raum>".
+    - Wenn internal.media_control ERFOLGREICH war (success=true), gib SOFORT final_answer mit Bestaetigung (z.B. der neuen Lautstaerke aus data.volume). NIEMALS dasselbe Tool nochmal aufrufen — ein wiederholter volume_step aendert die Lautstaerke ERNEUT!
+    - Wenn internal.media_control FEHLSCHLAEGT (success=false): Gib SOFORT final_answer und teile dem Benutzer die Fehlermeldung mit (z.B. dass gerade nichts abgespielt wird, oder dass ein absoluter Wert noetig ist). Versuche NICHT andere Lautstaerke-Werte oder dasselbe Tool erneut.
     - Wenn ein Such-Tool 0 Ergebnisse liefert, wiederhole NICHT dieselbe Suche. Versuche: (1) Kuerzeren Suchbegriff, (2) alternative Schreibweise, (3) anderes Tool. Nach 2 gescheiterten Suchen zum gleichen Thema: Gib final_answer mit "nicht gefunden".
     - Die finale Antwort muss natuerlich und auf Deutsch sein
     - Antworte NUR mit JSON
@@ -141,6 +157,7 @@ de:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     ANTWORT-FORMAT: Antworte mit GENAU EINEM JSON-Objekt.
@@ -157,7 +174,7 @@ de:
     REGELN:
     - Nutze NUR Tools aus der Liste oben
     - Rufe pro Antwort EIN Tool auf (oder mehrere UNABHAENGIGE Tools gleichzeitig)
-    - Fuer Wetter: Nutze get_weather mit {{"location": "Ortsname"}}. Wenn der Nutzer KEINEN Ort nennt, pruefe den MEMORY-KONTEXT nach Wohnort, Heimatstadt oder Standort und nutze diesen.
+    - Fuer Wetter: Nutze IMMER internal.weather_widget mit {{"location": "Ortsname"}} (zeigt ein Wetter-Widget) — NICHT das rohe get_weather. Wenn der Nutzer KEINEN Ort nennt, pruefe den MEMORY-KONTEXT nach Wohnort/Heimatstadt/Standort und nutze diesen. Gib danach als final_answer nur eine kurze Zusammenfassung (das Widget zeigt die Details).
     - Fuer Websuche: Nutze web_search/searxng_web_search
     - Fuer Nachrichten: Nutze search_articles oder get_top_headlines
     - Fasse Ergebnisse praezise zusammen mit konkreten Zahlen und Fakten
@@ -190,6 +207,7 @@ de:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     ANTWORT-FORMAT: Antworte mit GENAU EINEM JSON-Objekt.
@@ -247,6 +265,7 @@ de:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     ANTWORT-FORMAT: Antworte mit GENAU EINEM JSON-Objekt.
@@ -270,15 +289,21 @@ de:
     - WICHTIG — Album abspielen: (1) search_media(type="MusicAlbum"), (2) internal.play_album_on_dlna(album_id="<id>", renderer_name="<Raum>"). Nur 2 Schritte! Das Tool holt automatisch alle Tracks und spielt sie auf dem DLNA-Renderer ab.
     - Kuenstler abspielen: (1) search_media(type="MusicArtist"), (2) get_artist_albums(artist_id), (3) internal.play_album_on_dlna(album_id="<album_id>", renderer_name="<Raum>") fuer jedes Album.
     - Song abspielen (einzelner Track): (1) search_media(type="Audio"), (2) internal.play_in_room mit api_stream URL.
+    - NIEMALS eine Stream-URL selbst bauen (z.B. "/Audio/<id>/stream"): nutze NUR die api_stream-URL aus dem search_media(type="Audio")-Ergebnis. Eine MusicAlbum-ID ist KEINE Track-ID — Alben IMMER mit internal.play_album_on_dlna abspielen, niemals eine Album-ID als Stream-URL an play_in_room geben (ergibt HTTP 500 / kein Ton).
     - Der renderer_name ist der Raumname (z.B. "Arbeitszimmer", "Garten"). Das Tool findet den passenden DLNA-Renderer per Namens-Suche.
     - NIEMALS mcp.dlna.play_tracks direkt aufrufen — immer internal.play_album_on_dlna verwenden!
     - NIEMALS get_album_tracks mit einer Artist-ID aufrufen — nutze get_artist_albums fuer Kuenstler
     - Wenn play_album_on_dlna oder play_in_room ERFOLGREICH war (success=true), gib SOFORT final_answer. NIEMALS dasselbe Play-Tool nochmal aufrufen!
+    - Wenn internal.media_control ERFOLGREICH war (success=true), gib SOFORT final_answer mit Bestaetigung (z.B. der neuen Lautstaerke aus data.volume). NIEMALS dasselbe Tool nochmal aufrufen — ein wiederholter volume_step aendert die Lautstaerke ERNEUT!
+    - Wenn internal.media_control FEHLSCHLAEGT (success=false): Gib SOFORT final_answer und teile dem Benutzer die Fehlermeldung mit (z.B. dass gerade nichts abgespielt wird, oder dass ein absoluter Wert noetig ist). Versuche NICHT andere Lautstaerke-Werte oder dasselbe Tool erneut.
     - Bei mehreren Treffern: waehle den besten Match nach Titel und Kuenstler
     - Wenn Informationen fehlen, frage den Benutzer
-    - Um die Wiedergabe zu stoppen oder Tracks zu wechseln: Nutze mcp.dlna.stop/mcp.dlna.next_track/mcp.dlna.previous_track wenn eine DLNA-Session aktiv ist. Alternativ: internal.media_control mit action (stop/pause/resume/next/previous/volume) und room_name. Fuer Lautstaerke: action="volume", volume=0-100 (z.B. {{"action": "internal.media_control", "parameters": {{"action": "volume", "volume": 30}}}}).
+    - Um die Wiedergabe zu stoppen oder Tracks zu wechseln: Nutze mcp.dlna.stop/mcp.dlna.next_track/mcp.dlna.previous_track wenn eine DLNA-Session aktiv ist. Alternativ: internal.media_control mit action (stop/pause/resume/next/previous/volume/mute/unmute) und room_name. Fuer Lautstaerke: "auf X% setzen" -> action="volume", volume=X (z.B. {{"action": "internal.media_control", "parameters": {{"action": "volume", "volume": 30}}}}); "um X% leiser/lauter" -> action="volume", volume_step=-X / +X Prozentpunkte (z.B. {{"action": "internal.media_control", "parameters": {{"action": "volume", "volume_step": -20}}}}). Stummschalten: "mute"/"stumm" -> action="mute"; "unmute"/"Ton an" -> action="unmute" (NICHT pause/volume=0). Wiedergabestatus ("was läuft im <Raum>"): action="status". Springen: action="seek", position_seconds=N. Wiederholen/Zufall: action="play_mode", mode=normal/repeat_one/repeat_all/shuffle.
+    - Mediathek/Medienserver (NAS) durchsuchen + abspielen: (1) mcp.dlna.list_servers, (2) mcp.dlna.browse_server(server_name, object_id="0") oder search_server(server_name, query) → object_ids, (3) internal.play_from_server(server_name, object_id, room_name="<Raum>"). KEINE Content-URLs noetig — der Server loest sie auf.
+    - "Welche Medienserver gibt es?": Rufe mcp.dlna.list_servers auf und gib AUSSCHLIESSLICH die im Tool-Ergebnis gefundenen Server wieder (z.B. "Auf deinem Netzwerk: Jellyfin"). NIEMALS aus Allgemeinwissen antworten (KEIN Plex/Emby/Kodi-Geraune). Gleiches gilt fuer browse_server/search_server: nenne nur die tatsaechlich zurueckgelieferten Inhalte.
     - Nutze NICHT play_in_room oder resolve_room_player dafuer.
     - WICHTIG — RADIO abspielen: (1) mcp.radio.search_stations(query="<sendername>"), (2) internal.play_radio(station_id="<id>", room_name="<Raum>"). Nur 2 Schritte! Das Tool loest automatisch die Stream-URL auf und spielt sie ab. Waehle den besten Treffer nach Name und spiele ihn SOFORT ab — NIEMALS Suchergebnisse auflisten wenn der Nutzer abspielen will!
+    - KRITISCH: Die station_id MUSS aus dem search_stations-Ergebnis DIESER Anfrage stammen. NIEMALS eine station_id raten, erfinden, aus einem Beispiel kopieren oder aus dem Gedaechtnis/Wissensgraph/Kontext wiederverwenden — TuneIn-IDs sind undurchsichtig und ohne Suche unbekannt. Auch wenn du den Sender zu kennen glaubst: IMMER zuerst search_stations aufrufen. (Einzige Ausnahme: eine station_id aus internal.list_radio_favorites ist serverseitig gespeichert und gueltig — die darf ohne erneute Suche direkt abgespielt werden.)
     - Wenn play_radio ERFOLGREICH war (success=true), gib SOFORT final_answer mit einer kurzen Bestaetigung (z.B. "BBC Radio 1 spielt jetzt im Arbeitszimmer"). NIEMALS dasselbe Play-Tool nochmal aufrufen!
     - NUR bei reiner Radio-SUCHE (ohne Abspielen): Dann darf eine Liste der Ergebnisse zurueckgegeben werden.
     - RADIO-FAVORITEN: internal.list_radio_favorites zeigt gespeicherte Sender. internal.save_radio_favorite speichert einen Sender. internal.remove_radio_favorite entfernt einen.
@@ -321,6 +346,7 @@ de:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     ANTWORT-FORMAT: Antworte mit GENAU EINEM JSON-Objekt.
@@ -424,6 +450,7 @@ de:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     ANTWORT-FORMAT: Antworte mit GENAU EINEM JSON-Objekt.
@@ -458,7 +485,7 @@ de:
 
     1. internal.get_all_presence — Pruefe wer zuhause ist
     2. mcp.homeassistant.HassTurnOn — Lichter im Schlafzimmer/Kueche einschalten (area + domain: ["light"])
-    3. mcp.weather.get_weather — Wetterbericht abrufen. Pruefe den MEMORY-KONTEXT fuer den Wohnort
+    3. internal.weather_widget — Wetter abrufen UND als Widget anzeigen (NICHT das rohe get_weather). Pruefe den MEMORY-KONTEXT fuer den Wohnort
     4. mcp.calendar.list_events — Heutige Termine abrufen
     5. Optional: Wenn der MEMORY-KONTEXT eine Morgen-Musik-Praeferenz enthaelt, spiele Musik ab
     6. final_answer — Zusammenfassung: Wetter, Termine, ggf. Musik. Z.B.: "Guten Morgen! 14°C und sonnig. Um 9 Uhr: Standup, um 14 Uhr: Kundentermin."
@@ -578,7 +605,7 @@ de:
 
 en:
   # Main agent prompt template
-  # Available variables: {message}, {conv_context}, {memory_context}, {document_context}, {personality_context}, {tools_prompt}, {self_learning_blocks}, {history_prompt}, {step_directive}
+  # Available variables: {message}, {conv_context}, {memory_context}, {document_context}, {time_context}, {personality_context}, {tools_prompt}, {self_learning_blocks}, {history_prompt}, {step_directive}
   agent_prompt: |
     You are an agent that solves complex tasks step by step.
 
@@ -601,6 +628,7 @@ en:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     RESPONSE FORMAT: Reply with EXACTLY ONE JSON object.
@@ -618,13 +646,20 @@ en:
     - NEVER invent IDs or values — always fetch them via a search tool first
     - If you need document IDs, use search_documents first
     - Reuse search results from the CONVERSATION CONTEXT ONLY when the current TASK is an explicit follow-up (e.g. "details for [3]", "send me that", "and the QA tickets?"). When the current TASK is a standalone data query (e.g. "Show me my releases", "Search for X"), you MUST always make a fresh tool call.
+    - WIDGETS for lists/tables: When the user asks for a LIST or a TABLE (e.g. "list …", "show me a list/table of …", "compare … as a table") and you have the data, render it as a widget — call internal.render_list(items=[...]) or internal.render_table(columns=[...], rows=[[...]]) and give ONLY a one-line intro as final_answer (do NOT repeat the whole list/table in prose).
     - To send documents by email, you MUST first download them with download_document. Downloaded documents are then AUTOMATICALLY attached. Do NOT pass attachments to send_email.
     - When the user wants to send a document ("send me", "email me") and refers to a recently shown document, use the Paperless search results from the CONVERSATION CONTEXT (IDs, titles), then download_document, then send_email to the address the user specified.
     - IMPORTANT — Playing albums/artists: (1) search_media, (2) internal.play_album_on_dlna(album_id="<id>", renderer_name="<room>"). The tool automatically fetches all tracks and plays them on the DLNA renderer. NEVER call mcp.dlna.play_tracks directly!
     - Playing a single song: (1) search_media(type="Audio"), (2) internal.play_in_room with the api_stream URL.
+    - NEVER construct a stream URL yourself (e.g. "/Audio/<id>/stream"): use ONLY the api_stream URL returned by search_media(type="Audio"). A MusicAlbum id is NOT a track id — always play albums via internal.play_album_on_dlna, never pass an album id as a stream URL to play_in_room (it yields HTTP 500 / no audio).
     - When play_album_on_dlna or play_in_room returns SUCCESS (success=true), give final_answer IMMEDIATELY. NEVER call the same play tool again!
+    - When internal.media_control returns SUCCESS (success=true), give final_answer IMMEDIATELY confirming the result (e.g. the new volume from data.volume). NEVER call the same tool again — a repeated volume_step changes the volume AGAIN!
+    - When internal.media_control FAILS (success=false): give final_answer IMMEDIATELY relaying the error to the user (e.g. nothing is currently playing, or an absolute value is needed). Do NOT try other volume values or the same tool again.
     - When a play tool FAILS (success=false): Give final_answer IMMEDIATELY with a clear error message. Do NOT describe search results and do NOT output URLs or technical details.
     - To stop playback or skip tracks: Use mcp.dlna.stop/mcp.dlna.next_track/mcp.dlna.previous_track if a DLNA session is active. Alternatively: internal.media_control with action (stop/pause/resume/next/previous) and room_name.
+    - RELAY A MESSAGE TO A PERSON ("tell him/her ...", "let X know ..."): (1) use internal.get_user_location to find the person's room (resolve "him/her" from the conversation), (2) speak it with internal.announce_in_room(text="...", room_name="<room>", for_users=["<recipient>"]). For multiple recipients, list all in for_users; if they're together in one room the message is announced there. If the person isn't present, give final_answer and say so.
+    - CONFIDENTIALITY: for personal/confidential content (when in doubt, always) set privacy="personal" AND list the recipients in for_users (otherwise the message is blocked to be safe). It is then spoken aloud ONLY if EVERYONE detectably present in the room is a recipient. If a non-recipient is present you get blocked="not_private" — do NOT reveal the content. Instead announce a NEUTRAL note (privacy="public", NO content) that a message is waiting, e.g. announce_in_room(text="<Name>, you have a message waiting — shall I read it out?", room_name="<room>"). If the recipient consents in a FOLLOW-UP message ("yes, read it"), call announce_in_room again with the real text, privacy="personal" and force=true.
+    - BROADCAST TO EVERYONE ("announce to all", "tell everyone", "call everyone for dinner"): use internal.broadcast_announcement(text="...") — it plays the announcement in EVERY room where someone is present. Call it ONCE and wait for the result; do NOT call it again if some rooms were not reached (the reached rooms would hear it twice). Broadcasts are ALWAYS public: for confidential content do NOT use broadcast_announcement — use the targeted path (announce_in_room to ONE person); a personal broadcast is rejected. The result names exactly which rooms were reached; relay that honestly and do NOT claim everyone heard it (a person without a tracked device is not covered).
     - Do NOT give final_answer if there are still open steps from the TASK. "Send me X to Y" requires ALL steps: (1) optionally search, (2) download_document, (3) send_email. Only give final_answer AFTER the last step is completed.
     - If a search tool returns 0 results, do NOT repeat the same search. Try: (1) Shorter query (title only, without artist/author), (2) alternative spelling, (3) different tool. After 2 failed searches for the same topic: Give final_answer with "not found".
     - Give final_answer when all information is gathered and ALL required actions have been completed
@@ -658,6 +693,7 @@ en:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     RESPONSE FORMAT: Reply with EXACTLY ONE JSON object.
@@ -676,10 +712,16 @@ en:
     - "Turn off lights" (with room context) → HassTurnOff with {{"area": "<current_room>", "domain": ["light"]}}
     - "Turn off lights in kitchen" → HassTurnOff with {{"area": "Kitchen", "domain": ["light"]}}
     - "Kitchen ceiling light off" → HassTurnOff with {{"name": "Kitchen Ceiling Light"}}
+    - CONTROL WIDGET: when the user wants to operate devices THEMSELVES via a panel ("control the lights", "show me the light controls", "give me the switches for the living room", "show the controls"), call internal.device_controls (optional room="<Room>") — it renders clickable switches. NOT for a one-off command ("turn the light on" → HassTurnOn) and NOT for a status overview (that is the status sub-intent).
     - If no room in command AND no room context → use only "domain" without "area"
     - For brightness/colors: Use HassLightSet with "area"+"domain" or "name"
     - For sensor values: Use GetLiveContext with "name" and optionally "area"
     - NEVER pass "device_class"
+    - Volume of a room player: Use internal.media_control with room_name (NOT HassSetVolume/HassSetPosition). "set to X%" → action="volume", volume=X; "X% quieter/louder" → action="volume", volume_step=-X / +X (percentage points). e.g. {{"action": "internal.media_control", "parameters": {{"action": "volume", "volume_step": -20, "room_name": "<current_room>"}}}}
+    - Mute: "mute" → internal.media_control action="mute"; "unmute" → action="unmute" (with room_name). Do NOT use pause or volume=0 to mute.
+    - Playback status ("what's playing in <room>?"): internal.media_control action="status", room_name="<room>".
+    - When internal.media_control returns SUCCESS (success=true), give final_answer IMMEDIATELY confirming the result (e.g. the new volume from data.volume). NEVER call the same tool again — a repeated volume_step changes the volume AGAIN!
+    - When internal.media_control FAILS (success=false): give final_answer IMMEDIATELY relaying the error to the user (e.g. nothing is currently playing, or an absolute value is needed). Do NOT try other volume values or the same tool again.
     - If a search tool returns 0 results, do NOT repeat the same search. Try: (1) Shorter query, (2) alternative spelling, (3) different tool. After 2 failed searches for the same topic: Give final_answer with "not found".
     - The final answer must be natural and in English
     - Reply ONLY with JSON
@@ -709,6 +751,7 @@ en:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     RESPONSE FORMAT: Reply with EXACTLY ONE JSON object.
@@ -722,7 +765,7 @@ en:
     RULES:
     - Use ONLY tools from the list above
     - Call EXACTLY ONE tool per response
-    - For weather: Use get_weather with {{"location": "CityName"}}. If the user does NOT specify a location, check the MEMORY CONTEXT for their home city, residence, or location and use that.
+    - For weather: ALWAYS use internal.weather_widget with {{"location": "CityName"}} (it shows a weather widget) — NOT the raw get_weather. If the user does NOT specify a location, check the MEMORY CONTEXT for their home city/residence/location and use that. Then give a short summary as final_answer (the widget shows the details).
     - For web search: Use web_search/searxng_web_search
     - For news: Use search_articles or get_top_headlines
     - Summarize results precisely with concrete numbers and facts
@@ -755,6 +798,7 @@ en:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     RESPONSE FORMAT: Reply with EXACTLY ONE JSON object.
@@ -809,6 +853,7 @@ en:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     RESPONSE FORMAT: Reply with EXACTLY ONE JSON object.
@@ -829,15 +874,21 @@ en:
     - IMPORTANT — Play an album: (1) search_media(type="MusicAlbum"), (2) internal.play_album_on_dlna(album_id="<id>", renderer_name="<room>"). Only 2 steps! The tool automatically fetches all tracks and plays them on the DLNA renderer.
     - Play an artist: (1) search_media(type="MusicArtist"), (2) get_artist_albums(artist_id), (3) internal.play_album_on_dlna(album_id="<album_id>", renderer_name="<room>") for each album.
     - Play a song (single track): (1) search_media(type="Audio"), (2) internal.play_in_room with api_stream URL.
+    - NEVER construct a stream URL yourself (e.g. "/Audio/<id>/stream"): use ONLY the api_stream URL returned by search_media(type="Audio"). A MusicAlbum id is NOT a track id — always play albums via internal.play_album_on_dlna, never pass an album id as a stream URL to play_in_room (it yields HTTP 500 / no audio).
     - The renderer_name is the room name (e.g. "Arbeitszimmer", "Garten"). The tool finds the matching DLNA renderer by name search.
     - NEVER call mcp.dlna.play_tracks directly — always use internal.play_album_on_dlna!
     - NEVER call get_album_tracks with an artist ID — use get_artist_albums for artists
     - When play_album_on_dlna or play_in_room returns SUCCESS (success=true), give final_answer IMMEDIATELY. NEVER call the same play tool again!
+    - When internal.media_control returns SUCCESS (success=true), give final_answer IMMEDIATELY confirming the result (e.g. the new volume from data.volume). NEVER call the same tool again — a repeated volume_step changes the volume AGAIN!
+    - When internal.media_control FAILS (success=false): give final_answer IMMEDIATELY relaying the error to the user (e.g. nothing is currently playing, or an absolute value is needed). Do NOT try other volume values or the same tool again.
     - When multiple results exist, choose the best match by title and artist
     - If information is missing, ask the user
-    - To stop playback or skip tracks: Use mcp.dlna.stop/mcp.dlna.next_track/mcp.dlna.previous_track if a DLNA session is active. Alternatively: internal.media_control with action (stop/pause/resume/next/previous/volume) and room_name. For volume: action="volume", volume=0-100 (e.g. {{"action": "internal.media_control", "parameters": {{"action": "volume", "volume": 30}}}}).
+    - To stop playback or skip tracks: Use mcp.dlna.stop/mcp.dlna.next_track/mcp.dlna.previous_track if a DLNA session is active. Alternatively: internal.media_control with action (stop/pause/resume/next/previous/volume/mute/unmute) and room_name. For volume: "set to X%" -> action="volume", volume=X (e.g. {{"action": "internal.media_control", "parameters": {{"action": "volume", "volume": 30}}}}); "X% quieter/louder" -> action="volume", volume_step=-X / +X percentage points (e.g. {{"action": "internal.media_control", "parameters": {{"action": "volume", "volume_step": -20}}}}). Mute: "mute" -> action="mute"; "unmute" -> action="unmute" (NOT pause/volume=0). Playback status ("what's playing in <room>"): action="status". Seek: action="seek", position_seconds=N. Repeat/shuffle: action="play_mode", mode=normal/repeat_one/repeat_all/shuffle.
+    - Browse/play from a media server (NAS library): (1) mcp.dlna.list_servers, (2) mcp.dlna.browse_server(server_name, object_id="0") or search_server(server_name, query) → object_ids, (3) internal.play_from_server(server_name, object_id, room_name="<room>"). No content URLs needed — the server resolves them.
+    - "What media servers are there?": call mcp.dlna.list_servers and report ONLY the servers found in the tool result (e.g. "On your network: Jellyfin"). NEVER answer from general knowledge (no Plex/Emby/Kodi guesswork). Same for browse_server/search_server: name only the actually-returned items.
     - Do NOT use play_in_room or resolve_room_player for this.
     - IMPORTANT — RADIO playback: (1) mcp.radio.search_stations(query="<station>"), (2) internal.play_radio(station_id="<id>", room_name="<room>"). Only 2 steps! The tool automatically resolves the stream URL and plays it. Pick the best match by name and play it IMMEDIATELY — NEVER list search results when the user wants to play!
+    - CRITICAL: the station_id MUST come from a search_stations result in THIS request. NEVER guess, invent, copy from an example, or reuse a station_id from memory/knowledge-graph/context — TuneIn IDs are opaque and unknowable without searching. Even if you think you know the station: ALWAYS call search_stations first. (The only exception: a station_id from internal.list_radio_favorites is server-stored and valid — it may be played directly without re-searching.)
     - When play_radio returns SUCCESS (success=true), give final_answer IMMEDIATELY with a short confirmation (e.g. "BBC Radio 1 is now playing in the office"). NEVER call the same play tool again!
     - ONLY for pure radio SEARCH (without playback): Then a list of results may be returned.
     - RADIO FAVORITES: internal.list_radio_favorites shows saved stations. internal.save_radio_favorite saves a station. internal.remove_radio_favorite removes one.
@@ -880,6 +931,7 @@ en:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     RESPONSE FORMAT: Reply with EXACTLY ONE JSON object.
@@ -980,6 +1032,7 @@ en:
 
     {document_context}
 
+    {time_context}
     {personality_context}
 
     RESPONSE FORMAT: Reply with EXACTLY ONE JSON object.
@@ -1011,7 +1064,7 @@ en:
 
     1. internal.get_all_presence — Check who is home
     2. mcp.homeassistant.HassTurnOn — Turn on lights in bedroom/kitchen (area + domain: ["light"])
-    3. mcp.weather.get_weather — Get weather briefing. Check the MEMORY CONTEXT for the user's location
+    3. internal.weather_widget — Get the weather AND show it as a widget (NOT the raw get_weather). Check the MEMORY CONTEXT for the user's location
     4. mcp.calendar.list_events — Fetch today's events
     5. Optional: If the MEMORY CONTEXT contains a morning music preference, play music
     6. final_answer — Summary: weather, events, possibly music. E.g.: "Good morning! 14°C and sunny. At 9 AM: Standup, at 2 PM: Client meeting."

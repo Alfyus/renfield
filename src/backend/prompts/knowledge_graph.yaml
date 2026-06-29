@@ -3,10 +3,17 @@
 # entities and relations from conversation exchanges.
 
 de:
-  extraction_system: "Du extrahierst Entitaeten und Relationen aus Dialogen. Antworte NUR mit einem JSON-Objekt. Keine Nummern, IDs, URLs oder OCR-Artefakte als Entitaeten. Nur Entitaeten mit konkretem Eigennamen."
+  extraction_system: "Du extrahierst Entitaeten und Relationen aus Dialogen. Antworte NUR mit einem JSON-Objekt. Keine Nummern, IDs, URLs oder OCR-Artefakte als Entitaeten. Nur Entitaeten mit konkretem Eigennamen. Du erfindest niemals Fakten — du extrahierst ausschliesslich, was im Dialog steht."
 
   extraction_prompt: |
     Analysiere den folgenden Dialog und extrahiere benannte Entitaeten und ihre Beziehungen.
+
+    GRUNDREGELN — IMMER BEFOLGEN:
+    1. Sowohl Subject als auch Object jeder Relation MUESSEN woertlich im Dialog (User- ODER Assistent-Nachricht) vorkommen. Wenn auch nur einer der beiden Namen nicht im Text steht: KEINE Relation.
+    2. NIEMALS eine Relation ausgeben, bei der Subject und Object dieselbe Entitaet sind (kein Self-Loop wie "Anna ist_verheiratet_mit Anna").
+    3. NIEMALS Weltwissen ausserhalb des Dialogs nutzen, um Lücken zu fuellen. Wenn der Dialog nichts ueber den Ehepartner einer Person sagt, gibt es KEINE ist_verheiratet_mit-Relation — auch dann nicht, wenn du den Ehepartner aus Trainingsdaten zu kennen glaubst.
+    4. Pronomen sorgfaeltig aufloesen: "Du", "ich", "meine Frau", "meine Mutter" beziehen sich auf VERSCHIEDENE Personen. Fakten ueber "ich" gehoeren nicht zu "meine Mutter", auch wenn beide im selben Dialog vorkommen.
+    5. BESCHREIBUNG (`description`): ein SPEZIFISCHES, unterscheidendes Detail ueber GENAU diese Entitaet, das im Dialog steht (z.B. eine Rolle, Beziehung oder Eigenschaft) — oder leerer String "". NIEMALS eine generische Beschreibung des TYPS selbst (z.B. "Vollstaendiger Name einer Person", "eine Stadt", "eine Firma"): solche Floskeln machen verschiedene Entitaeten im Embedding-Raum ununterscheidbar und fuehren dazu, dass fremde Namen faelschlich derselben Person zugeordnet werden.
 
     Nur KONKRETE, BENANNTE Entitaeten extrahieren — mit echtem Namen oder Titel:
     - Personen (vollstaendiger Name oder Spitzname, NICHT generische Rollen)
@@ -17,8 +24,9 @@ de:
     - Konzepte: NUR persoenliche Hobbys, Studienfaecher, Berufsbezeichnungen — NICHT Dokumentfelder oder juristische Begriffe
 
     RELATIONEN extrahieren:
-    - Beziehungen zwischen Entitaeten ("wohnt_in", "arbeitet_bei", "mag", "besitzt", "kennt", "ist_verheiratet_mit")
+    - Beziehungen zwischen Entitaeten ("wohnt_in", "arbeitet_bei", "mag", "besitzt", "kennt", "ist_verheiratet_mit", "hat_kind", "ist_mutter_von", "ist_vater_von")
     - Nur Relationen die EXPLIZIT im Dialog erwaehnt werden
+    - Praedikat-Objekt-Typ muss passen: "wohnt_in" / "befindet_sich_in" / "hat_sitz_in" → Ort; "ist_verheiratet_mit" / "hat_kind" / "ist_mutter_von" → Person. Verwende KEIN Personen-Praedikat mit einem Ort als Object.
     - confidence: 0.5-1.0 (wie sicher ist die Relation)
 
     IGNORIERE (NIEMALS als Entitaet extrahieren):
@@ -33,13 +41,28 @@ de:
     - KEINE Geldbetraege oder Waehrungsangaben ("100 EUR", "0,04 Euro")
     - KEINE generischen Geschaeftsbegriffe ("Leistungserbringer", "Zahlungsdienstleister", "Vertragsnummer", "Abrechnungszeitraum")
 
-    Dialog:
+    BEISPIEL fuer korrekte Ablehnung — Dialog: "Anna ist meine Mutter."
+    RICHTIG:
+      entities: [{{"name": "Anna", "type": "person"}}]
+      relations: [{{"subject": "Anna", "predicate": "ist_mutter_von", "object": "<Sprecher-Name falls im Dialog genannt, sonst nichts>", "confidence": 0.9}}]
+    FALSCH (Self-Loop):
+      relations: [{{"subject": "Anna", "predicate": "ist_mutter_von", "object": "Anna"}}]
+    FALSCH (Halluzination — Ehemann nicht im Dialog):
+      relations: [{{"subject": "Anna", "predicate": "ist_verheiratet_mit", "object": "Hans Filbinger"}}]
+
+    {speaker_clause}Dialog:
     User: {user_message}
     Assistent: {assistant_response}
 
+    MEHRFACH-TYP: hat eine Entitaet mehrere Rollen (z.B. eine Person, die auch
+    Musiker ist), gib "types" als Liste — erster Eintrag aus
+    person|place|organization|thing|event|concept, weitere frei (z.B. "musician").
+    VORLIEBEN/GESCHMACK als RELATION zwischen Person und Sache modellieren
+    (Praedikat z.B. "mag", "mag_musik_von"), NICHT als generischen Knoten.
+
     Antworte als JSON-Objekt (leere Arrays wenn nichts relevant):
     {{
-      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "description": "..."}}],
+      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "types": ["person"], "description": "<spezifisches Detail oder leer>"}}],
       "relations": [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.8}}]
     }}
 
@@ -56,6 +79,8 @@ de:
 
   document_extraction_prompt: |
     Analysiere den folgenden Textabschnitt aus einem Dokument und extrahiere benannte Entitaeten und ihre Beziehungen.
+
+    BESCHREIBUNG (`description`): ein SPEZIFISCHES, unterscheidendes Detail ueber GENAU diese Entitaet aus dem Text (Rolle, Beziehung, Eigenschaft) — oder leerer String "". NIEMALS eine generische Beschreibung des TYPS selbst (z.B. "Vollstaendiger Name einer Person", "eine Firma"): solche Floskeln machen verschiedene Entitaeten im Embedding-Raum ununterscheidbar und ordnen fremde Namen faelschlich derselben Person zu.
 
     Nur KONKRETE, BENANNTE Entitaeten mit echtem Namen extrahieren:
     - Personen (vollstaendiger Name, NICHT generische Rollen wie "Kunde" oder "Sachbearbeiter")
@@ -94,15 +119,22 @@ de:
 
     Antworte als JSON-Objekt (leere Arrays wenn nichts relevant):
     {{
-      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "description": "..."}}],
+      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "description": "<spezifisches Detail oder leer>"}}],
       "relations": [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.8}}]
     }}
 
 en:
-  extraction_system: "You extract entities and relations from dialogs. Reply ONLY with a JSON object. No numbers, IDs, URLs, or OCR artifacts as entities. Only entities with concrete proper names."
+  extraction_system: "You extract entities and relations from dialogs. Reply ONLY with a JSON object. No numbers, IDs, URLs, or OCR artifacts as entities. Only entities with concrete proper names. You never invent facts — you only extract what is actually in the dialog."
 
   extraction_prompt: |
     Analyze the following dialog and extract named entities and their relationships.
+
+    GROUND RULES — ALWAYS FOLLOW:
+    1. Both the subject and the object of every relation MUST appear verbatim in the dialog (user OR assistant turn). If either name is not in the text: NO relation.
+    2. NEVER emit a relation where subject and object are the same entity (no self-loops like "Anna married_to Anna").
+    3. NEVER use world knowledge from outside the dialog to fill in facts. If the dialog says nothing about a person's spouse, there is NO married_to relation — even if you believe you know the spouse from training data.
+    4. Resolve pronouns carefully: "you", "I", "my wife", "my mother" refer to DIFFERENT people. Facts about "I" do not belong to "my mother", even when both appear in the same dialog.
+    5. DESCRIPTION (`description`): a SPECIFIC, distinguishing detail about THIS exact entity stated in the dialog (a role, relationship, or attribute) — or an empty string "". NEVER a generic description of the TYPE itself (e.g. "full name of a person", "a city", "a company"): such filler makes different entities indistinguishable in embedding space and causes foreign names to be mis-attributed to the same person.
 
     Only extract CONCRETE, NAMED entities — with real names or titles:
     - People (full names or nicknames, NOT generic roles)
@@ -113,8 +145,9 @@ en:
     - Concepts: ONLY personal hobbies, fields of study, job titles — NOT document fields or legal terms
 
     EXTRACT relations:
-    - Relationships between entities ("lives_in", "works_at", "likes", "owns", "knows", "married_to")
+    - Relationships between entities ("lives_in", "works_at", "likes", "owns", "knows", "married_to", "has_child", "is_mother_of", "is_father_of")
     - Only relations EXPLICITLY mentioned in the dialog
+    - Predicate/object-type must match: "lives_in" / "located_in" / "headquartered_in" → place; "married_to" / "has_child" / "is_mother_of" → person. NEVER use a person-relation predicate with a place as the object.
     - confidence: 0.5-1.0 (how certain is the relation)
 
     IGNORE (NEVER extract as entity):
@@ -129,13 +162,28 @@ en:
     - NO monetary amounts or currency references ("100 EUR", "0.04 Euro")
     - NO generic business terms ("service provider", "payment processor", "contract number", "billing period")
 
-    Dialog:
+    EXAMPLE of correct rejection — dialog: "Anna is my mother."
+    CORRECT:
+      entities: [{{"name": "Anna", "type": "person"}}]
+      relations: [{{"subject": "Anna", "predicate": "is_mother_of", "object": "<speaker name if mentioned in dialog, otherwise nothing>", "confidence": 0.9}}]
+    WRONG (self-loop):
+      relations: [{{"subject": "Anna", "predicate": "is_mother_of", "object": "Anna"}}]
+    WRONG (hallucination — husband not in dialog):
+      relations: [{{"subject": "Anna", "predicate": "married_to", "object": "Hans Filbinger"}}]
+
+    {speaker_clause}Dialog:
     User: {user_message}
     Assistant: {assistant_response}
 
+    MULTI-TYPE: if an entity has several roles (e.g. a person who is also a
+    musician), give "types" as a list — the first item from
+    person|place|organization|thing|event|concept, the rest free-form (e.g. "musician").
+    TASTES/PREFERENCES: model as a RELATION between the person and the thing
+    (predicate e.g. "likes", "likes_music_by"), NOT as a generic node.
+
     Reply as JSON object (empty arrays if nothing relevant):
     {{
-      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "description": "..."}}],
+      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "types": ["person"], "description": "<specific detail or empty>"}}],
       "relations": [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.8}}]
     }}
 
@@ -152,6 +200,8 @@ en:
 
   document_extraction_prompt: |
     Analyze the following text passage from a document and extract named entities and their relationships.
+
+    DESCRIPTION (`description`): a SPECIFIC, distinguishing detail about THIS exact entity from the text (role, relationship, attribute) — or an empty string "". NEVER a generic description of the TYPE itself (e.g. "full name of a person", "a company"): such filler makes different entities indistinguishable in embedding space and mis-attributes foreign names to the same person.
 
     Only extract CONCRETE, NAMED entities with real names:
     - People (full names, NOT generic roles like "customer" or "clerk")
@@ -190,7 +240,7 @@ en:
 
     Reply as JSON object (empty arrays if nothing relevant):
     {{
-      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "description": "..."}}],
+      "entities": [{{"name": "...", "type": "person|place|organization|thing|event|concept", "description": "<specific detail or empty>"}}],
       "relations": [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.8}}]
     }}
 
@@ -200,3 +250,27 @@ llm_options:
   top_p: 0.2
   num_predict: 1024
   num_ctx: 4096
+
+# Deterministic post-extraction validation (services/kg_validator.py).
+# Applied to every relation candidate before it is persisted, in BOTH the
+# chat path (extract_and_save) and the document path (extract_from_text).
+# See tasks/kg-strategy.md (P1) for the rationale.
+relation_validation:
+  # Rule 4 — confidence floor. Defense-in-depth only; the 2026-05-26 incident
+  # relations were all emitted at confidence 1.0, so this does not catch them.
+  # MUST match the lower bound the extraction prompt advertises to the model
+  # ("confidence: 0.5-1.0") — a higher floor silently drops relations the LLM
+  # emitted exactly as instructed. Keep this and the prompt range in lockstep.
+  confidence_floor: 0.5
+
+  # Rule 3 — predicate/object-type contract. First matching pattern wins.
+  # A predicate matching NO pattern is allowed (open vocabulary is deliberate;
+  # this table must not become a back-door closed enum). object_type is one of
+  # person|place|organization|thing|event|concept.
+  predicate_object_type:
+    # Kinship / marriage predicates must target a person.
+    - pattern: "^(heiratet|ist_verheiratet|verheiratet_mit|hat_kind|ist_kind_von|ist_(mutter|vater|sohn|tochter|elternteil|eltern)|hat_elternteil|ist_eltern_mit|ist_geschwister|ist_verwandt|married_to|has_child|is_(mother|father|son|daughter|parent|sibling)_of)"
+      object_type: person
+    # Location predicates must target a place.
+    - pattern: "^(wohnt_in|lebt_in|befindet_sich_in|hat_sitz_in|ansaessig_in|sitzt_in|liegt_in|lives_in|located_in|based_in|headquartered_in|resides_in)"
+      object_type: place

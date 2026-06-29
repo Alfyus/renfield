@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { debug } from '../../../utils/debug';
 import { getWebSocketUrl } from '../../../utils/env';
+import type { MessageSource } from '../../../types/chat';
 
 export interface BaseWsMessage {
   type: string;
@@ -16,6 +17,18 @@ export interface DoneMessage extends BaseWsMessage {
   type: 'done';
   tts_handled?: boolean;
   intent?: { intent: string; confidence?: number };
+  sources?: MessageSource[];
+  /** Resolved agent role for this turn (item 6 role badge). */
+  role?: string;
+  /** Persisted DB ids for this turn (chat branching). The frontend stamps them
+   *  onto the rendered user/assistant turns so edit/regenerate can fork. */
+  user_message_id?: number;
+  assistant_message_id?: number;
+}
+
+export interface FollowupsMessage extends BaseWsMessage {
+  type: 'followups';
+  suggested_followups: string[];
 }
 
 export interface ActionWsMessage extends BaseWsMessage {
@@ -54,6 +67,54 @@ export interface DocumentErrorMessage extends BaseWsMessage {
   filename: string;
   error: string;
   upload_id: string;
+}
+
+// Pushed when async chat-upload text extraction (OCR) finishes — flips the
+// pending attachment chip from "processing" to completed (or failed).
+export interface UploadProcessedMessage extends BaseWsMessage {
+  type: 'upload_processed';
+  upload_id: number;
+  filename: string;
+  status: string;            // "completed" | "failed"
+  text_preview?: string | null;
+  error?: string | null;
+}
+
+// Pushed when an async Paperless commit finishes in the background (consume +
+// deferred PATCH) — carries the final user-facing result to show in chat.
+export interface PaperlessCommittedMessage extends BaseWsMessage {
+  type: 'paperless_committed';
+  status: string;            // "completed" | "failed" | "pending"
+  document_id?: number | null;
+  filename: string;
+  message: string;
+}
+
+// Interactive Paperless confirm card. Pushed when an upload needs the user to
+// resolve ambiguous metadata (correspondent / type / tags). The user picks per
+// field and submits a structured decision back (no free-text parsing).
+export interface PaperlessConfirmOption {
+  action: 'use' | 'create' | 'skip';
+  value: string | null;
+  label: string;
+}
+
+export interface PaperlessConfirmField {
+  idx: number;              // 1-based over the backend proposals list
+  field: string;            // correspondent | document_type | storage_path | tag
+  label: string;            // localized field label from the backend
+  extracted_value: string | null;
+  options: PaperlessConfirmOption[];
+  default: { action: 'use' | 'create' | 'skip'; value: string | null };
+}
+
+export interface PaperlessConfirmRequestMessage extends BaseWsMessage {
+  type: 'paperless_confirm_request';
+  confirm_token: string;
+  attachment_id?: number | null;
+  filename?: string | null;
+  summary: Record<string, unknown>;
+  fields: PaperlessConfirmField[];
 }
 
 export interface AgentThinkingMessage extends BaseWsMessage {
@@ -97,6 +158,34 @@ export interface CardMessage extends BaseWsMessage {
   replace_text?: string;
 }
 
+// Chat artifact frame (Lane A: typed table/list/keyvalue/chart). Mirrors the
+// `card` frame. Multiple same-`id` frames stream/patch one artifact (the first
+// may carry partial:true; later same-id frames append rows/items). The payload
+// `data` is loosely typed — ArtifactRenderer's zod schema is the authoritative
+// shape validator (a bad shape → escaped-text fallback).
+export interface ArtifactWsMessage extends BaseWsMessage {
+  type: 'artifact';
+  artifact: {
+    id: string;
+    kind: string;
+    title?: string;
+    data: unknown;
+    partial?: boolean;
+  };
+  replace_text?: string;
+}
+
+/** Result of an interactive device-control widget interaction (Gen-UI). */
+export interface DeviceActionResultMessage extends BaseWsMessage {
+  type: 'device_action_result';
+  entity_id: string;
+  success: boolean;
+  state?: string;
+  brightness?: number;
+  targetTemp?: number;
+  message?: string;
+}
+
 interface UseChatWebSocketOptions {
   onStreamChunk?: (content: string) => void;
   onStreamDone?: (data: DoneMessage) => void;
@@ -106,11 +195,17 @@ interface UseChatWebSocketOptions {
   onDocumentProcessing?: (data: DocumentProcessingMessage) => void;
   onDocumentReady?: (data: DocumentReadyMessage) => void;
   onDocumentError?: (data: DocumentErrorMessage) => void;
+  onUploadProcessed?: (data: UploadProcessedMessage) => void;
+  onPaperlessCommitted?: (data: PaperlessCommittedMessage) => void;
+  onPaperlessConfirmRequest?: (data: PaperlessConfirmRequestMessage) => void;
   onAgentThinking?: (data: AgentThinkingMessage) => void;
   onAgentToolCall?: (data: AgentToolCallMessage) => void;
   onAgentToolResult?: (data: AgentToolResultMessage) => void;
   onAgentFederationProgress?: (data: AgentFederationProgressMessage) => void;
   onCard?: (data: CardMessage) => void;
+  onArtifact?: (data: ArtifactWsMessage) => void;
+  onFollowups?: (data: FollowupsMessage) => void;
+  onDeviceActionResult?: (data: DeviceActionResultMessage) => void;
 }
 
 /**
@@ -126,11 +221,17 @@ export function useChatWebSocket({
   onDocumentProcessing,
   onDocumentReady,
   onDocumentError,
+  onUploadProcessed,
+  onPaperlessCommitted,
+  onPaperlessConfirmRequest,
   onAgentThinking,
   onAgentToolCall,
   onAgentToolResult,
   onAgentFederationProgress,
   onCard,
+  onArtifact,
+  onFollowups,
+  onDeviceActionResult,
 }: UseChatWebSocketOptions = {}) {
   const [wsConnected, setWsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -192,6 +293,14 @@ export function useChatWebSocket({
         const msg = data as DocumentErrorMessage;
         debug.log('Document error:', msg.filename, msg.error);
         onDocumentError?.(msg);
+      } else if (data.type === 'upload_processed') {
+        const msg = data as UploadProcessedMessage;
+        debug.log('Upload processed:', msg.filename, msg.status);
+        onUploadProcessed?.(msg);
+      } else if (data.type === 'paperless_committed') {
+        const msg = data as PaperlessCommittedMessage;
+        debug.log('Paperless committed:', msg.filename, msg.status);
+        onPaperlessCommitted?.(msg);
       } else if (data.type === 'agent_thinking') {
         const msg = data as AgentThinkingMessage;
         debug.log('Agent thinking:', msg.content?.substring(0, 80));
@@ -208,9 +317,21 @@ export function useChatWebSocket({
         const msg = data as AgentFederationProgressMessage;
         debug.log('Federation progress:', msg.peer_display_name, msg.label, `seq=${msg.sequence}`);
         onAgentFederationProgress?.(msg);
+      } else if (data.type === 'followups') {
+        onFollowups?.(data as FollowupsMessage);
       } else if (data.type === 'card') {
         debug.log('Card received');
         onCard?.(data as CardMessage);
+      } else if (data.type === 'artifact') {
+        const msg = data as ArtifactWsMessage;
+        debug.log('Artifact received:', msg.artifact?.kind, msg.artifact?.id, msg.artifact?.partial ? '(partial)' : '');
+        onArtifact?.(msg);
+      } else if (data.type === 'paperless_confirm_request') {
+        const msg = data as PaperlessConfirmRequestMessage;
+        debug.log('Paperless confirm request:', msg.filename, `${msg.fields?.length ?? 0} fields`);
+        onPaperlessConfirmRequest?.(msg);
+      } else if (data.type === 'device_action_result') {
+        onDeviceActionResult?.(data as DeviceActionResultMessage);
       }
     };
 
@@ -229,7 +350,7 @@ export function useChatWebSocket({
     };
 
     wsRef.current = ws;
-  }, [onStreamChunk, onStreamDone, onAction, onRagContext, onIntentFeedbackRequest, onDocumentProcessing, onDocumentReady, onDocumentError, onAgentThinking, onAgentToolCall, onAgentToolResult, onAgentFederationProgress, onCard]);
+  }, [onStreamChunk, onStreamDone, onAction, onRagContext, onIntentFeedbackRequest, onDocumentProcessing, onDocumentReady, onDocumentError, onUploadProcessed, onPaperlessCommitted, onPaperlessConfirmRequest, onAgentThinking, onAgentToolCall, onAgentToolResult, onAgentFederationProgress, onCard, onArtifact, onFollowups, onDeviceActionResult]);
 
   useEffect(() => {
     connectWebSocket();

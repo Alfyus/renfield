@@ -717,14 +717,26 @@ async def move_device_to_room(
 # --- Output Device Endpoints ---
 
 def _output_device_to_response(device) -> OutputDeviceResponse:
-    """Convert RoomOutputDevice model to response"""
+    """Convert RoomOutputDevice model to response.
+
+    The three legacy brand fields (``renfield_device_id`` / ``ha_entity_id`` /
+    ``dlna_renderer_name``) are no longer columns — they are COMPUTED from the
+    ``(output_provider, output_target_id)`` pair purely for backward-compatible
+    API shape (older API consumers + the legacy frontend picker still read them).
+    Each is populated only when the provider matches; a non-legacy provider
+    (samsung/sonos) leaves all three None and is identified by the pair.
+    """
+    provider = device.output_provider
+    target_id = device.output_target_id
     return OutputDeviceResponse(
         id=device.id,
         room_id=device.room_id,
         output_type=device.output_type,
-        renfield_device_id=device.renfield_device_id,
-        ha_entity_id=device.ha_entity_id,
-        dlna_renderer_name=device.dlna_renderer_name,
+        renfield_device_id=target_id if provider == "renfield" else None,
+        ha_entity_id=target_id if provider == "homeassistant" else None,
+        dlna_renderer_name=target_id if provider == "dlna" else None,
+        output_provider=provider,
+        output_target_id=target_id,
         priority=device.priority,
         allow_interruption=device.allow_interruption,
         tts_volume=device.tts_volume,
@@ -770,19 +782,11 @@ async def add_output_device(
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
 
-    # Validate that exactly one device identifier is provided
-    identifiers = [request.renfield_device_id, request.ha_entity_id, request.dlna_renderer_name]
-    set_count = sum(1 for v in identifiers if v)
-    if set_count == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="One of renfield_device_id, ha_entity_id, or dlna_renderer_name must be provided"
-        )
-    if set_count > 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Only one of renfield_device_id, ha_entity_id, or dlna_renderer_name can be provided"
-        )
+    # Device-identity validation (exactly one legacy id OR the
+    # (output_provider, output_target_id) pair) is owned by
+    # OutputRoutingService.add_output_device — it raises ValueError, caught below
+    # as a 400. Don't duplicate a legacy-only guard here: it would reject the
+    # generic pair (samsung/sonos, or any device added via the unified picker).
 
     # Validate output_type
     from models.database import OUTPUT_TYPES
@@ -801,6 +805,8 @@ async def add_output_device(
             renfield_device_id=request.renfield_device_id,
             ha_entity_id=request.ha_entity_id,
             dlna_renderer_name=request.dlna_renderer_name,
+            output_provider=request.output_provider,
+            output_target_id=request.output_target_id,
             priority=request.priority,
             allow_interruption=request.allow_interruption,
             tts_volume=request.tts_volume,
@@ -933,8 +939,18 @@ async def get_available_outputs(
     # Get DLNA renderers
     dlna_renderers = await routing_service.get_available_dlna_renderers()
 
+    # Flag-on: also return the unified capability-tagged union (built-in + MCP
+    # providers like samsung), parallel-discovered, degraded-not-dropped.
+    output_targets = None
+    from utils.config import settings as _root_settings
+    if _root_settings.output_providers_enabled:
+        from main import app
+        mcp_manager = getattr(app.state, "mcp_manager", None)
+        output_targets = await routing_service.get_aggregated_outputs(room_id, mcp_manager)
+
     return AvailableOutputResponse(
         renfield_devices=renfield_list,
         ha_media_players=ha_media_players,
-        dlna_renderers=dlna_renderers
+        dlna_renderers=dlna_renderers,
+        output_targets=output_targets,
     )

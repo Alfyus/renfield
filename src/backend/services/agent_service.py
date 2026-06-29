@@ -402,6 +402,32 @@ _DEFAULT_LLM_OPTIONS_TOOL_PRESELECT = {
     "temperature": 0, "num_predict": 120, "num_ctx": 4096,
 }
 
+# Hard workflow prerequisites: a tool the pre-selection LLM may pick cannot
+# function without its companion(s), so they are re-added even when the LLM
+# prunes them. STRUCTURAL dependencies, not preferences: internal.play_radio
+# plays a TuneIn station_id that ONLY mcp.radio.search_stations can resolve —
+# drop the search tool and the agent guesses an id and loops.
+_REQUIRED_TOOL_COMPANIONS: dict[str, tuple[str, ...]] = {
+    "internal.play_radio": ("mcp.radio.search_stations",),
+}
+
+
+def _with_required_companions(selected_names: list[str]) -> list[str]:
+    """Expand a selected-tool-name list with the structural prerequisites of any
+    selected tool (see ``_REQUIRED_TOOL_COMPANIONS``). Pure, order-stable, and
+    dedup-safe — unknown tools are untouched. Filtering to actually-available
+    tools happens at the call site, so naming a companion that the current role
+    lacks is harmless.
+    """
+    out = list(selected_names)
+    seen = set(out)
+    for name in selected_names:
+        for companion in _REQUIRED_TOOL_COMPANIONS.get(name, ()):
+            if companion not in seen:
+                out.append(companion)
+                seen.add(companion)
+    return out
+
 
 def _llm_options_or_default(prompt_key: str, fallback: dict) -> dict:
     """Resolve LLM options from prompts/agent.yaml, falling back to a default.
@@ -413,6 +439,35 @@ def _llm_options_or_default(prompt_key: str, fallback: dict) -> dict:
     """
     cfg = prompt_manager.get_config("agent", prompt_key)
     return cfg if cfg is not None else fallback
+
+
+async def _apply_agent_system_prompt_hook(
+    json_system_message: str, role: Any, lang: str | None
+) -> str:
+    """Let a plugin prepend a role-specific system prompt to the agent's system message.
+
+    Fires the ``agent_system_prompt`` hook (``role``, ``lang``). The first
+    handler returning a non-empty string has it PREPENDED to ``json_system_message``
+    (which carries the "respond only with JSON" format directive); the full ReAct
+    format + tools live in the user-message ``agent_prompt``, so prepending adds
+    role identity without disturbing the format contract.
+
+    Fail-open by contract: with 0 handlers (e.g. standalone Renfield) the input is
+    returned unchanged — byte-identical — and any handler error is swallowed so a
+    misbehaving plugin can never break the agent loop.
+    """
+    try:
+        from utils.hooks import run_hooks
+
+        results = await run_hooks("agent_system_prompt", role=role, lang=lang)
+        role_sys = next(
+            (r for r in (results or []) if isinstance(r, str) and r.strip()), None
+        )
+        if role_sys:
+            return role_sys + "\n\n" + json_system_message
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"agent_system_prompt hook skipped: {e}")
+    return json_system_message
 
 
 # Fields that contain large binary data (base64-encoded)
@@ -642,6 +697,7 @@ class AgentService:
         self.step_timeout = step_timeout or settings.agent_step_timeout
         self.total_timeout = total_timeout or settings.agent_total_timeout
         self._prompt_key = (role.prompt_key if role else None) or "agent_prompt"
+        self._role = role  # exposed to the agent_system_prompt hook (plugin role prompts)
         self._preselected_tools: dict | None = None
 
     def _should_use_native_fc(self, agent_client) -> bool:
@@ -787,6 +843,11 @@ class AgentService:
             if not isinstance(selected, list) or not selected:
                 logger.warning(f"Tool pre-selection returned non-list: {response_text[:100]}")
                 return None
+
+            # Re-add any structural prerequisites the LLM pruned (e.g. it picked
+            # internal.play_radio but dropped mcp.radio.search_stations, which it
+            # needs to resolve the station_id). Filtered against the registry below.
+            selected = _with_required_companions(selected)
 
             # Filter to valid tool names
             filtered = {
@@ -971,6 +1032,7 @@ class AgentService:
         memory_context: str = "",
         document_context: str = "",
         personality_context: str = "",
+        time_context: str = "",
         context_vars_text: str = "",
         summary_text: str = "",
         user_id: int | None = None,
@@ -1160,6 +1222,7 @@ class AgentService:
             memory_context=memory_context,
             document_context=document_context,
             personality_context=personality_context,
+            time_context=time_context,
             tools_prompt=tools_prompt,
             self_learning_blocks=self_learning_blocks,
             history_prompt=history_prompt,
@@ -1177,6 +1240,7 @@ class AgentService:
                 memory_context=memory_context,
                 document_context=document_context,
                 personality_context=personality_context,
+                time_context=time_context,
                 tools_prompt=tools_prompt,
                 self_learning_blocks=self_learning_blocks,
                 history_prompt=history_prompt,
@@ -1196,6 +1260,7 @@ class AgentService:
         memory_context: str = "",
         document_context: str = "",
         personality_context: str = "",
+        time_context: str = "",
         user_permissions: list[str] | None = None,
         user_id: int | None = None,
         context_vars_text: str = "",
@@ -1237,12 +1302,26 @@ class AgentService:
                 memory_context=memory_context,
                 document_context=document_context,
                 personality_context=personality_context,
+                time_context=time_context,
                 user_permissions=user_permissions,
                 user_id=user_id,
                 context_vars_text=context_vars_text,
                 summary_text=summary_text,
                 progress_sink=progress_sink,
             ):
+                # _run_impl records tool_call/tool_result/error into
+                # context.steps but yields the terminal final_answer WITHOUT
+                # recording it (it `return`s straight after the yield). The
+                # post-turn bookkeeping classifies the turn from context.steps,
+                # so a missing final_answer makes EVERY turn read as ABORT:
+                # the trajectory is dropped (default capture-set excludes
+                # abort) and turn_success is forced False (no skill auto-
+                # extraction; injected skills mis-recorded as failures).
+                # Record the terminal step here, at the single point every
+                # final_answer streams through, rather than at each of the
+                # ~10 yield sites inside _run_impl.
+                if step.step_type == "final_answer":
+                    context.steps.append(step)
                 yield step
         finally:
             # Publish real token counts from the AgentContext — fires on every
@@ -1316,6 +1395,7 @@ class AgentService:
         memory_context: str = "",
         document_context: str = "",
         personality_context: str = "",
+        time_context: str = "",
         user_permissions: list[str] | None = None,
         user_id: int | None = None,
         context_vars_text: str = "",
@@ -1337,6 +1417,7 @@ class AgentService:
             memory_context: Formatted memory section for the agent prompt
             document_context: Formatted document section for the agent prompt
             personality_context: Formatted personality section for the agent prompt
+            time_context: Formatted time-of-day section for the agent prompt
             user_permissions: User's permission strings for MCP access control.
                 None means no auth / allow all (backwards-compatible).
             user_id: Authenticated user ID for per-user tool filtering.
@@ -1377,6 +1458,11 @@ class AgentService:
         llm_options = _llm_options_or_default("llm_options", _DEFAULT_LLM_OPTIONS)
         llm_options_retry = _llm_options_or_default("llm_options_retry", _DEFAULT_LLM_OPTIONS_RETRY)
         json_system_message = prompt_manager.get("agent", "json_system_message", lang=lang)
+        # Let a plugin (e.g. an edition's role-specific prompts) prepend a role
+        # system prompt. Computed once — reused at every LLM call site below.
+        json_system_message = await _apply_agent_system_prompt_hook(
+            json_system_message, getattr(self, "_role", None), lang
+        )
 
         # Native function calling — opt-in per role AND requires the agent client
         # to advertise `supports_native_tools`. Default path stays on ReAct.
@@ -1405,11 +1491,12 @@ class AgentService:
             # (tool-health warnings, procedural skill injection) and to
             # _enforce_token_budget which re-invokes _build_agent_prompt up
             # to 5 times during reduction passes.
-            prompt = await self._build_agent_prompt(message, context, conversation_history, room_context=room_context, lang=lang, memory_context=memory_context, document_context=document_context, personality_context=personality_context, context_vars_text=context_vars_text, summary_text=summary_text, user_id=user_id)
+            prompt = await self._build_agent_prompt(message, context, conversation_history, room_context=room_context, lang=lang, memory_context=memory_context, document_context=document_context, personality_context=personality_context, time_context=time_context, context_vars_text=context_vars_text, summary_text=summary_text, user_id=user_id)
             prompt, memory_context, document_context, conversation_history = await self._enforce_token_budget(
                 prompt, context, message, conversation_history,
                 memory_context=memory_context, document_context=document_context, lang=lang,
                 room_context=room_context, personality_context=personality_context,
+                time_context=time_context,
                 context_vars_text=context_vars_text, summary_text=summary_text,
                 user_id=user_id,
             )
@@ -1620,6 +1707,13 @@ class AgentService:
 
                     # Yield results and add to context
                     no_result = "No result" if lang == "en" else "Kein Ergebnis"
+                    # An action_required tool (e.g. paperless confirm) returns a
+                    # preview the user MUST see verbatim. The single-tool
+                    # short-circuit below never runs in the parallel path, so
+                    # capture it here and relay it instead of letting the LLM
+                    # summarise (which drops the per-field choices).
+                    parallel_preview: tuple[str, Any] | None = None
+                    parallel_confirm_data: dict | None = None
                     for act, res in zip(valid_actions, exec_results):
                         if isinstance(res, Exception):
                             logger.error(f"❌ Parallel tool '{act['action']}' failed: {res}")
@@ -1652,6 +1746,42 @@ class AgentService:
                         context.steps.append(result_step)
                         context.tool_results.append(res)
                         yield result_step
+
+                        _rd = res.get("data")
+                        if (
+                            parallel_preview is None
+                            and isinstance(_rd, dict)
+                            and _rd.get("action_required")
+                        ):
+                            parallel_preview = (
+                                res.get("message") or "", _rd["action_required"],
+                            )
+                            parallel_confirm_data = _rd
+
+                    # Relay an action_required preview verbatim + stop the loop
+                    # (mirrors the single-tool short-circuit below).
+                    if parallel_preview is not None and parallel_preview[0]:
+                        yield AgentStep(
+                            step_number=step_num,
+                            step_type="final_answer",
+                            content=parallel_preview[0],
+                            reason=(
+                                "Relaying tool preview verbatim — "
+                                f"action_required={parallel_preview[1]}"
+                            ),
+                        )
+                        # Interactive confirm card (see single-tool path).
+                        if (
+                            isinstance(parallel_confirm_data, dict)
+                            and parallel_confirm_data.get("action_required") == "paperless_confirm"
+                            and parallel_confirm_data.get("confirm")
+                        ):
+                            yield AgentStep(
+                                step_number=step_num,
+                                step_type="paperless_confirm",
+                                data=parallel_confirm_data,
+                            )
+                        return
 
                     continue  # Next iteration of ReAct loop
 
@@ -1861,6 +1991,19 @@ class AgentService:
                             f"action_required={tool_data['action_required']}"
                         ),
                     )
+                    # Interactive confirm card: when the tool supplied a
+                    # structured `confirm` payload, emit it as its own step so
+                    # the frontend renders a clickable picker (the preview text
+                    # above stays as the assistant bubble + fallback). Attaches
+                    # AFTER the final_answer so the bubble exists first (same
+                    # ordering the `card` step relies on).
+                    if tool_data.get("action_required") == "paperless_confirm" \
+                            and tool_data.get("confirm"):
+                        yield AgentStep(
+                            step_number=step_num,
+                            step_type="paperless_confirm",
+                            data=tool_data,
+                        )
                     return
 
             # Check for repeated empty results from the same tool
@@ -2147,6 +2290,20 @@ def step_to_ws_message(step: AgentStep) -> dict:
         if data.get("replace_text"):
             msg["replace_text"] = data["replace_text"]
         return msg
+    elif step.step_type == "paperless_confirm":
+        # Interactive Paperless confirm card. Carries the structured per-field
+        # options the frontend renders as a clickable picker; the user's choice
+        # comes back as a {type:"paperless_confirm"} frame (see chat_handler).
+        data = step.data or {}
+        confirm = data.get("confirm") or {}
+        return {
+            "type": "paperless_confirm_request",
+            "confirm_token": data.get("confirm_token"),
+            "attachment_id": data.get("attachment_id"),
+            "filename": data.get("filename"),
+            "summary": confirm.get("summary") or {},
+            "fields": confirm.get("fields") or [],
+        }
     else:
         return {
             "type": "agent_thinking",

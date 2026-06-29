@@ -25,6 +25,7 @@ import {
   Zap,
   Brain,
   Inbox,
+  CalendarClock,
   CircleDashed,
   MapPin,
   Wrench,
@@ -45,7 +46,19 @@ import NotificationToast from './NotificationToast';
 import NavBadge from './NavBadge';
 import { useWissensbasisAvailable } from '../api/resources/wissensbasis';
 import { useDraftCountQuery } from '../api/resources/skills';
+import { useFeatureFlags } from '../api/resources/brain';
 import { useAuth } from '../context/AuthContext';
+
+// The six corpus nav entries the Wissen workspace collapses into one (D10).
+// Skills + Federation Audit are NOT corpus and stay standalone.
+const WISSEN_CORPUS_HREFS = new Set([
+  '/knowledge',
+  '/brain',
+  '/brain/review',
+  '/brain/fristen',
+  '/memory',
+  '/knowledge-graph',
+]);
 
 interface NavItemConfig {
   nameKey: string;
@@ -64,6 +77,7 @@ const mainNavigationConfig: NavItemConfig[] = [
   { nameKey: 'nav.knowledge', href: '/knowledge', icon: BookOpen, permission: ['kb.own', 'kb.shared', 'kb.all'], feature: 'knowledge' },
   { nameKey: 'nav.brain', href: '/brain', icon: Brain },
   { nameKey: 'nav.brainReview', href: '/brain/review', icon: Inbox },
+  { nameKey: 'nav.fristen', href: '/brain/fristen', icon: CalendarClock },
   { nameKey: 'nav.brainSkills', href: '/brain/skills', icon: Sparkles },
   { nameKey: 'nav.federationAudit', href: '/brain/audit', icon: History },
   { nameKey: 'nav.memory', href: '/memory', icon: Brain },
@@ -159,7 +173,31 @@ export default function Layout({ children }: LayoutProps) {
   // permanently empty page.
   const wissensbasisAvailable = useWissensbasisAvailable();
 
-  const mainNavigation: NavItem[] = mainNavigationConfig.map((item) => ({
+  // D10: when the workspace flag is on, collapse the six corpus entries into a
+  // single "Wissen" entry (inserted where the first corpus entry was). Off =>
+  // legacy flat nav. The flag resolving late just reveals the collapse once.
+  const { data: featureFlags } = useFeatureFlags();
+  const wissenWorkspace = featureFlags?.wissen_workspace_enabled ?? false;
+
+  const mainNavSource: NavItemConfig[] = wissenWorkspace
+    ? (() => {
+        const out: NavItemConfig[] = [];
+        let inserted = false;
+        for (const item of mainNavigationConfig) {
+          if (WISSEN_CORPUS_HREFS.has(item.href)) {
+            if (!inserted) {
+              out.push({ nameKey: 'nav.wissen', href: '/wissen', icon: BookOpen });
+              inserted = true;
+            }
+            continue; // drop the individual corpus entry
+          }
+          out.push(item);
+        }
+        return out;
+      })()
+    : mainNavigationConfig;
+
+  const mainNavigation: NavItem[] = mainNavSource.map((item) => ({
     ...item,
     name: t(item.nameKey),
   }));
@@ -194,11 +232,15 @@ export default function Layout({ children }: LayoutProps) {
   const railTranslate = hoverCapable ? 'lg:translate-x-0' : '';
   const railFade = hoverCapable ? 'lg:opacity-0 lg:group-hover/sidebar:opacity-100' : '';
   const railOnlyMenuBtn = hoverCapable ? 'hidden lg:flex lg:group-hover/sidebar:hidden' : 'hidden';
+  // CSS-grid 0fr↔1fr accordion: animates to the submenu's *natural* height with
+  // no hardcoded max-height, so it never clips regardless of how many admin items
+  // exist (a fixed max-h-[600px] silently clipped the bottom items once the list
+  // outgrew it). The parent <nav> (overflow-y-auto) scrolls if it exceeds viewport.
   const adminSubmenuCls = hoverCapable
     ? (adminExpanded
-        ? 'max-h-[600px] opacity-100 lg:max-h-0 lg:opacity-0 lg:group-hover/sidebar:max-h-[600px] lg:group-hover/sidebar:opacity-100'
-        : 'max-h-0 opacity-0')
-    : (adminExpanded ? 'max-h-[600px] opacity-100' : 'max-h-0 opacity-0');
+        ? 'grid-rows-[1fr] opacity-100 lg:grid-rows-[0fr] lg:opacity-0 lg:group-hover/sidebar:grid-rows-[1fr] lg:group-hover/sidebar:opacity-100'
+        : 'grid-rows-[0fr] opacity-0')
+    : (adminExpanded ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0');
 
   // Handle logout
   const handleLogout = () => {
@@ -278,7 +320,12 @@ export default function Layout({ children }: LayoutProps) {
 
   const NavLink = ({ item, onClick }: NavLinkProps) => {
     const Icon = item.icon;
-    const isActive = location.pathname === item.href;
+    // The Wissen entry lights for any lens path (/wissen/dokumente, …), so a
+    // deep lens link still shows the section as active (D8 risk #6).
+    const isActive =
+      item.href === '/wissen'
+        ? location.pathname === '/wissen' || location.pathname.startsWith('/wissen/')
+        : location.pathname === item.href;
     // Sidebar Skills Inbox draft count. Only fetched when the user can
     // see the entry (the badge component itself hides at 0, so even on
     // non-admin views nothing visible escapes — but we gate the query
@@ -464,15 +511,19 @@ export default function Layout({ children }: LayoutProps) {
                 />
               </button>
 
-              {/* Admin Submenu — hidden in rail, shown on hover when expanded */}
+              {/* Admin Submenu — hidden in rail, shown on hover when expanded.
+                  grid 0fr/1fr collapses to content height; inner overflow-hidden
+                  wrapper does the clipping during the transition. */}
               <div
                 id="admin-menu"
-                className={`overflow-hidden transition-all duration-200 ease-in-out ${adminSubmenuCls}`}
+                className={`grid transition-all duration-200 ease-in-out ${adminSubmenuCls}`}
               >
-                <div className="ml-3 pl-3 border-l border-gray-200 dark:border-gray-700 space-y-1 py-1">
-                  {visibleAdminNav.map((item) => (
-                    <NavLink key={item.href} item={item} onClick={handleNavClick} />
-                  ))}
+                <div className="overflow-hidden">
+                  <div className="ml-3 pl-3 border-l border-gray-200 dark:border-gray-700 space-y-1 py-1">
+                    {visibleAdminNav.map((item) => (
+                      <NavLink key={item.href} item={item} onClick={handleNavClick} />
+                    ))}
+                  </div>
                 </div>
               </div>
             </>
@@ -537,7 +588,14 @@ export default function Layout({ children }: LayoutProps) {
         tabIndex={-1}
       >
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          <div key={location.pathname} className="animate-fade-slide-in">
+          {/* The Wissen workspace is a persistent shell: all /wissen/* paths
+              share ONE content key so switching lenses reconciles the shell
+              (rail + search + Graph WebGL) instead of remounting it (D8).
+              Every other section keeps its per-pathname entrance animation. */}
+          <div
+            key={location.pathname.startsWith('/wissen') ? 'wissen' : location.pathname}
+            className="animate-fade-slide-in"
+          >
             {children}
           </div>
         </div>

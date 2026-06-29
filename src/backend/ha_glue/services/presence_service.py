@@ -17,6 +17,34 @@ from utils.config import settings
 from ha_glue.utils.config import ha_glue_settings
 
 
+# Security (review H1): IRKs permanently de-anonymize a resident's rotating BLE
+# address. Only push them to allowlisted satellites. Track which satellites we've
+# already warned about (when the allowlist is empty) so the warning fires once.
+_irk_ungated_warned: set[str] = set()
+
+
+def irk_push_allowed(satellite_id: str) -> bool:
+    """Whether ``satellite_id`` may receive per-person BLE IRKs.
+
+    Driven by ``settings.satellite_irk_allowlist`` (comma-separated). Non-empty
+    → allow only listed ids. Empty → ungated (legacy) but log a one-shot warning
+    per satellite so the exposure is visible and operators can lock it down.
+    """
+    raw = (settings.satellite_irk_allowlist or "").strip()
+    if raw:
+        allow = {s.strip() for s in raw.split(",") if s.strip()}
+        return satellite_id in allow
+    if satellite_id not in _irk_ungated_warned:
+        _irk_ungated_warned.add(satellite_id)
+        logger.warning(
+            f"⚠️ IRK push to satellite '{satellite_id}' is UNGATED "
+            f"(SATELLITE_IRK_ALLOWLIST empty) — any device registering as a "
+            f"satellite receives household IRKs (location-tracking keys). Set "
+            f"SATELLITE_IRK_ALLOWLIST to the known satellite ids to close this."
+        )
+    return True
+
+
 @dataclass
 class DeviceSighting:
     """A single BLE scan result from a satellite."""
@@ -35,7 +63,13 @@ class UserPresence:
     satellite_id: str | None = None
     confidence: float = 0.0
     last_seen: float = 0.0
-    consecutive_room_count: int = 0  # for hysteresis
+    consecutive_room_count: int = 0  # scans the user has held the CURRENT room
+    # Hysteresis candidate: the room currently challenging current.room_id and how
+    # many CONSECUTIVE scans it has won. A switch only happens when this reaches
+    # the threshold; it resets whenever the current room wins again — so a single
+    # stray sighting from an adjacent satellite can't flip the room.
+    pending_room_id: int | None = None
+    pending_room_count: int = 0
 
 
 class PresenceService:
@@ -60,6 +94,10 @@ class PresenceService:
         self._user_first_names: dict[int, str] = {}      # user_id → first_name
         self._user_last_names: dict[int, str] = {}       # user_id → last_name
         self._pending_events: list[tuple[str, dict]] = []  # (event_name, kwargs)
+        # Per-person IRK store (for resolving rotating RPAs on non-bonded
+        # satellites). label → user_id, and label → decrypted IRK hex.
+        self._irk_label_to_user: dict[str, int] = {}
+        self._irks_hex: dict[str, str] = {}
 
     async def load_device_registry(self, db: AsyncSession):
         """Load UserBleDevice table into MAC → user_id cache."""
@@ -87,6 +125,38 @@ class PresenceService:
         logger.info(f"Presence: loaded {len(self._mac_to_user)} devices "
                      f"(BLE: {sum(1 for m in self._mac_to_method.values() if m == 'ble')}, "
                      f"Classic BT: {sum(1 for m in self._mac_to_method.values() if m == 'classic_bt')})")
+
+        await self._load_irks(db)
+
+    async def _load_irks(self, db: AsyncSession):
+        """Load UserBleIrk into the label → user_id and label → IRK-hex caches,
+        decrypting each IRK. A row that fails to decrypt is skipped (logged)."""
+        from models.database import UserBleIrk
+        from services.secret_encryption import decrypt_secret
+
+        result = await db.execute(
+            select(UserBleIrk).where(UserBleIrk.is_enabled == True)  # noqa: E712
+        )
+        rows = result.scalars().all()
+        label_to_user: dict[str, int] = {}
+        irks_hex: dict[str, str] = {}
+        for row in rows:
+            try:
+                irks_hex[row.label] = decrypt_secret(row.irk_encrypted)
+            except Exception:
+                logger.warning(f"Presence: could not decrypt IRK for label '{row.label}' (skipped)")
+                continue
+            label_to_user[row.label] = row.user_id
+        self._irk_label_to_user = label_to_user
+        self._irks_hex = irks_hex
+        if rows and not irks_hex:
+            # All IRKs failed to decrypt — almost certainly a SECRET_KEY change.
+            # Surface a single aggregate signal, not just scattered per-row warns.
+            logger.error(
+                f"Presence: {len(rows)} BLE IRK(s) present but 0 decryptable — "
+                "SECRET_KEY may have rotated; phone presence will not resolve."
+            )
+        logger.info(f"Presence: loaded {len(irks_hex)} BLE IRK(s)")
 
     def set_room_name(self, room_id: int, name: str):
         """Cache a room name for display."""
@@ -150,12 +220,18 @@ class PresenceService:
         now = time.time()
 
         for device in devices:
-            mac = device.get("mac", "").upper()
             rssi = device.get("rssi", -100)
 
-            # Only track known devices
-            if mac not in self._mac_to_user:
-                continue
+            # An IRK-resolved reading carries a stable `identity` (the rotating
+            # `mac` would never match a whitelist); key it by the identity so a
+            # phone is tracked across RPA rotation. Otherwise key by MAC.
+            identity = device.get("identity")
+            if identity and identity in getattr(self, "_irk_label_to_user", {}):
+                key = "irk:" + identity
+            else:
+                key = device.get("mac", "").upper()
+                if self._user_for_key(key) is None:
+                    continue  # not a known device
 
             sighting = DeviceSighting(
                 satellite_id=satellite_id,
@@ -165,15 +241,15 @@ class PresenceService:
             )
 
             # Keep only recent sightings (last 2 minutes)
-            if mac not in self._sightings:
-                self._sightings[mac] = []
-            self._sightings[mac] = [
-                s for s in self._sightings[mac]
+            if key not in self._sightings:
+                self._sightings[key] = []
+            self._sightings[key] = [
+                s for s in self._sightings[key]
                 if now - s.timestamp < self._stale_timeout
             ]
-            self._sightings[mac].append(sighting)
+            self._sightings[key].append(sighting)
 
-            self._assign_room(mac)
+            self._assign_room(key)
 
         # Clean up stale presence
         self._cleanup_stale(now)
@@ -181,9 +257,17 @@ class PresenceService:
         # Fire collected presence events
         await self._fire_pending_events()
 
+    def _user_for_key(self, key: str) -> int | None:
+        """Resolve a sighting key (a MAC, or an "irk:<label>" identity) to a
+        user_id. Keeps IRK identities out of the MAC caches used for the
+        satellite known-MAC push."""
+        if key.startswith("irk:"):
+            return getattr(self, "_irk_label_to_user", {}).get(key[4:])
+        return self._mac_to_user.get(key)
+
     def _assign_room(self, mac: str):
         """Assign a user to a room based on multi-satellite RSSI aggregation with hysteresis."""
-        user_id = self._mac_to_user.get(mac)
+        user_id = self._user_for_key(mac)
         if user_id is None:
             return
 
@@ -254,13 +338,26 @@ class PresenceService:
         current.confidence = confidence
 
         if best_room_id == current.room_id:
-            # Same room — reinforce
+            # Same room — reinforce, and abandon any pending switch. This is the
+            # crux of the flip-flop fix: while the current room keeps winning, a
+            # stray candidate must NOT keep accumulating toward a switch.
             current.consecutive_room_count += 1
+            current.pending_room_id = None
+            current.pending_room_count = 0
             current.satellite_id = best_satellite_id
         else:
-            # Different room — apply hysteresis
-            current.consecutive_room_count += 1
-            if current.room_id is None or current.consecutive_room_count >= self._hysteresis_threshold:
+            # A different room is winning. Require N CONSECUTIVE scans of the SAME
+            # candidate before switching, so one stray detection from an adjacent
+            # satellite (common: the RSSI read is throttled, so most sightings
+            # report a flat synthetic value and adjacent rooms tie) can't flip the
+            # room. A different candidate resets the count.
+            if current.pending_room_id == best_room_id:
+                current.pending_room_count += 1
+            else:
+                current.pending_room_id = best_room_id
+                current.pending_room_count = 1
+
+            if current.room_id is None or current.pending_room_count >= self._hysteresis_threshold:
                 old_room_id = current.room_id
                 old_room_name = current.room_name
 
@@ -271,6 +368,8 @@ class PresenceService:
                 current.room_name = self._room_names.get(best_room_id) if best_room_id else None
                 current.satellite_id = best_satellite_id
                 current.consecutive_room_count = 1
+                current.pending_room_id = None
+                current.pending_room_count = 0
                 new_room = current.room_name or current.room_id
                 logger.debug(f"Presence: user {user_id} moved {old_room_name or old_room_id} → {new_room}")
 
@@ -299,6 +398,7 @@ class PresenceService:
                         "room_name": self._room_names.get(best_room_id),
                         "confidence": confidence,
                         "source": "ble",
+                        "satellite_id": best_satellite_id,
                     }))
                     if was_first:
                         self._pending_events.append(("presence_first_arrived", {
@@ -472,15 +572,41 @@ class PresenceService:
         """Get MAC addresses of Classic BT devices only."""
         return {mac for mac, method in self._mac_to_method.items() if method == "classic_bt"}
 
+    def get_ble_irks(self) -> list[dict]:
+        """Per-person IRKs to push to satellites: [{'name': label, 'irk': hex}].
+        IRK hex is decrypted in memory; only ever leaves over the WS link."""
+        return [{"name": label, "irk": irk} for label, irk in getattr(self, "_irks_hex", {}).items()]
+
+    def irks_for_satellite(
+        self, satellite_id: str, is_enrolled_authenticated: bool = False
+    ) -> list[dict]:
+        """IRK list to push to ``satellite_id`` (security H1).
+
+        When per-satellite enrollment is enabled, the IRK push keys on whether
+        THIS connection presented a valid enrollment PSK — the allowlist
+        stop-gap is bypassed entirely (a verified satellite is a stronger
+        signal than a config string). When enrollment is disabled, fall back to
+        the legacy ``SATELLITE_IRK_ALLOWLIST`` gate.
+
+        Returns the IRKs only when permitted; an empty list otherwise (so the
+        caller's ``if irks:`` guard naturally skips the send).
+        """
+        if settings.satellite_enrollment_enabled:
+            return self.get_ble_irks() if is_enrolled_authenticated else []
+        if not irk_push_allowed(satellite_id):
+            return []
+        return self.get_ble_irks()
+
     async def push_macs_to_satellites(self):
-        """Push current known MACs to all connected satellites."""
+        """Push current known MACs + IRKs to all connected satellites."""
         from ha_glue.services.satellite_manager import get_satellite_manager
 
         manager = get_satellite_manager()
         ble_macs = list(self.get_ble_macs())
         classic_macs = list(self.get_classic_bt_macs())
+        all_irks = self.get_ble_irks()
 
-        if not ble_macs and not classic_macs:
+        if not ble_macs and not classic_macs and not all_irks:
             return
 
         for sat_id, sat_info in manager.satellites.items():
@@ -495,9 +621,22 @@ class PresenceService:
                         "type": "classic_bt_known_devices",
                         "devices": classic_macs,
                     })
-                logger.debug(f"Pushed {len(ble_macs)} BLE + {len(classic_macs)} Classic BT MACs to {sat_id}")
+                # IRKs are gated per satellite (H1): enrollment-auth when
+                # enrollment is on, else the legacy allowlist. Mirrors
+                # irks_for_satellite so the two push paths agree.
+                if settings.satellite_enrollment_enabled:
+                    irks = all_irks if getattr(sat_info, "authenticated", False) else []
+                else:
+                    irks = all_irks if irk_push_allowed(sat_id) else []
+                if irks:
+                    await sat_info.websocket.send_json({
+                        "type": "ble_known_irks",
+                        "irks": irks,
+                    })
+                logger.debug(f"Pushed {len(ble_macs)} BLE + {len(classic_macs)} Classic BT MACs "
+                             f"+ {len(irks)} IRK(s) to {sat_id}")
             except Exception as e:
-                logger.warning(f"Failed to push MACs to {sat_id}: {e}")
+                logger.warning(f"Failed to push MACs/IRKs to {sat_id}: {e}")
 
     async def add_device(
         self,

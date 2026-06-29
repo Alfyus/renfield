@@ -1,8 +1,10 @@
 """
 Konfiguration und Settings
 """
+import json
 import os
 from functools import lru_cache
+from typing import Literal
 
 from loguru import logger
 from pydantic import Field, SecretStr, model_validator
@@ -48,6 +50,21 @@ class Settings(BaseSettings):
     feature_tasks: bool | None = None            # None = use edition default
     feature_knowledge: bool | None = None        # None = use edition default
     feature_knowledge_graph: bool | None = None  # None = use edition default
+
+    # Day/night awareness — time-of-day windows used by services/daypart_service.py
+    # to compute the current daypart (day/evening/night) for the agent prompt and
+    # the `daypart_changed` hook. Windows are HH:MM in the local timezone.
+    daypart_timezone: str = ""  # empty => reuse ha_glue presence_analytics_timezone, else UTC
+    daypart_night_start: str = "22:00"
+    daypart_night_end: str = "07:00"
+    daypart_evening_start: str = "18:00"
+    # Satellite LED brightness (0-31, APA102/XVF3800 scale) per daypart. The
+    # backend pushes the night level to all connected satellites on the
+    # `daypart_changed` → night transition (and rides it in register_ack so a
+    # mid-night reconnect comes up dimmed). Animations are never disabled — only
+    # their brightness is scaled. See ha_glue/services/led_dimming_service.py.
+    led_day_brightness: int = 20
+    led_night_brightness: int = 5
 
     # Datenbank - Einzelfelder für dynamischen DATABASE_URL-Aufbau
     database_url: str | None = None
@@ -152,6 +169,7 @@ class Settings(BaseSettings):
     # Output Routing
     advertise_host: str | None = None  # Hostname/IP that external services (like HA) can reach
     advertise_port: int = 8000            # Port for advertise_host
+    advertise_scheme: Literal["http", "https"] = "http"  # URL scheme for advertise_host-built media URLs. https requires renderers to resolve+trust advertise_host's cert. Pair https with ADVERTISE_PORT=443.
     backend_internal_url: str = "http://backend:8000"  # Internal URL for Docker networking (fallback when advertise_host not set)
 
     # Wake Word Detection
@@ -169,6 +187,15 @@ class Settings(BaseSettings):
     agent_total_timeout: float = Field(default=120.0, ge=5.0, le=600.0)
     agent_model: str | None = None     # Optional: separate model for agent (default: ollama_model)
     agent_ollama_url: str | None = None # Optional: separate Ollama instance for agent (default: ollama_url)
+
+    # Follow-up suggestion chips (chat-ui roadmap item 2). Opt-in/dark. After an
+    # assistant answer, a small best-effort LLM call proposes 2-4 tappable
+    # follow-up questions, attached to the `done` frame (ephemeral, not persisted).
+    # Failure/timeout silently yields no chips — never blocks the turn.
+    followup_chips_enabled: bool = False
+    followup_chips_model: str = ""              # "" → ollama_intent_model (small/fast tier)
+    followup_chips_count: int = Field(default=3, ge=1, le=5)
+    followup_chips_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
 
     # OpenAI-compatible LLM endpoint (e.g. llama-server). When set, the agent
     # tier (and optionally chat/RAG/intent via per-tier overrides below) routes
@@ -301,6 +328,14 @@ class Settings(BaseSettings):
     rag_force_ocr: bool = False               # Always force full-page OCR (ignores embedded text)
     rag_ocr_auto_detect: bool = True          # Auto-detect garbled embedded text and re-run with OCR
     rag_ocr_space_threshold: float = 0.03    # Space ratio below this triggers auto OCR (default 3%)
+    # Page-raster scale for the force_full_page_ocr converter. Memory during a
+    # full-page-OCR pass scales ~quadratically with this (a multi-page PDF rasters
+    # every page at this factor). 2.0 doubled accuracy-vs-memory; dropped to 1.5 to
+    # keep the OCR re-conversion within the worker/backend 6Gi limit after a hybrid
+    # doc OOM'd ingestion (the Docling-default → force-OCR re-conversion held two
+    # converters + rasters at once). Raise toward 2.0 only if OCR accuracy regresses
+    # AND the memory limit is also raised.
+    rag_ocr_images_scale: float = Field(default=1.5, ge=0.5, le=4.0)
     # Per-chunk-rate trigger that complements rag_ocr_space_threshold.
     # When the chunker drops more than this fraction of chunks as
     # low-quality (utils.content_quality.is_low_quality_text), the
@@ -310,6 +345,92 @@ class Settings(BaseSettings):
     # distinct error_message='ocr_quality_low_after_forced_ocr' so the
     # maintenance UI can distinguish "tried our best" from "first attempt".
     rag_chunk_quality_drop_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
+    # Text-layer UNION for field extraction (Schicht A). A raw poppler `pdftotext`
+    # pass recovers positioned text-layer tokens (e.g. right-aligned deadline dates
+    # in subsetted no-ToUnicode fonts) that the Docling/OCR stack drops; Docling OCR
+    # in turn recovers image-only values the text layer lacks. process_document unions
+    # them into result["field_text"] when the text layer passes these quality gates.
+    # A garbled/empty text layer is dropped (OCR-only). Thresholds calibrated on the
+    # Schicht A golden set (see tasks T-A0-1/T-A0-2).
+    rag_text_layer_min_chars_per_page: int = 50      # below => scan/no text layer => OCR-only
+    rag_text_layer_min_space_ratio: float = 0.05     # below => no-space mojibake => drop text layer
+    rag_text_layer_max_replacement_ratio: float = 0.02  # above => broken encoding => drop text layer
+    rag_text_layer_min_vowel_ratio: float = 0.55     # below => garbled glyphs => drop text layer
+    rag_text_layer_max_chars: int = 1_000_000        # cap raw text-layer length (OOM guard on pathological PDFs)
+    # Schicht A field extractor (post_document_ingest consumer). Reads field_text,
+    # extracts identifiers (deterministic) + obligations (LLM), stores as atoms.
+    # Opt-in: the LLM obligation pass costs one classification call per ingest, and
+    # the obligation/alert layer that consumes these facts isn't wired yet.
+    schicht_a_extraction_enabled: bool = False
+    # Unified "Wissen" workspace (frontend). When on, the 6 corpus nav entries
+    # (knowledge/brain/review/fristen/memory/knowledge-graph) collapse into one
+    # /wissen workspace and the old routes redirect in. Off => legacy flat nav.
+    # Runtime flag (exposed via /api/config/features) so it flips without a rebuild.
+    wissen_workspace_enabled: bool = False
+    # Gates the chat command palette UI (`/`-trigger + touch button + overlay).
+    # Frontend-only gate; the backend `role_hint` handling is always present
+    # (no-op when absent), so flipping this needs no backend redeploy.
+    command_palette_enabled: bool = False
+    # Gates the chat agent-role badge (item 6): shows which agent role answered +
+    # lets the user pin a role for the next turn (reuses role_hint). Frontend-only
+    # gate; the backend always emits the resolved role on the done frame + persists
+    # it, so flipping this needs no backend redeploy.
+    role_surfacing_enabled: bool = False
+    # Gates the chat message-search UI (item 3): the search field in the
+    # conversations sidebar + the results list + jump-to-message. Frontend-only
+    # gate; the backend search route + the messages.search_vector column are
+    # always present (harmless when unused), so flipping this needs no backend
+    # redeploy. See docs/design/chat-ui-modernization.md.
+    message_search_enabled: bool = False
+    # Chat artifacts Lane A (typed table/list/keyvalue/chart rendered as real
+    # React components — zero model HTML, React's escape boundary is the security
+    # story). Gates BOTH the backend `artifact` WS frame emit and the frontend
+    # renderer (exposed via /api/config/features). Ships dark; flip without a
+    # rebuild. See docs/design/chat-artifacts-sandbox.md §8.
+    artifacts_typed_enabled: bool = False
+    # Chat room-handoff affordance (item 8): a quiet inline meta line in the chat
+    # thread when Media Follow moves the user's OWN playback to the room they just
+    # entered ("🔊 Wiedergabe folgt nach {room}"). Gates BOTH the backend
+    # `media_handoff` device-WS frame emit and the frontend indicator (exposed via
+    # /api/config/features). Reuses the existing presence/Media-Follow data — no
+    # new presence mechanism. Surfaces only the acting user's own location, routed
+    # to the same room audience as the existing follow info push (no privacy
+    # widening). Ships dark; flip without a rebuild.
+    room_handoff_enabled: bool = False
+    # Chat message branching (edit-and-fork, Phase 1). Gates the FORK affordances:
+    # the per-message edit/regenerate actions in the frontend (exposed via
+    # /api/config/features) AND whether the backend honors an inbound
+    # `fork_from_message_id` on a chat turn. The conversation TREE
+    # (messages.parent_message_id / conversations.active_leaf_message_id) and the
+    # active-path query are ALWAYS maintained regardless of this flag — the
+    # backfill makes flag-off byte-identical to pre-branching. Ships dark; flip
+    # without a rebuild. See docs/design/chat-ui-modernization.md.
+    chat_branching_enabled: bool = False
+    # Chat artifacts Lane B (free-form HTML/SVG in a sandboxed iframe). DEFERRED —
+    # NOT wired to anything in this delivery. Placeholder so the per-lane flag
+    # split (§8 Q5) exists; defaults off and requires its own security review
+    # before it is ever built/enabled. Do NOT enable.
+    artifacts_html_sandbox_enabled: bool = False
+    # Generic output-provider registry for room media/control routing. When on,
+    # room output discovery + dispatch route through the pluggable OutputProvider
+    # registry (built-in renfield/HA + MCP-declared dlna/samsung/sonos via the
+    # `output_provider:` stanza in mcp_servers.yaml) instead of the hardcoded
+    # 3-source branches. Off => byte-identical legacy routing. See
+    # docs/design/output-providers.md.
+    output_providers_enabled: bool = False
+    # Per-provider timeout (seconds) for the aggregated available-outputs discover
+    # fan-out. A provider that exceeds it is shown DEGRADED (not dropped).
+    output_provider_discover_timeout: float = 5.0
+    schicht_a_extraction_model: str = ""             # empty => ollama_chat_model || ollama_model
+    # Output-token cap for the obligation/universal LLM pass. The old fixed 1200
+    # cap (→ OpenAI max_tokens) silently truncated rich docs' JSON → unparseable
+    # → all LLM facts lost (doc 43: 1 vs 14). Output size tracks fact DENSITY, not
+    # doc size, so no fixed cap is safe. 0 = no cap: let the model generate to
+    # completion, bounded by the server context (verified: the densest real doc,
+    # an invoice, completes at ~3.2k chars well within context). Set >0 only to
+    # deliberately bound a misbehaving model. The parser also salvages a truncated
+    # tail as defense-in-depth.
+    schicht_a_extraction_num_predict: int = 0
 
     # Conversation Memory (Long-term)
     memory_enabled: bool = False                                             # Opt-in
@@ -422,6 +543,28 @@ class Settings(BaseSettings):
     skill_curator_min_uses_to_consider_stale: int = Field(default=3, ge=1, le=100)  # Avoid archiving rarely-tested skills
     skill_curator_max_merges_per_run: int = Field(default=20, ge=1, le=200)   # Safety cap
 
+    # KG entity reconciler (Structured Memory Phase 1, T5). Periodic per-user
+    # self-join over kg_entities embeddings: same-tier high-confidence dupes are
+    # auto-merged; cross-tier / gray-zone dupes become kg_merge_proposals for
+    # owner review (D3). Opt-in.
+    kg_reconciler_enabled: bool = False                                          # Master switch
+    kg_reconciler_interval: int = Field(default=86400, ge=300, le=604800)        # Seconds between runs (default 1d)
+    kg_reconciler_candidate_threshold: float = Field(default=0.85, ge=0.5, le=1.0)   # Cosine to consider a pair at all
+    kg_reconciler_auto_merge_threshold: float = Field(default=0.95, ge=0.5, le=1.0)  # Same-tier auto-merge bar (>= candidate)
+    kg_reconciler_max_per_run: int = Field(default=50, ge=1, le=500)             # Safety cap per user per run
+    kg_reconciler_embed_backfill_per_run: int = Field(default=50, ge=0, le=500)  # Re-embed up to N null-embedding entities per pass (#6); 0 disables
+    # KG conflation tripwire (read-only early warning, services/kg_conflation_monitor.py).
+    # Logs + gauges DISTINCT-name same-type pairs embedding >= threshold (a forming
+    # generic-centroid magnet); never mutates. Expected count: 0.
+    kg_conflation_monitor_enabled: bool = False                                  # Master switch (opt-in scheduled scan)
+    kg_conflation_monitor_interval: int = Field(default=86400, ge=300, le=604800)    # Seconds between scans (default 1d)
+    kg_conflation_monitor_threshold: float = Field(default=0.85, ge=0.5, le=1.0)     # Cosine at/above which a distinct-name same-type pair is flagged
+    kg_conflation_monitor_max_pairs: int = Field(default=100, ge=1, le=1000)         # Cap on pairs reported per user per scan
+    memory_kg_bridge_enabled: bool = False                                       # Phase 3: link memory subjects to canonical KG entities (save-time + entity-augmented retrieval). Opt-in.
+    memory_subsume_to_kg: bool = False                                           # Phase 3-subsume: decomposable facts (category=fact + subject) live in the KG only; skip the flat duplicate. Opt-in, aggressive.
+    memory_subsume_require_kg_relation: bool = True                              # Phase 3-subsume recall-loss REDUCER (subject-level proxy, NOT a per-fact guarantee): only drop the flat fact when the subject's person-entity already has >=1 relation — protects never-before-related subjects. A state/feeling fact about an already-related person is still subsumed-and-lost; per-fact fix is a TODOS follow-up. Off = legacy unguarded subsume. Does NOT make subsume multi-user-safe.
+    memory_retrieval_subject_union_limit: int = Field(default=5, ge=1, le=50)    # Phase 3c: max deterministic subject-linked memories merged into retrieval per turn
+
     # Skill draft-gate shadow log (v2.10 admin console rollout). When True,
     # SkillService.find_similar runs a parallel "would-have-injected" query
     # that relaxes the status='approved' filter, so we can measure how much
@@ -439,6 +582,11 @@ class Settings(BaseSettings):
     kg_retrieval_threshold: float = Field(default=0.70, ge=0.0, le=1.0)         # Context retrieval threshold
     kg_max_entities_per_user: int = Field(default=5000, ge=10, le=50000)         # Max active entities per user
     kg_max_context_triples: int = Field(default=15, ge=1, le=50)                 # Max triples injected into prompt
+    # Graph-expansion retrieval (Phase 4, post-RRF) — opt-in, off = byte-identical
+    graph_expansion_enabled: bool = False                                       # Walk 1-2 hops from fused kg_node pivots (post-RRF in PolymorphicAtomStore)
+    graph_expansion_max_pivots: int = Field(default=8, ge=1, le=50)             # Max fused kg_node pivots to expand from
+    graph_expansion_max_hops: int = Field(default=2, ge=1, le=3)               # Traversal depth
+    graph_expansion_max_expanded: int = Field(default=15, ge=1, le=100)        # Cap on added neighbour atoms (hub-flood guard)
 
     # Document Upload
     upload_dir: str = "/app/data/uploads"
@@ -450,6 +598,38 @@ class Settings(BaseSettings):
     chat_upload_retention_days: int = Field(default=30, ge=1, le=365)
     chat_upload_cleanup_enabled: bool = False
     chat_upload_email_account: str = "primary"
+
+    # Folder-ingest (watch-folder auto-ingest via renfield-mcp-filesystem).
+    # The dedicated Filesystem MCP pushes settled files to
+    # POST /api/folder-ingest/document; the backend never mounts the shares.
+    # The Bearer token lives in SystemSetting (revocable), not here. Owner/tier
+    # (D4) and the Paperless leg toggle are consumed in later tasks (T5/T6);
+    # the push route (T3) uses enabled + kb_name + target_user.
+    folder_ingest_enabled: bool = False
+    folder_ingest_kb_name: str = "Eingang"  # target KB; auto-created on first push
+    folder_ingest_target_user: str = ""  # owner username/id; empty → admin/first user
+    folder_ingest_default_tier: int = Field(default=0, ge=0, le=4)  # circle tier at create
+    folder_ingest_to_paperless: bool = True
+    folder_ingest_notify_on_filed: bool = True
+
+    # Email-mailbox auto-ingest (Phase 1; ships dark). The dedicated
+    # renfield-mcp-email-ingest watcher PUSHES attachments to
+    # POST /api/email-ingest/document; the backend owns the SPHERE routing here
+    # (server-authoritative — the watcher only sends a mailbox_id). Each entry:
+    #   {"id": "<stable mailbox id>", "owner": "<username|id|''>",
+    #    "tier": <0-4>, "kb": "<target KB name>"}
+    # Stored as a JSON STRING (EMAIL_INGEST_MAILBOXES_JSON, or the
+    # renfield-mcp-config ConfigMap) and parsed by the email_ingest_mailboxes
+    # property — graceful: a malformed value falls back to [] rather than
+    # crashing the backend at import (a raw list[dict] env would). An unknown
+    # mailbox_id on a push → failed (route).
+    email_ingest_enabled: bool = False
+    email_ingest_to_paperless: bool = True
+    email_ingest_mailboxes_json: str = ""
+    # Paperless cold-start confirm ramp: the first N archives show a metadata
+    # confirm; after N the system trusts itself and archives silently. 0 =
+    # never confirm (always silent). Tunable without a code change.
+    paperless_cold_start_confirm_n: int = Field(default=3, ge=0, le=100)
 
     # Federation (v2 — F5a depth + cycle detection)
     # Max number of federation hops a query can traverse before
@@ -508,6 +688,10 @@ class Settings(BaseSettings):
 
     # === Plugin / Extension System ===
     plugin_module: str = ""  # e.g. "renfield_twin.hooks:register"
+    # Comma-separated list of additional "module:callable" startup plugins,
+    # e.g. "renfield_twin.hooks:register,other_pkg.mod:init". Loaded in order
+    # after plugin_module; duplicates across both are deduped.
+    plugin_modules: str = ""
 
     # === Authentication ===
     # Set to True to enable authentication (default: False for development)
@@ -573,6 +757,30 @@ class Settings(BaseSettings):
     # WebSocket Security
     ws_auth_enabled: bool = False  # Enable WebSocket authentication (set True in production)
     ws_token_expire_minutes: int = 60  # WebSocket token expiration
+
+    # Security (review H1): comma-separated allowlist of satellite_ids permitted
+    # to receive per-person BLE IRKs (which permanently de-anonymize a resident's
+    # rotating BLE address — a location-tracking key). When non-empty, IRKs are
+    # pushed ONLY to listed satellites; when empty (default) the push is ungated
+    # for backward compatibility but logs a loud one-shot warning per satellite.
+    # NOTE: this is a stop-gap — the full fix is a per-satellite enrollment
+    # credential so a rogue LAN device can't register as a satellite at all.
+    satellite_irk_allowlist: str = ""
+
+    # Security (review H1, full fix): per-satellite enrollment credential. When
+    # enabled, a satellite must present its enrollment PSK in the register frame
+    # (verified constant-time against the bcrypt hash in the `satellites` table).
+    # Effective-mode state machine (see docs/private/security/satellite-trust-design.md):
+    #   - enabled=False (default): legacy — no PSK checks, byte-identical behavior.
+    #   - enabled=True, not enforcing (PERMISSIVE/soak): a presented PSK is
+    #     verified (wrong/unknown/revoked → reject); no PSK → allowed but logged
+    #     unenrolled; IRKs pushed ONLY to verified-enrolled satellites.
+    #   - ENFORCING (auto-flip latched): no valid PSK → reject.
+    satellite_enrollment_enabled: bool = False
+    # Auto-flip PERMISSIVE→ENFORCING once EVERY enrolled satellite row has
+    # authenticated at least once (not just currently-connected ones), then
+    # latch it persistently. Default off until the fleet is fully enrolled.
+    satellite_enrollment_autoflip_enabled: bool = False
 
     # WebSocket Rate Limiting
     # Note: Audio streaming sends ~12.5 chunks/second, so limits must accommodate this
@@ -650,6 +858,35 @@ class Settings(BaseSettings):
     proactive_reminders_enabled: bool = False
     proactive_reminder_check_interval: int = 15        # Sekunden
 
+    # Obligation-deadline notifier (Schicht A). Daily idempotent scan over
+    # document_facts (obligations are the scheduling source of truth) →
+    # owner-targeted lead-time reminders + a (fact, milestone) notified-ledger.
+    # Opt-in; delivery degrades gracefully if proactive_enabled is off.
+    obligation_notifier_enabled: bool = False
+    obligation_notifier_interval: int = 86400          # daily (seconds)
+    obligation_notifier_overdue_grace_days: int = 30   # still fire "overdue" within this window
+
+    # Weekly obligation digest — the safety floor under the per-milestone
+    # notifier. One owner-targeted summary per ISO week of every OPEN obligation
+    # (no lower date bound), so a late-extracted / very-overdue deadline the
+    # notifier's grace window missed still surfaces. Opt-in; also needs
+    # proactive_enabled (delivery runs through the proactive subsystem).
+    obligation_digest_enabled: bool = False
+    obligation_digest_interval: int = 604800           # weekly (seconds)
+    obligation_digest_horizon_days: int = 30           # include upcoming within N days (overdue always included)
+
+    # Obligation → calendar auto-push (Calendar MCP). Per-user, opt-in: only
+    # users who set a calendar preference get their open obligations mirrored as
+    # calendar events (create/update/delete reconciler). Needs the calendar MCP
+    # (CALENDAR_ENABLED) reachable; degrades gracefully if not. Events are timed
+    # at obligation_calendar_event_hour (all-day not supported by the MCP).
+    obligation_calendar_sync_enabled: bool = False
+    obligation_calendar_sync_interval: int = 86400     # daily (seconds)
+    obligation_calendar_event_hour: int = 9            # local hour for the (timed) event
+    obligation_calendar_horizon_days: int = 90         # sync obligations due within N days
+    obligation_calendar_retain_past_days: int = 30     # keep past-due events this long before cleanup
+    obligation_calendar_max_ops_per_run: int = 100     # cap create/update MCP calls per user per pass
+
     @property
     def features(self) -> dict[str, bool]:
         """Resolve feature flags: explicit override > edition preset."""
@@ -672,6 +909,25 @@ class Settings(BaseSettings):
     def allowed_extensions_list(self) -> list[str]:
         """Gibt allowed_extensions als Liste zurück"""
         return [ext.strip().lower() for ext in self.allowed_extensions.split(",")]
+
+    @property
+    def email_ingest_mailboxes(self) -> list[dict]:
+        """Parsed email-ingest routing table from ``email_ingest_mailboxes_json``.
+        Graceful: a malformed JSON value logs + falls back to ``[]`` so a config
+        typo can't crash the backend at import (a typed ``list[dict]`` env would).
+        """
+        raw = (self.email_ingest_mailboxes_json or "").strip()
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("email_ingest_mailboxes_json is not valid JSON; using []")
+            return []
+        if not isinstance(data, list):
+            logger.warning("email_ingest_mailboxes_json is not a JSON list; using []")
+            return []
+        return [e for e in data if isinstance(e, dict)]
 
     @property
     def supported_languages_list(self) -> list[str]:
@@ -767,6 +1023,38 @@ class Settings(BaseSettings):
                 f"default: {', '.join(offenders)}. Set them via env vars "
                 "(POSTGRES_PASSWORD, SECRET_KEY, DEFAULT_ADMIN_PASSWORD) or "
                 "Docker Secrets."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def fail_closed_on_insecure_jwt_key(self) -> "Settings":
+        """Security (review M1): refuse to boot when JWT auth is enabled but the
+        signing key is still the in-repo placeholder default.
+
+        A WARNING is insufficient for this case: the placeholder is public (it
+        ships in the repo), so with AUTH_ENABLED=true anyone can forge a valid
+        admin JWT (HS256 over the known key) — a full auth bypass. This check is
+        independent of RENFIELD_ENV (closing the "forgot to set it" gap) and only
+        fires when auth is actually on, so AUTH_ENABLED=false single-user /
+        household deployments and dev/test are unaffected.
+        """
+        if not self.auth_enabled:
+            return self
+        field_info = type(self).model_fields.get("secret_key")
+        placeholder = field_info.default if field_info else None
+        if isinstance(placeholder, SecretStr):
+            placeholder = placeholder.get_secret_value()
+        current = (
+            self.secret_key.get_secret_value()
+            if isinstance(self.secret_key, SecretStr)
+            else self.secret_key
+        )
+        if placeholder is not None and current == placeholder:
+            raise ValueError(
+                "SECRET_KEY is still the placeholder default while "
+                "AUTH_ENABLED=true — refusing to start. The default key is public "
+                "(it ships in the repo), so anyone could forge an admin JWT. Set "
+                "SECRET_KEY to a strong random value (env var or Docker secret)."
             )
         return self
 

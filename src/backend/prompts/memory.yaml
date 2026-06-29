@@ -22,8 +22,27 @@ de:
     User: {user_message}
     Assistent: {assistant_response}
 
+    WICHTIG — SUBJEKT: "subject" ist der EIGENNAME der Person/Entitaet, ueber die
+    der Fakt handelt — aber NUR wenn dieser Name im Dialog vorkommt. Regeln:
+    - Nur echte Eigennamen ("Jutta", "Tom"). NIEMALS Pronomen ("sie", "er", "es")
+      oder Rollen-/Beziehungsfloskeln ("meine Frau", "mein Bruder", "der Benutzer")
+      als subject. Liegt nur ein Pronomen oder eine Rolle OHNE Namen vor → subject: null.
+    - Fakt ueber den Sprecher selbst oder allgemein/aufgabenbezogen → subject: null.
+    - Fuehrt ein Fakt einen Namen ein ("Meine Frau heisst Jutta", "mein Bruder Tom"),
+      ist dieser Name das subject (Jutta bzw. Tom).
+    - Gilt fuer JEDE benannte Person, auch wenn sie nicht zum Sprecher gehoert:
+      "Anna wohnt in Bonn" → subject "Anna".
+    - Ein Fakt, ein Subjekt — nie mehrere Personen in einem Eintrag mischen.
+
+    BEISPIELE (nur zur Veranschaulichung des subject-Felds):
+    - "Anna wohnt in Bonn und mag Jazz." → [{{"content":"Wohnt in Bonn","subject":"Anna","category":"fact","importance":0.5}}, {{"content":"Mag Jazz","subject":"Anna","category":"preference","importance":0.5}}]
+    - "Meine Frau heisst Jutta und mag Jazz." → [{{"content":"Heisst Jutta","subject":"Jutta","category":"fact","importance":0.6}}, {{"content":"Mag Jazz","subject":"Jutta","category":"preference","importance":0.5}}]
+    - "Meine Frau ist Fan von Beachvolleyball." (kein Name) → [{{"content":"Ehefrau ist Fan von Beachvolleyball","subject":null,"category":"fact","importance":0.5}}]
+    - "Sie mag uebrigens Tennis." (nur Pronomen) → [{{"content":"Mag Tennis","subject":null,"category":"preference","importance":0.4}}]
+    - "Ich heisse Max." → [{{"content":"Heisst Max","subject":null,"category":"fact","importance":0.7}}]
+
     Antwort als JSON-Array (leeres Array [] wenn nichts erinnerungswuerdig):
-    [{{"content": "...", "category": "preference|fact|instruction|context", "importance": 0.1-1.0}}]
+    [{{"content": "...", "subject": "<Name> oder null", "category": "preference|fact|instruction|context", "importance": 0.1-1.0}}]
 
   extraction_system: "Du extrahierst Fakten aus Dialogen. Antworte NUR mit einem JSON-Array."
 
@@ -193,8 +212,27 @@ en:
     User: {user_message}
     Assistant: {assistant_response}
 
+    IMPORTANT — SUBJECT: "subject" is the PROPER NAME of the person/entity the
+    fact is ABOUT — but ONLY if that name appears in the dialog. Rules:
+    - Real proper names only ("Jutta", "Tom"). NEVER a pronoun ("she", "he", "it")
+      or a role/relationship phrase ("my wife", "my brother", "the user") as the
+      subject. If only a pronoun or a role (no name) is present → subject: null.
+    - Fact about the speaker themselves, or general/task facts → subject: null.
+    - If a fact introduces a name ("My wife is called Jutta", "my brother Tom"),
+      that name is the subject (Jutta / Tom).
+    - Applies to ANY named person, even one unrelated to the speaker:
+      "Anna lives in Bonn" → subject "Anna".
+    - One fact, one subject — never mix multiple people in one entry.
+
+    EXAMPLES (illustrating the subject field only):
+    - "Anna lives in Bonn and likes jazz." → [{{"content":"Lives in Bonn","subject":"Anna","category":"fact","importance":0.5}}, {{"content":"Likes jazz","subject":"Anna","category":"preference","importance":0.5}}]
+    - "My wife is called Jutta and likes jazz." → [{{"content":"Is called Jutta","subject":"Jutta","category":"fact","importance":0.6}}, {{"content":"Likes jazz","subject":"Jutta","category":"preference","importance":0.5}}]
+    - "My wife is a beach volleyball fan." (no name) → [{{"content":"Wife is a beach volleyball fan","subject":null,"category":"fact","importance":0.5}}]
+    - "She also likes tennis." (pronoun only) → [{{"content":"Likes tennis","subject":null,"category":"preference","importance":0.4}}]
+    - "My name is Max." → [{{"content":"Name is Max","subject":null,"category":"fact","importance":0.7}}]
+
     Reply as JSON array (empty array [] if nothing memorable):
-    [{{"content": "...", "category": "preference|fact|instruction|context", "importance": 0.1-1.0}}]
+    [{{"content": "...", "subject": "<name> or null", "category": "preference|fact|instruction|context", "importance": 0.1-1.0}}]
 
   extraction_system: "You extract facts from dialogs. Reply ONLY with a JSON array."
 

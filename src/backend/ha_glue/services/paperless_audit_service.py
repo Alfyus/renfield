@@ -10,15 +10,19 @@ calls MCP tools for all Paperless interactions.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import Float, and_, cast, func, or_, select
 
 from utils.config import settings
 from ha_glue.utils.config import ha_glue_settings
@@ -27,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 # Content length limit for LLM analysis (avoid huge prompts)
 _MAX_CONTENT_LENGTH = 3000
+
+# A document counts as "low-quality OCR" if the latest ingest attempt dropped
+# at least this fraction of its chunks at the quality gate. 30% = a clearly
+# degraded scan, not just a single bad page in a long document.
+_LOW_QUALITY_DROP_RATIO = 0.30
 
 
 class PaperlessAuditService:
@@ -39,6 +48,8 @@ class PaperlessAuditService:
         self._running = False
         self._progress = {"current": 0, "total": 0, "current_doc_id": None}
         self._cancel_requested = False
+        # Lazily created on first local re-OCR (mirrors PaperlessMetadataExtractor).
+        self._document_processor = None
 
     async def start(self):
         """Start only if Paperless MCP server is available."""
@@ -613,10 +624,23 @@ class PaperlessAuditService:
         return {"skipped": count}
 
     async def reprocess_documents(self, result_ids: list[int]) -> dict:
-        """Trigger re-OCR for specific results via MCP."""
+        """Re-OCR documents with Renfield's local stack, writing the cleaned
+        text back into Paperless.
+
+        For each result: download the original via MCP, run the local
+        DocumentProcessor with forced full-page OCR (the same engine + garbled
+        recovery a KB ingest uses), and — if the result scores at least as well
+        as the stored content — PATCH Paperless's ``content``. When local OCR
+        can't beat the current text, or anything fails, fall back to
+        Paperless-NGX's own ``reprocess``.
+
+        Returns counts: ``improved`` (written back locally), ``fallback``
+        (delegated to Paperless), ``failed``.
+        """
         from models.database import PaperlessAuditResult
 
-        triggered = 0
+        improved = 0
+        fallback = 0
         failed = 0
 
         async with self._db_factory() as db:
@@ -626,16 +650,328 @@ class PaperlessAuditService:
             results = (await db.execute(stmt)).scalars().all()
 
         for result in results:
-            mcp_result = await self._mcp.execute_tool(
-                "mcp.paperless.reprocess_document",
-                {"document_id": result.paperless_doc_id},
-            )
-            if mcp_result.get("success"):
-                triggered += 1
+            outcome = await self._local_reocr(result)
+            if outcome == "improved":
+                improved += 1
+            elif outcome == "fallback":
+                fallback += 1
             else:
                 failed += 1
 
-        return {"triggered": triggered, "failed": failed}
+        # Keep the legacy "triggered" key (improved + fallback both kicked off
+        # a re-OCR) so existing callers/UI counters keep working.
+        return {
+            "triggered": improved + fallback,
+            "improved": improved,
+            "fallback": fallback,
+            "failed": failed,
+        }
+
+    async def _local_reocr(self, result) -> str:
+        """Re-OCR one audited document locally and write the text back.
+
+        Returns ``"improved"`` (local OCR written back to Paperless),
+        ``"fallback"`` (delegated to Paperless-native reprocess), or
+        ``"failed"``.
+        """
+        doc_id = result.paperless_doc_id
+
+        # 1. Download the original bytes via MCP. truncate=False is essential:
+        #    the base64 file payload is far larger than the LLM-oriented
+        #    response cap, and the generic truncator would byte-cut it
+        #    mid-payload into unparseable JSON (the download is for our OCR
+        #    pipeline, not the LLM context).
+        dl = await self._mcp.execute_tool(
+            "mcp.paperless.download_document",
+            {"document_id": doc_id},
+            truncate=False,
+        )
+        parsed = self._parse_mcp_result(dl) if dl.get("success") else None
+        b64 = (parsed or {}).get("content_base64")
+        if not b64:
+            logger.warning(
+                f"re-OCR: download failed for doc {doc_id} — "
+                "falling back to Paperless reprocess"
+            )
+            return await self._paperless_reprocess(doc_id)
+
+        # 2. Local quality-aware OCR on a temp file (forced full-page OCR:
+        #    the stored content is what the user flagged as suspect).
+        suffix = Path((parsed or {}).get("filename") or f"doc_{doc_id}.pdf").suffix or ".pdf"
+        tmp_path = None
+        new_text = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(base64.b64decode(b64))
+            if self._document_processor is None:
+                from services.document_processor import DocumentProcessor
+                self._document_processor = DocumentProcessor()
+            new_text = await self._document_processor.extract_text_only(
+                tmp_path, max_chars=1_000_000, force_ocr=True,
+            )
+        except Exception as e:
+            logger.error(f"re-OCR: local extraction failed for doc {doc_id}: {e}")
+            return await self._paperless_reprocess(doc_id)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        # 3. Only write back if the local OCR is non-empty and STRICTLY better
+        #    than the stored content. Forcing full-page OCR on an already-good
+        #    text layer re-rasterizes it and can regress quality without
+        #    lowering the coarse 1-5 score; requiring a strict improvement
+        #    means equal-score (incl. already-clean native text) is left
+        #    untouched and delegated to Paperless instead of being clobbered.
+        from utils.ocr_quality import score_ocr_quality
+
+        new_score, new_issues = score_ocr_quality(new_text) if new_text else (1, "No/minimal OCR text")
+        old_score = result.ocr_quality or 1
+        if not new_text or new_score <= old_score:
+            logger.info(
+                f"re-OCR: local result for doc {doc_id} not better "
+                f"(new={new_score} vs old={old_score}) — falling back to Paperless reprocess"
+            )
+            return await self._paperless_reprocess(doc_id)
+
+        upd = await self._mcp.execute_tool(
+            "mcp.paperless.update_document",
+            {"document_id": doc_id, "content": new_text},
+        )
+        if not upd.get("success"):
+            logger.error(
+                f"re-OCR: content write-back failed for doc {doc_id}: {upd.get('message')}"
+            )
+            return "failed"
+
+        # 4. Reflect the improved quality on the audit row.
+        async with self._db_factory() as db:
+            from models.database import PaperlessAuditResult
+
+            row = (await db.execute(
+                select(PaperlessAuditResult).where(PaperlessAuditResult.id == result.id)
+            )).scalar_one_or_none()
+            if row:
+                row.ocr_quality = new_score
+                row.ocr_issues = new_issues
+                await db.commit()
+
+        logger.info(f"re-OCR: wrote local OCR back to Paperless doc {doc_id} (quality {new_score})")
+        return "improved"
+
+    async def _paperless_reprocess(self, doc_id: int) -> str:
+        """Trigger Paperless-NGX's own OCR reprocess (fallback).
+
+        Returns ``"fallback"`` on success, ``"failed"`` otherwise.
+        """
+        res = await self._mcp.execute_tool(
+            "mcp.paperless.reprocess_document", {"document_id": doc_id}
+        )
+        return "fallback" if res.get("success") else "failed"
+
+    # ------------------------------------------------------------------
+    # Low-quality OCR signal (Admin UX for low-quality OCR documents)
+    # ------------------------------------------------------------------
+    #
+    # A renfield Document qualifies as "low-quality OCR" if EITHER:
+    #   1. status='failed' AND error_message LIKE 'ocr_quality%'  (the ingest
+    #      pipeline rejected it outright on quality grounds), OR
+    #   2. its LATEST document_processing_history row dropped >= 30% of chunks
+    #      at the quality gate:
+    #          dropped / NULLIF(produced + dropped, 0) >= 0.30
+    #
+    # "Latest" = highest started_at, tie-break highest id.
+    #
+    # The audit table keys on the Paperless-external paperless_doc_id; the
+    # signal lives on the renfield-internal Document, joined via
+    # Document.paperless_document_id == PaperlessAuditResult.paperless_doc_id.
+    # This is a LEFT relationship: Paperless-only docs (never ingested into the
+    # renfield KB) have NO Document row, so they are simply absent from the
+    # qualifying set / lookup map (no badge).
+
+    @staticmethod
+    def _latest_history_subquery():
+        """Subquery: the id of the LATEST processing-history row per document.
+
+        Latest = highest started_at, tie-break highest id. Implemented with a
+        DISTINCT ON over (document_id) ordered by started_at DESC, id DESC —
+        Postgres-native and index-friendly. Returns a subquery selecting
+        (document_id, latest_history_id) — one row per document that has any
+        history.
+        """
+        from models.database import DocumentProcessingHistory as _DPH
+
+        return (
+            select(
+                _DPH.document_id.label("document_id"),
+                _DPH.id.label("history_id"),
+            )
+            .distinct(_DPH.document_id)
+            .order_by(
+                _DPH.document_id,
+                _DPH.started_at.desc(),
+                _DPH.id.desc(),
+            )
+            .subquery()
+        )
+
+    @classmethod
+    def _qualifying_doc_ids_subquery(cls):
+        """Scalar subquery of paperless_document_ids whose renfield Document is
+        low-quality OCR (signal 1 OR signal 2). Used to restrict / count the
+        audit page when ``low_quality_only`` is set.
+
+        Only documents with a non-null ``paperless_document_id`` can match an
+        audit row, so they are the only ones selected.
+        """
+        from models.database import Document
+        from models.database import DocumentProcessingHistory as _DPH
+
+        latest = cls._latest_history_subquery()
+
+        produced = func.coalesce(_DPH.chunks_produced, 0)
+        dropped = func.coalesce(_DPH.chunks_dropped_low_quality, 0)
+        denom = func.nullif(produced + dropped, 0)
+        # dropped / denom >= ratio. denom NULL (no chunks at all) → comparison
+        # is NULL → not selected, which is the correct behavior.
+        drop_ratio_qualifies = (
+            cast(dropped, Float) / denom
+        ) >= _LOW_QUALITY_DROP_RATIO
+
+        return (
+            select(Document.paperless_document_id)
+            .select_from(Document)
+            .outerjoin(latest, latest.c.document_id == Document.id)
+            .outerjoin(_DPH, _DPH.id == latest.c.history_id)
+            .where(Document.paperless_document_id.isnot(None))
+            .where(
+                or_(
+                    and_(
+                        Document.status == "failed",
+                        Document.error_message.like("ocr_quality%"),
+                    ),
+                    drop_ratio_qualifies,
+                )
+            )
+        )
+
+    async def _low_quality_lookup(self, db, paperless_doc_ids: list[int]) -> dict:
+        """Batch-resolve the low-quality-OCR signal for a page of audit rows.
+
+        ONE query (no N+1): joins Document (by paperless_document_id IN (...))
+        to its latest processing-history row, computing the signal per
+        paperless_doc_id.
+
+        Returns a dict keyed by paperless_doc_id → {
+            renfield_document_id, low_quality_ocr, chunks_dropped,
+            chunks_total, quality_ignored
+        }. Paperless-only docs (no Document row) are simply absent from the map
+        — callers default to the null/false shape.
+        """
+        if not paperless_doc_ids:
+            return {}
+
+        from models.database import Document
+        from models.database import DocumentProcessingHistory as _DPH
+
+        latest = self._latest_history_subquery()
+
+        rows = (
+            await db.execute(
+                select(
+                    Document.paperless_document_id,
+                    Document.id,
+                    Document.status,
+                    Document.error_message,
+                    Document.quality_ignored,
+                    _DPH.chunks_produced,
+                    _DPH.chunks_dropped_low_quality,
+                )
+                .select_from(Document)
+                .outerjoin(latest, latest.c.document_id == Document.id)
+                .outerjoin(_DPH, _DPH.id == latest.c.history_id)
+                .where(Document.paperless_document_id.in_(paperless_doc_ids))
+            )
+        ).all()
+
+        lookup: dict[int, dict] = {}
+        for pdoc_id, doc_id, status, err, ignored, produced, dropped in rows:
+            # A single paperless_doc_id could in theory map to >1 renfield
+            # Document (different KBs). If any maps low-quality, the badge
+            # shows; keep the first non-null counts seen. We resolve
+            # deterministically by keeping the qualifying row if one exists.
+            produced_i = produced if produced is not None else None
+            dropped_i = dropped if dropped is not None else None
+            total = None
+            if produced_i is not None or dropped_i is not None:
+                total = (produced_i or 0) + (dropped_i or 0)
+
+            failed_signal = status == "failed" and bool(
+                err and err.startswith("ocr_quality")
+            )
+            drop_signal = (
+                total is not None
+                and total > 0
+                and (dropped_i or 0) / total >= _LOW_QUALITY_DROP_RATIO
+            )
+            entry = {
+                "renfield_document_id": doc_id,
+                "low_quality_ocr": failed_signal or drop_signal,
+                "chunks_dropped": dropped_i,
+                "chunks_total": total,
+                "quality_ignored": bool(ignored),
+            }
+            existing = lookup.get(pdoc_id)
+            # Prefer a qualifying entry over a non-qualifying one.
+            if existing is None or (
+                entry["low_quality_ocr"] and not existing["low_quality_ocr"]
+            ):
+                lookup[pdoc_id] = entry
+        return lookup
+
+    async def set_quality_ignored(
+        self, result_ids: list[int], ignored: bool
+    ) -> dict:
+        """Set/clear ``quality_ignored`` on the renfield Documents backing the
+        given audit results. Called from the admin API.
+
+        Resolves audit results → their paperless_doc_ids → Document rows (by
+        paperless_document_id), flips the flag, commits. Audit rows whose
+        paperless_doc_id has no matching renfield Document are silently skipped
+        (only updated docs are counted).
+        """
+        from models.database import Document, PaperlessAuditResult
+
+        if not result_ids:
+            return {"updated": 0}
+
+        async with self._db_factory() as db:
+            paperless_ids = (
+                await db.execute(
+                    select(PaperlessAuditResult.paperless_doc_id).where(
+                        PaperlessAuditResult.id.in_(result_ids)
+                    )
+                )
+            ).scalars().all()
+            paperless_ids = [p for p in paperless_ids if p is not None]
+            if not paperless_ids:
+                return {"updated": 0}
+
+            docs = (
+                await db.execute(
+                    select(Document).where(
+                        Document.paperless_document_id.in_(paperless_ids)
+                    )
+                )
+            ).scalars().all()
+
+            updated = 0
+            for doc in docs:
+                doc.quality_ignored = ignored
+                updated += 1
+
+            await db.commit()
+            return {"updated": updated}
 
     # Columns allowed for sorting
     _SORTABLE_COLUMNS = {
@@ -661,12 +997,27 @@ class PaperlessAuditService:
         sort_by: str | None = None,
         sort_order: str = "desc",
         search: str | None = None,
+        low_quality_only: bool | None = None,
     ) -> dict:
-        """Get paginated audit results with sorting and search."""
+        """Get paginated audit results with sorting and search.
+
+        Each result dict is enriched with the low-quality-OCR signal
+        (``low_quality_ocr``/``chunks_dropped``/``chunks_total``/
+        ``quality_ignored``/``renfield_document_id``) resolved in ONE batch
+        query per page. When ``low_quality_only`` is set the page (and count)
+        is restricted to audit rows whose document qualifies as low-quality.
+        """
         from models.database import PaperlessAuditResult
 
         async with self._db_factory() as db:
             query = select(PaperlessAuditResult)
+
+            if low_quality_only:
+                query = query.where(
+                    PaperlessAuditResult.paperless_doc_id.in_(
+                        self._qualifying_doc_ids_subquery()
+                    )
+                )
 
             if status:
                 query = query.where(PaperlessAuditResult.status == status)
@@ -715,13 +1066,49 @@ class PaperlessAuditService:
             query = query.offset((page - 1) * per_page).limit(per_page)
             results = (await db.execute(query)).scalars().all()
 
+            # Batch-resolve the low-quality-OCR signal for this page (one query).
+            lookup = await self._low_quality_lookup(
+                db, [r.paperless_doc_id for r in results]
+            )
+
+            dicts = []
+            for r in results:
+                d = self._result_to_dict(r)
+                self._inject_low_quality(d, lookup.get(r.paperless_doc_id))
+                dicts.append(d)
+
             return {
-                "results": [self._result_to_dict(r) for r in results],
+                "results": dicts,
                 "total": total,
                 "page": page,
                 "per_page": per_page,
                 "pages": (total + per_page - 1) // per_page,
             }
+
+    @staticmethod
+    def _inject_low_quality(result_dict: dict, signal: dict | None) -> None:
+        """Merge the low-quality-OCR signal into a result dict in place.
+
+        ``signal`` is the per-paperless_doc_id entry from
+        ``_low_quality_lookup`` (or None for Paperless-only docs with no
+        renfield Document — they get the null/false default shape, no badge).
+        """
+        if signal is None:
+            result_dict.update(
+                renfield_document_id=None,
+                low_quality_ocr=False,
+                chunks_dropped=None,
+                chunks_total=None,
+                quality_ignored=False,
+            )
+        else:
+            result_dict.update(
+                renfield_document_id=signal["renfield_document_id"],
+                low_quality_ocr=signal["low_quality_ocr"],
+                chunks_dropped=signal["chunks_dropped"],
+                chunks_total=signal["chunks_total"],
+                quality_ignored=signal["quality_ignored"],
+            )
 
     async def get_result_by_id(self, result_id: int) -> dict | None:
         """Get a single audit result."""
@@ -1005,35 +1392,17 @@ class PaperlessAuditService:
 
     @staticmethod
     def _check_ocr_quality(content: str) -> tuple[int, str]:
-        """Rate OCR quality 1-5 based on heuristics."""
-        if not content or len(content.strip()) < 20:
-            return 1, "No/minimal OCR text"
+        """Thin delegate to the shared ``utils.ocr_quality.score_ocr_quality``.
 
-        issues = []
-
-        # Check space ratio (garbled text has very few spaces)
-        space_ratio = content.count(" ") / len(content)
-        if space_ratio < 0.03:
-            issues.append("Very few spaces (garbled)")
-
-        # Check for repeated characters
-        if re.search(r'(.)\1{5,}', content):
-            issues.append("Repeated characters")
-
-        # Check alphanumeric ratio
-        alnum = sum(c.isalnum() or c.isspace() for c in content)
-        if alnum / len(content) < 0.6:
-            issues.append("High special char ratio")
-
-        # Check for very short lines (fragmented OCR)
-        lines = [line for line in content.split('\n') if line.strip()]
-        if lines:
-            avg_line_len = sum(len(line) for line in lines) / len(lines)
-            if avg_line_len < 10 and len(lines) > 5:
-                issues.append("Fragmented text (very short lines)")
-
-        score = max(1, 5 - len(issues))
-        return score, "; ".join(issues) or "OK"
+        The heuristic moved into ``utils/ocr_quality.py`` (shared with the
+        ingest pipeline's garbled-layer gate). The old ``(.)\\1{5,}``
+        "Repeated characters" rule was dropped entirely — measured 0 true
+        positives on the real corpus (only formatting, redaction masks, and
+        zero-padding). Garbling is caught by the space/special-char/
+        fragmentation signals instead.
+        """
+        from utils.ocr_quality import score_ocr_quality
+        return score_ocr_quality(content)
 
     @staticmethod
     def _check_missing_fields(doc: dict) -> list[str]:

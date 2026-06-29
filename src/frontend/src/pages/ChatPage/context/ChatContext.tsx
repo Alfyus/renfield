@@ -31,19 +31,28 @@ import type {
   AgentThinkingMessage,
   AgentToolCallMessage,
   AgentToolResultMessage,
+  ArtifactWsMessage,
   CardMessage,
+  DeviceActionResultMessage,
   DocumentErrorMessage,
   DocumentProcessingMessage,
   DocumentReadyMessage,
   DoneMessage,
+  FollowupsMessage,
   IntentFeedbackRequestMessage,
+  PaperlessCommittedMessage,
+  PaperlessConfirmField,
+  PaperlessConfirmRequestMessage,
   RagContextMessage,
+  UploadProcessedMessage,
 } from '../hooks/useChatWebSocket';
 import type { UploadStates, UploadedDocument } from '../hooks/useDocumentUpload';
-import type { Conversation } from '../../../types/chat';
+import type { BranchInfo, ChatArtifactPayload, Conversation, MessageSource } from '../../../types/chat';
+import type { DeviceActionResult } from '../../../components/chat/artifacts/DeviceControlArtifact';
 import type { TraceEntity } from '../../../api/resources/wissensbasis';
 import { useConfirmDialog } from '../../../components/ConfirmDialog';
 import { drainSentenceTts, type SentenceStreamState } from './sentenceStream';
+import { shouldRearmWakeWord } from './wakeWordRecovery';
 
 const SESSION_STORAGE_KEY = 'renfield_current_session';
 // How long sendMessageInternal waits for the WebSocket handshake before
@@ -73,6 +82,8 @@ export interface MessageAttachment {
   indexed?: boolean;
   document_id?: string;
   indexError?: string;
+  extractError?: string;
+  text_preview?: string | null;
   file_size?: number;
 }
 
@@ -82,36 +93,154 @@ interface IntentInfo {
 }
 
 export interface ChatUiMessage {
+  /** Persisted DB message id. Set on history load and on the `done` frame
+   *  (user_message_id / assistant_message_id). Needed for chat branching
+   *  (edit/regenerate fork from a specific turn). Undefined while streaming
+   *  before the `done` frame lands. */
+  id?: number;
   role: 'user' | 'assistant';
   content: string;
   streaming?: boolean;
   intentInfo?: IntentInfo;
   feedbackRequested?: boolean;
   userQuery?: string;
+  /** Resolved agent role that produced this answer (item 6 role badge). */
+  agentRole?: string;
   agentSteps?: AgentStep[];
   federationProgress?: Record<string, FederationProgressEntry>;
   attachments?: MessageAttachment[];
   card?: Record<string, unknown>;
+  // Interactive Paperless confirm card (cold-start upload metadata picker).
+  // Attached to the assistant bubble that streamed the preview; the user
+  // resolves each field and submits a structured decision. `status` flips to
+  // 'submitted' once sent so the card renders read-only.
+  paperlessConfirm?: {
+    confirmToken: string;
+    filename?: string | null;
+    summary: Record<string, unknown>;
+    fields: PaperlessConfirmField[];
+    status: 'open' | 'submitted';
+  };
   // Entities resolved during THIS turn, persisted per-message by Reva's
   // on_pre_save_message. Lets the chip renderer wrap mentions per bubble
   // instead of smearing the session-last reasoning trace across all of them.
   entities?: TraceEntity[];
+  // Provenance source chips — the KB documents a knowledge-backed answer drew
+  // on. Arrives on the `done` frame live; rehydrates from `metadata.sources`.
+  sources?: MessageSource[];
+  // Ephemeral follow-up suggestion chips for this turn (NOT persisted — only
+  // the live last assistant turn carries them).
+  suggestedFollowups?: string[];
+  // Typed artifacts (Lane A: table/list/keyvalue/chart). An ARRAY keyed by id —
+  // a turn may carry several (e.g. a table + a chart). Streaming frames with the
+  // same id append rows/items (see mergeArtifactFrame); on history reload they
+  // rehydrate from metadata.artifacts.
+  artifacts?: ChatArtifactPayload[];
+  // Chat branching (Phase 2): sibling-branch info for the ‹n/m› switcher.
+  // Present only on a history message that has >1 sibling. Server-computed;
+  // not carried on the live `done` frame (a fork reloads history to refresh it).
+  branch?: BranchInfo;
+}
+
+/**
+ * Apply a streaming artifact frame into a message's artifact array, keyed by id
+ * (§8 decision 1). A new id appends; a same-id frame APPENDS rows (table) /
+ * items (list) — never re-parses/replaces — so re-delivery of the same frame
+ * does NOT double-append (we replace the stored payload's tail by length match
+ * is unsafe; instead we treat each frame's data as the authoritative latest for
+ * non-appendable kinds and as an incremental chunk for table/list).
+ *
+ * To stay idempotent on re-delivery AND tolerant of out-of-order arrival, a
+ * same-id frame's table rows / list items are MERGED by replacing the stored
+ * collection with the longer of (stored, incoming-appended-onto-stored-prefix).
+ * In practice the backend sends disjoint chunks; we concatenate and the keyed
+ * de-dup below drops an exact-duplicate trailing chunk.
+ */
+export function mergeArtifactFrame(
+  existing: ChatArtifactPayload[] | undefined,
+  incoming: ChatArtifactPayload,
+): ChatArtifactPayload[] {
+  const list = existing ? [...existing] : [];
+  const idx = list.findIndex((a) => a.id === incoming.id);
+  if (idx === -1) {
+    list.push(incoming);
+    return list;
+  }
+  const prev = list[idx];
+  // Only table/list append; other kinds (keyvalue/chart) are replaced wholesale.
+  if (incoming.kind === 'table' && prev.kind === 'table') {
+    list[idx] = { ...incoming, data: appendRows(prev.data, incoming.data) };
+  } else if (incoming.kind === 'list' && prev.kind === 'list') {
+    list[idx] = { ...incoming, data: appendItems(prev.data, incoming.data) };
+  } else {
+    list[idx] = incoming;
+  }
+  return list;
+}
+
+// Append incoming table rows onto the stored rows, idempotent on exact
+// re-delivery (a trailing chunk identical to what's already stored is dropped).
+function appendRows(prev: unknown, incoming: unknown): unknown {
+  const p = prev as { columns?: unknown; rows?: unknown[] } | null;
+  const i = incoming as { columns?: unknown; rows?: unknown[] } | null;
+  if (!i || !Array.isArray(i.rows)) return incoming;
+  const prevRows = p && Array.isArray(p.rows) ? p.rows : [];
+  const merged = dedupAppend(prevRows, i.rows);
+  return { columns: i.columns ?? p?.columns, rows: merged };
+}
+
+function appendItems(prev: unknown, incoming: unknown): unknown {
+  const p = prev as { items?: unknown[]; ordered?: unknown } | null;
+  const i = incoming as { items?: unknown[]; ordered?: unknown } | null;
+  if (!i || !Array.isArray(i.items)) return incoming;
+  const prevItems = p && Array.isArray(p.items) ? p.items : [];
+  const merged = dedupAppend(prevItems, i.items);
+  return { items: merged, ordered: i.ordered ?? p?.ordered };
+}
+
+// Concatenate prev + incoming, but if `incoming` is a re-delivery of the SAME
+// chunk already at the tail of prev, don't double-append (keyed idempotency).
+function dedupAppend(prev: unknown[], incoming: unknown[]): unknown[] {
+  if (incoming.length === 0) return prev;
+  // If the entire incoming chunk already equals the tail of prev, it's a
+  // re-delivery → drop it.
+  if (incoming.length <= prev.length) {
+    const tail = prev.slice(prev.length - incoming.length);
+    if (JSON.stringify(tail) === JSON.stringify(incoming)) return prev;
+  }
+  return [...prev, ...incoming];
 }
 
 /** Map a persisted history message to the in-memory UI shape. */
 export function historyToUiMessage(m: {
+  id?: number;
   role: string;
   content: string;
   metadata?: unknown;
+  branch?: BranchInfo;
 }): ChatUiMessage {
   const meta = m.metadata as
-    | { attachments?: MessageAttachment[]; wb_entities?: TraceEntity[] }
+    | {
+        attachments?: MessageAttachment[];
+        wb_entities?: TraceEntity[];
+        sources?: MessageSource[];
+        agent_role?: string;
+        artifacts?: ChatArtifactPayload[];
+      }
     | undefined;
   return {
+    ...(typeof m.id === 'number' && { id: m.id }),
     role: m.role === 'system' ? 'assistant' : (m.role as 'user' | 'assistant'),
     content: m.content,
     ...(meta?.attachments && meta.attachments.length > 0 && { attachments: meta.attachments }),
     ...(meta?.wb_entities && meta.wb_entities.length > 0 && { entities: meta.wb_entities }),
+    ...(meta?.sources && meta.sources.length > 0 && { sources: meta.sources }),
+    // Role badge rehydration on history reload (item 6).
+    ...(meta?.agent_role && { agentRole: meta.agent_role }),
+    // Typed artifacts rehydration (Lane A) — mirrors the sources path.
+    ...(Array.isArray(meta?.artifacts) && meta.artifacts.length > 0 && { artifacts: meta.artifacts }),
+    // Chat branching (Phase 2): sibling-branch switcher info (top-level, not in metadata).
+    ...(m.branch && m.branch.count > 1 && { branch: m.branch }),
   };
 }
 
@@ -141,6 +270,20 @@ export interface ChatContextValue {
   setInput: Dispatch<SetStateAction<string>>;
   historyLoading: boolean;
   sendMessage: (text: string, fromVoice?: boolean) => Promise<void>;
+  // Submit the user's interactive Paperless-confirm decision (per-field
+  // choices, or an abort) for the given pending confirm_token.
+  submitPaperlessConfirm: (
+    confirmToken: string,
+    payload: { decisions: { idx: number; action: string; value: string | null }[] } | { abort: true },
+  ) => void;
+
+  // Command palette (chat-ui item 4)
+  paletteOpen: boolean;
+  openPalette: () => void;
+  closePalette: () => void;
+  pendingRoleHint: string | null;
+  setRoleHint: (roleId: string) => void;
+  clearRoleHint: () => void;
 
   // Session
   sessionId: string | null;
@@ -149,6 +292,14 @@ export interface ChatContextValue {
   switchConversation: (newSessionId: string) => Promise<void>;
   startNewChat: () => void;
   handleDeleteConversation: (id: string) => Promise<void>;
+
+  // Message search jump-to-message (chat-ui item 3). jumpToMessage switches to
+  // the target conversation (if needed) then arms pendingScrollIndex; once the
+  // history has loaded ChatMessages scrolls that message into view, focuses it,
+  // and calls clearPendingScroll.
+  pendingScrollIndex: number | null;
+  jumpToMessage: (targetSessionId: string, messageIndex: number) => Promise<void>;
+  clearPendingScroll: () => void;
 
   // Conversations
   conversations: Conversation[];
@@ -213,6 +364,19 @@ export interface ChatContextValue {
     originalValue: string | undefined,
     correctedValue: string,
   ) => Promise<void>;
+  regenerateWithCorrectedIntent: (text: string, correctedIntent: string) => void;
+  // Chat branching (Phase 1): edit-and-resubmit the user turn at `messageIndex`
+  // (forks from its parent); regenerate the assistant turn at `assistantIndex`
+  // (forks a new assistant sibling under the same user message).
+  editAndResubmit: (messageIndex: number, newText: string) => void;
+  regenerateTurn: (assistantIndex: number) => void;
+  // Chat branching (Phase 2): switch the active branch to a sibling message;
+  // delete a branch (switching to a sibling first). Both reload history.
+  switchBranch: (messageId: number) => Promise<void>;
+  deleteBranch: (deleteMessageId: number, switchToMessageId: number) => Promise<void>;
+  // Interactive device widget (Gen-UI): toggle/run/dim/set-temperature a device;
+  // resolves with the resolved state/value. Gated server-side on HA_CONTROL.
+  sendDeviceAction: (entityId: string, action: string, value?: number) => Promise<DeviceActionResult>;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -235,6 +399,14 @@ export function ChatProvider({ children }: ChatProviderProps) {
   const [messages, setMessages] = useState<ChatUiMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [input, setInput] = useState('');
+  // Command palette (chat-ui item 4): open state + a next-turn agent-role hint.
+  // The hint is consumed by the next sent message (role_hint on the WS frame),
+  // then cleared — "next turn only".
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [pendingRoleHint, setPendingRoleHint] = useState<string | null>(null);
+  // Message-search jump target: 0-based message index to scroll to once the
+  // active conversation's history is loaded (chat-ui item 3).
+  const [pendingScrollIndex, setPendingScrollIndex] = useState<number | null>(null);
 
   // Session management
   const [sessionId, setSessionId] = useState<string | null>(() => {
@@ -258,6 +430,18 @@ export function ChatProvider({ children }: ChatProviderProps) {
   const wakeWordActivatedRef = useRef(false);
   const wakeWordEnabledRef = useRef(false);
   const audioContextUnlockedRef = useRef<AudioContext | null>(null);
+  // Wake-word reconnect-recovery refs — read inside the wsConnected-edge
+  // effect below so it doesn't re-subscribe to every listening/recording
+  // change (which would let it fire mid normal turn). See wakeWordRecovery.ts.
+  const wakeWordListeningRef = useRef(false);
+  const recordingRef = useRef(false);
+  const resumeWakeWordRef = useRef<() => Promise<void>>(async () => undefined);
+  const hasConnectedRef = useRef(false);
+  // True while a chat turn is streaming over the WS (set after a successful
+  // wsSendMessage, cleared on `done`). Lets reconnect recovery interrupt ONLY a
+  // dead WS stream — never a REST-fallback turn, which completes on its own and
+  // would otherwise get a spurious "connection interrupted" message.
+  const wsStreamingTurnRef = useRef(false);
 
   // Voice input tracking
   const lastInputChannelRef = useRef<'text' | 'voice'>('text');
@@ -404,7 +588,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
   // Ref for sendMessageInternal (used by handleTranscription before
   // sendMessageInternal is declared below).
   const sendMessageInternalRef = useRef<
-    (text: string, fromVoice?: boolean, voiceMeta?: { speakerEmbedding?: number[] | null }) => Promise<void>
+    (text: string, fromVoice?: boolean, voiceMeta?: { speakerEmbedding?: number[] | null }, opts?: { correctedIntent?: string }) => Promise<void>
   >(
     async () => undefined,
   );
@@ -413,6 +597,15 @@ export function ChatProvider({ children }: ChatProviderProps) {
   // useVoiceStream (e.g. handleStreamComplete) can use it. Initialized
   // to a no-op; assigned after speakText is declared below.
   const speakTextRef = useRef<(text: string) => Promise<void>>(async () => undefined);
+
+  // Chat branching (Phase 2): when the in-flight turn is a FORK (edit/regenerate),
+  // its `done` frame has created a new sibling — but the WS stream carries no
+  // branch metadata, so the ‹n/m› switcher only appears once history is reloaded.
+  // `sendMessageInternal` arms this flag for a forked turn; `handleStreamDone`
+  // reloads history once when it sees it set (via reloadHistoryRef — reloadHistory
+  // is declared further below, same forward-reference pattern as speakTextRef).
+  const pendingForkReloadRef = useRef(false);
+  const reloadHistoryRef = useRef<() => Promise<void>>(async () => undefined);
 
   // Sentence-streaming auto-TTS (option A). Tracks accumulated chat
   // content so we can dispatch each completed sentence as its own
@@ -552,10 +745,21 @@ export function ChatProvider({ children }: ChatProviderProps) {
           ...lastMsg,
           streaming: false,
           intentInfo,
+          // Chat branching: stamp the persisted assistant message id so a later
+          // regenerate can fork from this turn's user message.
+          ...(typeof data.assistant_message_id === 'number' && { id: data.assistant_message_id }),
+          // Resolved agent role for the role badge (item 6). Present on router-path
+          // turns; absent on legacy/shortcut turns (→ no badge). On an orchestrated
+          // multi-domain turn this is the single primary-classified role (known
+          // limitation — the badge can under-represent a multi-sub-agent answer).
+          agentRole: data.role,
           userQuery: lastUserQueryRef.current || undefined,
           // F4c — any lingering per-peer progress lines belong only to
           // the live streaming phase; drop them when the message finalizes.
           federationProgress: undefined,
+          // Provenance source chips for this turn (knowledge-backed answers).
+          ...(data.sources && data.sources.length > 0 && { sources: data.sources }),
+          // Follow-up chips arrive separately, AFTER `done`, via handleFollowups.
         };
         lastIntentInfoRef.current = null;
 
@@ -635,11 +839,34 @@ export function ChatProvider({ children }: ChatProviderProps) {
           }
         }
 
-        return [...prev.slice(0, -1), completedMessage];
+        // Chat branching: stamp the persisted user message id onto the
+        // immediately-preceding user turn so an edit can fork from its parent.
+        const head = prev.slice(0, -1);
+        if (
+          typeof data.user_message_id === 'number' &&
+          head.length > 0 &&
+          head[head.length - 1].role === 'user'
+        ) {
+          head[head.length - 1] = {
+            ...head[head.length - 1],
+            id: data.user_message_id,
+          };
+        }
+        return [...head, completedMessage];
       }
       return prev;
     });
+    // Turn finished cleanly — no longer a live WS stream for reconnect to interrupt.
+    wsStreamingTurnRef.current = false;
     setLoading(false);
+
+    // Chat branching (Phase 2): a forked turn just landed — reload history so the
+    // new sibling's ‹n/m› switcher renders immediately (the WS stream carries no
+    // branch metadata). One-shot; ignored on a normal append.
+    if (pendingForkReloadRef.current) {
+      pendingForkReloadRef.current = false;
+      void reloadHistoryRef.current();
+    }
   }, [resumeWakeWord]);
 
   // Sentence boundary regex for streaming TTS dispatch. Matches a
@@ -846,7 +1073,51 @@ export function ChatProvider({ children }: ChatProviderProps) {
     }));
   }, []);
 
+  // Async chat-upload text extraction finished server-side: the backend pushes
+  // this over the WS (no polling). Flip the PENDING attachment chip from
+  // "processing" to its terminal status so it becomes sendable (completedIds
+  // filters on status === 'completed') — or surface the extraction error.
+  const handleUploadProcessed = useCallback((data: UploadProcessedMessage) => {
+    setAttachments((prev) => prev.map((att) =>
+      // att.id is the numeric upload id at runtime (typed string in the shape).
+      (att.id as unknown as number) === data.upload_id
+        ? {
+            ...att,
+            status: data.status,
+            text_preview: data.text_preview ?? att.text_preview,
+            ...(data.status === 'failed' && data.error ? { extractError: data.error } : {}),
+          }
+        : att,
+    ));
+  }, []);
+
+  // An async Paperless commit finished in the background (consume + deferred
+  // PATCH). The commit's immediate reply was "wird verarbeitet…"; this push
+  // carries the final outcome ("Im Paperless abgelegt" / a failure), shown as
+  // an assistant message so the user sees the result without re-asking.
+  const handlePaperlessCommitted = useCallback((data: PaperlessCommittedMessage) => {
+    if (!data.message) return;
+    setMessages((prev) => [...prev, { role: 'assistant', content: data.message }]);
+  }, []);
+
   // Adaptive Card from server (sent after orchestrated/single-role response)
+  // Follow-up suggestion chips arrive AFTER `done` (generated in the background
+  // so they never delay the turn). Attach to the most recent assistant message;
+  // ephemeral, so they're gone on reload.
+  const handleFollowups = useCallback((data: FollowupsMessage) => {
+    if (!data.suggested_followups || data.suggested_followups.length === 0) return;
+    setMessages((prev) => {
+      const updated = [...prev];
+      for (let i = updated.length - 1; i >= 0; i--) {
+        if (updated[i].role === 'assistant') {
+          updated[i] = { ...updated[i], suggestedFollowups: data.suggested_followups };
+          break;
+        }
+      }
+      return updated;
+    });
+  }, []);
+
   const handleCard = useCallback((data: CardMessage) => {
     if (!data.card) return;
     setMessages((prev) => {
@@ -871,6 +1142,101 @@ export function ChatProvider({ children }: ChatProviderProps) {
     });
   }, []);
 
+  // Chat artifacts (Lane A). T4 (P2): rapid same-id streaming frames are
+  // COALESCED — buffered in a ref and flushed once per animation frame — so a
+  // fast stream of append-patches triggers one React render per frame, not one
+  // per frame-on-the-wire (avoids render thrash). On flush each buffered frame
+  // is merged (keyed by id, table/list append) into the latest assistant turn.
+  const artifactQueueRef = useRef<ChatArtifactPayload[]>([]);
+  const artifactRafRef = useRef<number | null>(null);
+  const artifactReplaceTextRef = useRef<string | null>(null);
+
+  const flushArtifacts = useCallback(() => {
+    artifactRafRef.current = null;
+    const queued = artifactQueueRef.current;
+    artifactQueueRef.current = [];
+    const replaceText = artifactReplaceTextRef.current;
+    artifactReplaceTextRef.current = null;
+    if (queued.length === 0) return;
+    setMessages((prev) => {
+      const updated = [...prev];
+      for (let i = updated.length - 1; i >= 0; i--) {
+        if (updated[i].role === 'assistant') {
+          let artifacts = updated[i].artifacts;
+          for (const frame of queued) {
+            artifacts = mergeArtifactFrame(artifacts, frame);
+          }
+          updated[i] = {
+            ...updated[i],
+            artifacts,
+            ...(replaceText ? { content: replaceText } : {}),
+          };
+          break;
+        }
+      }
+      return updated;
+    });
+  }, []);
+
+  const handleArtifact = useCallback((data: ArtifactWsMessage) => {
+    const art = data.artifact;
+    if (!art || typeof art.id !== 'string' || !art.id) return;
+    artifactQueueRef.current.push(art);
+    if (data.replace_text) artifactReplaceTextRef.current = data.replace_text;
+    if (artifactRafRef.current === null) {
+      // requestAnimationFrame coalesces; fall back to a microtask in
+      // environments without rAF (jsdom provides it, but guard anyway).
+      const raf =
+        typeof requestAnimationFrame === 'function'
+          ? requestAnimationFrame
+          : (cb: FrameRequestCallback) => setTimeout(() => cb(performance.now()), 0) as unknown as number;
+      artifactRafRef.current = raf(flushArtifacts) as unknown as number;
+    }
+  }, [flushArtifacts]);
+
+  // Interactive Paperless confirm request — attach the structured picker to
+  // the assistant bubble that just streamed the preview text (same "most
+  // recent assistant message" attach as handleCard).
+  const handlePaperlessConfirmRequest = useCallback((data: PaperlessConfirmRequestMessage) => {
+    if (!data.confirm_token || !data.fields) return;
+    setMessages((prev) => {
+      const updated = [...prev];
+      for (let i = updated.length - 1; i >= 0; i--) {
+        if (updated[i].role === 'assistant') {
+          updated[i] = {
+            ...updated[i],
+            paperlessConfirm: {
+              confirmToken: data.confirm_token,
+              filename: data.filename,
+              summary: data.summary || {},
+              fields: data.fields,
+              status: 'open',
+            },
+          };
+          break;
+        }
+      }
+      return updated;
+    });
+  }, []);
+
+  // Interactive device widget (Gen-UI): resolvers keyed by entity_id so a
+  // toggle click's `sendDeviceAction` promise settles when the matching
+  // `device_action_result` frame arrives. One in-flight action per entity.
+  const deviceActionResolversRef = useRef<Map<string, (r: DeviceActionResult) => void>>(new Map());
+  const handleDeviceActionResult = useCallback((data: DeviceActionResultMessage) => {
+    const resolve = deviceActionResolversRef.current.get(data.entity_id);
+    if (resolve) {
+      deviceActionResolversRef.current.delete(data.entity_id);
+      resolve({
+        success: !!data.success,
+        state: data.state,
+        brightness: data.brightness,
+        targetTemp: data.targetTemp,
+      });
+    }
+  }, []);
+
   // WebSocket hook
   const { wsConnected, sendMessage: wsSendMessage, isReady, whenReady } = useChatWebSocket({
     onStreamChunk: handleStreamChunk,
@@ -880,13 +1246,101 @@ export function ChatProvider({ children }: ChatProviderProps) {
     onIntentFeedbackRequest: handleIntentFeedbackRequest,
     onDocumentProcessing: handleDocumentProcessing,
     onDocumentReady: handleDocumentReady,
+    onUploadProcessed: handleUploadProcessed,
+    onPaperlessCommitted: handlePaperlessCommitted,
     onDocumentError: handleDocumentError,
     onAgentThinking: handleAgentThinking,
     onAgentToolCall: handleAgentToolCall,
     onAgentToolResult: handleAgentToolResult,
     onAgentFederationProgress: handleAgentFederationProgress,
     onCard: handleCard,
+    onArtifact: handleArtifact,
+    onFollowups: handleFollowups,
+    onPaperlessConfirmRequest: handlePaperlessConfirmRequest,
+    onDeviceActionResult: handleDeviceActionResult,
   });
+
+  // Interactive device widget: send a toggle/run action over the WS and resolve
+  // when the backend's `device_action_result` frame returns the new state. The
+  // backend gates on HA_CONTROL + re-validates the entity/action (the widget
+  // grants no control the user lacks via the agent). Resolves {success:false}
+  // on a non-OPEN socket or a 6 s timeout so the widget can revert/clear.
+  const sendDeviceAction = useCallback(
+    (entityId: string, action: string, value?: number): Promise<DeviceActionResult> => {
+      const ok = wsSendMessage({
+        type: 'device_action',
+        session_id: sessionId,
+        entity_id: entityId,
+        action,
+        ...(typeof value === 'number' && { value }),
+      });
+      if (!ok) return Promise.resolve({ success: false });
+      return new Promise((resolve) => {
+        // Settle any earlier in-flight action for this entity so its promise
+        // doesn't orphan (idle until the 6s timeout) when a new one overwrites
+        // the resolver — one device_action_result per entity arrives at a time.
+        const prev = deviceActionResolversRef.current.get(entityId);
+        if (prev) prev({ success: false });
+        deviceActionResolversRef.current.set(entityId, resolve);
+        setTimeout(() => {
+          if (deviceActionResolversRef.current.has(entityId)) {
+            deviceActionResolversRef.current.delete(entityId);
+            resolve({ success: false });
+          }
+        }, 6000);
+      });
+    },
+    [wsSendMessage, sessionId],
+  );
+
+  // Submit the user's structured Paperless-confirm decision over the WS. The
+  // backend routes the {type:"paperless_confirm"} frame straight to
+  // internal.paperless_commit_upload (see chat_handler). We flip the card to
+  // 'submitted' immediately so it renders read-only; the commit's result
+  // arrives as a normal streamed assistant message.
+  const submitPaperlessConfirm = useCallback(
+    (
+      confirmToken: string,
+      payload: { decisions: { idx: number; action: string; value: string | null }[] } | { abort: true },
+    ): void => {
+      // Only flip the card to read-only if the frame actually went out.
+      // wsSendMessage returns false when the socket isn't OPEN — marking it
+      // 'submitted' anyway would strand the confirm with no retry path.
+      const sent = wsSendMessage({
+        type: 'paperless_confirm',
+        confirm_token: confirmToken,
+        session_id: sessionId,
+        ...payload,
+      });
+      if (!sent) {
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: t('errors.couldNotProcess') },
+        ]);
+        return;
+      }
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.paperlessConfirm?.confirmToken === confirmToken
+            ? { ...msg, paperlessConfirm: { ...msg.paperlessConfirm, status: 'submitted' } }
+            : msg,
+        ),
+      );
+    },
+    [wsSendMessage, sessionId, t],
+  );
+
+  // Register this session on the WS as soon as it's connected, so background
+  // pushes (e.g. async chat-upload `upload_processed`) can reach it BEFORE the
+  // first chat message — otherwise an upload-then-wait flow leaves the chip
+  // stuck in "processing" because the backend only registered the session on
+  // the first text message. Re-runs on reconnect (wsConnected flips) and on
+  // session change. wsSendMessage re-checks readyState and no-ops if not open.
+  useEffect(() => {
+    if (wsConnected && sessionId) {
+      wsSendMessage({ type: 'register', session_id: sessionId });
+    }
+  }, [wsConnected, sessionId, wsSendMessage]);
 
   // Handle transcription from audio recording
   const handleTranscription = useCallback((text: string) => {
@@ -896,6 +1350,9 @@ export function ChatProvider({ children }: ChatProviderProps) {
 
   // Handle recording error
   const handleRecordingError = useCallback((errorMessage: string) => {
+    // The turn errored and is being reported now — clear the streaming-turn
+    // latch so a later benign WS reconnect doesn't re-flag it as interrupted.
+    wsStreamingTurnRef.current = false;
     setMessages((prev) => [...prev, { role: 'assistant', content: errorMessage }]);
     setLoading(false);
   }, []);
@@ -1045,6 +1502,95 @@ export function ChatProvider({ children }: ChatProviderProps) {
   const startRecording = VOICE_STREAM_ENABLED ? startStreamRecording : audioRec.startRecording;
   const toggleRecording = VOICE_STREAM_ENABLED ? toggleStreamRecording : audioRec.toggleRecording;
 
+  // Keep the latest wake-word/recording values in refs so the recovery effects
+  // below read them without depending on (and re-running for) every
+  // isListening/recording change — which would let them fire in the middle of
+  // a normal turn. Runs after every render (cheap ref writes).
+  useEffect(() => {
+    wakeWordListeningRef.current = wakeWord.isListening;
+    recordingRef.current = recording;
+    resumeWakeWordRef.current = resumeWakeWord;
+  });
+
+  // Resume a stranded wake-word engine when a recovery trigger fires (chat-WS
+  // reconnect, tab becoming visible, network back online). The local engine is
+  // independent of the WS, but it can be left paused — by a mid-turn WS drop, an
+  // engine error (useWakeWord flips isListening:false), or a tab/network
+  // suspend — with no `done` frame to resume it, until a manual reload. The
+  // guards (see wakeWordRecovery.ts) skip the happy path (already listening),
+  // an active capture, and a live wake-word turn. Reads live refs so callers
+  // can stay edge-triggered.
+  const attemptWakeWordRearm = useCallback((trigger: string) => {
+    if (
+      shouldRearmWakeWord({
+        isRecoveryTrigger: true,
+        wakeWordEnabled: wakeWordEnabledRef.current,
+        isListening: wakeWordListeningRef.current,
+        recording: recordingRef.current,
+        wakeWordActivated: wakeWordActivatedRef.current,
+      })
+    ) {
+      debug.log(`🔁 ${trigger} — re-arming stranded wake word`);
+      setWakeWordStatus('listening');
+      void resumeWakeWordRef.current();
+    }
+  }, []);
+
+  // Chat-WS reconnect recovery. A backend Recreate rollout (deploy / ConfigMap
+  // reload) drops the WS; if it dropped mid-turn the turn is dead (its `done`
+  // will never arrive on the new socket). Clear the stuck "thinking" spinner +
+  // tell the user, clear the mid-turn latch, then re-arm wake word. Edge-
+  // triggered on wsConnected ONLY (other values via refs) so it cannot fire
+  // mid normal turn when isListening/recording churn.
+  useEffect(() => {
+    if (!wsConnected) return;
+    const isReconnect = hasConnectedRef.current;
+    hasConnectedRef.current = true;
+    if (!isReconnect) return; // initial connect — useWakeWord auto-enable handles startup
+    // A WS chat turn in flight when the socket dropped is dead — its stream
+    // won't resume on the new socket. Clear the stuck "thinking" spinner and
+    // tell the user. Guarded on the streaming-turn ref (NOT loading) so a
+    // REST-fallback turn, which completes on its own, isn't falsely interrupted.
+    if (wsStreamingTurnRef.current) {
+      wsStreamingTurnRef.current = false;
+      setLoading(false);
+      // Finalize any half-streamed assistant bubble (else it spins forever and
+      // its speak/intent UI never shows), then append the interruption note.
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        const finalized =
+          last && last.role === 'assistant' && last.streaming
+            ? [...prev.slice(0, -1), { ...last, streaming: false }]
+            : prev;
+        return [...finalized, { role: 'assistant', content: t('errors.connectionInterrupted') }];
+      });
+    }
+    // The dead turn's latch must be cleared so the resume guards apply here
+    // and in handleRecordingStop (if a capture is still running).
+    wakeWordActivatedRef.current = false;
+    attemptWakeWordRearm('Chat WS reconnected');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsConnected]);
+
+  // Wake-from-suspend recovery: a backgrounded tab or a dropped network can
+  // stall the wake-word engine (suspended AudioContext / ended mic track). When
+  // the tab becomes visible again or the network returns, re-arm it. These do
+  // NOT clear the activation latch (unlike reconnect, the current turn is not
+  // necessarily dead), so the latch guard keeps a live turn from being double-
+  // armed.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') attemptWakeWordRearm('Tab visible');
+    };
+    const onOnline = () => attemptWakeWordRearm('Network online');
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('online', onOnline);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('online', onOnline);
+    };
+  }, [attemptWakeWordRearm]);
+
   // Streaming-aware speakText. Resolves when the TTS request is dispatched
   // (streaming) or playback completes (legacy). Existing callers see the
   // same Promise<void> shape.
@@ -1130,6 +1676,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     text: string,
     fromVoice = false,
     voiceMeta?: { speakerEmbedding?: number[] | null },
+    opts?: { correctedIntent?: string; forkFromMessageId?: number; suppressAppend?: boolean },
   ): Promise<void> => {
     if (!text.trim()) return;
 
@@ -1156,24 +1703,39 @@ export function ChatProvider({ children }: ChatProviderProps) {
     sentenceStreamRef.current.dispatchedIdx = 0;
     sentenceStreamRef.current.active = false;
     sentenceStreamRef.current.streamDone = false;
+    // New turn — not streaming over the WS until a wsSendMessage succeeds below.
+    wsStreamingTurnRef.current = false;
 
     lastUserQueryRef.current = text;
     lastIntentInfoRef.current = null;
 
-    // Capture current attachments before clearing
-    const currentAttachments = [...attachments];
+    // A "Korrigieren & neu beantworten" re-run is NOT a composer submit: it
+    // replays a past query, so it must NOT pull in whatever the user has since
+    // staged in the composer (wrong attachments on the old query) nor clear
+    // their in-progress draft. Only a real composer send touches that state.
+    const isRerun = !!opts?.correctedIntent;
+
+    // Capture current attachments before clearing (skip for an isolated re-run).
+    const currentAttachments = isRerun ? [] : [...attachments];
     const completedIds = currentAttachments
       .filter((a) => a.status === 'completed')
       .map((a) => a.id);
 
-    const userMessage: ChatUiMessage = {
-      role: 'user',
-      content: text,
-      ...(currentAttachments.length > 0 && { attachments: currentAttachments }),
-    };
-    setMessages((prev) => [...prev, userMessage]);
-    setInput('');
-    setAttachments([]);
+    // Chat branching: a regenerate re-runs an EXISTING user turn, so the user
+    // bubble is already in the array (suppressAppend) — only an edit/normal send
+    // appends a new user bubble.
+    if (!opts?.suppressAppend) {
+      const userMessage: ChatUiMessage = {
+        role: 'user',
+        content: text,
+        ...(currentAttachments.length > 0 && { attachments: currentAttachments }),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+    }
+    if (!isRerun) {
+      setInput('');
+      setAttachments([]);
+    }
     setLoading(true);
 
     const previewText = text.length > 50 ? text.substring(0, 50) + '...' : text;
@@ -1215,12 +1777,35 @@ export function ChatProvider({ children }: ChatProviderProps) {
       ...(voiceMeta?.speakerEmbedding && {
         speaker_embedding: voiceMeta.speakerEmbedding,
       }),
+      // Command-palette role override for this turn (soft hint; backend validates).
+      ...(pendingRoleHint && { role_hint: pendingRoleHint }),
+      // "Korrigieren & neu beantworten": the corrected intent is mapped to the
+      // owning agent role server-side and used as the route for this re-run.
+      ...(opts?.correctedIntent && { corrected_intent: opts.correctedIntent }),
+      // Chat branching: fork this turn from the given message (edit → the edited
+      // user msg's parent; regenerate → the user msg itself). Backend honors it
+      // only when chat_branching_enabled; ignored otherwise.
+      ...(typeof opts?.forkFromMessageId === 'number' && { fork_from_message_id: opts.forkFromMessageId }),
     };
 
     // wsSendMessage re-checks readyState before .send() and returns false
     // if the socket isn't OPEN, so we close the race between whenReady()
     // resolving true and the actual transmit.
     if (isReady() && wsSendMessage(wsMessage)) {
+      // Consume the role hint ONLY on a confirmed WS send (the REST fallback
+      // below carries no role_hint). On a failed send the hint stays set + the
+      // badge stays visible, so the user's next attempt still applies the role
+      // instead of it silently vanishing.
+      if (pendingRoleHint) setPendingRoleHint(null);
+      // The turn is now streaming over the WS; a mid-stream socket drop makes it
+      // recoverable (the reconnect effect clears the spinner + notifies).
+      wsStreamingTurnRef.current = true;
+      // Chat branching (Phase 2): a forked turn → reload history on `done` so the
+      // new sibling's ‹n/m› switcher renders immediately. Armed only on a
+      // confirmed WS send (the REST fallback doesn't carry the fork).
+      if (typeof opts?.forkFromMessageId === 'number') {
+        pendingForkReloadRef.current = true;
+      }
       setRagSources([]);
     } else {
       try {
@@ -1237,12 +1822,104 @@ export function ChatProvider({ children }: ChatProviderProps) {
         setLoading(false);
       }
     }
-  }, [sessionId, messages.length, useRag, selectedKnowledgeBase, isReady, whenReady, wsSendMessage, addConversation, attachments, t]);
+  }, [sessionId, messages.length, useRag, selectedKnowledgeBase, isReady, whenReady, wsSendMessage, addConversation, attachments, t, pendingRoleHint]);
 
   // Wire ref so handleTranscription (declared above) can call sendMessageInternal
   useEffect(() => {
     sendMessageInternalRef.current = sendMessageInternal;
   }, [sendMessageInternal]);
+
+  // "Korrigieren & neu beantworten": re-run a turn's original query, forcing the
+  // route the user just corrected to (backend maps the intent → agent role). The
+  // feedback POST already happened in handleFeedbackSubmit; this is the re-answer.
+  const regenerateWithCorrectedIntent = useCallback((text: string, correctedIntent: string) => {
+    void sendMessageInternal(text, false, undefined, { correctedIntent });
+  }, [sendMessageInternal]);
+
+  // Chat branching (Phase 1): edit-and-resubmit a user turn. Forks from the
+  // edited user message's PARENT (the preceding assistant, or root) so the new
+  // user message becomes a sibling of the edited one; the old branch is dropped
+  // from the view (still preserved server-side). Phase 1 only allows editing the
+  // LATEST user message — the UI gates this — so the abandoned tail is simply
+  // everything from the edited message onward.
+  const editAndResubmit = useCallback((messageIndex: number, newText: string) => {
+    if (!newText.trim()) return;
+    setMessages((prev) => {
+      const target = prev[messageIndex];
+      if (!target || target.role !== 'user') return prev;
+      // Truncate the abandoned tail: keep everything BEFORE the edited message.
+      return prev.slice(0, messageIndex);
+    });
+    // Parent of the edited message = the message immediately before it (an
+    // assistant turn), if any. Undefined → the edited message was the root.
+    const parent = messageIndex > 0 ? messages[messageIndex - 1]?.id : undefined;
+    void sendMessageInternal(newText, false, undefined, {
+      ...(typeof parent === 'number' && { forkFromMessageId: parent }),
+    });
+  }, [messages, sendMessageInternal]);
+
+  // Chat branching (Phase 1): regenerate a turn — re-run the same user message,
+  // forking a new assistant sibling under it. Phase 1 only allows regenerating
+  // the LATEST assistant turn (UI-gated). Forks from the turn's USER message id
+  // (backend reads its 'user' role → regenerate mode, no duplicate user bubble).
+  const regenerateTurn = useCallback((assistantIndex: number) => {
+    const assistantMsg = messages[assistantIndex];
+    const userMsg = messages[assistantIndex - 1];
+    if (!assistantMsg || assistantMsg.role !== 'assistant') return;
+    if (!userMsg || userMsg.role !== 'user' || typeof userMsg.id !== 'number') return;
+    const forkId = userMsg.id;
+    const userText = userMsg.content;
+    // Drop the abandoned assistant turn from the view; keep the user message.
+    setMessages((prev) => prev.slice(0, assistantIndex));
+    void sendMessageInternal(userText, false, undefined, {
+      forkFromMessageId: forkId,
+      suppressAppend: true,
+    });
+  }, [messages, sendMessageInternal]);
+
+  // Chat branching (Phase 2): re-fetch the active branch from the server and
+  // replace the thread. Used after a branch switch / delete so the active path
+  // AND the ‹n/m› switcher metadata are authoritative (a fork/switch reshapes
+  // the tree in ways the client can't fully recompute locally).
+  const reloadHistory = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const history = await loadConversationHistory(sessionId);
+      setMessages(history.map(historyToUiMessage));
+    } catch (err) {
+      console.error('Failed to reload history after branch change:', err);
+    }
+  }, [sessionId, loadConversationHistory]);
+  // Expose to handleStreamDone (declared earlier) via the forward-ref.
+  reloadHistoryRef.current = reloadHistory;
+
+  // Switch the active branch to the sibling identified by `messageId` (the ◂/▸
+  // switcher). The backend repoints the active leaf to that sibling's subtree
+  // tip and recomputes branch memory activation; we reload to render it.
+  const switchBranch = useCallback(async (messageId: number) => {
+    if (!sessionId) return;
+    try {
+      await apiClient.put(`/api/chat/${sessionId}/active-leaf`, { message_id: messageId });
+      await reloadHistory();
+    } catch (err) {
+      console.error('Failed to switch branch:', err);
+    }
+  }, [sessionId, reloadHistory]);
+
+  // Delete the branch rooted at `deleteMessageId`, first switching to the
+  // sibling `switchToMessageId` so the deleted branch is no longer on the active
+  // path (the backend refuses to delete an active-path message → 409). Reload
+  // after so the switcher reflects the reduced sibling set.
+  const deleteBranch = useCallback(async (deleteMessageId: number, switchToMessageId: number) => {
+    if (!sessionId) return;
+    try {
+      await apiClient.put(`/api/chat/${sessionId}/active-leaf`, { message_id: switchToMessageId });
+      await apiClient.delete(`/api/chat/${sessionId}/branch/${deleteMessageId}`);
+      await reloadHistory();
+    } catch (err) {
+      console.error('Failed to delete branch:', err);
+    }
+  }, [sessionId, reloadHistory]);
 
   // Summarize handler (must be after sendMessageInternal)
   const handleSummarize = useCallback((uploadId: string) => {
@@ -1320,6 +1997,26 @@ export function ChatProvider({ children }: ChatProviderProps) {
     }
   }, [sessionId, loadConversationHistory]);
 
+  // Jump to a specific message from a search result (chat-ui item 3). Switches
+  // to the target conversation if it isn't already active, then arms the
+  // pending-scroll index. When the target IS already active, switchConversation
+  // is a no-op (early return) so the messages are already loaded — arm the
+  // index directly. Either way ChatMessages consumes pendingScrollIndex once
+  // the history is present.
+  const jumpToMessage = useCallback(
+    async (targetSessionId: string, messageIndex: number) => {
+      if (targetSessionId !== sessionId) {
+        await switchConversation(targetSessionId);
+      } else {
+        setSidebarOpen(false);
+      }
+      setPendingScrollIndex(messageIndex);
+    },
+    [sessionId, switchConversation],
+  );
+
+  const clearPendingScroll = useCallback(() => setPendingScrollIndex(null), []);
+
   // Start new chat
   const startNewChat = useCallback(() => {
     const newId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -1358,6 +2055,15 @@ export function ChatProvider({ children }: ChatProviderProps) {
     setInput,
     historyLoading,
     sendMessage: sendMessageInternal,
+    submitPaperlessConfirm,
+
+    // Command palette
+    paletteOpen,
+    openPalette: () => setPaletteOpen(true),
+    closePalette: () => setPaletteOpen(false),
+    pendingRoleHint,
+    setRoleHint: (roleId: string) => { setPendingRoleHint(roleId); setPaletteOpen(false); },
+    clearRoleHint: () => setPendingRoleHint(null),
 
     // Session
     sessionId,
@@ -1366,6 +2072,11 @@ export function ChatProvider({ children }: ChatProviderProps) {
     switchConversation,
     startNewChat,
     handleDeleteConversation,
+
+    // Message search jump-to-message (chat-ui item 3)
+    pendingScrollIndex,
+    jumpToMessage,
+    clearPendingScroll,
 
     // Conversations (from useChatSessions)
     conversations,
@@ -1421,9 +2132,20 @@ export function ChatProvider({ children }: ChatProviderProps) {
     // Actions
     speakText,
     handleFeedbackSubmit,
+    regenerateWithCorrectedIntent,
+    editAndResubmit,
+    regenerateTurn,
+    switchBranch,
+    deleteBranch,
+    sendDeviceAction,
   }), [
-    messages, loading, input, historyLoading, sendMessageInternal,
+    messages, loading, input, historyLoading, sendMessageInternal, submitPaperlessConfirm,
+    regenerateWithCorrectedIntent,
+    editAndResubmit, regenerateTurn,
+    switchBranch, deleteBranch, sendDeviceAction,
+    paletteOpen, pendingRoleHint,
     sessionId, sidebarOpen, switchConversation, startNewChat, handleDeleteConversation,
+    pendingScrollIndex, jumpToMessage, clearPendingScroll,
     conversations, conversationsLoading,
     wsConnected,
     recording, audioLevel, silenceTimeRemaining, partialText, toggleRecording,

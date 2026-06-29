@@ -60,6 +60,13 @@ HOOK_EVENTS: frozenset[str] = frozenset({
     "presence_leave_room",
     "presence_first_arrived",
     "presence_last_left",
+    # Time-of-day transition — fired by the lifecycle daypart watcher when the
+    # computed daypart changes (or on the first tick after boot). Lets features
+    # react to day/evening/night boundaries (e.g. satellite LED dimming).
+    # Kwargs: `previous: str` (the prior daypart, or None on first tick),
+    # `current: str` (the new daypart), `local_time: str` (HH:MM in the
+    # configured local timezone).
+    "daypart_changed",
     "compact_mcp_result",
     "authenticate",
     # Pluggable-auth identity resolution — fired ONCE by /auth/login after
@@ -261,6 +268,23 @@ HOOK_EVENTS: frozenset[str] = frozenset({
     "post_orchestration",
     "pre_sub_agent",
     "post_sub_agent",
+    # Per-request tool filtering for the MAIN agent loop — fired by the
+    # WebSocket chat handler right after AgentToolRegistry.create() and before
+    # AgentService runs, with the classified role (and its `sub_intent`) in
+    # scope. The orchestrator sub-agent path already has `pre_sub_agent`; this
+    # is the symmetric seam for the single-role web-chat loop. Handlers receive
+    # `registry`, `role`, `message` and may mutate `registry._tools` in place to
+    # restrict the tool set (e.g. deterministic sub-intent → tool-set filtering).
+    # Return value is ignored; exceptions are caught (run_hooks) so a faulty
+    # filter degrades to the unfiltered registry rather than breaking the turn.
+    "filter_agent_tools",
+    # Role-specific system prompt for the MAIN agent loop — fired by
+    # AgentService once per request (where the JSON system message is built),
+    # with the classified `role` and `lang` in scope. A handler returns a
+    # string to PREPEND to the system message (e.g. an edition's role-specific
+    # prompt), or None. Renfield does not ship a handler; the default is
+    # byte-identical. Symmetric, for the system prompt, to filter_agent_tools.
+    "agent_system_prompt",
     "check_output",
     "extract_context_vars",
     "build_synthesis_context",
@@ -405,6 +429,19 @@ def has_hook(event: str) -> bool:
     (see the post_authenticate contract).
     """
     return bool(_hooks.get(event))
+
+
+def is_hook_registered(event: str, fn: HookFn) -> bool:
+    """True if *fn* is already registered for *event*.
+
+    Handler-level companion to `has_hook` (which is event-level only). Lets a
+    caller register idempotently — needed where the same registration may run
+    from more than one entry point in a single process (e.g. the document
+    ingest hooks, registered by both the API lifecycle and the worker startup
+    via services/document_ingest_hooks.py). Keeps the internal `_hooks`
+    representation private to this module.
+    """
+    return fn in _hooks.get(event, [])
 
 
 def clear_hooks() -> None:

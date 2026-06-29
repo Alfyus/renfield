@@ -168,6 +168,37 @@ class KGRetrieval:
             logger.debug(f"KG: Could not parse entity list from: {raw_text[:200]}")
             return []
 
+    async def _resolve_entity_names(
+        self, ids, user_id: int | None
+    ) -> dict[int, str]:
+        """Resolve entity ids → names, circle-filtered by the asker's access.
+
+        Only ids the asker may see are returned; callers default missing ids to
+        ``"?"`` so a visible relation can't disclose the NAME of an endpoint
+        entity in a circle the asker can't reach. Same per-node visibility gate
+        as ``kg_graph_service.focus`` (auth-off → all, anonymous → public-only,
+        authenticated → the standard kg_entities circle filter).
+        """
+        from services.circle_sql import kg_entities_circles_filter
+
+        ids = list(ids)
+        if not ids:
+            return {}
+        base = select(KGEntity.id, KGEntity.name).where(
+            KGEntity.is_active == True,  # noqa: E712
+            KGEntity.id.in_(ids),
+        )
+        if not settings.auth_enabled:
+            pass
+        elif user_id is None:
+            from models.database import TIER_PUBLIC
+            base = base.where(KGEntity.circle_tier == TIER_PUBLIC)
+        else:
+            clause, params = kg_entities_circles_filter(user_id, alias="kg_entities")
+            base = base.where(text(clause).bindparams(**params))
+        rows = (await self.db.execute(base)).all()
+        return {r.id: r.name for r in rows}
+
     async def get_relevant_context(
         self,
         query: str,
@@ -303,16 +334,15 @@ class KGRetrieval:
         if not relation_rows:
             return None
 
-        # Fetch all entity names we need
+        # Fetch the endpoint entity names we need — circle-filtered so a visible
+        # relation can't disclose the NAME of an endpoint entity in a circle the
+        # asker can't reach (inaccessible ids fall through to "?" below).
         entity_ids = set()
         for r in relation_rows:
             entity_ids.add(r.subject_id)
             entity_ids.add(r.object_id)
 
-        entities_result = await self.db.execute(
-            select(KGEntity).where(KGEntity.id.in_(entity_ids))
-        )
-        entity_map = {e.id: e.name for e in entities_result.scalars().all()}
+        entity_map = await self._resolve_entity_names(entity_ids, user_id)
 
         # Format triples
         triples = []
@@ -339,3 +369,136 @@ class KGRetrieval:
                 "Do NOT invent additional information about these entities."
             )
         return f"{header}\n" + "\n".join(triples)
+
+    async def get_relevant_atoms(
+        self,
+        query: str,
+        user_id: int | None = None,
+        lang: str = "de",
+    ) -> dict[str, list[dict[str, Any]]]:
+        """
+        Structured sibling of ``get_relevant_context``: returns the matched
+        entities and their relations as dicts (each with its id + circle_tier)
+        so ``PolymorphicAtomStore`` can emit one ``kg_node`` atom per entity and
+        one ``kg_edge`` atom per relation — each carrying its source id, which
+        the unified-search detail drawer needs (the old single ``kg_aggregated``
+        blob had none).
+
+        Deliberately duplicates the entity-search + circle-filter walk from
+        ``get_relevant_context`` rather than refactoring a shared core: the
+        agent/RAG path consumes the string form, and backend tests run on the
+        .159 box (not locally), so keeping that path's diff at zero isolates the
+        risk to this new method until the suite confirms parity. TODO: DRY the
+        two once verified on .159.
+
+        Returns ``{"entities": [...], "relations": [...]}`` (empty lists on no
+        match). Entities are returned even when they have no visible relations
+        (a lone entity is still a valid kg_node atom for the drawer).
+        """
+        from services.circle_sql import (
+            kg_entities_circles_filter,
+            kg_relations_circles_filter,
+        )
+
+        threshold = settings.kg_retrieval_threshold
+        max_triples = settings.kg_max_context_triples
+
+        if not settings.auth_enabled:
+            entity_filter = ""
+            entity_params: dict[str, Any] = {}
+            relation_filter_clause = ""
+            relation_params: dict[str, Any] = {}
+        elif user_id is None:
+            from models.database import TIER_PUBLIC
+            entity_filter = "AND e.circle_tier = :pub_tier"
+            entity_params = {"pub_tier": TIER_PUBLIC}
+            relation_filter_clause = "AND r.circle_tier = :pub_tier"
+            relation_params = {"pub_tier": TIER_PUBLIC}
+        else:
+            ent_clause, ent_params = kg_entities_circles_filter(user_id, alias="e")
+            entity_filter = f"AND {ent_clause}"
+            entity_params = ent_params
+            rel_clause, rel_params = kg_relations_circles_filter(user_id, alias="r")
+            relation_filter_clause = f"AND {rel_clause}"
+            relation_params = rel_params
+
+        extracted_names = await self._extract_query_entities(query, lang)
+        search_texts = extracted_names if extracted_names else [query]
+
+        entities: dict[int, dict[str, Any]] = {}
+        for search_text in search_texts:
+            try:
+                embedding = await self._get_embedding(search_text)
+            except Exception as e:
+                logger.warning(f"KG atoms: could not embed '{search_text}': {e}")
+                continue
+            if not embedding:
+                continue
+            embedding_str = f"[{','.join(map(str, embedding))}]"
+            params = {**entity_params, "embedding": embedding_str}
+            sql = text(f"""
+                SELECT e.id, e.name, e.entity_type, e.circle_tier,
+                       1 - (e.embedding <=> CAST(:embedding AS vector)) as similarity
+                FROM kg_entities e
+                WHERE e.is_active = true
+                  AND e.embedding IS NOT NULL
+                  {entity_filter}
+                ORDER BY e.embedding <=> CAST(:embedding AS vector)
+                LIMIT 10
+            """)
+            result = await self.db.execute(sql, params)
+            for row in result.fetchall():
+                sim = float(row.similarity) if row.similarity else 0.0
+                if sim >= threshold and row.id not in entities:
+                    entities[row.id] = {
+                        "id": row.id,
+                        "name": row.name,
+                        "entity_type": row.entity_type,
+                        "circle_tier": int(row.circle_tier or 0),
+                        "similarity": sim,
+                    }
+
+        if not entities:
+            return {"entities": [], "relations": []}
+
+        rel_sql = text(f"""
+            SELECT r.id, r.subject_id, r.predicate, r.object_id, r.circle_tier
+            FROM kg_relations r
+            WHERE r.is_active = true
+              AND (r.subject_id = ANY(:rel_ids) OR r.object_id = ANY(:rel_ids))
+              {relation_filter_clause}
+            LIMIT :max_triples
+        """)
+        rel_result = await self.db.execute(
+            rel_sql,
+            {**relation_params, "rel_ids": list(entities.keys()), "max_triples": max_triples},
+        )
+        relation_rows = rel_result.fetchall()
+
+        # Resolve subject/object names (may reference entities outside the match
+        # set). Circle-filtered so a visible relation can't disclose the NAME of
+        # an endpoint entity in a circle the asker can't reach — inaccessible
+        # endpoints fall through to "?" below. The matched `entities` already
+        # passed the entity filter, so reuse their names and only gate the
+        # out-of-set endpoints. Mirrors kg_graph_service.focus.
+        needed_ids = {r.subject_id for r in relation_rows} | {r.object_id for r in relation_rows}
+        # `entities` is non-empty here (early-returned above otherwise).
+        name_map = {eid: e["name"] for eid, e in entities.items()}
+        missing = {i for i in needed_ids if i not in name_map}
+        if missing:
+            name_map.update(await self._resolve_entity_names(missing, user_id))
+
+        relations = [
+            {
+                "id": r.id,
+                "subject_id": r.subject_id,
+                "subject_name": name_map.get(r.subject_id, "?"),
+                "predicate": r.predicate,
+                "object_id": r.object_id,
+                "object_name": name_map.get(r.object_id, "?"),
+                "circle_tier": int(r.circle_tier or 0),
+            }
+            for r in relation_rows
+        ]
+
+        return {"entities": list(entities.values()), "relations": relations}

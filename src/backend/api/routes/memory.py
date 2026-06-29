@@ -17,7 +17,7 @@ from api.routes.memory_schemas import (
 )
 from models.database import ConversationMemory, User
 from services.api_rate_limiter import limiter
-from services.auth_service import get_current_user
+from services.auth_service import get_user_or_default
 from services.conversation_memory_service import ConversationMemoryService
 from services.database import get_db
 from utils.config import settings
@@ -26,7 +26,7 @@ router = APIRouter()
 
 
 async def _verify_memory_ownership(
-    memory_id: int, current_user: User | None, db: AsyncSession
+    memory_id: int, current_user: User, db: AsyncSession
 ) -> None:
     """Verify that the memory belongs to the current user. Raises 404 if not found or not owned."""
     result = await db.execute(
@@ -37,10 +37,9 @@ async def _verify_memory_ownership(
         raise HTTPException(status_code=404, detail="Memory not found")
 
     owner_id = row[0]
-    user_id = current_user.id if current_user else None
 
-    # Both None (no auth) → OK; both match → OK; otherwise → 404 (don't leak existence)
-    if owner_id != user_id:
+    # 404 (not 403) so we don't leak the existence of other users' memories.
+    if owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="Memory not found")
 
 
@@ -54,6 +53,8 @@ def _memory_to_response(memory) -> MemoryResponse:
         access_count=memory.access_count,
         created_at=memory.created_at.isoformat() if memory.created_at else "",
         last_accessed_at=memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
+        subject_name=memory.subject_name,
+        subject_entity_id=memory.subject_entity_id,
     )
 
 
@@ -65,20 +66,25 @@ async def list_memories(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
-    current_user: User | None = Depends(get_current_user),
+    current_user: User = Depends(get_user_or_default),
 ):
-    """List active memories with optional category filter."""
+    """List active memories with optional category filter.
+
+    Uses ``get_user_or_default`` so AUTH_ENABLED=false deploys see the admin's
+    memories (matching where ``ConversationMemoryService.save`` writes them).
+    The previous ``get_current_user`` dependency returned None in single-user
+    mode and the ``WHERE user_id IS NULL`` query never matched any rows.
+    """
     try:
         service = ConversationMemoryService(db)
-        user_id = current_user.id if current_user else None
 
         memories = await service.list_for_user(
-            user_id=user_id,
+            user_id=current_user.id,
             category=category,
             limit=limit,
             offset=offset,
         )
-        total = await service.get_count(user_id=user_id, category=category)
+        total = await service.get_count(user_id=current_user.id, category=category)
 
         return MemoryListResponse(
             memories=[
@@ -90,6 +96,8 @@ async def list_memories(
                     access_count=m["access_count"],
                     created_at=m["created_at"] or "",
                     last_accessed_at=m.get("last_accessed_at"),
+                    subject_name=m.get("subject_name"),
+                    subject_entity_id=m.get("subject_entity_id"),
                 )
                 for m in memories
             ],
@@ -102,13 +110,51 @@ async def list_memories(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/by-subject/{entity_id}", response_model=MemoryListResponse)
+@limiter.limit(settings.api_rate_limit_chat)
+async def list_memories_by_subject(
+    request: Request,
+    entity_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_user_or_default),
+):
+    """Memories whose subject is the given KG entity (Phase 3c), circle-filtered.
+
+    Backs the /wissen entity drawer's "Erinnerungen über diesen Knoten". Tombstone-
+    safe (canonical_id chase) so a pre-merge link still resolves to the survivor.
+    """
+    try:
+        from services.memory_retrieval import MemoryRetrieval
+        rows = await MemoryRetrieval(db).list_by_subject_entity(
+            entity_id, current_user.id if current_user else None, limit,
+        )
+        return MemoryListResponse(
+            memories=[
+                MemoryResponse(
+                    id=m["id"], content=m["content"], category=m["category"],
+                    importance=m["importance"], access_count=m["access_count"],
+                    created_at=m["created_at"] or "",
+                    last_accessed_at=m.get("last_accessed_at"),
+                    subject_name=m.get("subject_name"),
+                    subject_entity_id=m.get("subject_entity_id"),
+                )
+                for m in rows
+            ],
+            total=len(rows), limit=limit, offset=0,
+        )
+    except Exception as e:
+        logger.error(f"List memories by subject error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("", response_model=MemoryResponse, status_code=201)
 @limiter.limit(settings.api_rate_limit_chat)
 async def create_memory(
     request: Request,
     body: MemoryCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User | None = Depends(get_current_user),
+    current_user: User = Depends(get_user_or_default),
 ):
     """Manually create a memory."""
     try:
@@ -116,7 +162,7 @@ async def create_memory(
         memory = await service.save(
             content=body.content,
             category=body.category,
-            user_id=current_user.id if current_user else None,
+            user_id=current_user.id,
             importance=body.importance,
         )
 
@@ -138,7 +184,7 @@ async def update_memory(
     memory_id: int,
     body: MemoryUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User | None = Depends(get_current_user),
+    current_user: User = Depends(get_user_or_default),
 ):
     """Update a memory's content, category, or importance."""
     await _verify_memory_ownership(memory_id, current_user, db)
@@ -168,7 +214,7 @@ async def get_memory_history(
     request: Request,
     memory_id: int,
     db: AsyncSession = Depends(get_db),
-    current_user: User | None = Depends(get_current_user),
+    current_user: User = Depends(get_user_or_default),
 ):
     """Get modification history for a memory."""
     await _verify_memory_ownership(memory_id, current_user, db)
@@ -206,7 +252,7 @@ async def delete_memory(
     request: Request,
     memory_id: int,
     db: AsyncSession = Depends(get_db),
-    current_user: User | None = Depends(get_current_user),
+    current_user: User = Depends(get_user_or_default),
 ):
     """Soft-delete a memory (set is_active=False)."""
     await _verify_memory_ownership(memory_id, current_user, db)

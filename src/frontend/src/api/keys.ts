@@ -22,6 +22,7 @@ export const keys = {
   memories: {
     all: ['memories'] as const,
     list: (category: string | null) => ['memories', 'list', { category }] as const,
+    bySubject: (entityId: number | null) => ['memories', 'bySubject', { entityId }] as const,
   },
   users: {
     all: ['users'] as const,
@@ -69,6 +70,8 @@ export const keys = {
     all: ['satellites'] as const,
     list: () => ['satellites', 'list'] as const,
     detail: (id: number) => ['satellites', 'detail', id] as const,
+    enrollment: () => ['satellites', 'enrollment'] as const,
+    enrollmentStatus: () => ['satellites', 'enrollment', 'status'] as const,
   },
   presence: {
     all: ['presence'] as const,
@@ -99,6 +102,7 @@ export const keys = {
     entities: (filters?: Record<string, unknown>) => ['knowledgeGraph', 'entities', filters ?? {}] as const,
     relations: (filters?: Record<string, unknown>) => ['knowledgeGraph', 'relations', filters ?? {}] as const,
     circleTiers: () => ['knowledgeGraph', 'circle-tiers'] as const,
+    mergeProposals: () => ['knowledgeGraph', 'merge-proposals'] as const,
   },
   circles: {
     all: ['circles'] as const,
@@ -126,6 +130,15 @@ export const keys = {
     search: (query: string, filters?: Record<string, unknown>) =>
       ['brain', 'search', { query, ...(filters ?? {}) }] as const,
     review: () => ['brain', 'review'] as const,
+    atom: (atomId: string) => ['brain', 'atom', atomId] as const,
+    facts: (documentId: number) => ['brain', 'facts', documentId] as const,
+    obligations: (filters?: Record<string, unknown>) =>
+      ['brain', 'obligations', filters ?? {}] as const,
+    calendarPref: () => ['brain', 'calendar-pref'] as const,
+  },
+  config: {
+    all: ['config'] as const,
+    features: () => ['config', 'features'] as const,
   },
   maintenance: {
     all: ['maintenance'] as const,
@@ -135,6 +148,8 @@ export const keys = {
     all: ['chatSessions'] as const,
     list: () => ['chatSessions', 'list'] as const,
     history: (id: string) => ['chatSessions', 'history', id] as const,
+    messageSearch: (q: string, sessionId: string | null) =>
+      ['chatSessions', 'messageSearch', q, sessionId ?? '__global__'] as const,
   },
   preferences: {
     all: ['preferences'] as const,

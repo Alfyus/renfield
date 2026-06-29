@@ -27,7 +27,8 @@
     "noResults": "No results found",
     "continue": "Continue",
     "back": "Back",
-    "done": "Done"
+    "done": "Done",
+    "clear": "Clear"
   },
   "nav": {
     "chat": "Chat",
@@ -47,6 +48,7 @@
     "memory": "Memories",
     "brain": "Second Brain",
     "brainReview": "Review",
+    "fristen": "Deadlines",
     "federationAudit": "Federation log",
     "circles": "Circles",
     "intents": "Intents",
@@ -64,7 +66,8 @@
     "adminSkills": "Skills Inbox",
     "adminToolHealth": "Tool Health",
     "adminTrajectories": "Trajectories",
-    "adminCurator": "Curator"
+    "adminCurator": "Curator",
+    "wissen": "Knowledge"
   },
   "auth": {
     "login": "Login",
@@ -124,7 +127,115 @@
     "yourMessage": "Your message",
     "assistantResponse": "Response from {{appName}}",
     "readAloud": "Read aloud",
+    "edit": "Edit",
+    "editMessage": "Edit message",
+    "resubmit": "Resubmit",
+    "regenerate": "Regenerate",
+    "branch": {
+      "group": "Branch navigation",
+      "previous": "Previous branch",
+      "next": "Next branch",
+      "position": "{{current}}/{{total}}",
+      "delete": "Delete this branch",
+      "deleteConfirm": "Delete this branch and all its replies? This cannot be undone."
+    },
     "albumArt": "Album art",
+    "mediaHandoff": {
+      "followed": "Playback following you to {{room}}",
+      "followedUnknownRoom": "Playback is following you",
+      "continued": "Continued in {{room}}",
+      "continuedUnknownRoom": "Playback continued",
+      "ariaLabel": "Notice: media playback followed you to another room"
+    },
+    "sources": {
+      "label": "Sources",
+      "more": "+{{count}} more"
+    },
+    "followups": {
+      "label": "Follow-up suggestions"
+    },
+    "artifacts": {
+      "generated": "generated",
+      "loading": "Loading artifact",
+      "regionLabel": "Generated artifact: {{title}}",
+      "regionLabelUntitled": "Generated artifact",
+      "fallbackNote": "could not be displayed as an artifact",
+      "emptyTable": "No rows",
+      "emptyList": "No entries",
+      "emptyKeyValue": "No entries",
+      "emptyChart": "No data points",
+      "weather": {
+        "feelsLike": "Feels like {{temp}}"
+      },
+      "deviceControl": {
+        "empty": "No controllable devices found",
+        "run": "Run scene {{name}}",
+        "runLabel": "Run",
+        "brightness": "Brightness of {{name}}",
+        "tempDown": "Lower {{name}} setpoint",
+        "tempUp": "Raise {{name}} setpoint"
+      },
+      "presenceMap": {
+        "empty": "Nobody detected at home right now",
+        "nobody": "empty"
+      },
+      "chartSummary": "{{type}} with {{count}} series",
+      "chartType": {
+        "bar": "Bar chart",
+        "line": "Line chart"
+      },
+      "seriesFallback": "Series {{n}}"
+    },
+    "roleBadge": {
+      "pin": "Answered by {{role}} · pin for the next turn",
+      "pinned": "{{role}} pinned for the next turn"
+    },
+    "roles": {
+      "smart_home": "Smart Home",
+      "media": "Media",
+      "documents": "Documents",
+      "research": "Research",
+      "presence": "Presence",
+      "workflow": "Automation",
+      "general": "General",
+      "conversation": "Conversation",
+      "knowledge": "Knowledge",
+      "routine": "Routine"
+    },
+    "palette": {
+      "title": "Actions",
+      "open": "Open action palette",
+      "search": "Search actions…",
+      "noResults": "No action found",
+      "roleActive": "Role: {{role}}",
+      "clearRole": "Clear role",
+      "categories": {
+        "navigate": "Navigation",
+        "tool": "Action",
+        "setRole": "Role"
+      },
+      "actions": {
+        "knowledge": "Open documents",
+        "brain": "Open knowledge",
+        "fristen": "Open deadlines",
+        "memory": "Open memories",
+        "graph": "Open knowledge graph",
+        "circles": "Circles settings",
+        "homeassistant": "Open smart home",
+        "cameras": "Open cameras",
+        "rooms": "Open rooms",
+        "btScan": "Scan Bluetooth devices",
+        "goodNight": "Start good-night routine",
+        "goodMorning": "Start good-morning routine",
+        "presence": "Who's home?",
+        "searchDocs": "Search documents",
+        "roleSmartHome": "Role: Smart home",
+        "roleMedia": "Role: Media",
+        "roleDocuments": "Role: Documents",
+        "roleResearch": "Role: Research",
+        "roleGeneral": "Role: General"
+      }
+    },
     "intent": "Intent",
     "startConversation": "Start a conversation with {{appName}}",
     "useTextOrMic": "You can type text or use the microphone",
@@ -150,10 +261,11 @@
     "attachFile": "Attach file",
     "uploading": "Uploading...",
     "uploadSuccess": "Uploaded",
-    "uploadFailed": "Upload failed",
+    "uploadFailed": "Processing failed",
     "unsupportedFormat": "Unsupported file format",
     "fileTooLarge": "File too large (max. {{size}}MB)",
     "removeAttachment": "Remove attachment",
+    "uploadProcessing": "processing …",
     "documentUploaded": "Document uploaded: {{filename}}",
     "documentAttached": "{{count}} document(s) attached",
     "dropFileHere": "Drop file to attach",
@@ -180,6 +292,22 @@
     "emailFailed": "Failed to send email",
     "documentIndexing": "Indexing to KB...",
     "documentIndexed": "Indexed to KB",
+    "paperlessConfirm": {
+      "title": "File document in Paperless",
+      "decisionsHeading": "Please choose per field",
+      "confirm": "File it",
+      "abort": "Cancel",
+      "submitted": "Choice submitted",
+      "createValueLabel": "New entry",
+      "summaryFields": {
+        "title": "Title",
+        "correspondent": "Correspondent",
+        "document_type": "Document type",
+        "tags": "Tags",
+        "storage_path": "Storage path",
+        "created_date": "Issue date"
+      }
+    },
     "agentThinking": "Thinking...",
     "agentStepsCount": "{{count}} step completed",
     "agentStepsCount_other": "{{count}} steps completed",
@@ -193,7 +321,23 @@
     },
     "exampleWeather": "How's the weather?",
     "exampleLight": "Turn on the living room light",
-    "exampleMusic": "Play some jazz music"
+    "exampleMusic": "Play some jazz music",
+    "search": {
+      "placeholderGlobal": "Search messages…",
+      "placeholderInConversation": "Search this conversation…",
+      "clear": "Clear search",
+      "searching": "Searching…",
+      "resultsLabel": "Search results",
+      "roleUser": "You",
+      "roleAssistant": "Renfield",
+      "moreResults": "More matches available – refine your search",
+      "emptyTitle": "No messages found for “{{query}}”",
+      "emptyHintGlobal": "Try different terms or check the spelling.",
+      "emptyHintInConversation": "There's no matching message in this conversation.",
+      "noPermissionTitle": "Search unavailable",
+      "noPermissionHint": "Please sign in to search your messages.",
+      "error": "Search failed. Please try again."
+    }
   },
   "voice": {
     "startRecording": "Start voice recording",
@@ -481,6 +625,20 @@
     "serverError": "Something went wrong during upload.",
     "showDetails": "Show details",
     "hideDetails": "Hide details",
+    "facts": {
+      "toggle": "Facts",
+      "title": "Extracted facts",
+      "loadError": "Could not load facts.",
+      "extracting": "Extracting facts …",
+      "empty": "No facts found.",
+      "disabled": "Fact extraction is disabled.",
+      "disabledHint": "Can be enabled in settings.",
+      "group": {
+        "identifier": "Identifiers",
+        "universal": "Key data",
+        "obligation": "Deadlines"
+      }
+    },
     "failedRetry": "Upload again",
     "pollingTimeout": "Processing of \"{{filename}}\" is taking longer than expected. Please refresh to see the current status."
   },
@@ -497,6 +655,8 @@
     "noMemories": "No memories yet",
     "count": "{{count}} memories",
     "couldNotLoad": "Could not load memories",
+    "subjectLabel": "About: {{name}}",
+    "aboutThisEntity": "Memories about this entity",
     "content": "Content",
     "importance": "Importance",
     "accessCount": "Access count",
@@ -786,9 +946,58 @@
       "completed": "Completed",
       "failed": "Failed",
       "rolling_back": "Restoring backup..."
+    },
+    "enrollment": {
+      "title": "Satellite Enrollment",
+      "description": "Issues each satellite a unique enrollment key (PSK) that it uses to prove its identity to the backend. The key is shown ONCE — provision it to the satellite afterwards.",
+      "statusEnabled": "Enrollment on",
+      "statusDisabled": "Enrollment off",
+      "statusEnforcing": "Enforcing",
+      "statusPermissive": "Soak phase",
+      "pendingCount": "{{count}} not yet authenticated",
+      "satelliteId": "Satellite ID",
+      "satelliteIdPlaceholder": "e.g. sat-wohnzimmer",
+      "room": "Room",
+      "roomPlaceholder": "Room (optional)",
+      "enroll": "Enroll",
+      "enrolling": "Enrolling…",
+      "enrollFailed": "Enrollment failed",
+      "tokenMinted": "Key minted for {{id}}",
+      "tokenRotated": "Key rotated for {{id}}",
+      "tokenOnceWarning": "This key is shown only once. Copy it now and provision it to the satellite (host_vars or a k8s Secret).",
+      "copy": "Copy",
+      "copied": "Copied",
+      "lastAuth": "Last authenticated",
+      "never": "never",
+      "connected": "Connected",
+      "offline": "Offline",
+      "revoked": "revoked",
+      "revoke": "Revoke",
+      "rotate": "Rotate",
+      "alreadyEnrolled": "Already enrolled — use “Rotate” to issue a fresh token.",
+      "copyFailed": "Copy failed — select the token manually (it is shown only once).",
+      "invalidIdFormat": "Invalid satellite ID format — only letters, digits and . _ - allowed."
     }
   },
   "presence": {
+    "irk": {
+      "title": "Phone presence (BLE pairing)",
+      "description": "Pair a phone once so its rotating Bluetooth address resolves to a stable identity for room presence. No app required.",
+      "user": "User",
+      "selectUser": "Select user…",
+      "satellite": "Satellite",
+      "selectSatellite": "Select satellite…",
+      "label": "Label",
+      "labelPlaceholder": "e.g. eduard-iphone",
+      "startPairing": "Start pairing",
+      "waiting": "Waiting for phone…",
+      "instructions": "On the phone: Settings → Bluetooth → tap “Renfield {{room}}”.",
+      "theSatellite": "the satellite",
+      "captured": "Paired — phone presence is now tracked.",
+      "failed": "No phone paired in time. Try again.",
+      "disabled": "disabled",
+      "revoke": "Revoke"
+    },
     "title": "Presence",
     "subtitle": "Who is where — room presence via BLE, voice, and web",
     "roomOccupancy": "Room Occupancy",
@@ -833,6 +1042,12 @@
     "tabLive": "Live",
     "tabAnalytics": "Analytics",
     "heatmapTitle": "Room Activity Heatmap",
+    "heatmapDescription": "How often each room was entered, by time of day (local time). Darker = more often.",
+    "heatmapHourAxis": "Time (hour of day)",
+    "heatmapRoomLabel": "Room",
+    "heatmapLegendLess": "less",
+    "heatmapLegendMore": "more",
+    "heatmapCellTooltip": "{{room}} at {{hour}}:00 — {{count}}×",
     "predictionsTitle": "Presence Predictions",
     "dailySummaryTitle": "Daily Activity",
     "allUsers": "All Users",
@@ -886,6 +1101,7 @@
     "selectCorrectIntent": "Select correct intent:",
     "selectComplexity": "Select correct complexity:",
     "correctionSaved": "Correction saved! {{appName}} will learn from this.",
+    "regenerate": "Answer again",
     "proactiveQuestion": "Was this the right classification?",
     "intentConversation": "General conversation",
     "intentKnowledge": "Knowledge base",
@@ -913,7 +1129,8 @@
     "forbidden": "Access denied",
     "serverError": "Server error",
     "validationError": "Validation error",
-    "couldNotProcess": "Sorry, there was an error processing your request."
+    "couldNotProcess": "Sorry, there was an error processing your request.",
+    "connectionInterrupted": "The connection was interrupted during the response. Please try again."
   },
   "errorBoundary": {
     "title": "Something went wrong",
@@ -1029,6 +1246,7 @@
       "control": "Audit Control",
       "review": "Review Queue",
       "ocr": "OCR Issues",
+      "lowquality": "Low OCR Quality",
       "completeness": "Completeness",
       "duplicates": "Duplicates",
       "correspondents": "Correspondents",
@@ -1075,6 +1293,16 @@
       "reocr": "Re-process",
       "noIssues": "No OCR issues found"
     },
+    "lowQuality": {
+      "title": "Document",
+      "empty": "No low-quality OCR documents found",
+      "failedBadge": "OCR failed",
+      "droppedBadge": "{{pct}}% dropped",
+      "ignore": "Ignore",
+      "unignore": "Un-ignore",
+      "ignored": "ignored",
+      "reocr": "Re-OCR"
+    },
     "completeness": {
       "score": "Completeness",
       "issues": "Issues",
@@ -1107,7 +1335,53 @@
     "notConfigured": "Paperless Audit is not configured. Enable PAPERLESS_AUDIT_ENABLED=true and ensure the Paperless MCP server is connected.",
     "error": "Failed to load audit data"
   },
+  "obligations": {
+    "title": "Deadlines",
+    "subtitle": "Upcoming obligations from your documents",
+    "loadError": "Could not load deadlines.",
+    "confirmError": "Could not save confirmation.",
+    "exportIcs": "Export (.ics)",
+    "calendarSyncLabel": "Calendar sync:",
+    "calendarSyncOff": "Off",
+    "calendarError": "Could not load/save the calendar setting.",
+    "timeRangeLabel": "Range",
+    "group": {
+      "overdue": "Overdue",
+      "thisWeek": "This week",
+      "later": "Later"
+    },
+    "frist": {
+      "today": "today · {{date}}",
+      "future_one": "in {{count}} day · {{date}}",
+      "future_other": "in {{count}} days · {{date}}",
+      "overdue_one": "{{count}} day overdue · {{date}}",
+      "overdue_other": "{{count}} days overdue · {{date}}"
+    },
+    "kind": {
+      "zahlung": "Payment",
+      "widerspruch": "Appeal",
+      "klagefrist": "Filing deadline",
+      "frist": "Deadline"
+    },
+    "legal": "legal",
+    "legalAria": "Legal deadline — requires confirmation",
+    "bestaetigen": "Confirm",
+    "rueckgaengig": "Undo",
+    "wiederOeffnen": "Reopen",
+    "toastConfirmed": "Confirmed",
+    "toastConfirmedAria": "Confirmed — undo within 5 seconds",
+    "loadMore": "Load more",
+    "emptyTitle": "No open obligations.",
+    "emptyBody": "All deadlines from your documents are handled or still further away.",
+    "openSource": "Open document"
+  },
   "circles": {
+    "tierOverridden": "Custom visibility (differs from the document).",
+    "tierOverriddenShort": "custom",
+    "resetTier": "Reset to document tier",
+    "filterLabel": "Filter results",
+    "filterAll": "All",
+    "filterFactsOnly": "Facts only",
     "tier": {
       "0": "Self",
       "1": "Trusted",
@@ -1134,6 +1408,24 @@
     "reviewDaysLabel": "Window",
     "reviewEmpty": "No new atoms to review.",
     "reviewTierChanged": "Tier updated.",
+    "mergeProposals": {
+      "sectionTitle": "Merge suggestions",
+      "whySuggested": "Possible duplicate · {{pct}}% similarity",
+      "reason": {
+        "cross_tier": "different visibility",
+        "gray_zone": "similar but uncertain"
+      },
+      "survivorLegend": "Which entity should remain?",
+      "keepThis": "Keep {{name}}",
+      "mentions_one": "{{count}} mention",
+      "mentions_other": "{{count}} mentions",
+      "willMerge": "merges into",
+      "visibilityWarning": "Note: visibility changes from {{from}} to {{to}}",
+      "merge": "Merge",
+      "reject": "Reject",
+      "merged": "Merged",
+      "undo": "Undo"
+    },
     "settingsTitle": "Circles & Members",
     "settingsSubtitle": "Manage your tiers and who is invited into each.",
     "defaultCaptureTier": "Default capture tier",
@@ -1150,8 +1442,16 @@
       "kb_document": "Document",
       "kg_node": "Entity",
       "kg_edge": "Relation",
-      "conversation_memory": "Memory"
+      "conversation_memory": "Memory",
+      "document_fact": "Fact"
     },
+    "source": {
+      "deterministic": "verified",
+      "deterministicTitle": "Deterministically extracted — reliable",
+      "advisory": "model suggestion",
+      "advisoryTitle": "Suggested by the language model — please verify"
+    },
+    "lowConfidence": "(low confidence)",
     "couldNotLoad": "Could not load data.",
     "couldNotSave": "Could not save changes.",
     "score": "Relevance",
@@ -1433,6 +1733,73 @@
         "staleArchived": "Stale archived",
         "error": "Error"
       }
+    }
+  },
+  "lens": {
+    "uebersicht": "Overview",
+    "dokumente": "Documents",
+    "graph": "Graph",
+    "erinnerungen": "Memories",
+    "fristen": "Deadlines",
+    "pruefen": "Review",
+    "railLabel": "Knowledge views",
+    "pickerLabel": "Choose view",
+    "searchAllPlaceholder": "Search everything…",
+    "scopeLabel": "Search scope",
+    "scopeThis": "This view",
+    "scopeAll": "Everything",
+    "searchNoResults": "Nothing found for “{{query}}”",
+    "searchWidenHint": "Switch to “Everything” to search the whole knowledge base.",
+    "overview": {
+      "title": "At a glance",
+      "figDocs_one": "{{count}} document",
+      "figDocs_other": "{{count}} documents",
+      "figEntities_one": "{{count}} entity",
+      "figEntities_other": "{{count}} entities",
+      "figRelations_one": "{{count}} relation",
+      "figRelations_other": "{{count}} relations",
+      "figMemories_one": "{{count}} memory",
+      "figMemories_other": "{{count}} memories",
+      "open": "Open",
+      "fristen": "Upcoming deadlines",
+      "fristenSoon_one": "{{count}} in the next 7 days",
+      "fristenSoon_other": "{{count}} in the next 7 days",
+      "overdueAccent_one": "{{count}} overdue",
+      "overdueAccent_other": "{{count}} overdue",
+      "noFristen": "No deadlines in the next 7 days.",
+      "review": "To review",
+      "reviewNone": "Nothing to review.",
+      "reviewShort_one": "{{count}} to review",
+      "reviewShort_other": "{{count}} to review",
+      "docsNone": "No documents yet.",
+      "graphNone": "No entities yet.",
+      "memoriesNone": "No memories yet.",
+      "emptyTitle": "Your second brain is empty.",
+      "emptyCta": "Upload a document"
+    },
+    "detail": {
+      "title": "Detail",
+      "tier": "Visibility",
+      "openInDocs": "Open in Documents",
+      "openInGraph": "Open in Graph"
+    }
+  },
+  "commandCenter": {
+    "title": "Command Center",
+    "subtitle": "Live constellation of the running system",
+    "idle": "idle",
+    "srSummary": "{{roles}} agent roles, {{tools}} tools, {{rooms}} rooms. Active role: {{active}}.",
+    "ring": {
+      "roles": "Agent roles",
+      "tools": "Tools & integrations",
+      "rooms": "Rooms & satellites",
+      "peers": "Federation peers"
+    },
+    "legend": {
+      "healthy": "Healthy",
+      "degraded": "Degraded",
+      "down": "Down",
+      "unknown": "Unknown"
     }
   }
 }

@@ -1,44 +1,70 @@
-# Open Follow-Ups — refreshed 2026-05-22
+# Plan — H1 per-satellite enrollment credential (PSK)
 
-Shipped / superseded items from the old voice-pipeline plan:
+Full design + rationale: `docs/private/security/satellite-trust-design.md` (RESOLVED
+decisions + implementation plan). Closes H1 root cause (no per-satellite identity).
+Ship DARK behind `satellite_enrollment_enabled` (default off → byte-identical).
 
-| Item | Reality |
-|---|---|
-| Phase A — streaming-first pipeline | Shipped: PR #509 (`faster-whisper` streaming + in-process Piper + singleton dedup), PR #534 (partial text + activation) |
-| Phase C — voice tier on GPU | Shipped: PR #531 (`voice-server` pod live on `k8s-gpu-3`); PR #532 wired `whisper_service` + `piper_service` thin-client delegation via `voice_server_url` |
-| Phase B.5 — XTTS-v2 evaluation | Shipped: PR #539 (decision: stay on Piper) |
-| End-of-utterance robustness | Shipped: PRs #535, #536 ("5 compounded design flaws") |
-| Voice-originated tool-call guard | Shipped: PR #542 (`verify_tool_call` hook + `voice_originated` ContextVar) |
-| **Voice barge-in (Fork A acoustic)** | **Shipped — v2.8.0** (PR #601, deployed 2026-05-22): interrupt the assistant by speaking. AEC spike passed 6.77×; two independent reviews. Plan: `tasks/voice-barge-in-plan.md`. **Open:** run the PR's 8-step manual barge-in checklist live (needs a human + mic). |
-| **Vision tier (`qwen3-vl:8b`)** | **Shipped — 2026-05-22** (PR #604): `OLLAMA_VISION_MODEL` flipped on. `qwen3-vl:8b` is served by the in-cluster `ollama` pod on k8s-gpu-1 (idle 16 GB GPU); `OLLAMA_VISION_URL` already routed there. The old "new CPU pod on k8s-gpu-2" plan was moot — model + routing already existed. Verified: accurate sub-second image inference. |
-| Cosmetic `AGENT_MODEL=qwen3.6` | Done in `k8s/configmap.yaml` |
-| `:llama-rc5` re-tag to versioned | Moot — backend is on `:latest` with `imagePullPolicy: Always` |
-| Reva submodule bump (Stage 1) | Moot — submodule pointer is current (`v2.6.1-21-g856ae13`) |
-| Local repo cleanup | Done 2026-05-22 — merged `[gone]` branches pruned, no stale stashes. Recurring hygiene, not a backlog item. |
+## Locked decisions
+- Credential = **PSK** (bcrypt-hashed server-side), carried in the **register
+  first-frame** (`token` field) — smallest satellite transport change.
+- Enrollment = **Ansible + UI**; issuance endpoint **ADMIN-gated**.
+- Rollout = **auto-flip with persisted latch** ("all `satellites` rows seen
+  authenticated", not just connected) behind `satellite_enrollment_autoflip_enabled`.
+- Effective-mode state machine: OFF (legacy default) → PERMISSIVE (soak) → ENFORCING.
 
-Voice runs through `/ws/voice` on the `voice-server` pod with the frontend `useVoiceStream` hook, gated by `VITE_FEATURE_VOICE_STREAM=true`. Frames use the `RFWA` binary header (4-byte magic + 16-byte UUID + 4-byte sequence).
+## PR-A — backend core (dark) — IMPLEMENTED (branch `security/satellite-enrollment-h1`)
+- [x] `ha_glue/models/database.py` — `Satellite` + `SatelliteFleetState` models (+ re-export in `models/database.py`).
+- [x] migration `pc20260624_satellite_enrollment` (down_revision = `pc20260619_ble_irk_store`,
+      the real head; apply TARGETED); `satellites` + singleton `satellite_fleet_state`.
+- [x] `ha_glue/services/satellite_enrollment_service.py` — enroll/rotate / verify (constant-time +
+      dummy_verify) / revoke / is_enforcing / maybe_autoflip (latch) / authorize_register (state machine).
+- [x] `ha_glue/api/websocket/satellite_handler.py` — register-handler PSK verify + reject + mode;
+      passes `authenticated` to register + `is_enrolled_authenticated` to the IRK push. Flag-off skips the block.
+- [x] `ha_glue/services/satellite_manager.py` — `SatelliteInfo.authenticated` + eviction guard
+      (unauth newcomer cannot evict an authenticated incumbent) + `is_connected()`.
+- [x] `ha_glue/services/presence_service.py` — BOTH IRK push paths (`irks_for_satellite` +
+      `push_macs_to_satellites`) keyed on enrollment-auth when enabled; allowlist = OFF fallback.
+- [x] `main.py` `/api/ws/token` — 401 when unauthenticated + WS auth on (inert in prod; ws_auth_enabled=False).
+- [x] `utils/config.py` — `satellite_enrollment_enabled` + `_autoflip_enabled` (both False).
+- [x] admin API (own prefix `/api/satellite-enrollment` to avoid the `/api/satellites/{id}` wildcard):
+      `POST /enroll` (PSK once, rotate) · `GET ""` (list, no token) · `GET /status` · `DELETE /{id}`. Mounted in bootstrap.
+- [x] tests authored (run on .159): `test_satellite_enrollment.py` (service + state machine + latch +
+      both IRK gates) + `test_satellite_enrollment_routes.py` (routes + `/api/ws/token` 401 + eviction guard).
+      Conftest route-mount spec added.
+- [x] **Validated on .159**: `36 passed` (25 `test_satellite_enrollment.py` + 11 `test_satellite_enrollment_routes.py`).
+      The only blocker was pre-existing box drift (`rag_service` missing `DuplicateDocumentError` on the stale
+      `wip/lane-c` tree) — overlaid to confirm, box restored after. Local env lacks backend deps.
+- [ ] **Remaining validation**: run the migration up/down on a throwaway PG DB (mechanically trivial; mirrors
+      the proven `pc20260619` pattern; tables already exercised via `create_all` in the 36 tests).
 
----
+## PR-B — satellite + provisioning — IMPLEMENTED (same branch)
+- [x] satellite `config.py` — `ServerConfig.enrollment_token` + YAML load (blank→None) + `RENFIELD_ENROLLMENT_TOKEN` env.
+- [x] `network/websocket_client.py` — `enrollment_token` ctor param; `_register()` includes `"token"` only when set
+      (legacy frame shape preserved); wired through in `satellite.py`.
+- [x] `satellite.yaml.j2` — `enrollment_token: "{{ satellite_enrollment_token | default('') }}"`; group_vars default `""`
+      + comment (real token in gitignored host_vars); k8s per-pod `secretKeyRef` (`optional: true` so the pod still boots dark).
+- [x] `bin/enroll_satellite.py` — server-side mint/rotate, prints PSK to stdout once (UI + Ansible share the service path).
+- [x] satellite tests `tests/satellite/test_enrollment_token.py` — config (default/YAML/blank/env) + register frame include/omit.
+- [x] **Validated on .159**: `34 passed` (6 new + 28 existing config/websocket regression). k8s manifest parses. Box restored.
 
-## 1. Voice — edge STT (Phase B-original) — re-evaluate
+## PR-C — UI — IMPLEMENTED (same branch)
+- [x] `api/resources/satelliteEnrollment.ts` — list/status/enroll/revoke hooks (+ `keys.satellites.enrollment*`).
+- [x] `components/satellites/SatelliteEnrollment.tsx` — status badges (enabled/enforcing/permissive/pending),
+      enroll form (id datalist of connected sats + room), **one-time token reveal** (copy), enrolled list
+      (connected dot + last-auth + rotate + revoke). Patterned on `IrkPairing.tsx`.
+- [x] Wired into `SatellitesPage.tsx` (section after the satellite list).
+- [x] i18n: 26 keys under `satellites.enrollment.*` in de.json + en.json (minimal-diff insert).
+- [x] MSW default handlers for `/api/satellite-enrollment[/status]` (empty/disabled fleet).
+- [x] Tests: `tests/frontend/react/components/SatelliteEnrollment.test.tsx` (mint+reveal / list+revoke / enforcing badge).
+- [x] **Validated**: vitest 6/6 (3 new + 3 existing SatellitesPage regression — fixed a datalist room-text
+      collision); `tsc --noEmit` clean for my files (2 errors pre-existing, unrelated); eslint clean for my
+      files (2 errors pre-existing in SatellitesPage transcription line).
 
-Original idea: `window.SpeechRecognition` in-browser, send only final text. Since the voice-server is now GPU-fast (<2 s STT for 10 s audio per the original Phase C estimate), this may no longer be worth the multi-engine complexity. Action: park unless someone measures a concrete win.
+## Rollout (ops, post-merge, staged)
+- [ ] enroll fleet → write PSKs to host_vars / k8s secrets → re-provision → flip
+      `enabled=True` (PERMISSIVE) → verify all rows `last_authenticated_at` → flip
+      `autoflip_enabled=True` → latch enforces. Break-glass: `enabled=False`.
 
-## 2. Voice — Speech-to-Speech (Phase D) — tracking only
-
-Not actionable. Watch upstream releases of Moshi (Kyutai), Llama-Voice, Qwen-Voice. Migrate when a stable open-weights model fits in 16-32 GB VRAM at acceptable quality with built-in barge-in.
-
----
-
-## 3. Reva cross-migration — Stages 2 + 3 still open
-
-Stage 1 (submodule bump) is moot; current pointer tracks main. Open:
-
-- **Stage 2 (1-2 h)** — make `reva.llm.openai_client.OpenAIClient` extend `renfield.utils.llm_client.OpenAICompatibleClient` so Reva inherits the `_OllamaShapedMessage`/`_OllamaShapedResponse` wrappers, `_options_to_openai`, `_think_extra_body`, `_convert_messages` (incl. Qwen3 thinking-mode workaround). Reva keeps `_log_llm_exchange` trace logging and multi-backend dispatch (Anthropic, vLLM) as overrides.
-- **Stage 3 (1 h + prod-validation)** — drop per-role `ollama_url: "http://cuda.local:8081/v1"` in `reva/config/agent_roles.yaml`; switch to platform-level `LLM_OPENAI_BASE_URL` + per-tier `LLM_OPENAI_FOR_*` flags for opt-outs.
-
-Neither urgent; Reva works as-is.
-
----
-
-*Last refreshed 2026-05-22 — voice barge-in (v2.8.0) + vision tier (PR #604) shipped; local branch cleanup done.*
+## Open sub-decision (confirm during build)
+- Enforcing-latch storage: recommend a tiny singleton `satellite_fleet_state` row
+  (boolean + timestamp) in the same migration vs. overloading a generic settings table.

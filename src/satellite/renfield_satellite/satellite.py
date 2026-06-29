@@ -11,8 +11,10 @@ Orchestrates all satellite components:
 
 import asyncio
 import math
+import os
 import struct
 import time
+from collections import deque
 from enum import Enum
 from typing import Optional, Dict, Any
 
@@ -34,6 +36,7 @@ from .network.model_downloader import get_model_downloader, ModelDownloader
 from .wakeword.detector import MICRO_BUILTIN_MODELS
 from .ble.scanner import BLEScanner, BLEAK_AVAILABLE
 from .ble.classic_scanner import ClassicBTScanner
+from .ble.discovery_scanner import BTDiscoveryScanner
 from .update import UpdateManager, UpdateStage
 
 
@@ -80,7 +83,14 @@ class Satellite:
         self._processing_timeout: float = 60.0  # Max time to wait for server response (vision models need more time)
         self._reconnecting: bool = False  # Prevent duplicate reconnection attempts
         self._wakeword_pending: bool = False  # Prevent duplicate wakeword processing
+        # VAD-gated wake-word state: openwakeword is ~4x more expensive than the
+        # VAD, so in idle we run the VAD continuously and only spend wake-word
+        # inference when speech is present. Pre-roll keeps openwakeword's streaming
+        # context warm so the start of the wake word is never clipped.
+        self._ww_preroll: deque = deque(maxlen=1)  # sized from config in _setup_components
+        self._ww_gate_remaining: int = 0  # chunks left to run wake-word after last speech
         self._pending_snapshot: Optional[asyncio.Task] = None  # Background camera capture
+        self._reconnect_task: Optional[asyncio.Task] = None  # Startup-failure reconnect loop (kept referenced so asyncio doesn't GC it)
 
         # Metrics tracking
         self._last_wakeword: Optional[Dict[str, Any]] = None
@@ -148,6 +158,9 @@ class Satellite:
             stop_words=self.config.wakeword.stop_words,
             refractory_seconds=self.config.wakeword.refractory_seconds,
         )
+        # Size the wake-word pre-roll buffer from config (keep >=1 so the
+        # current chunk always has a slot even when pre-roll is disabled).
+        self._ww_preroll = deque(maxlen=max(1, self.config.wakeword.vad_gate_preroll_chunks))
 
         # LED controller (select based on type)
         if self.config.led.type == "gpio_rgb":
@@ -209,6 +222,10 @@ class Satellite:
             server_url=self.config.server.url,  # May be None if using auto-discovery
             reconnect_interval=self.config.server.reconnect_interval,
             heartbeat_interval=self.config.server.heartbeat_interval,
+            ping_interval=self.config.server.ping_interval,
+            ping_timeout=self.config.server.ping_timeout,
+            register_timeout=self.config.server.register_timeout,
+            enrollment_token=self.config.server.enrollment_token,
             language=self.config.satellite.language,
             # Real hardware capabilities so the fleet page reflects THIS
             # device, not a hardcoded "3 LEDs" for every satellite.
@@ -232,30 +249,49 @@ class Satellite:
         # Service discovery for auto-finding server
         self.discovery = ServiceDiscovery()
 
-        # OTA Update manager
-        self.update_manager = UpdateManager()
+        # OTA Update manager — verify TLS on the package download per the same
+        # policy as the WS/auth paths (review H6).
+        self.update_manager = UpdateManager(
+            verify_tls=self.config.server.verify_tls,
+            release_pubkeys=self.config.update.release_pubkeys,
+            require_signature=self.config.update.require_signature,
+        )
 
         # BLE Scanner (optional, for presence detection)
         self.ble_scanner: Optional[BLEScanner] = None
         self._ble_known_macs: set = set()
+        self._ble_irks: dict = {}
         if self.config.ble.enabled and BLEAK_AVAILABLE:
             self.ble_scanner = BLEScanner(
                 scan_duration=self.config.ble.scan_duration,
                 rssi_threshold=self.config.ble.rssi_threshold,
+                smoothing_alpha=self.config.ble.smoothing_alpha,
+                freshness_seconds=self.config.ble.freshness_seconds,
             )
             # Pre-populate from config (backend will push updates)
             self._ble_known_macs = {mac.upper() for mac in self.config.ble.known_devices}
-            print(f"BLE scanning enabled (interval={self.config.ble.scan_interval}s)")
+            self._ble_irks = self._parse_irks(self.config.ble.irks)
+            self.ble_scanner.update_irks(self._ble_irks)
+            print(f"BLE scanning enabled (interval={self.config.ble.scan_interval}s, "
+                  f"known_macs={len(self._ble_known_macs)}, irks={len(self._ble_irks)})")
         elif self.config.ble.enabled and not BLEAK_AVAILABLE:
             print("Warning: BLE enabled in config but bleak not installed. BLE scanning disabled.")
 
         # Classic BT Scanner (for Apple devices with permanent Classic BT MACs)
-        self.classic_bt_scanner = ClassicBTScanner(timeout=5.0)
+        self.classic_bt_scanner = ClassicBTScanner(
+            timeout=5.0,
+            read_rssi=self.config.ble.classic_rssi,
+            rssi_interval=self.config.ble.classic_rssi_interval,
+        )
         self._classic_bt_known_macs: set = set()
         if self.config.ble.enabled and self.classic_bt_scanner.available:
             print("Classic BT scanning enabled (hcitool available)")
         elif self.config.ble.enabled:
             print("Warning: hcitool not found. Classic BT scanning disabled.")
+
+        # On-demand broad BT discovery scanner (backend "scan all bluetooth
+        # devices" request). Independent of the known-MAC presence scanners.
+        self.bt_discovery_scanner = BTDiscoveryScanner()
 
         # Wire up callbacks
         self._setup_callbacks()
@@ -278,6 +314,16 @@ class Satellite:
         self.ws_client.on_ble_known_devices(self._on_ble_known_devices)
         # Classic BT known devices callback
         self.ws_client.on_classic_bt_known_devices(self._on_classic_bt_known_devices)
+        # Backend-pushed per-person IRKs (resolve rotating RPAs)
+        self.ws_client.on_ble_irks(self._on_ble_irks_received)
+        # Backend-pushed LED brightness (night-dimming)
+        self.ws_client.on_led_config(self._on_led_config_update)
+        # On-demand camera snapshot (backend occupancy check for private announcements)
+        self.ws_client._capture_snapshot = self._capture_snapshot_for_request
+        # On-demand Bluetooth discovery scan ("scan all bluetooth devices")
+        self.ws_client.on_bt_scan_request(self._handle_bt_scan_for_request)
+        # On-demand IRK pairing capture (UI "pair my phone for presence")
+        self.ws_client.on_irk_capture(self._capture_irk_for_request)
 
         # Update manager progress callback
         self.update_manager.on_progress(self._on_update_progress)
@@ -355,7 +401,7 @@ class Satellite:
             self._set_state(SatelliteState.ERROR)
             self.leds.set_pattern(LEDPattern.ERROR)
             await asyncio.sleep(2)
-            asyncio.create_task(self._reconnect_with_discovery())
+            self._start_reconnect_loop()
 
         # Go to idle state
         self._set_state(SatelliteState.IDLE)
@@ -418,12 +464,147 @@ class Satellite:
             print("No Renfield server found on network")
             return None
 
+    def _start_reconnect_loop(self):
+        """Schedule the reconnect loop from the async run() context.
+
+        The first connect commonly fails at boot because mDNS resolution of the
+        server host (e.g. renfield.local) is cold for the first ~2-3s until
+        avahi's multicast cache warms — getaddrinfo raises
+        "[Errno -2] Name or service not known", then resolves fine seconds later.
+        The reconnect loop recovers from that, BUT it must actually run: a bare
+        asyncio.create_task() whose result is discarded is held only weakly by
+        the event loop and can be garbage-collected before it is ever scheduled,
+        which silently strands the satellite in idle forever ("will retry" never
+        happens). Keep a strong reference on self, and honor the _reconnecting
+        guard so a concurrent _on_disconnected does not spawn a duplicate loop.
+        """
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        self._reconnect_task = asyncio.create_task(
+            self._reconnect_with_discovery_wrapper()
+        )
+
     async def _reconnect_with_discovery_wrapper(self):
         """Wrapper for reconnection that resets the reconnecting flag"""
         try:
             await self._reconnect_with_discovery()
         finally:
             self._reconnecting = False
+
+    async def _capture_snapshot_for_request(self):
+        """Capture a JPEG for a backend on-demand snapshot request (or None if no
+        camera). Checked at call time since self.camera may be None if open() failed."""
+        if self.camera and self.camera.available:
+            return await self.camera.capture()
+        return None
+
+    async def _handle_bt_scan_for_request(self, params: dict) -> list[dict]:
+        """Run a broad BT discovery scan for a backend "scan all bluetooth
+        devices" request, returning the discovered device list (BLE + Classic)."""
+        return await self.bt_discovery_scanner.discover(
+            params.get("ble_duration", 10.0),
+            params.get("classic_timeout", 12.0),
+        )
+
+    @staticmethod
+    def _read_bonded_irks(bt_root: str = "/var/lib/bluetooth") -> dict:
+        """Map bonded-device MAC -> IRK hex (most-significant-octet first) from
+        BlueZ's store. BlueZ does not expose bonding keys over D-Bus, so we read
+        the on-disk info files (requires root / a hostPath mount in the k8s pod).
+
+        BlueZ writes the IdentityResolvingKey *least*-significant-octet first,
+        but the RPA resolver and the backend store expect it MSO-first (see
+        ble/rpa.py — "reverse them at the config boundary, not here"). This
+        reader IS that boundary, so it reverses the bytes; without this, a
+        captured IRK is stored byte-swapped and silently never resolves a
+        rotating address (a bonded satellite still resolves natively via BlueZ,
+        which masked the bug)."""
+        import glob
+        import os
+        found = {}
+        for info_path in glob.glob(f"{bt_root}/*/*/info"):
+            try:
+                with open(info_path) as fh:
+                    txt = fh.read()
+            except OSError:
+                continue
+            if "[IdentityResolvingKey]" not in txt:
+                continue
+            mac = os.path.basename(os.path.dirname(info_path)).upper()
+            irk = None
+            in_section = False
+            for raw in txt.splitlines():
+                line = raw.strip()
+                if line == "[IdentityResolvingKey]":
+                    in_section = True
+                    continue
+                if in_section and line.startswith("["):
+                    break
+                if in_section and line.startswith("Key="):
+                    irk = line.split("=", 1)[1].strip()
+                    break
+            if irk:
+                try:
+                    # BlueZ stores the IRK LSO-first; convert to the MSO-first
+                    # form the resolver + backend expect.
+                    found[mac] = bytes.fromhex(irk)[::-1].hex().upper()
+                except ValueError:
+                    continue
+        return found
+
+    async def _capture_irk_for_request(self, params: dict) -> dict:
+        """Open a one-time pairing window, let a phone bond, and capture its IRK
+        from BlueZ; re-secure the adapter afterward. Returns
+        {'irk': hex, 'mac': str, 'name': label} or {} (no new bond in time).
+        Raises (→ surfaced as error) if the BlueZ store isn't readable."""
+        import asyncio as _aio
+        import os
+
+        label = params.get("label") or "device"
+        window = int(params.get("window_seconds", 60))
+        bt_root = "/var/lib/bluetooth"
+
+        if not os.path.isdir(bt_root) or not os.access(bt_root, os.R_OK):
+            raise RuntimeError(
+                f"{bt_root} not readable — IRK capture needs root / a hostPath mount"
+            )
+
+        async def _bctl(*args):
+            proc = await _aio.create_subprocess_exec(
+                "bluetoothctl", *args,
+                stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+
+        before = set(self._read_bonded_irks(bt_root).keys())
+        await _bctl("system-alias", f"Renfield {self.config.satellite.room}")
+        await _bctl("power", "on")
+        await _bctl("pairable", "on")
+        await _bctl("discoverable-timeout", "0")
+        await _bctl("discoverable", "on")
+        agent = await _aio.create_subprocess_exec(
+            "bt-agent", "-c", "NoInputNoOutput",
+            stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL,
+        )
+        print(f"IRK capture window open ({window}s) — pair the phone now")
+        try:
+            for _ in range(window):
+                await _aio.sleep(1)
+                current = self._read_bonded_irks(bt_root)
+                new_macs = set(current.keys()) - before
+                if new_macs:
+                    mac = sorted(new_macs)[0]
+                    print(f"IRK captured for newly-bonded {mac}")
+                    return {"irk": current[mac], "mac": mac, "name": label}
+            return {}
+        finally:
+            await _bctl("discoverable", "off")
+            await _bctl("pairable", "off")
+            try:
+                agent.terminate()
+            except ProcessLookupError:
+                pass
 
     async def _reconnect_with_discovery(self):
         """
@@ -434,8 +615,30 @@ class Satellite:
         """
         attempts = 0
         max_backoff = 60
+        disconnect_start = time.monotonic()
+        max_disconnected = getattr(self.config.server, "max_disconnected_seconds", 0)
 
         while self._running:
+            # Disconnect watchdog: if we've been unable to reconnect for too long,
+            # exit so systemd (Restart=always) brings up a FRESH process. This is
+            # the backstop for any in-process wedge the reconnect loop can't clear
+            # (a clean exit, never the SIGKILL-mid-restart that risks the SD card).
+            if max_disconnected and (time.monotonic() - disconnect_start) > max_disconnected:
+                # NEVER restart mid-OTA: the installer does a non-atomic
+                # rmtree+copytree of the install dir, so an os._exit during it
+                # would leave a half-written install — exactly the brick we're
+                # trying to avoid. Defer the watchdog (fresh window) until the
+                # update finishes.
+                if self.update_manager.current_stage != UpdateStage.IDLE:
+                    print("Disconnect watchdog deferred: OTA update in progress")
+                    disconnect_start = time.monotonic()
+                else:
+                    print(
+                        f"Disconnected >{max_disconnected}s after {attempts} attempts; "
+                        "exiting for a clean systemd restart"
+                    )
+                    os._exit(1)
+
             attempts += 1
             backoff = min(self.config.server.reconnect_interval * (2 ** (attempts - 1)), max_backoff)
 
@@ -445,20 +648,30 @@ class Satellite:
             if not self._running:
                 break
 
-            # Re-discover server if auto-discovery is enabled and no URL set
-            if self.config.server.auto_discover and not self.config.server.url:
-                print("Re-discovering server...")
-                server_url = await self._discover_server()
-                if server_url:
-                    self.ws_client.set_server_url(server_url)
+            # Guard the whole attempt: a transient exception in discovery, token
+            # fetch, or connect must NOT escape the loop. If it did, the wrapper's
+            # finally would reset _reconnecting=False and the task would die — and
+            # on the startup-failure path there is no live receive loop left to
+            # re-fire _on_disconnected, so reconnection would never restart AND the
+            # disconnect watchdog above (which only runs inside this loop) would be
+            # bypassed. Swallow, log, and let the next iteration retry with backoff.
+            try:
+                # Re-discover server if auto-discovery is enabled and no URL set
+                if self.config.server.auto_discover and not self.config.server.url:
+                    print("Re-discovering server...")
+                    server_url = await self._discover_server()
+                    if server_url:
+                        self.ws_client.set_server_url(server_url)
 
-                    # Fetch new auth token if authentication is enabled
-                    if self.config.server.auth_enabled:
-                        await self._fetch_and_set_token(server_url)
+                        # Fetch new auth token if authentication is enabled
+                        if self.config.server.auth_enabled:
+                            await self._fetch_and_set_token(server_url)
 
-            # Try to connect
-            if await self.ws_client.connect():
-                return True
+                # Try to connect
+                if await self.ws_client.connect():
+                    return True
+            except Exception as e:
+                print(f"Reconnect attempt {attempts} errored: {e} - will retry")
 
         return False
 
@@ -563,11 +776,7 @@ class Satellite:
 
         # Process for wake word in IDLE state
         if self._state == SatelliteState.IDLE and not self._wakeword_pending:
-            detection = self.wakeword.process_audio(audio_bytes)
-            if detection and not detection.is_stop_word:
-                # Set flag immediately to prevent duplicate detection
-                self._wakeword_pending = True
-                self._schedule_async(self._on_wakeword_detected(detection.keyword, detection.confidence))
+            self._process_wakeword_idle(audio_bytes)
             return
 
         # Check for stop words during LISTENING or PROCESSING (only if stop words configured)
@@ -609,6 +818,44 @@ class Satellite:
             # Check max recording length
             if len(self._audio_buffer) * self.config.audio.chunk_size / self.config.audio.sample_rate > self.config.vad.max_recording_seconds:
                 self._schedule_async(self._end_listening("timeout"))
+
+    def _process_wakeword_idle(self, audio_bytes: bytes):
+        """Run wake-word detection in IDLE, gated by the VAD to save CPU.
+
+        openwakeword is ~4x the cost of the VAD, so when ``vad_gated`` is on we
+        only spend wake-word inference while the VAD reports speech (plus a short
+        pre-roll/tail to keep openwakeword's streaming context warm). This frees
+        idle CPU headroom so audio frames are not silently dropped under load —
+        the root cause of marginal wake-word scores. With ``vad_gated`` off the
+        behaviour is identical to running the detector on every chunk.
+        """
+        if not self.config.wakeword.vad_gated:
+            self._dispatch_wakeword(audio_bytes)
+            return
+
+        # Always keep a rolling pre-roll of the most recent raw chunks.
+        self._ww_preroll.append(audio_bytes)
+
+        if self.vad.is_speech(audio_bytes):
+            if self._ww_gate_remaining <= 0:
+                # Speech onset — warm openwakeword with the buffered pre-roll
+                # (all but the current chunk, dispatched below) so the leading
+                # edge of the wake word is not lost.
+                for chunk in list(self._ww_preroll)[:-1]:
+                    self.wakeword.process_audio(chunk)
+            self._ww_gate_remaining = self.config.wakeword.vad_gate_tail_chunks
+
+        if self._ww_gate_remaining > 0:
+            self._ww_gate_remaining -= 1
+            self._dispatch_wakeword(audio_bytes)
+
+    def _dispatch_wakeword(self, audio_bytes: bytes):
+        """Feed one chunk to the wake-word detector and act on a detection."""
+        detection = self.wakeword.process_audio(audio_bytes)
+        if detection and not detection.is_stop_word:
+            # Set flag immediately to prevent duplicate detection
+            self._wakeword_pending = True
+            self._schedule_async(self._on_wakeword_detected(detection.keyword, detection.confidence))
 
     async def _on_wakeword_detected(self, keyword: str, confidence: float):
         """Handle wake word detection"""
@@ -1012,6 +1259,65 @@ class Satellite:
         self._classic_bt_known_macs = {mac.upper() for mac in devices}
         print(f"Classic BT known devices updated: {len(self._classic_bt_known_macs)} MACs")
 
+    def _on_ble_irks_received(self, irks: list):
+        """Handle per-person IRKs pushed from the backend ([{name, irk(hex)}]).
+        Parses hex → 16 bytes and feeds the scanner's RPA resolver."""
+        parsed = self._parse_irks({item.get("name"): item.get("irk")
+                                   for item in irks if item.get("name") and item.get("irk")})
+        self._ble_irks = parsed
+        if self.ble_scanner is not None:
+            self.ble_scanner.update_irks(parsed)
+        print(f"BLE IRKs updated: {len(parsed)}")
+        # Loud guard: without `cryptography`, rpa.resolve_rpa() silently returns
+        # False for every address, so the IRKs are dead weight and NO phone is
+        # ever resolved — a silent, total feature failure. Surface it (this is
+        # exactly how the missing-cryptography drift hid for so long, 2026-06).
+        if parsed:
+            from .ble.rpa import _CRYPTO_AVAILABLE
+            if not _CRYPTO_AVAILABLE:
+                print(f"⚠️ {len(parsed)} BLE IRK(s) received but `cryptography` is "
+                      "NOT installed in the venv — RPA resolution is DISABLED; no "
+                      "phone will be detected via IRK until it is installed.")
+
+    def _on_led_config_update(self, brightness: int):
+        """Apply a backend-pushed LED brightness (night-dimming).
+
+        Only scales animation brightness — never stops/restarts the running
+        pattern. Brightness is clamped to the APA102/XVF3800 0-31 range. For the
+        XVF3800 (XMOS renders effects in hardware) an explicit LED_BRIGHTNESS
+        command is needed; APA102/GPIO read ``self.leds.brightness`` live per
+        frame so setting the attribute is enough.
+        """
+        clamped = min(31, max(0, int(brightness)))
+        old = getattr(self.leds, "brightness", None)
+        self.leds.brightness = clamped
+
+        # XVF3800: push the brightness to the XMOS chip at runtime.
+        if hasattr(self.leds, "_run"):
+            try:
+                self.leds._run("LED_BRIGHTNESS", str(clamped))
+            except Exception as e:
+                print(f"Failed to set XVF3800 LED brightness: {e}")
+
+        print(f"LED brightness updated: {old} -> {clamped}")
+
+    @staticmethod
+    def _parse_irks(irks_hex: dict) -> dict:
+        """Convert a name->hex IRK map (from config/backend) to name->16 bytes.
+        Skips malformed entries. Hex is MSO-first (see ble/rpa.py)."""
+        out = {}
+        for name, h in (irks_hex or {}).items():
+            try:
+                b = bytes.fromhex(str(h).replace(":", "").strip())
+            except ValueError:
+                print(f"BLE: invalid IRK hex for '{name}', skipping")
+                continue
+            if len(b) == 16:
+                out[name] = b
+            else:
+                print(f"BLE: IRK for '{name}' is {len(b)} bytes (need 16), skipping")
+        return out
+
     async def _start_ble_scan_loop(self):
         """Start the BLE scanning background loop"""
         # Avoid duplicate loops
@@ -1020,18 +1326,31 @@ class Satellite:
         self._ble_task = asyncio.create_task(self._ble_scan_loop())
 
     async def _ble_scan_loop(self):
-        """Background loop that periodically scans for BLE devices"""
-        print("BLE scan loop started")
+        """Background loop reporting BLE presence.
+
+        Continuous mode (config.ble.continuous): keep ONE BleakScanner running
+        with a detection callback and poll its smoothed per-device RSSI every
+        scan_interval — lower latency + steadier RSSI. Periodic mode (default):
+        a discover() burst each scan_interval (works on any adapter).
+        """
+        continuous = self.config.ble.continuous
+        print(f"BLE scan loop started ({'continuous' if continuous else 'periodic'})")
         try:
             while self._running:
                 await asyncio.sleep(self.config.ble.scan_interval)
                 if not self._running or not self.ws_client.is_connected:
                     continue
-                if not self._ble_known_macs:
+                if not self._ble_known_macs and not self._ble_irks:
                     continue
 
                 try:
-                    devices = await self.ble_scanner.scan(self._ble_known_macs)
+                    if continuous:
+                        # idempotent: starts once, then just refreshes the
+                        # known-MAC whitelist the callback filters on
+                        await self.ble_scanner.start_continuous(self._ble_known_macs)
+                        devices = self.ble_scanner.get_readings()
+                    else:
+                        devices = await self.ble_scanner.scan(self._ble_known_macs)
                     if devices:
                         await self.ws_client.send_ble_presence(devices)
                         print(f"BLE scan: {len(devices)} known devices detected")
@@ -1039,6 +1358,9 @@ class Satellite:
                     print(f"BLE scan error: {e}")
         except asyncio.CancelledError:
             pass
+        finally:
+            if continuous and self.ble_scanner is not None:
+                await self.ble_scanner.stop_continuous()
         print("BLE scan loop stopped")
 
     async def _start_classic_bt_scan_loop(self):
@@ -1070,7 +1392,15 @@ class Satellite:
             pass
         print("Classic BT scan loop stopped")
 
-    def _on_update_request(self, target_version: str, package_url: str, checksum: str, size_bytes: int):
+    def _on_update_request(
+        self,
+        target_version: str,
+        package_url: str,
+        checksum: str,
+        size_bytes: int,
+        manifest: str | None = None,
+        signature: str | None = None,
+    ):
         """
         Handle OTA update request from server.
 
@@ -1079,6 +1409,7 @@ class Satellite:
             package_url: URL path to download package
             checksum: Expected checksum (sha256:hexdigest)
             size_bytes: Expected package size
+            manifest/signature: signed release manifest (H6), verified before install
         """
         print(f"📦 OTA Update requested: v{target_version}")
 
@@ -1093,9 +1424,22 @@ class Satellite:
             return
 
         # Start update asynchronously
-        self._schedule_async(self._start_update(target_version, package_url, checksum, size_bytes, base_url))
+        self._schedule_async(
+            self._start_update(
+                target_version, package_url, checksum, size_bytes, base_url, manifest, signature
+            )
+        )
 
-    async def _start_update(self, target_version: str, package_url: str, checksum: str, size_bytes: int, base_url: str):
+    async def _start_update(
+        self,
+        target_version: str,
+        package_url: str,
+        checksum: str,
+        size_bytes: int,
+        base_url: str,
+        manifest: str | None = None,
+        signature: str | None = None,
+    ):
         """Start the OTA update process"""
         from . import __version__
         old_version = __version__
@@ -1107,7 +1451,9 @@ class Satellite:
             package_url=package_url,
             checksum=checksum,
             size_bytes=size_bytes,
-            base_url=base_url
+            base_url=base_url,
+            manifest=manifest,
+            signature=signature,
         )
 
         if success:
@@ -1118,11 +1464,13 @@ class Satellite:
                 new_version=target_version
             )
         else:
-            # Send failure message
+            # Send the REAL failure reason (e.g. "release manifest signature does
+            # not verify…") + the real rollback state, so a security rejection is
+            # distinguishable from a benign failure instead of a generic message.
             await self.ws_client.send_update_failed(
                 stage=self.update_manager.current_stage.value,
-                error="Update failed - check satellite logs",
-                rolled_back=True
+                error=self.update_manager.last_error or "Update failed - check satellite logs",
+                rolled_back=self.update_manager.rolled_back,
             )
 
     def _on_update_progress(self, stage: UpdateStage, progress: int, message: str):

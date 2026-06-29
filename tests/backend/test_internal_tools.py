@@ -19,6 +19,28 @@ def internal_tools():
     return InternalToolService()
 
 
+@pytest.fixture(autouse=True)
+def _stub_room_id_db():
+    """Stub ``_get_room_id`` so tests never open a real DB connection.
+
+    ``_get_room_id`` opens a REAL ``AsyncSessionLocal()`` (asyncpg SSL connect to
+    Postgres). The play paths reach it via ``_register_media_follow`` and it
+    isn't mocked by the per-class ``_patch_main_app`` helpers. Left live, every
+    such test leaks a real Postgres connection; under pytest-asyncio's per-test
+    event loops these accumulate and trip a latent OpenSSL/asyncpg
+    use-after-free → process SEGFAULT (faulthandler points at asyncpg
+    ``_create_ssl_connection``; a segfault is NOT caught by the method's
+    ``try/except``). Stubbing ``_get_room_id`` (the actual DB choke point) rather
+    than ``_register_media_follow`` keeps that method's real presence-fallback
+    logic testable — the ``TestRegisterMediaFollowPresenceFallback`` class sets
+    its own per-instance ``_get_room_id`` mock, which overrides this class-level
+    default.
+    """
+    from unittest.mock import AsyncMock as _AsyncMock
+    with patch.object(InternalToolService, "_get_room_id", new_callable=_AsyncMock, return_value=1):
+        yield
+
+
 import sys
 from types import ModuleType
 
@@ -84,11 +106,12 @@ class TestResolveRoomPlayer:
         mock_room.name = "Arbeitszimmer"
 
         mock_output_device = MagicMock()
-        mock_output_device.ha_entity_id = "media_player.arbeitszimmer_speaker"
         mock_output_device.device_name = "Arbeitszimmer Speaker"
 
         mock_decision = MagicMock()
         mock_decision.output_device = mock_output_device
+        mock_decision.target_type = "homeassistant"
+        mock_decision.target_id = "media_player.arbeitszimmer_speaker"
         mock_decision.reason = "device_available"
 
         mock_room_service = MagicMock()
@@ -114,11 +137,12 @@ class TestResolveRoomPlayer:
         mock_room.name = "Wohnzimmer"
 
         mock_output_device = MagicMock()
-        mock_output_device.ha_entity_id = "media_player.wohnzimmer"
         mock_output_device.device_name = "Wohnzimmer Speaker"
 
         mock_decision = MagicMock()
         mock_decision.output_device = mock_output_device
+        mock_decision.target_type = "homeassistant"
+        mock_decision.target_id = "media_player.wohnzimmer"
         mock_decision.reason = "device_available"
 
         mock_room_service = MagicMock()
@@ -178,11 +202,13 @@ class TestResolveRoomPlayer:
         mock_room.name = "Küche"
 
         mock_output_device = MagicMock()
-        mock_output_device.ha_entity_id = None
         mock_output_device.device_name = "Satellite Küche"
 
         mock_decision = MagicMock()
         mock_decision.output_device = mock_output_device
+        # HA-typed decision with no resolvable entity id → "no HA media player".
+        mock_decision.target_type = "homeassistant"
+        mock_decision.target_id = None
         mock_decision.reason = "device_available"
 
         mock_room_service = MagicMock()
@@ -270,13 +296,12 @@ class TestResolveRoomPlayer:
         mock_room.name = "Garten"
 
         mock_output_device = MagicMock()
-        mock_output_device.ha_entity_id = None
-        mock_output_device.dlna_renderer_name = "HiFiBerry Garten"
         mock_output_device.device_name = "HiFiBerry Garten"
 
         mock_decision = MagicMock()
         mock_decision.output_device = mock_output_device
         mock_decision.target_type = "dlna"
+        mock_decision.target_id = "HiFiBerry Garten"  # DLNA target_id == renderer name
         mock_decision.reason = "device_available"
 
         mock_room_service = MagicMock()
@@ -360,6 +385,55 @@ class TestPlayInRoom:
             },
             timeout=15.0,
         )
+
+    @pytest.mark.unit
+    async def test_play_in_room_dlna_routes_to_dlna_not_ha(self, internal_tools):
+        """A room resolving to a DLNA renderer plays via mcp.dlna.play_tracks
+        (one-item queue) instead of HA media_player — and must NOT KeyError on
+        the absent entity_id (the regression that crashed DLNA-room playback)."""
+        import json as _json
+        from types import ModuleType
+
+        resolve_result = {
+            "success": True,
+            "message": "Found DLNA renderer",
+            "action_taken": True,
+            "data": {
+                "target_type": "dlna",
+                "dlna_renderer_name": '55" Interactive Signage Flip',
+                "room_name": "Arbeitszimmer",
+                "device_name": "Flip",
+                # note: no entity_id — exactly the shape that used to KeyError
+            },
+        }
+        mock_mgr = MagicMock()
+        mock_mgr.execute_tool = AsyncMock(return_value={"success": True, "message": "ok"})
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=resolve_result), \
+             patch.object(internal_tools, "_register_media_follow", new_callable=AsyncMock), \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_in_room({
+                "media_url": "http://jellyfin:8096/Audio/abc/universal",
+                "room_name": "Arbeitszimmer",
+                "thumb": "http://jellyfin:8096/Items/abc/Images/Primary",
+            })
+
+        assert result["success"] is True, result
+        assert result["data"]["target_type"] == "dlna"
+        assert result["data"]["renderer_name"] == '55" Interactive Signage Flip'
+        # Routed to the DLNA path with a single-track queue — NOT HA play_media.
+        tool_name, tool_params = mock_mgr.execute_tool.await_args.args
+        assert tool_name == "mcp.dlna.play_tracks"
+        assert tool_params["renderer_name"] == '55" Interactive Signage Flip'
+        tracks = _json.loads(tool_params["tracks"])
+        assert len(tracks) == 1
+        assert tracks[0]["url"] == "http://jellyfin:8096/Audio/abc/universal"
+        # Cover art is forwarded as `art_url` (same field the video path uses).
+        assert tracks[0]["art_url"] == "http://jellyfin:8096/Items/abc/Images/Primary"
 
     @pytest.mark.unit
     async def test_play_in_room_room_not_found(self, internal_tools):
@@ -684,6 +758,139 @@ class TestPlayInRoom:
         assert "failed" in result["message"].lower()
         # Only one call_service — no transcode retry
         mock_ha_client.call_service.assert_called_once()
+
+
+# ============================================================================
+# Test play_radio invalid-station guard
+# ============================================================================
+
+class TestPlayRadioInvalidStation:
+    """A guessed/invalid station_id resolves to TuneIn's 'notcompatible'
+    placeholder (silent dead air). play_radio must fail loudly and steer the
+    agent to search_stations instead of streaming the placeholder."""
+
+    def _mcp_with_stream_url(self, stream_url: str) -> MagicMock:
+        import json as _json
+
+        mock_mgr = MagicMock()
+        mock_mgr.execute_tool = AsyncMock(
+            return_value={
+                "success": True,
+                "data": [{"type": "text", "text": _json.dumps({"stream_url": stream_url})}],
+            }
+        )
+        return mock_mgr
+
+    @pytest.mark.unit
+    async def test_notcompatible_placeholder_is_rejected(self, internal_tools):
+        mock_mgr = self._mcp_with_stream_url(
+            "http://cdn-cms.tunein.com/service/Audio/notcompatible.enUS.mp3"
+        )
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock) as resolve, \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_radio({
+                "station_id": "s12345",  # a guessed/example id → placeholder
+                "room_name": "Arbeitszimmer",
+                "station_name": "1Live",
+            })
+
+        assert result["success"] is False, result
+        assert result["action_taken"] is False
+        assert "search_stations" in result["message"]
+        # Must bail BEFORE resolving the room / playing anything.
+        resolve.assert_not_awaited()
+        # Only the stream-url resolution ran — never a play tool.
+        assert mock_mgr.execute_tool.await_count == 1
+        assert mock_mgr.execute_tool.await_args.args[0] == "mcp.radio.get_stream_url"
+
+    @pytest.mark.unit
+    async def test_valid_stream_url_is_not_rejected(self, internal_tools):
+        """A real station stream proceeds PAST the guard to room resolution.
+
+        Stubs room resolution as not-found so the flow stops there with the room
+        error — proving the guard did NOT fire (it would have returned its own
+        'search_stations' message and never awaited _resolve_room_player).
+        """
+        mock_mgr = self._mcp_with_stream_url(
+            "https://wdr-1live-live.icecastssl.wdr.de/wdr/1live/live/mp3/128/stream.mp3"
+        )
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+        resolve_result = {"success": False, "message": "Room 'Arbeitszimmer' not found", "action_taken": False}
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=resolve_result) as resolve, \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_radio({
+                "station_id": "s25260",
+                "room_name": "Arbeitszimmer",
+                "station_name": "1Live",
+            })
+
+        # Positive proof the guard did NOT fire: the flow advanced to room
+        # resolution and surfaced THAT error (not the guard's message).
+        resolve.assert_awaited_once()
+        assert result["message"] == "Room 'Arbeitszimmer' not found"
+        assert "search_stations" not in result["message"]
+
+    @pytest.mark.unit
+    async def test_placeholder_match_is_case_insensitive(self, internal_tools):
+        """A mixed-case 'NotCompatible' placeholder is still caught (.lower())."""
+        mock_mgr = self._mcp_with_stream_url(
+            "http://cdn-cms.tunein.com/service/Audio/NotCompatible.deDE.mp3"
+        )
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock) as resolve, \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_radio(
+                {"station_id": "s99999", "room_name": "Arbeitszimmer"}
+            )
+
+        assert result["success"] is False
+        assert "search_stations" in result["message"]
+        resolve.assert_not_awaited()
+
+    @pytest.mark.unit
+    async def test_placeholder_caught_even_in_non_stream_url_shape(self, internal_tools):
+        """If the resolver returns the placeholder in an unexpected shape (not a
+        parseable {"stream_url": ...}), the whole-response scan still catches it
+        and the guard fires with the actionable message — not a generic error."""
+        import json as _json
+
+        mock_mgr = MagicMock()
+        # camelCase key → parsed['stream_url'] is empty, but raw_text holds the URL.
+        mock_mgr.execute_tool = AsyncMock(
+            return_value={
+                "success": True,
+                "data": [{"type": "text", "text": _json.dumps(
+                    {"streamUrl": "http://cdn-cms.tunein.com/service/Audio/notcompatible.enUS.mp3"}
+                )}],
+            }
+        )
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.mcp_manager = mock_mgr
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock) as resolve, \
+             patch.dict(sys.modules, {"main": fake_main}):
+            result = await internal_tools._play_radio(
+                {"station_id": "s12345", "room_name": "Arbeitszimmer"}
+            )
+
+        assert result["success"] is False
+        assert "search_stations" in result["message"]
+        resolve.assert_not_awaited()
 
 
 # ============================================================================
@@ -1497,6 +1704,775 @@ class TestMediaControl:
 
 
 # ============================================================================
+# Test _resolve_target_volume (pure precedence + step math + clamping helper)
+# ============================================================================
+
+class TestResolveTargetVolume:
+    """Pure-function tests for the shared volume-target helper."""
+
+    @pytest.mark.unit
+    def test_both_volume_and_step_is_error(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume(
+            {"volume": 30, "volume_step": -20}, current_pct=50
+        )
+        assert target is None
+        assert err["success"] is False
+        assert "not both" in err["message"]
+
+    @pytest.mark.unit
+    def test_neither_volume_nor_step_is_error(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume({}, current_pct=50)
+        assert target is None
+        assert err["success"] is False
+        assert "required" in err["message"]
+
+    @pytest.mark.unit
+    def test_absolute_passthrough(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume({"volume": "42"}, current_pct=None)
+        assert err is None
+        assert target == 42
+
+    @pytest.mark.unit
+    def test_absolute_clamps_high(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume({"volume": 150}, current_pct=None)
+        assert err is None
+        assert target == 100
+
+    @pytest.mark.unit
+    def test_absolute_clamps_low(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume({"volume": -10}, current_pct=None)
+        assert err is None
+        assert target == 0
+
+    @pytest.mark.unit
+    def test_relative_step_down(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume(
+            {"volume_step": -20}, current_pct=30
+        )
+        assert err is None
+        assert target == 10
+
+    @pytest.mark.unit
+    def test_relative_step_up(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume(
+            {"volume_step": 15}, current_pct=30
+        )
+        assert err is None
+        assert target == 45
+
+    @pytest.mark.unit
+    def test_relative_clamps_floor(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume(
+            {"volume_step": -20}, current_pct=10
+        )
+        assert err is None
+        assert target == 0
+
+    @pytest.mark.unit
+    def test_relative_clamps_ceil(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume(
+            {"volume_step": 20}, current_pct=90
+        )
+        assert err is None
+        assert target == 100
+
+    @pytest.mark.unit
+    def test_relative_with_no_current_is_clear_error(self, internal_tools):
+        target, err = internal_tools._resolve_target_volume(
+            {"volume_step": -20}, current_pct=None
+        )
+        assert target is None
+        assert err["success"] is False
+        assert "absolute" in err["message"].lower()
+
+
+# ============================================================================
+# Test relative volume on HA + DLNA branches (reads current server-side)
+# ============================================================================
+
+class TestRelativeVolume:
+    """Relative ('leiser/lauter um X') volume for HA + DLNA."""
+
+    @staticmethod
+    def _patch_main_app(mock_mcp_manager):
+        mock_app = MagicMock()
+        mock_app.state.mcp_manager = mock_mcp_manager
+        fake_main = ModuleType("main")
+        fake_main.app = mock_app
+        return patch.dict(sys.modules, {"main": fake_main})
+
+    @staticmethod
+    def _ha_resolve():
+        return {
+            "success": True,
+            "message": "Found",
+            "action_taken": True,
+            "data": {
+                "entity_id": "media_player.arbeitszimmer",
+                "target_type": "homeassistant",
+                "room_name": "Arbeitszimmer",
+                "device_name": "Speaker",
+            },
+        }
+
+    @staticmethod
+    def _dlna_resolve():
+        return {
+            "success": True,
+            "message": "Found DLNA renderer",
+            "action_taken": True,
+            "data": {
+                "target_type": "dlna",
+                "dlna_renderer_name": "HiFiBerry Arbeitszimmer",
+                "room_name": "Arbeitszimmer",
+                "device_name": "HiFiBerry Arbeitszimmer",
+            },
+        }
+
+    # --- HA branch ---
+
+    @pytest.mark.unit
+    async def test_volume_absolute_unchanged_regression_ha(self, internal_tools):
+        """REGRESSION: absolute volume=N still calls volume_set with N/100 and
+        never reads current state (no wasted get_state HTTP read)."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.call_service = AsyncMock(return_value=True)
+        mock_ha_client.get_state = AsyncMock(return_value=None)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume": "50",
+            })
+
+        assert result["success"] is True
+        mock_ha_client.get_state.assert_not_called()
+        mock_ha_client.call_service.assert_called_once_with(
+            domain="media_player",
+            service="volume_set",
+            entity_id="media_player.arbeitszimmer",
+            service_data={"volume_level": 0.5},
+        )
+
+    @pytest.mark.unit
+    async def test_volume_relative_reads_current_ha(self, internal_tools):
+        """Relative step computes target from get_state volume_level (0.3 -> 30 -> 10)."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.call_service = AsyncMock(return_value=True)
+        mock_ha_client.get_state = AsyncMock(
+            return_value={"attributes": {"volume_level": 0.3}}
+        )
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": -20,
+            })
+
+        assert result["success"] is True
+        call_kwargs = mock_ha_client.call_service.call_args
+        assert call_kwargs.kwargs["service_data"]["volume_level"] == 0.1
+
+    @pytest.mark.unit
+    async def test_volume_relative_offline_ha_clear_error(self, internal_tools):
+        """get_state returns None (entity offline) -> clear error, no call_service."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.call_service = AsyncMock(return_value=True)
+        mock_ha_client.get_state = AsyncMock(return_value=None)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": -20,
+            })
+
+        assert result["success"] is False
+        assert "absolute" in result["message"].lower()
+        mock_ha_client.call_service.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_volume_relative_missing_attr_ha_clear_error(self, internal_tools):
+        """State present but volume_level attr missing -> clear error."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.call_service = AsyncMock(return_value=True)
+        mock_ha_client.get_state = AsyncMock(return_value={"attributes": {}})
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": -20,
+            })
+
+        assert result["success"] is False
+        assert "absolute" in result["message"].lower()
+        mock_ha_client.call_service.assert_not_called()
+
+    # --- DLNA branch ---
+
+    @pytest.mark.unit
+    async def test_volume_absolute_unchanged_regression_dlna(self, internal_tools):
+        """REGRESSION: absolute volume=N still calls set_volume with N and never
+        calls get_volume."""
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(return_value={
+            "success": True, "message": "Volume set",
+        })
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume": "75",
+            })
+
+        assert result["success"] is True
+        mock_mcp_manager.execute_tool.assert_called_once_with(
+            "mcp.dlna.set_volume", {"renderer_name": "HiFiBerry Arbeitszimmer", "volume": 75},
+        )
+
+    @pytest.mark.unit
+    async def test_volume_relative_reads_current_dlna(self, internal_tools):
+        """Relative step via mocked mcp.dlna.get_volume (40 -> +15 -> 55)."""
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_volume":
+                return {"success": True, "volume": 40}
+            return {"success": True, "message": "Volume set"}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": 15,
+            })
+
+        assert result["success"] is True
+        # get_volume read, then set_volume with computed target.
+        mock_mcp_manager.execute_tool.assert_any_call(
+            "mcp.dlna.get_volume", {"renderer_name": "HiFiBerry Arbeitszimmer"},
+        )
+        mock_mcp_manager.execute_tool.assert_any_call(
+            "mcp.dlna.set_volume", {"renderer_name": "HiFiBerry Arbeitszimmer", "volume": 55},
+        )
+
+    @pytest.mark.unit
+    async def test_volume_relative_reads_current_dlna_nested_payload(self, internal_tools):
+        """get_volume value nested in data content blocks (MCP wrapper shape)."""
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_volume":
+                return {
+                    "success": True,
+                    "data": [{"type": "text", "text": '{"volume": 40}'}],
+                }
+            return {"success": True, "message": "Volume set"}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": 15,
+            })
+
+        assert result["success"] is True
+        mock_mcp_manager.execute_tool.assert_any_call(
+            "mcp.dlna.set_volume", {"renderer_name": "HiFiBerry Arbeitszimmer", "volume": 55},
+        )
+
+    @pytest.mark.unit
+    async def test_volume_relative_dlna_volume_none_clear_error(self, internal_tools):
+        """get_volume returns volume=None (renderer can't report) -> clear error,
+        no set_volume call."""
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_volume":
+                return {"success": True, "volume": None}
+            return {"success": True, "message": "Volume set"}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": 15,
+            })
+
+        assert result["success"] is False
+        assert "absolute" in result["message"].lower()
+        # set_volume must NOT have been called (only the get_volume read).
+        for call in mock_mcp_manager.execute_tool.call_args_list:
+            assert call.args[0] != "mcp.dlna.set_volume"
+
+    @pytest.mark.unit
+    async def test_volume_relative_dlna_get_volume_errored_clear_error(self, internal_tools):
+        """get_volume tool returns success=False (errored / not deployed) -> clear
+        error, no set_volume call."""
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_volume":
+                return {"success": False, "message": "unknown tool"}
+            return {"success": True, "message": "Volume set"}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": 15,
+            })
+
+        assert result["success"] is False
+        assert "absolute" in result["message"].lower()
+        for call in mock_mcp_manager.execute_tool.call_args_list:
+            assert call.args[0] != "mcp.dlna.set_volume"
+
+    # --- muted-device (volume == 0) guards: 0 is a valid level, not "no reading" ---
+
+    @pytest.mark.unit
+    async def test_volume_relative_from_muted_dlna(self, internal_tools):
+        """A muted DLNA renderer (volume=0) + step up resolves correctly — 0 must
+        be treated as a real reading, not as 'can't report' (no falsy-0 bug)."""
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_volume":
+                return {"success": True, "volume": 0}
+            return {"success": True, "message": "Volume set"}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": 20,
+            })
+
+        assert result["success"] is True
+        mock_mcp_manager.execute_tool.assert_any_call(
+            "mcp.dlna.set_volume", {"renderer_name": "HiFiBerry Arbeitszimmer", "volume": 20},
+        )
+
+    @pytest.mark.unit
+    async def test_volume_relative_from_muted_ha(self, internal_tools):
+        """A muted HA device (volume_level=0.0) + step up resolves correctly —
+        0.0 must be distinguished from None (offline), not collapsed by a falsy check."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.call_service = AsyncMock(return_value=True)
+        mock_ha_client.get_state = AsyncMock(
+            return_value={"attributes": {"volume_level": 0.0}}
+        )
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "volume",
+                "room_name": "Arbeitszimmer",
+                "volume_step": 30,
+            })
+
+        assert result["success"] is True
+        call_kwargs = mock_ha_client.call_service.call_args
+        assert call_kwargs.kwargs["service_data"]["volume_level"] == pytest.approx(0.3)
+
+    # --- loop-prevention: volume success echoes the resulting level so the agent
+    #     gives final_answer instead of re-issuing (a repeated volume_step would
+    #     re-apply the delta — the rc.13 +10% → +30% loop bug) ---
+
+    @pytest.mark.unit
+    async def test_volume_result_echoes_level_dlna(self, internal_tools):
+        """DLNA volume success returns the resulting level in data.volume + message."""
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_volume":
+                return {"success": True, "volume": 40}
+            return {"success": True, "message": "ok"}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "volume", "room_name": "Arbeitszimmer", "volume_step": 15,
+            })
+
+        assert result["success"] is True
+        assert result["data"]["volume"] == 55  # 40 + 15
+        assert "55" in result["message"]
+
+    @pytest.mark.unit
+    async def test_volume_result_echoes_level_ha(self, internal_tools):
+        """HA volume success returns the resulting level in data.volume + message."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.call_service = AsyncMock(return_value=True)
+
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "volume", "room_name": "Arbeitszimmer", "volume": 65,
+            })
+
+        assert result["success"] is True
+        assert result["data"]["volume"] == 65
+        assert "65" in result["message"]
+
+    # --- native mute/unmute (no pause, no stored volume) ---
+
+    @pytest.mark.unit
+    async def test_mute_dlna(self, internal_tools):
+        """mute on DLNA calls mcp.dlna.set_mute with mute=True."""
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(return_value={"success": True, "muted": True})
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "mute", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        mock_mcp_manager.execute_tool.assert_called_once_with(
+            "mcp.dlna.set_mute", {"renderer_name": "HiFiBerry Arbeitszimmer", "mute": True},
+        )
+        assert "muted" in result["message"].lower()
+
+    @pytest.mark.unit
+    async def test_unmute_dlna(self, internal_tools):
+        """unmute on DLNA calls mcp.dlna.set_mute with mute=False."""
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(return_value={"success": True, "muted": False})
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "unmute", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        mock_mcp_manager.execute_tool.assert_called_once_with(
+            "mcp.dlna.set_mute", {"renderer_name": "HiFiBerry Arbeitszimmer", "mute": False},
+        )
+
+    @pytest.mark.unit
+    async def test_mute_ha(self, internal_tools):
+        """mute on an HA player calls media_player.volume_mute is_volume_muted=True."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.call_service = AsyncMock(return_value=True)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "mute", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        mock_ha_client.call_service.assert_called_once_with(
+            domain="media_player",
+            service="volume_mute",
+            entity_id="media_player.arbeitszimmer",
+            service_data={"is_volume_muted": True},
+        )
+
+    @pytest.mark.unit
+    async def test_unmute_ha(self, internal_tools):
+        """unmute on an HA player calls media_player.volume_mute is_volume_muted=False."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.call_service = AsyncMock(return_value=True)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "unmute", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        mock_ha_client.call_service.assert_called_once_with(
+            domain="media_player",
+            service="volume_mute",
+            entity_id="media_player.arbeitszimmer",
+            service_data={"is_volume_muted": False},
+        )
+
+    # --- status (what's playing) — room-based, read-only ---
+
+    @pytest.mark.unit
+    async def test_status_dlna(self, internal_tools):
+        """status on DLNA calls mcp.dlna.get_status and parses the nested
+        content-block payload (the REAL execute_tool shape, not a flat dict)."""
+        import json as _json
+        payload = _json.dumps({"state": "playing", "title": "1LIVE", "artist": "WDR"})
+
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_status":
+                return {"success": True, "data": [{"type": "text", "text": payload}]}
+            return {"success": True}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "status", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        mock_mcp_manager.execute_tool.assert_called_once_with(
+            "mcp.dlna.get_status", {"renderer_name": "HiFiBerry Arbeitszimmer"},
+        )
+        assert result["data"]["status"]["title"] == "1LIVE"
+        assert result["data"]["status"]["state"] == "playing"
+
+    @pytest.mark.unit
+    async def test_status_dlna_failure_surfaced(self, internal_tools):
+        """A failing get_status is surfaced as success=False, not wrapped as ok."""
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.get_status":
+                return {"success": False, "message": "Renderer 'X' not found"}
+            return {"success": True}
+
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mcp_manager):
+            result = await internal_tools._media_control({
+                "action": "status", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "not found" in result["message"]
+
+    @pytest.mark.unit
+    async def test_status_ha(self, internal_tools):
+        """status on an HA player reads get_state and normalizes the media fields."""
+        mock_ha_client = MagicMock()
+        mock_ha_client.get_state = AsyncMock(return_value={
+            "state": "playing",
+            "attributes": {"media_title": "Song", "media_artist": "Artist",
+                           "media_album_name": "Album"},
+        })
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha_client):
+            result = await internal_tools._media_control({
+                "action": "status", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        st = result["data"]["status"]
+        assert st["state"] == "playing"
+        assert st["title"] == "Song"
+        assert st["artist"] == "Artist"
+
+    # --- seek / play_mode (Phase 2) ---
+
+    @pytest.mark.unit
+    async def test_seek_dlna(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.seek":
+                return {"success": True}
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._media_control({
+                "action": "seek", "room_name": "Arbeitszimmer", "position_seconds": 30,
+            })
+        assert result["success"] is True
+        mock_mgr.execute_tool.assert_called_once_with(
+            "mcp.dlna.seek", {"renderer_name": "HiFiBerry Arbeitszimmer", "position_seconds": 30},
+        )
+
+    @pytest.mark.unit
+    async def test_play_mode_dlna(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._media_control({
+                "action": "play_mode", "room_name": "Arbeitszimmer", "mode": "shuffle",
+            })
+        assert result["success"] is True
+        mock_mgr.execute_tool.assert_called_once_with(
+            "mcp.dlna.set_play_mode", {"renderer_name": "HiFiBerry Arbeitszimmer", "mode": "shuffle"},
+        )
+
+    @pytest.mark.unit
+    async def test_seek_missing_position_is_error(self, internal_tools):
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(return_value={"success": True})
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._media_control({
+                "action": "seek", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "position_seconds" in result["message"]
+
+    @pytest.mark.unit
+    async def test_seek_ha_media_seek(self, internal_tools):
+        mock_ha = MagicMock(); mock_ha.call_service = AsyncMock(return_value=True)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha):
+            result = await internal_tools._media_control({
+                "action": "seek", "room_name": "Arbeitszimmer", "position_seconds": 12,
+            })
+        assert result["success"] is True
+        mock_ha.call_service.assert_called_once_with(
+            domain="media_player", service="media_seek",
+            entity_id="media_player.arbeitszimmer", service_data={"seek_position": 12},
+        )
+
+    @pytest.mark.unit
+    async def test_seek_dlna_failure_surfaced(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.seek":
+                return {"success": False, "message": "seek not supported"}
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._media_control({
+                "action": "seek", "room_name": "Arbeitszimmer", "position_seconds": 5,
+            })
+        assert result["success"] is False
+        assert "seek" in result["message"].lower()
+
+    @pytest.mark.unit
+    async def test_play_mode_ha_missing_mode_is_error(self, internal_tools):
+        mock_ha = MagicMock(); mock_ha.call_service = AsyncMock(return_value=True)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._ha_resolve()), \
+             patch("ha_glue.integrations.homeassistant.HomeAssistantClient", return_value=mock_ha):
+            result = await internal_tools._media_control({
+                "action": "play_mode", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "mode" in result["message"].lower()
+        mock_ha.call_service.assert_not_called()
+
+
+# ============================================================================
+# Test internal.play_from_server (Phase 3 — media-server browsing)
+# ============================================================================
+
+class TestPlayFromServer:
+    @staticmethod
+    def _patch_main_app(mock_mcp_manager):
+        mock_app = MagicMock()
+        mock_app.state.mcp_manager = mock_mcp_manager
+        fake_main = ModuleType("main")
+        fake_main.app = mock_app
+        return patch.dict(sys.modules, {"main": fake_main})
+
+    @staticmethod
+    def _dlna_resolve():
+        return {
+            "success": True, "action_taken": True,
+            "data": {"target_type": "dlna", "dlna_renderer_name": "HiFiBerry Arbeitszimmer",
+                     "room_name": "Arbeitszimmer", "device_name": "HiFiBerry Arbeitszimmer"},
+        }
+
+    @pytest.mark.unit
+    async def test_play_from_server_resolves_room_and_plays(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.play_from_server":
+                return {"success": True, "data": [{"type": "text", "text": '{"played": 12}'}]}
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._play_from_server({
+                "server_name": "NAS", "object_id": "album-42", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        mock_mgr.execute_tool.assert_called_once_with(
+            "mcp.dlna.play_from_server",
+            {"server_name": "NAS", "object_id": "album-42", "renderer_name": "HiFiBerry Arbeitszimmer"},
+        )
+        assert result["data"]["result"]["played"] == 12
+
+    @pytest.mark.unit
+    async def test_play_from_server_requires_params(self, internal_tools):
+        result = await internal_tools._play_from_server({"server_name": "NAS", "object_id": "x"})
+        assert result["success"] is False
+        assert "room_name" in result["message"]
+
+    @pytest.mark.unit
+    async def test_play_from_server_non_dlna_room_errors(self, internal_tools):
+        ha_resolve = {"success": True, "data": {"target_type": "homeassistant",
+                      "entity_id": "media_player.x", "room_name": "Wohnzimmer"}}
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=ha_resolve):
+            result = await internal_tools._play_from_server({
+                "server_name": "NAS", "object_id": "y", "room_name": "Wohnzimmer",
+            })
+        assert result["success"] is False
+        assert "no dlna renderer" in result["message"].lower()
+
+    @pytest.mark.unit
+    async def test_play_from_server_failure_surfaced(self, internal_tools):
+        async def _exec(tool_name, tool_params):
+            if tool_name == "mcp.dlna.play_from_server":
+                return {"success": False, "message": "object not found"}
+            return {"success": True}
+        mock_mgr = MagicMock(); mock_mgr.execute_tool = AsyncMock(side_effect=_exec)
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=self._dlna_resolve()), \
+             self._patch_main_app(mock_mgr):
+            result = await internal_tools._play_from_server({
+                "server_name": "NAS", "object_id": "bad", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "failed" in result["message"].lower() or "not found" in result["message"].lower()
+
+    @pytest.mark.unit
+    async def test_play_from_server_busy_room_clear_error(self, internal_tools):
+        busy = {"success": False, "data": {"status": "busy", "target_type": "dlna",
+                "dlna_renderer_name": "HiFiBerry Arbeitszimmer", "room_name": "Arbeitszimmer"},
+                "message": "busy"}
+        with patch.object(internal_tools, "_resolve_room_player",
+                          new_callable=AsyncMock, return_value=busy):
+            result = await internal_tools._play_from_server({
+                "server_name": "NAS", "object_id": "x", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is False
+        assert "stop it first" in result["message"].lower() or "currently playing" in result["message"].lower()
+
+
+# ============================================================================
 # Test play_album_on_dlna
 # ============================================================================
 
@@ -1916,13 +2892,13 @@ class TestResolveRoomVisualPlayer:
         mock_room_service.get_room_by_alias = AsyncMock(return_value=None)
 
         mock_output_device = MagicMock()
-        mock_output_device.dlna_renderer_name = "Samsung TV"
         mock_output_device.device_name = "Samsung TV"
 
         mock_decision = MagicMock()
         mock_decision.reason = "ok"
         mock_decision.output_device = mock_output_device
         mock_decision.target_type = "dlna"
+        mock_decision.target_id = "Samsung TV"  # DLNA target_id == renderer name
 
         mock_routing_service = MagicMock()
         mock_routing_service.get_visual_output_for_room = AsyncMock(return_value=mock_decision)
@@ -2421,3 +3397,823 @@ class TestRemoveRadioFavorite:
         })
         assert result["success"] is False
         assert "station_id" in result["message"]
+
+
+# ============================================================================
+# Test announce_in_room (relay-a-message primitive + privacy gate)
+# ============================================================================
+
+class TestAnnounceInRoom:
+    """internal.announce_in_room: TTS into a room, with the fail-closed privacy
+    gate (a personal message is NOT spoken aloud if the person isn't alone)."""
+
+    @staticmethod
+    def _patch_deps(*, occupants, room_name="Arbeitszimmer", room_id=2,
+                    tts=b"WAVDATA", play_ok=True, name_to_id=None,
+                    camera_sat=False, snapshot=None, people=None, fail_closed=False):
+        import sys
+        from types import ModuleType
+        from ha_glue.utils.config import ha_glue_settings
+
+        mock_db = AsyncMock()
+
+        @asynccontextmanager
+        async def mock_session():
+            yield mock_db
+
+        room = MagicMock(id=room_id, name=room_name)
+        mock_room_service = MagicMock()
+        mock_room_service.get_room_by_name = AsyncMock(return_value=room)
+        mock_room_service.get_room_by_alias = AsyncMock(return_value=None)
+
+        presence = MagicMock()
+        presence.get_room_occupants = MagicMock(return_value=occupants)
+        presence.find_user_by_name = MagicMock(side_effect=lambda n: (name_to_id or {}).get(n))
+
+        piper = MagicMock()
+        piper.synthesize_to_bytes = AsyncMock(return_value=tts)
+
+        decision = MagicMock()
+        decision.output_device = MagicMock()
+        decision.fallback_to_input = False
+        routing = MagicMock()
+        routing.get_audio_output_for_room = AsyncMock(return_value=decision)
+
+        audio = MagicMock()
+        audio.play_audio = AsyncMock(return_value=play_ok)
+
+        dm = MagicMock()
+        dm.get_devices_in_room = MagicMock(return_value=[])
+
+        # Camera occupancy check deps.
+        sat_mgr = MagicMock()
+        cam = MagicMock(satellite_id="sat-arbeitszimmer") if camera_sat else None
+        sat_mgr.get_camera_satellite_for_room = MagicMock(return_value=cam)
+        sat_mgr.request_snapshot = AsyncMock(return_value=snapshot)
+        ollama = MagicMock()
+        ollama.count_people_in_image = AsyncMock(return_value=people)
+        fake_main = ModuleType("main")
+        fake_main.app = MagicMock()
+        fake_main.app.state.ollama = ollama
+
+        ensure = []
+        for mod_name in [
+            "services.database", "services.piper_service",
+            "ha_glue.services.room_service", "ha_glue.services.presence_service",
+            "ha_glue.services.output_routing_service",
+            "ha_glue.services.audio_output_service", "ha_glue.services.device_manager",
+        ]:
+            if mod_name not in sys.modules:
+                sys.modules[mod_name] = ModuleType(mod_name)
+                ensure.append(mod_name)
+
+        patches = [
+            patch("services.database.AsyncSessionLocal", mock_session, create=True),
+            patch("services.piper_service.PiperService", return_value=piper, create=True),
+            patch("ha_glue.services.room_service.RoomService", return_value=mock_room_service, create=True),
+            patch("ha_glue.services.presence_service.get_presence_service", return_value=presence, create=True),
+            patch("ha_glue.services.output_routing_service.OutputRoutingService", return_value=routing, create=True),
+            patch("ha_glue.services.audio_output_service.get_audio_output_service", return_value=audio, create=True),
+            patch("ha_glue.services.device_manager.get_device_manager", return_value=dm, create=True),
+            patch("ha_glue.services.satellite_manager.get_satellite_manager", return_value=sat_mgr, create=True),
+            patch.dict(sys.modules, {"main": fake_main}),
+            patch.object(ha_glue_settings, "announce_camera_check_fail_closed", fail_closed),
+        ]
+
+        class Combined:
+            def __enter__(self_):
+                for p in patches:
+                    p.__enter__()
+                self_.piper = piper
+                self_.audio = audio
+                self_.sat_mgr = sat_mgr
+                self_.ollama = ollama
+                return self_
+
+            def __exit__(self_, *a):
+                for p in reversed(patches):
+                    p.__exit__(*a)
+                for m in ensure:
+                    sys.modules.pop(m, None)
+
+        return Combined()
+
+    @pytest.mark.unit
+    async def test_personal_blocked_when_not_alone(self, internal_tools):
+        """SAFETY: a personal message is NOT spoken aloud (no TTS) when others
+        are present in the room — returns blocked=not_private instead."""
+        occ = [MagicMock(user_name="evdb"), MagicMock(user_name="Jutta")]
+        with self._patch_deps(occupants=occ) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "Dein Steuerbescheid ist da", "room_name": "Arbeitszimmer",
+                "privacy": "personal",
+            })
+        assert result["success"] is False
+        assert result.get("blocked") == "not_private"
+        # Crucially: nothing was synthesized or played.
+        deps.piper.synthesize_to_bytes.assert_not_called()
+        deps.audio.play_audio.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_personal_announced_when_recipient_alone(self, internal_tools):
+        """A personal message IS announced when the (only) person present is the
+        intended recipient."""
+        occ = [MagicMock(user_id=2)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2}) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "Dein Steuerbescheid ist da", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard"],
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_personal_blocked_when_room_untracked(self, internal_tools):
+        """FAIL-CLOSED: nobody tracked in the room → personal message blocked
+        (can't prove the recipient is alone; an untracked bystander may be there)."""
+        with self._patch_deps(occupants=[], name_to_id={"Eduard": 2}) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard"],
+            })
+        assert result["success"] is False
+        assert result.get("blocked") == "not_private"
+        deps.piper.synthesize_to_bytes.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_personal_blocked_when_no_recipients_given(self, internal_tools):
+        """FAIL-CLOSED: privacy=personal without for_users → blocked (can't verify
+        who's allowed to hear it), even if only one person is present."""
+        occ = [MagicMock(user_id=2)]
+        with self._patch_deps(occupants=occ) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer", "privacy": "personal",
+            })
+        assert result["success"] is False
+        assert result.get("blocked") == "not_private"
+        deps.piper.synthesize_to_bytes.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_public_announced_even_with_others(self, internal_tools):
+        """A public message is announced regardless of who else is present."""
+        occ = [MagicMock(user_name="evdb"), MagicMock(user_name="Jutta")]
+        with self._patch_deps(occupants=occ) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "Das Essen ist fertig", "room_name": "Arbeitszimmer",
+                "privacy": "public",
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_default_privacy_is_public(self, internal_tools):
+        """No privacy arg → treated as public (announces with others present)."""
+        occ = [MagicMock(user_name="evdb"), MagicMock(user_name="Jutta")]
+        with self._patch_deps(occupants=occ) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "Das Essen ist fertig", "room_name": "Arbeitszimmer",
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_missing_text(self, internal_tools):
+        result = await internal_tools._announce_in_room({"room_name": "Arbeitszimmer"})
+        assert result["success"] is False and "text" in result["message"]
+
+    @pytest.mark.unit
+    async def test_missing_room(self, internal_tools):
+        result = await internal_tools._announce_in_room({"text": "hi"})
+        assert result["success"] is False and "room_name" in result["message"]
+
+    @pytest.mark.unit
+    async def test_personal_announced_for_two_recipients_both_present(self, internal_tools):
+        """Two intended recipients alone together → personal message IS announced."""
+        occ = [MagicMock(user_id=2), MagicMock(user_id=3)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2, "Jutta": 3}) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard", "Jutta"],
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_personal_blocked_when_a_non_recipient_present(self, internal_tools):
+        """3 present, message for 2 of them → blocked (the 3rd isn't a recipient)."""
+        occ = [MagicMock(user_id=2), MagicMock(user_id=3), MagicMock(user_id=9)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2, "Jutta": 3}) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard", "Jutta"],
+            })
+        assert result["success"] is False
+        assert result.get("blocked") == "not_private"
+        assert result["data"]["recipients_present"] == 2  # E + J present, X is the outsider
+        deps.piper.synthesize_to_bytes.assert_not_called()
+        deps.audio.play_audio.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_force_bypasses_gate_after_consent(self, internal_tools):
+        """force=true announces a personal message even with non-recipients present
+        (used after the recipient consents to 'go ahead')."""
+        occ = [MagicMock(user_id=2), MagicMock(user_id=9)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2}) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard"], "force": "true",
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_camera_blocks_when_extra_person_seen(self, internal_tools):
+        """BLE gate passes (only the recipient is tracked) but the room camera
+        sees MORE people than tracked → an untracked bystander → blocked."""
+        occ = [MagicMock(user_id=2)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2},
+                              camera_sat=True, snapshot="IMG_B64", people=2) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard"],
+            })
+        assert result["success"] is False
+        assert result.get("blocked") == "not_private"
+        assert result["data"]["people_seen"] == 2
+        deps.audio.play_audio.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_camera_allows_when_count_matches(self, internal_tools):
+        """Camera sees exactly the tracked recipient(s) → announced."""
+        occ = [MagicMock(user_id=2)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2},
+                              camera_sat=True, snapshot="IMG_B64", people=1) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard"],
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_camera_fail_open_when_snapshot_fails(self, internal_tools):
+        """Snapshot/vision unavailable + default fail-open → BLE decision stands
+        (announced)."""
+        occ = [MagicMock(user_id=2)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2},
+                              camera_sat=True, snapshot=None, people=None,
+                              fail_closed=False) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard"],
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_camera_fail_closed_when_snapshot_fails(self, internal_tools):
+        """Snapshot/vision unavailable + fail-closed policy → blocked."""
+        occ = [MagicMock(user_id=2)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2},
+                              camera_sat=True, snapshot=None, people=None,
+                              fail_closed=True) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard"],
+            })
+        assert result["success"] is False
+        assert result.get("blocked") == "not_private"
+        deps.audio.play_audio.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_no_camera_falls_back_to_ble(self, internal_tools):
+        """No camera in the room → BLE gate decides (recipient alone → announced)."""
+        occ = [MagicMock(user_id=2)]
+        with self._patch_deps(occupants=occ, name_to_id={"Eduard": 2},
+                              camera_sat=False) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "vertraulich", "room_name": "Arbeitszimmer",
+                "privacy": "personal", "for_users": ["Eduard"],
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+
+
+class TestAnnounceFallbackAllSpeakers:
+    """The raw-speaker fallback (reached only when the primary routing path did
+    NOT deliver) must play on ALL speakers in the room, not just the first to
+    answer — and must NOT run at all when the primary path succeeded."""
+
+    @staticmethod
+    def _speaker():
+        d = MagicMock()
+        d.capabilities.has_speaker = True
+        d.websocket.send_json = AsyncMock()
+        return d
+
+    @staticmethod
+    def _patch(*, devices, room_id=2, room_name="Arbeitszimmer", play_ok_primary=False):
+        import sys
+        from types import ModuleType
+
+        mock_db = AsyncMock()
+
+        @asynccontextmanager
+        async def mock_session():
+            yield mock_db
+
+        room = MagicMock(id=room_id, name=room_name)
+        room_service = MagicMock()
+        room_service.get_room_by_name = AsyncMock(return_value=room)
+        room_service.get_room_by_alias = AsyncMock(return_value=None)
+
+        presence = MagicMock()  # public path → privacy gate skipped, presence unused
+
+        piper = MagicMock()
+        piper.synthesize_to_bytes = AsyncMock(return_value=b"WAV")
+
+        decision = MagicMock()
+        # output_device present but play_audio False (play_ok_primary=False) →
+        # primary path does NOT return success → fallback runs.
+        decision.output_device = MagicMock()
+        decision.fallback_to_input = False
+        routing = MagicMock()
+        routing.get_audio_output_for_room = AsyncMock(return_value=decision)
+
+        audio = MagicMock()
+        audio.play_audio = AsyncMock(return_value=play_ok_primary)
+
+        dm = MagicMock()
+        dm.get_devices_in_room_by_id = MagicMock(return_value=devices)
+        dm.get_devices_in_room = MagicMock(return_value=[])
+
+        ensure = []
+        for mod_name in [
+            "services.database", "services.piper_service",
+            "ha_glue.services.room_service", "ha_glue.services.presence_service",
+            "ha_glue.services.output_routing_service",
+            "ha_glue.services.audio_output_service", "ha_glue.services.device_manager",
+        ]:
+            if mod_name not in sys.modules:
+                sys.modules[mod_name] = ModuleType(mod_name)
+                ensure.append(mod_name)
+
+        patches = [
+            patch("services.database.AsyncSessionLocal", mock_session, create=True),
+            patch("services.piper_service.PiperService", return_value=piper, create=True),
+            patch("ha_glue.services.room_service.RoomService", return_value=room_service, create=True),
+            patch("ha_glue.services.presence_service.get_presence_service", return_value=presence, create=True),
+            patch("ha_glue.services.output_routing_service.OutputRoutingService", return_value=routing, create=True),
+            patch("ha_glue.services.audio_output_service.get_audio_output_service", return_value=audio, create=True),
+            patch("ha_glue.services.device_manager.get_device_manager", return_value=dm, create=True),
+        ]
+
+        class Combined:
+            def __enter__(self_):
+                for p in patches:
+                    p.__enter__()
+                self_.dm = dm
+                self_.audio = audio
+                return self_
+
+            def __exit__(self_, *a):
+                for p in reversed(patches):
+                    p.__exit__(*a)
+                for m in ensure:
+                    sys.modules.pop(m, None)
+
+        return Combined()
+
+    @pytest.mark.unit
+    async def test_fallback_sends_to_all_speakers(self, internal_tools):
+        """A room with 2 raw speakers → BOTH receive the send (the bug played
+        only on the first)."""
+        s1, s2 = self._speaker(), self._speaker()
+        with self._patch(devices=[s1, s2], play_ok_primary=False):
+            result = await internal_tools._announce_in_room({
+                "text": "Hallo", "room_name": "Arbeitszimmer", "privacy": "public",
+            })
+        assert result["success"] is True
+        s1.websocket.send_json.assert_awaited_once()
+        s2.websocket.send_json.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_fallback_keys_on_room_id(self, internal_tools):
+        """Fallback looks up speakers by resolved room id, not the raw param."""
+        s1 = self._speaker()
+        with self._patch(devices=[s1], play_ok_primary=False) as deps:
+            await internal_tools._announce_in_room({
+                "text": "Hallo", "room_name": "Arbeitszimmer", "privacy": "public",
+            })
+        deps.dm.get_devices_in_room_by_id.assert_called_once_with(2)
+
+    @pytest.mark.unit
+    async def test_fallback_not_entered_when_primary_succeeds(self, internal_tools):
+        """Primary routing delivered → fallback never runs (no double-send)."""
+        s1 = self._speaker()
+        with self._patch(devices=[s1], play_ok_primary=True) as deps:
+            result = await internal_tools._announce_in_room({
+                "text": "Hallo", "room_name": "Arbeitszimmer", "privacy": "public",
+            })
+        assert result["success"] is True
+        deps.audio.play_audio.assert_awaited_once()
+        deps.dm.get_devices_in_room_by_id.assert_not_called()
+        s1.websocket.send_json.assert_not_awaited()
+
+    @pytest.mark.unit
+    async def test_fallback_fails_when_no_speaker_accepts(self, internal_tools):
+        """Every speaker's send raises → honest failure, not a false success."""
+        bad = MagicMock()
+        bad.capabilities.has_speaker = True
+        bad.websocket.send_json = AsyncMock(side_effect=RuntimeError("dead link"))
+        with self._patch(devices=[bad], play_ok_primary=False):
+            result = await internal_tools._announce_in_room({
+                "text": "Hallo", "room_name": "Arbeitszimmer", "privacy": "public",
+            })
+        assert result["success"] is False
+        assert "Lautsprecher" in result["message"]
+
+
+class TestBroadcastAnnouncement:
+    """internal.broadcast_announcement: public-only fan-out to every occupied
+    room. These isolate the broadcast orchestration by mocking _announce_core
+    (the per-room work is covered by TestAnnounceInRoom)."""
+
+    @staticmethod
+    def _pres(room_id, room_name="X"):
+        return MagicMock(room_id=room_id, room_name=room_name)
+
+    @staticmethod
+    def _patch(*, presence_map, rooms_by_id, tts=b"WAV"):
+        """presence_map: {user_id: UserPresence-like}; rooms_by_id: {id: name}
+        for RoomService.get_room (name=None → room not found)."""
+        import sys
+        from types import ModuleType
+
+        mock_db = AsyncMock()
+
+        @asynccontextmanager
+        async def mock_session():
+            yield mock_db
+
+        presence = MagicMock()
+        presence.get_all_presence = MagicMock(return_value=presence_map)
+
+        async def _get_room(rid):
+            name = rooms_by_id.get(rid)
+            if name is None:
+                return None
+            # NB: ``name`` is a reserved MagicMock ctor kwarg — assign after.
+            room = MagicMock(id=rid)
+            room.name = name
+            return room
+
+        room_service = MagicMock()
+        room_service.get_room = AsyncMock(side_effect=_get_room)
+
+        piper = MagicMock()
+        piper.synthesize_to_bytes = AsyncMock(return_value=tts)
+
+        ensure = []
+        for mod_name in [
+            "services.database", "services.piper_service",
+            "ha_glue.services.room_service", "ha_glue.services.presence_service",
+        ]:
+            if mod_name not in sys.modules:
+                sys.modules[mod_name] = ModuleType(mod_name)
+                ensure.append(mod_name)
+
+        patches = [
+            patch("services.database.AsyncSessionLocal", mock_session, create=True),
+            patch("services.piper_service.PiperService", return_value=piper, create=True),
+            patch("ha_glue.services.room_service.RoomService", return_value=room_service, create=True),
+            patch("ha_glue.services.presence_service.get_presence_service", return_value=presence, create=True),
+        ]
+
+        class Combined:
+            def __enter__(self_):
+                for p in patches:
+                    p.__enter__()
+                self_.piper = piper
+                self_.room_service = room_service
+                return self_
+
+            def __exit__(self_, *a):
+                for p in reversed(patches):
+                    p.__exit__(*a)
+                for m in ensure:
+                    sys.modules.pop(m, None)
+
+        return Combined()
+
+    @pytest.mark.unit
+    async def test_two_rooms_two_plays(self, internal_tools):
+        presence_map = {1: self._pres(2, "Arbeitszimmer"), 2: self._pres(3, "Küche")}
+        rooms = {2: "Arbeitszimmer", 3: "Küche"}
+        core = AsyncMock(return_value={"success": True})
+        with self._patch(presence_map=presence_map, rooms_by_id=rooms):
+            internal_tools._announce_core = core
+            result = await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        assert result["success"] is True
+        assert core.await_count == 2
+        assert "Arbeitszimmer" in result["message"] and "Küche" in result["message"]
+        assert "(2/2)" in result["message"]
+
+    @pytest.mark.unit
+    async def test_dedup_same_room(self, internal_tools):
+        """Two users in the same room → ONE play."""
+        presence_map = {1: self._pres(2, "Arbeitszimmer"), 2: self._pres(2, "Arbeitszimmer")}
+        core = AsyncMock(return_value={"success": True})
+        with self._patch(presence_map=presence_map, rooms_by_id={2: "Arbeitszimmer"}):
+            internal_tools._announce_core = core
+            result = await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        assert core.await_count == 1
+        assert "(1/1)" in result["message"]
+
+    @pytest.mark.unit
+    async def test_nobody_present_no_synth(self, internal_tools):
+        """Empty presence → no-op, NO synth, NO core call."""
+        core = AsyncMock(return_value={"success": True})
+        with self._patch(presence_map={}, rooms_by_id={}) as deps:
+            internal_tools._announce_core = core
+            result = await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        assert result["success"] is True
+        assert result["action_taken"] is False
+        assert "niemand" in result["message"].lower()
+        deps.piper.synthesize_to_bytes.assert_not_called()
+        core.assert_not_awaited()
+
+    @pytest.mark.unit
+    async def test_room_id_none_skipped(self, internal_tools):
+        """A presence with room_id=None is skipped; only the real room plays."""
+        presence_map = {1: self._pres(None, None), 2: self._pres(2, "Arbeitszimmer")}
+        core = AsyncMock(return_value={"success": True})
+        with self._patch(presence_map=presence_map, rooms_by_id={2: "Arbeitszimmer"}):
+            internal_tools._announce_core = core
+            result = await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        assert core.await_count == 1
+        assert "(1/1)" in result["message"]
+
+    @pytest.mark.unit
+    async def test_room_name_none_resolved_from_id(self, internal_tools):
+        """Presence room_name=None but room_id set → name resolved from id (the
+        canonical name, never None)."""
+        presence_map = {1: self._pres(5, None)}
+        core = AsyncMock(return_value={"success": True})
+        with self._patch(presence_map=presence_map, rooms_by_id={5: "Schlafzimmer"}):
+            internal_tools._announce_core = core
+            result = await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        assert core.await_count == 1
+        assert core.await_args.kwargs["room_name"] == "Schlafzimmer"
+        assert "Schlafzimmer" in result["message"]
+        assert "None" not in result["message"]
+
+    @pytest.mark.unit
+    async def test_synth_called_once(self, internal_tools):
+        """TTS is synthesized exactly ONCE regardless of room count."""
+        presence_map = {1: self._pres(2, "A"), 2: self._pres(3, "B"), 3: self._pres(4, "C")}
+        rooms = {2: "A", 3: "B", 4: "C"}
+        core = AsyncMock(return_value={"success": True})
+        with self._patch(presence_map=presence_map, rooms_by_id=rooms) as deps:
+            internal_tools._announce_core = core
+            await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        deps.piper.synthesize_to_bytes.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_core_called_public_with_shared_bytes(self, internal_tools):
+        """Each room gets the SAME pre-synthesized bytes, privacy=public, no recipients."""
+        presence_map = {1: self._pres(2, "A")}
+        core = AsyncMock(return_value={"success": True})
+        with self._patch(presence_map=presence_map, rooms_by_id={2: "A"}, tts=b"SYNTH"):
+            internal_tools._announce_core = core
+            await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        kw = core.await_args.kwargs
+        assert kw["audio_bytes"] == b"SYNTH"
+        assert kw["privacy"] == "public"
+        assert kw["for_users"] == []
+        assert kw["force"] is False
+
+    @pytest.mark.unit
+    async def test_one_room_throws_others_complete(self, internal_tools):
+        """One room raises → others still play; summary names the failed room."""
+        presence_map = {1: self._pres(2, "Arbeitszimmer"), 2: self._pres(3, "Küche")}
+        rooms = {2: "Arbeitszimmer", 3: "Küche"}
+
+        async def _core(**kwargs):
+            if kwargs["room_name"] == "Küche":
+                raise RuntimeError("router down")
+            return {"success": True}
+
+        with self._patch(presence_map=presence_map, rooms_by_id=rooms):
+            internal_tools._announce_core = _core
+            result = await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        assert result["success"] is True  # at least one reached
+        assert result["data"]["reached"] == ["Arbeitszimmer"]
+        assert result["data"]["failed"] == ["Küche"]
+        assert "Nicht erreicht: Küche" in result["message"]
+
+    @pytest.mark.unit
+    async def test_all_rooms_fail_honest_summary(self, internal_tools):
+        """Every room fails → success False with an honest 0/N summary, no crash."""
+        presence_map = {1: self._pres(2, "Arbeitszimmer"), 2: self._pres(3, "Küche")}
+        rooms = {2: "Arbeitszimmer", 3: "Küche"}
+        core = AsyncMock(return_value={"success": False})
+        with self._patch(presence_map=presence_map, rooms_by_id=rooms):
+            internal_tools._announce_core = core
+            result = await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        assert result["success"] is False
+        assert "(0/2)" in result["message"]
+        assert "Nicht erreicht" in result["message"]
+
+    @pytest.mark.unit
+    async def test_personal_rejected_at_boundary(self, internal_tools):
+        """privacy=personal → rejected before any presence/synth/fan-out."""
+        core = AsyncMock(return_value={"success": True})
+        with self._patch(presence_map={1: self._pres(2, "A")}, rooms_by_id={2: "A"}) as deps:
+            internal_tools._announce_core = core
+            result = await internal_tools._broadcast_announcement({
+                "text": "vertraulich", "privacy": "personal",
+            })
+        assert result["success"] is False
+        assert "announce_in_room" in result["message"]
+        core.assert_not_awaited()
+        deps.piper.synthesize_to_bytes.assert_not_called()
+
+    @pytest.mark.unit
+    async def test_missing_text(self, internal_tools):
+        result = await internal_tools._broadcast_announcement({})
+        assert result["success"] is False and "text" in result["message"]
+
+    @pytest.mark.unit
+    async def test_semaphore_bounds_concurrency(self, internal_tools):
+        """Concurrency never exceeds _BROADCAST_CONCURRENCY across many rooms,
+        and the fan-out IS actually parallel (not serialized)."""
+        import asyncio
+        presence_map = {uid: self._pres(uid + 1, f"Room{uid}") for uid in range(1, 11)}  # 10 rooms
+        rooms = {uid + 1: f"Room{uid}" for uid in range(1, 11)}
+        state = {"cur": 0, "max": 0}
+
+        async def _core(**kwargs):
+            state["cur"] += 1
+            state["max"] = max(state["max"], state["cur"])
+            await asyncio.sleep(0.01)
+            state["cur"] -= 1
+            return {"success": True}
+
+        with self._patch(presence_map=presence_map, rooms_by_id=rooms):
+            internal_tools._announce_core = _core
+            result = await internal_tools._broadcast_announcement({"text": "Mittagessen"})
+        assert state["max"] <= internal_tools._BROADCAST_CONCURRENCY
+        assert state["max"] > 1  # genuinely concurrent, not serialized
+        assert "(10/10)" in result["message"]
+
+
+class TestAnnouncePermissionGate:
+    """The announce/broadcast tools route TTS into rooms → gated on HA_CONTROL
+    in ha_glue_execute_tool (the execute_tool hook). user_permissions=None
+    (auth-disabled / unidentified voice) is allowed; an authenticated user
+    needs HA_CONTROL."""
+
+    @staticmethod
+    def _patch_dispatch():
+        """Stub InternalToolService.execute so we test ONLY the gate, not the
+        tool body. Returns the patch + the recording mock."""
+        from ha_glue.services.internal_tools import InternalToolService
+        executed = AsyncMock(return_value={"success": True, "action_taken": True, "message": "ok"})
+        return patch.object(InternalToolService, "execute", executed), executed
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("intent", [
+        "internal.announce_in_room", "internal.broadcast_announcement",
+    ])
+    async def test_denied_when_authenticated_user_lacks_ha_control(self, intent):
+        from ha_glue.bootstrap import ha_glue_execute_tool
+        p, executed = self._patch_dispatch()
+        with p:
+            result = await ha_glue_execute_tool(
+                intent=intent, parameters={"text": "hi", "room_name": "Küche"},
+                user_permissions=["ha.read", "kb.own"], user_id=7,
+            )
+        assert result["success"] is False
+        assert "Berechtigung" in result["message"]
+        executed.assert_not_awaited()  # blocked BEFORE the tool ran
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("intent", [
+        "internal.announce_in_room", "internal.broadcast_announcement",
+    ])
+    async def test_allowed_with_ha_control(self, intent):
+        from ha_glue.bootstrap import ha_glue_execute_tool
+        p, executed = self._patch_dispatch()
+        with p:
+            result = await ha_glue_execute_tool(
+                intent=intent, parameters={"text": "hi"},
+                user_permissions=["ha.control"], user_id=7,
+            )
+        assert result["success"] is True
+        executed.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_allowed_with_ha_full_via_hierarchy(self):
+        """ha.full implies ha.control through the permission hierarchy."""
+        from ha_glue.bootstrap import ha_glue_execute_tool
+        p, executed = self._patch_dispatch()
+        with p:
+            result = await ha_glue_execute_tool(
+                intent="internal.broadcast_announcement", parameters={"text": "hi"},
+                user_permissions=["ha.full"], user_id=1,
+            )
+        assert result["success"] is True
+        executed.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_allowed_when_permissions_none(self):
+        """user_permissions=None → auth-disabled / unidentified voice → allowed
+        (voice 'Ansage an alle' must keep working)."""
+        from ha_glue.bootstrap import ha_glue_execute_tool
+        p, executed = self._patch_dispatch()
+        with p:
+            result = await ha_glue_execute_tool(
+                intent="internal.broadcast_announcement", parameters={"text": "hi"},
+                user_permissions=None, user_id=None,
+            )
+        assert result["success"] is True
+        executed.assert_awaited_once()
+
+    @pytest.mark.unit
+    async def test_non_gated_internal_tool_not_affected(self):
+        """A non-announce internal tool runs even without HA_CONTROL."""
+        from ha_glue.bootstrap import ha_glue_execute_tool
+        p, executed = self._patch_dispatch()
+        with p:
+            result = await ha_glue_execute_tool(
+                intent="internal.get_all_presence", parameters={},
+                user_permissions=["ha.read"], user_id=7,
+            )
+        assert result["success"] is True
+        executed.assert_awaited_once()
+
+
+# ============================================================================
+# Media Follow Me — presence-derived session owner (option A)
+# ============================================================================
+
+class TestRegisterMediaFollowPresenceFallback:
+    """When playback has no authenticated chat user (AUTH disabled), the follow
+    session must be attributed to the user presence places in the playback room
+    — the SAME user_id that presence_leave_room later fires with — so leaving
+    actually stops the music."""
+
+    @pytest.mark.unit
+    def test_presence_room_user_single_vs_ambiguous(self, internal_tools, monkeypatch):
+        from types import SimpleNamespace
+        import ha_glue.services.presence_service as ps
+
+        class _PS:
+            def __init__(self, occ): self._occ = occ
+            def get_room_occupants(self, _rid): return self._occ
+
+        monkeypatch.setattr(ps, "get_presence_service", lambda: _PS([SimpleNamespace(user_id=7)]))
+        assert internal_tools._presence_room_user(2) == 7
+        # >1 occupant → ambiguous → None (never attribute the wrong person)
+        monkeypatch.setattr(ps, "get_presence_service",
+                            lambda: _PS([SimpleNamespace(user_id=7), SimpleNamespace(user_id=8)]))
+        assert internal_tools._presence_room_user(2) is None
+        # empty room → None
+        monkeypatch.setattr(ps, "get_presence_service", lambda: _PS([]))
+        assert internal_tools._presence_room_user(2) is None
+
+    def _wire(self, internal_tools, monkeypatch, presence_user, captured):
+        from ha_glue.utils.config import ha_glue_settings
+        import ha_glue.services.media_follow_service as mfs
+        monkeypatch.setattr(ha_glue_settings, "media_follow_enabled", True)
+        monkeypatch.setattr(internal_tools, "_get_room_id", AsyncMock(return_value=2))
+        monkeypatch.setattr(internal_tools, "_presence_room_user", lambda rid: presence_user)
+
+        class _MF:
+            def register_playback(self, **kw): captured.update(kw)
+
+        monkeypatch.setattr(mfs, "get_media_follow_service", lambda: _MF())
+
+    @pytest.mark.unit
+    async def test_falls_back_to_presence_room_user(self, internal_tools, monkeypatch):
+        captured: dict = {}
+        self._wire(internal_tools, monkeypatch, presence_user=7, captured=captured)
+        await internal_tools._register_media_follow({"user_id": None}, "Arbeitszimmer", "radio")
+        assert captured.get("user_id") == 7
+        assert captured.get("room_id") == 2
+        assert captured.get("room_name") == "Arbeitszimmer"
+
+    @pytest.mark.unit
+    async def test_chat_user_id_wins_over_presence(self, internal_tools, monkeypatch):
+        captured: dict = {}
+        self._wire(internal_tools, monkeypatch, presence_user=99, captured=captured)
+        await internal_tools._register_media_follow({"user_id": 5}, "Arbeitszimmer", "radio")
+        assert captured.get("user_id") == 5  # authenticated caller wins
+
+    @pytest.mark.unit
+    async def test_skips_when_no_user_resolvable(self, internal_tools, monkeypatch):
+        captured: dict = {}
+        self._wire(internal_tools, monkeypatch, presence_user=None, captured=captured)
+        await internal_tools._register_media_follow({"user_id": None}, "Arbeitszimmer", "radio")
+        assert captured == {}  # nothing registered (empty/ambiguous room)

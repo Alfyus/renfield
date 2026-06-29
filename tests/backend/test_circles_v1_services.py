@@ -38,7 +38,8 @@ from services.atom_types import (
 from services.circle_resolver import PolicyEvaluator
 from services.polymorphic_atom_store import (
     _rrf_merge,
-    _wrap_kg_context,
+    _wrap_document_fact_results,
+    _wrap_kg_atoms,
     _wrap_memory_results,
     _wrap_rag_results,
 )
@@ -471,21 +472,24 @@ class TestSourceWrapping:
 
     @pytest.mark.unit
     def test_kg_wrapper_handles_exception_input(self):
-        assert _wrap_kg_context(RuntimeError("KG down")) == []
+        assert _wrap_kg_atoms(RuntimeError("KG down")) == []
 
     @pytest.mark.unit
     def test_kg_wrapper_handles_none_input(self):
-        assert _wrap_kg_context(None) == []
-        assert _wrap_kg_context("") == []
+        assert _wrap_kg_atoms(None) == []
+        assert _wrap_kg_atoms({"entities": [], "relations": []}) == []
 
     @pytest.mark.unit
-    def test_kg_wrapper_returns_one_aggregated_match(self):
-        kg_context = "WISSENSGRAPH:\n- Anna lives_in Hamburg\n- Anna born_in 1985"
-        result = _wrap_kg_context(kg_context)
-        assert len(result) == 1
-        assert result[0].atom.atom_type == "kg_node"
-        assert result[0].atom.atom_id == "kg_aggregated"
-        assert "Anna" in result[0].atom.payload["content"]
+    def test_kg_wrapper_emits_per_entity_atoms(self):
+        # PR3: per-entity kg_node + per-relation kg_edge (was one aggregated blob).
+        result = _wrap_kg_atoms({
+            "entities": [{"id": 3, "name": "Anna", "entity_type": "person", "circle_tier": 1, "similarity": 0.8}],
+            "relations": [{"id": 9, "subject_id": 3, "subject_name": "Anna", "predicate": "lives_in", "object_id": 4, "object_name": "Hamburg", "circle_tier": 1}],
+        })
+        assert [m.atom.atom_type for m in result] == ["kg_node", "kg_edge"]
+        assert result[0].atom.atom_id == "kg_node:3"
+        assert result[0].atom.payload["entity_id"] == 3
+        assert result[1].atom.payload["relation_id"] == 9
 
     @pytest.mark.unit
     def test_memory_wrapper_handles_exception_input(self):
@@ -508,6 +512,65 @@ class TestSourceWrapping:
         assert result[0].atom.atom_id == "atom-5"
         assert result[0].atom.policy == {"tier": 0}
         assert result[0].score == 0.78
+
+    @pytest.mark.unit
+    def test_document_fact_wrapper_handles_exception_input(self):
+        assert _wrap_document_fact_results(RuntimeError("facts down")) == []
+
+    @pytest.mark.unit
+    def test_document_fact_wrapper_handles_empty_input(self):
+        assert _wrap_document_fact_results([]) == []
+        assert _wrap_document_fact_results(None) == []
+
+    @pytest.mark.unit
+    def test_document_fact_wrapper_extracts_fields(self):
+        fact_results = [{
+            "id": 9,
+            "document_id": 44,
+            "atom_id": "fact-atom-9",
+            "category": "obligation",
+            "kind": "zahlung",
+            "value": "Zahlung 120,00 EUR",
+            "normalized_value": None,
+            "excerpt": "… bis zum 10.06.2026 zu zahlen …",
+            "obligation_date": "2026-06-10",
+            "amount_value": 120.0,
+            "amount_currency": "EUR",
+            "legal_gate": False,
+            "payment_method": "manual",
+            "source": "llm",
+            "circle_tier": 2,
+            "similarity": 0.42,
+        }]
+        result = _wrap_document_fact_results(fact_results)
+        assert len(result) == 1
+        m = result[0]
+        assert m.atom.atom_type == "document_fact"
+        assert m.atom.atom_id == "fact-atom-9"          # real atom_id, not synthetic
+        assert m.atom.policy == {"tier": 2}
+        assert m.score == 0.42
+        assert m.rank == 1
+        assert m.snippet == "Zahlung 120,00 EUR"        # value preferred as snippet
+        # Structured payload carried for the /brain UI + obligation surfaces.
+        assert m.atom.payload["obligation_date"] == "2026-06-10"  # ISO preserved
+        assert m.atom.payload["amount_value"] == 120.0
+        assert m.atom.payload["category"] == "obligation"
+
+    @pytest.mark.unit
+    def test_document_fact_wrapper_synthetic_id_when_atom_id_missing(self):
+        result = _wrap_document_fact_results([{"id": 3, "value": "x", "circle_tier": 0}])
+        assert result[0].atom.atom_id == "document_fact:3"
+
+    @pytest.mark.unit
+    def test_document_fact_participates_in_rrf_merge(self):
+        # A fact match fuses with the other sources by atom_id like any source.
+        fact_match = _wrap_document_fact_results(
+            [{"id": 1, "atom_id": "fa-1", "value": "v", "circle_tier": 0, "similarity": 0.5}]
+        )
+        other = [_match("kb-1", 1)]
+        merged = _rrf_merge([fact_match, other], top_k=10)
+        ids = {m.atom.atom_id for m in merged}
+        assert "fa-1" in ids and "kb-1" in ids
 
 
 # =============================================================================

@@ -75,6 +75,31 @@ class TestCirclesFilterClause:
         )
         assert "a.source_id = (dc.id)::text" in clause
 
+    def test_no_atom_owner_fallback_by_default(self):
+        # Generic callers (kg_entities, conversation_memories) own via a
+        # direct column — no atom-owner fallback should be emitted.
+        clause = circles_filter_clause(table_alias="e")
+        assert "atoms da" not in clause
+
+    def test_atom_owner_fallback_when_owner_atom_id_expr_set(self):
+        # CM-1: null-KB documents have kb.owner_id IS NULL, so the owner
+        # branch must also match the document's atom owner.
+        clause = circles_filter_clause(
+            table_alias="dc",
+            owner_col="owner_id",
+            owner_table_alias="kb",
+            source_table_value="documents",
+            source_id_expr="d.id",
+            owner_atom_id_expr="d.atom_id",
+        )
+        # The KB-owner branch and the atom-owner fallback are OR'd together.
+        assert "kb.owner_id = :asker_id" in clause
+        assert "FROM atoms da" in clause
+        assert "da.atom_id = d.atom_id" in clause
+        assert "da.owner_user_id = :asker_id" in clause
+        # The fallback `da` alias must not collide with the grant `a` alias.
+        assert "atoms a ON a.atom_id = g.atom_id" in clause
+
 
 class TestCirclesFilterParams:
     def test_default_params(self):
@@ -160,6 +185,11 @@ class TestDocumentChunksWrapper:
         clause, params = document_chunks_circles_filter(asker_id=42)
         # Owner branch references kb.owner_id, not dc.user_id
         assert "kb.owner_id = :asker_id" in clause
+        # CM-1: null-KB docs (kb.owner_id IS NULL) reach the owner via the
+        # document's atom owner as a fallback.
+        assert "FROM atoms da" in clause
+        assert "da.atom_id = d.atom_id" in clause
+        assert "da.owner_user_id = :asker_id" in clause
         # Tier check is on chunk row (denormalized)
         assert "dc.circle_tier = :asker_id_pub" in clause
         # Membership reaches kb.owner_id
@@ -180,3 +210,5 @@ class TestDocumentChunksWrapper:
         assert "m.circle_owner_id = bases.owner_id" in clause
         # Grant anchor follows the doc_alias now, not the chunk_alias.
         assert "a.source_id = (doc.id)::text" in clause
+        # Atom-owner fallback follows the doc_alias too.
+        assert "da.atom_id = doc.atom_id" in clause

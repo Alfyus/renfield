@@ -21,6 +21,7 @@ Platform callers (agent_tools.py, action_executor.py, chat_handler.py)
 no longer import this module directly. They go through the hook system
 so platform-only deploys never reach the ha_glue package.
 """
+import asyncio
 import time
 
 from loguru import logger
@@ -54,16 +55,35 @@ class InternalToolService:
                 "user_name": "Name of the user to locate (username, first name, or last name)",
             },
         },
+        "internal.announce_in_room": {
+            "description": "Speak a text message out loud (TTS) on a room's audio device. Use it to relay a message to a person: find their room first (internal.get_user_location), then announce. Privacy: set privacy='personal' for personal/confidential content (when in doubt, do). A personal message is spoken ONLY if everyone currently in the room is an intended recipient (list them in for_users) — so two recipients together get it, but a non-recipient present blocks it (you get blocked='not_private'). When blocked: announce a NEUTRAL note that a message is waiting (privacy='public', NO content), and if the recipient says go ahead, call this again with force=true.",
+            "parameters": {
+                "text": "The message to speak aloud (required)",
+                "room_name": "The room to announce in (required) — e.g. the room the person is currently in",
+                "privacy": "'public' (default, anyone may overhear) or 'personal' (confidential)",
+                "for_users": "Intended recipient(s) — a name or list of names. A personal message plays only if everyone present is in this list.",
+                "force": "'true' to announce a personal message even if non-recipients are present — ONLY after the recipient has explicitly consented (default false)",
+            },
+        },
+        "internal.broadcast_announcement": {
+            "description": "Speak a text message OUT LOUD (TTS) in EVERY room where someone is currently present — a house-wide announcement. Use it ONLY for an explicit announcement to everybody: 'Ansage an alle', 'sag allen Bescheid', 'ruf alle zum Essen', 'tell everyone …'. PUBLIC ONLY — it REFUSES confidential content (privacy='personal' is rejected; for that use announce_in_room, the targeted relay). It fans out to all occupied rooms with NO consent dialog. Coverage is presence-based: only rooms with a BLE-tracked person are reached, so a person WITHOUT a tracked device is not covered — the result names exactly which rooms were reached; relay that honestly and do NOT claim everyone heard it. This is DIFFERENT from announce_in_room (which targets ONE room/person) — never confuse the two. Do NOT retry on a partial result (it would re-announce in the rooms that already played).",
+            "parameters": {
+                "text": "The message to speak aloud in every occupied room (required)",
+            },
+        },
         "internal.get_all_presence": {
             "description": "Get all currently present users and their room locations. Use this when asked 'where is everyone?' or 'who is home?'.",
             "parameters": {},
         },
         "internal.media_control": {
-            "description": "Control media playback in a room: stop, pause, resume, next track, previous track, set volume. Works with both Home Assistant media players and DLNA renderers.",
+            "description": "Control media playback in a room: stop, pause, resume, next, previous, volume, mute, unmute, seek, play_mode, or query status (what's playing). Works with both Home Assistant media players and DLNA renderers.",
             "parameters": {
-                "action": "Control action: stop, pause, resume, next, previous, volume (required)",
+                "action": "Control action: stop, pause, resume, next, previous, volume, mute, unmute, status, seek, play_mode (required)",
                 "room_name": "Target room name (required)",
-                "volume": "Volume level 0-100 (required when action is 'volume')",
+                "volume": "Absolute volume 0-100 (use for 'set volume to X'). Mutually exclusive with volume_step.",
+                "volume_step": "Relative volume change in percentage points, e.g. -20 for 20% quieter, +10 for louder (use for 'leiser/lauter um X'). Mutually exclusive with volume.",
+                "position_seconds": "Target offset in seconds from the track start (required when action is 'seek')",
+                "mode": "Play mode: normal, repeat_one, repeat_all, shuffle, random (required when action is 'play_mode')",
             },
         },
         "internal.play_album_on_dlna": {
@@ -85,10 +105,18 @@ class InternalToolService:
                 "image_url": "Thumbnail URL (optional)",
             },
         },
-        "internal.play_radio": {
-            "description": "Play a radio station in a room. Resolves the stream URL from a station ID and plays it on the room's audio device. Use after mcp.radio.search_stations to get a station_id.",
+        "internal.play_from_server": {
+            "description": "Play a library object (album/playlist/folder/track) from a DLNA MediaServer (e.g. a NAS/Jellyfin library) on a room's audio device. Use AFTER mcp.dlna.list_servers + browse_server/search_server to obtain a server_name + object_id — no content URLs needed.",
             "parameters": {
-                "station_id": "TuneIn station ID, e.g. 's12345' (required)",
+                "server_name": "DLNA MediaServer name from mcp.dlna.list_servers (required)",
+                "object_id": "Library object id from mcp.dlna.browse_server/search_server (required)",
+                "room_name": "Target room name whose DLNA renderer to play on (required)",
+            },
+        },
+        "internal.play_radio": {
+            "description": "Play a radio station in a room. Resolves the stream URL from a station ID and plays it on the room's audio device. ALWAYS call mcp.radio.search_stations FIRST to obtain the station_id — TuneIn IDs are opaque and cannot be known without searching.",
+            "parameters": {
+                "station_id": "Opaque TuneIn station ID taken from a mcp.radio.search_stations result in THIS request (required). NEVER invent, guess, copy from an example, or reuse an ID from memory/context — always search first.",
                 "room_name": "Target room name (required)",
                 "station_name": "Station display name for the media player UI (optional)",
                 "station_image": "Station logo URL for the media player UI (optional)",
@@ -114,6 +142,33 @@ class InternalToolService:
                 "station_id": "TuneIn station ID to remove (required)",
             },
         },
+        "internal.bluetooth_scan": {
+            "description": "Scan for ALL nearby Bluetooth devices (broad discovery, NOT the known-presence whitelist). Use for 'scan all bluetooth devices' / 'welche Bluetooth-Geräte sind in der Nähe?'. The scan is fanned out to every satellite and runs a BLE + Classic discovery in each room. It is SLOW — 15-30 seconds — so call it ONCE and WAIT for the result; do NOT retry or call it repeatedly. Only devices that are actively advertising/discoverable appear (most phones are not discoverable over Classic and won't show up). Returns each device's MAC, name (if any), best RSSI, `room_best` (the room with the strongest signal = where the device most likely is), transport, OUI vendor, and the full `rooms` list of every room that saw it. PRESENTING THE RESULT: (1) Account for ALL devices — `total_devices` must equal what you show. List every NAMED device, and for the unnamed (MAC-only) ones give a per-room count (e.g. 'Arbeitszimmer: 5 unbenannte BLE-Geräte') so nothing is silently dropped. Do NOT detail only the few named devices and wave the rest away as 'mehrere unbekannte'. (2) Report each device's room using its `room_best`/`rooms` ONLY. NEVER attribute a device to the asker's current room, and never claim a room saw a device unless that room is in its `rooms` list — the scan has no notion of the asker's location.",
+            "parameters": {
+                "ble_duration": "BLE listen time in seconds per satellite (default 10, max 20)",
+                "classic_timeout": "Classic inquiry time in seconds per satellite (default 12, max 20)",
+            },
+        },
+        "internal.device_controls": {
+            "description": "Show an INTERACTIVE device-control widget — clickable on/off toggles for lights and switches, a brightness slider for lights, 'run' buttons for scenes, and a thermostat setpoint for climate — so the user can operate devices by tapping. Use it when the user wants to CONTROL/OPERATE devices via a panel ('steuere die Lichter', 'zeig mir die Lichtsteuerung', 'gib mir die Schalter fürs Wohnzimmer', 'dimme das Licht', 'thermostat einstellen', 'show me the light controls'). NOT for a one-off command like 'mach das Licht an' (do that directly with HassTurnOn), and NOT for a read-only status overview (that is the status sub-intent). Optionally pass a room to scope it. After it renders give a one-line final_answer (the widget IS the answer).",
+            "parameters": {
+                "room": "Optional room name to scope the controls to (e.g. 'Wohnzimmer'). Omit to show all controllable devices.",
+            },
+        },
+        "internal.presence_map": {
+            "description": "Show a PRESENCE-MAP widget — a read-only overview of which rooms currently have which people present. Use it for 'wer ist wo?', 'zeig mir wer zuhause ist', 'who is home', 'show me where everyone is'. The widget renders rooms with the present users; give a one-line final_answer alongside.",
+            "parameters": {},
+        },
+        "internal.presence_history": {
+            "description": "Query a user's PERSISTED presence history (survives restarts, unlike the live current-location tools). Use for 'where was X earlier/yesterday', 'when was X last in the kitchen', or 'who was in the living room this morning'. Accepts username or first/last name.",
+            "parameters": {
+                "user_name": "Name of the user (username, first or last name). Required for 'timeline' and 'last_seen_by_room'.",
+                "room_name": "Room name to focus on. Required for 'who_was_in_room'; optional filter for 'timeline'.",
+                "since": "Start of the window as ISO8601 (e.g. 2026-06-14T08:00:00). Default: 24h ago.",
+                "until": "End of the window as ISO8601. Default: now.",
+                "query_type": "'timeline' (a user's room enter/leave events, default), 'last_seen_by_room' (per-room last seen for a user), or 'who_was_in_room' (everyone's events in a room over the window).",
+            },
+        },
     }
 
     _HANDLERS = {
@@ -121,13 +176,24 @@ class InternalToolService:
         "internal.play_in_room": "_play_in_room",
         "internal.get_user_location": "_get_user_location",
         "internal.get_all_presence": "_get_all_presence",
+        "internal.announce_in_room": "_announce_in_room",
+        "internal.broadcast_announcement": "_broadcast_announcement",
         "internal.media_control": "_media_control",
         "internal.play_album_on_dlna": "_play_album_on_dlna",
         "internal.play_video_on_dlna": "_play_video_on_dlna",
+        "internal.play_from_server": "_play_from_server",
         "internal.play_radio": "_play_radio",
         "internal.save_radio_favorite": "_save_radio_favorite",
         "internal.list_radio_favorites": "_list_radio_favorites",
         "internal.remove_radio_favorite": "_remove_radio_favorite",
+        "internal.presence_history": "_presence_history",
+        "internal.bluetooth_scan": "_bluetooth_scan",
+        "internal.device_controls": "_device_controls",
+        "internal.presence_map": "_presence_map",
+        # NOT in TOOLS — not agent-advertised. Dispatched only by the chat
+        # handler's `device_action` WS-frame route (after the HA_CONTROL gate),
+        # never chosen by the agent.
+        "internal.device_action": "_device_action",
     }
 
     async def execute(self, intent: str, parameters: dict) -> dict:
@@ -211,12 +277,22 @@ class InternalToolService:
                         "device_name": device_name,
                         "status": "busy",
                     }
-                    if busy_device and busy_device.dlna_renderer_name:
-                        data["target_type"] = "dlna"
-                        data["dlna_renderer_name"] = busy_device.dlna_renderer_name
+                    if busy_device:
+                        # Branch on target_type so each provider reports its real
+                        # type + id. Target identity is the (output_provider,
+                        # output_target_id) pair — target_id IS the renderer name
+                        # (dlna) / entity id (HA) / device id (renfield) etc.
+                        tt = busy_device.target_type
+                        data["target_type"] = tt
+                        if tt == "dlna":
+                            data["dlna_renderer_name"] = busy_device.target_id
+                        elif tt == "homeassistant":
+                            data["entity_id"] = busy_device.target_id
+                        else:
+                            data["output_target_id"] = busy_device.target_id
                     else:
                         data["target_type"] = "homeassistant"
-                        data["entity_id"] = busy_device.ha_entity_id if busy_device else None
+                        data["entity_id"] = None
                     return {
                         "success": False,
                         "message": f"The audio device '{device_name}' in room '{room.name}' is currently busy (playing). Ask the user if they want to interrupt the current playback.",
@@ -231,22 +307,44 @@ class InternalToolService:
                         "action_taken": False,
                     }
 
-                # DLNA renderer — return target_type + renderer name
-                if decision.target_type == "dlna":
+                # Generic output provider (samsung, sonos, …) — registry-driven
+                # dispatch. Gated on the flag; dlna/HA/renfield keep their own
+                # branches below. Surfaces the (target_type, output_target_id)
+                # pair for _play_in_room's registry path.
+                from utils.config import settings as _root_settings
+                if (
+                    _root_settings.output_providers_enabled
+                    and decision.target_type not in ("renfield", "homeassistant", "dlna")
+                ):
                     return {
                         "success": True,
-                        "message": f"Found DLNA renderer for {room.name}: {decision.output_device.dlna_renderer_name}",
+                        "message": f"Found {decision.target_type} output for {room.name}: {decision.target_id}",
                         "action_taken": True,
                         "data": {
-                            "target_type": "dlna",
-                            "dlna_renderer_name": decision.output_device.dlna_renderer_name,
+                            "target_type": decision.target_type,
+                            "output_target_id": decision.target_id,
                             "room_name": room.name,
-                            "device_name": decision.output_device.device_name or decision.output_device.dlna_renderer_name,
+                            "device_name": decision.output_device.device_name or decision.target_id,
                         },
                     }
 
-                # We need an HA entity for media playback
-                entity_id = decision.output_device.ha_entity_id
+                # DLNA renderer — return target_type + renderer name (target_id)
+                if decision.target_type == "dlna":
+                    renderer_name = decision.target_id
+                    return {
+                        "success": True,
+                        "message": f"Found DLNA renderer for {room.name}: {renderer_name}",
+                        "action_taken": True,
+                        "data": {
+                            "target_type": "dlna",
+                            "dlna_renderer_name": renderer_name,
+                            "room_name": room.name,
+                            "device_name": decision.output_device.device_name or renderer_name,
+                        },
+                    }
+
+                # We need an HA entity for media playback (target_id == entity id)
+                entity_id = decision.target_id
                 if not entity_id:
                     return {
                         "success": False,
@@ -289,6 +387,614 @@ class InternalToolService:
         except Exception:
             return None
 
+    # --- Interactive device-control widget (Gen-UI item 10) -----------------
+    # _CONTROL_DOMAINS / _DOMAIN_ACTIONS are the SERVER-SIDE actuation allowlist
+    # for the device_action frame. The HA_CONTROL permission gate lives in the
+    # chat handler (it has user_permissions); this is the second layer — a click
+    # can only ever turn_on/off/toggle/dim a real light, toggle a switch, run a
+    # real scene, or set a real climate setpoint — never an arbitrary call_service.
+    _CONTROL_DOMAINS = frozenset({"light", "switch", "scene", "climate"})
+    _DOMAIN_ACTIONS = {
+        "light": frozenset({"turn_on", "turn_off", "toggle", "set_brightness"}),
+        "switch": frozenset({"turn_on", "turn_off", "toggle"}),
+        "scene": frozenset({"activate"}),
+        "climate": frozenset({"set_temperature"}),
+    }
+
+    def _build_control_device(self, ha, st: dict, room_filter: str) -> dict | None:
+        """Map one raw HA state dict → a device_control device (with continuous-
+        control attributes), or None if not controllable / filtered out by room.
+        ``ha`` is a HomeAssistantClient (for _extract_room)."""
+        entity_id = st.get("entity_id", "")
+        domain = entity_id.split(".")[0] if "." in entity_id else ""
+        if domain not in self._CONTROL_DOMAINS:
+            return None
+        attrs = st.get("attributes", {}) or {}
+        name = attrs.get("friendly_name") or entity_id
+        rm = ha._extract_room(entity_id, name)
+        if room_filter and (rm or "").lower() != room_filter:
+            return None
+        state = st.get("state", "unknown")
+        dev: dict = {"entity_id": entity_id, "domain": domain, "name": name, "state": state}
+        if rm:
+            dev["room"] = rm
+        if domain == "light" and state == "on":
+            b = attrs.get("brightness")
+            if isinstance(b, (int, float)):  # HA brightness is 0-255
+                dev["brightness"] = max(0, min(100, round(b / 255 * 100)))
+        elif domain == "climate":
+            for src, dst in (
+                ("current_temperature", "currentTemp"), ("temperature", "targetTemp"),
+                ("min_temp", "minTemp"), ("max_temp", "maxTemp"), ("target_temp_step", "tempStep"),
+            ):
+                v = attrs.get(src)
+                if isinstance(v, (int, float)):
+                    dev[dst] = v
+        return dev
+
+    async def _device_controls(self, params: dict) -> dict:
+        """Producer: build an interactive `device_control` artifact from FRESH HA
+        states (lights/switches/scenes/climate), optionally scoped to a room.
+        Reads ``get_states()`` directly (NOT the 60s entity-map cache) so the
+        widget's initial toggle/slider values match reality — this is a deliberate
+        user request, not the per-turn intent map. ``data={"artifacts":[...]}``.
+        """
+        from utils.config import settings
+        if not settings.artifacts_typed_enabled:
+            return {"success": True, "message": "", "action_taken": False}
+
+        room = (params.get("room") or "").strip().lower()
+        try:
+            from ha_glue.integrations.homeassistant import HomeAssistantClient
+            ha = HomeAssistantClient()
+            states = await ha.get_states()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"device_controls: HA states fetch failed: {e}")
+            return {
+                "success": False,
+                "message": "Die Geräteliste konnte gerade nicht geladen werden.",
+                "action_taken": False,
+            }
+
+        devices = [
+            d for st in (states or [])
+            if (d := self._build_control_device(ha, st, room)) is not None
+        ]
+
+        if not devices:
+            where = f" in {params.get('room')}" if room else ""
+            return {
+                "success": True,
+                "action_taken": False,
+                "message": f"Ich habe keine schaltbaren Geräte{where} gefunden.",
+            }
+
+        import uuid
+        title = "Gerätesteuerung" + (f" – {params.get('room')}" if room else "")
+        artifact = {
+            "id": f"art_devctl_{uuid.uuid4().hex[:12]}",
+            "kind": "device_control",
+            "title": title,
+            "data": {"devices": devices},
+        }
+        return {
+            "success": True,
+            "action_taken": False,
+            "message": f"Hier ist die Steuerung für {len(devices)} Gerät(e).",
+            "data": {"artifacts": [artifact]},
+        }
+
+    async def _device_action(self, params: dict) -> dict:
+        """Actuate one device from a widget interaction (the `device_action`
+        frame): on/off/toggle, run-scene, set-brightness (lights), set-temperature
+        (climate).
+
+        SECURITY: the HA_CONTROL permission gate already ran in the chat handler.
+        Here we enforce the second layer — domain+action must be in the allowlist,
+        the entity must exist (get_state probe), and any numeric value is range-
+        validated/clamped — so a crafted frame can't drive an arbitrary service.
+        The new state is resolved from the ACTION (HA's state store lags the
+        service call) so the widget reconciles correctly.
+        """
+        entity_id = (params.get("entity_id") or "").strip()
+        action = (params.get("action") or "").strip().lower()
+        value = params.get("value")
+        if not entity_id or "." not in entity_id:
+            return {"success": False, "message": "Ungültige entity_id", "action_taken": False}
+        domain = entity_id.split(".")[0]
+        if domain not in self._CONTROL_DOMAINS:
+            return {"success": False, "message": f"Domain '{domain}' ist nicht schaltbar", "action_taken": False}
+        if action not in self._DOMAIN_ACTIONS.get(domain, frozenset()):
+            return {"success": False, "message": f"Aktion '{action}' ist für {domain} nicht erlaubt", "action_taken": False}
+
+        try:
+            from ha_glue.integrations.homeassistant import HomeAssistantClient
+            ha = HomeAssistantClient()
+            # Existence probe — a non-existent entity_id (or a state read failure)
+            # must not actuate. None → reject. Yields the prior state + attrs.
+            state = await ha.get_state(entity_id)
+            if not state:
+                return {"success": False, "message": f"Gerät {entity_id} nicht gefunden", "action_taken": False}
+            prior = (state or {}).get("state", "unknown")
+            attrs = (state or {}).get("attributes", {}) or {}
+
+            # --- continuous-value actions ---
+            if action == "set_brightness":
+                try:
+                    pct = int(round(float(value)))
+                except (ValueError, TypeError):
+                    return {"success": False, "message": "Helligkeit erfordert einen Zahlenwert 0-100", "action_taken": False}
+                pct = max(0, min(100, pct))
+                if pct <= 0:
+                    ok = await ha.call_service("light", "turn_off", entity_id)
+                    data = {"entity_id": entity_id, "state": "off"}
+                else:
+                    ok = await ha.call_service("light", "turn_on", entity_id, {"brightness_pct": pct})
+                    data = {"entity_id": entity_id, "state": "on", "brightness": pct}
+                if not ok:
+                    return {"success": False, "message": f"Helligkeit für {entity_id} fehlgeschlagen", "action_taken": False}
+                return {"success": True, "action_taken": True, "message": f"{entity_id} → {pct}%", "data": data}
+
+            if action == "set_temperature":
+                try:
+                    temp = float(value)
+                except (ValueError, TypeError):
+                    return {"success": False, "message": "Temperatur erfordert einen Zahlenwert", "action_taken": False}
+                # Clamp to the entity's own bounds when known (defaults are a sane
+                # household range so a missing min/max can't push an extreme value).
+                lo = attrs.get("min_temp"); hi = attrs.get("max_temp")
+                lo = lo if isinstance(lo, (int, float)) else 5.0
+                hi = hi if isinstance(hi, (int, float)) else 35.0
+                temp = max(lo, min(hi, temp))
+                ok = await ha.call_service("climate", "set_temperature", entity_id, {"temperature": temp})
+                if not ok:
+                    return {"success": False, "message": f"Temperatur für {entity_id} fehlgeschlagen", "action_taken": False}
+                # climate state is the hvac mode (unchanged by a setpoint); echo
+                # the new target so the stepper reconciles.
+                return {"success": True, "action_taken": True, "message": f"{entity_id} → {temp}°",
+                        "data": {"entity_id": entity_id, "state": prior, "targetTemp": temp}}
+
+            # --- on/off/toggle/scene ---
+            if domain == "scene":
+                ok = await ha.call_service("scene", "turn_on", entity_id)
+            else:
+                ok = await ha.call_service(domain, action, entity_id)
+            if not ok:
+                return {"success": False, "message": f"Schalten von {entity_id} fehlgeschlagen", "action_taken": False}
+
+            # New state from the action (not a stale re-read; toggle inverts prior).
+            if domain == "scene" or action == "turn_on":
+                resolved = "on"
+            elif action == "turn_off":
+                resolved = "off"
+            elif action == "toggle":
+                resolved = "off" if prior == "on" else "on"
+            else:
+                resolved = prior
+            return {
+                "success": True,
+                "action_taken": True,
+                "message": f"{entity_id} → {action}",
+                "data": {"entity_id": entity_id, "state": resolved},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"device_action {action} on {entity_id} failed: {e}")
+            return {"success": False, "message": f"Fehler: {e!s}", "action_taken": False}
+
+    async def _presence_map(self, params: dict) -> dict:
+        """Producer: a read-only `presence_map` widget (rooms → who's present)
+        from the live presence service. ``data={"artifacts":[...]}``.
+        """
+        from utils.config import settings
+        if not settings.artifacts_typed_enabled:
+            return {"success": True, "message": "", "action_taken": False}
+        try:
+            from ha_glue.services.presence_service import get_presence_service
+            ps = get_presence_service()
+            all_presence = ps.get_all_presence()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"presence_map: presence fetch failed: {e}")
+            return {"success": False, "message": "Anwesenheit konnte nicht geladen werden.", "action_taken": False}
+
+        if not all_presence:
+            return {
+                "success": True, "action_taken": False,
+                "message": "Aktuell ist niemand (mit getracktem Gerät) zuhause erkennbar.",
+            }
+        # Group present users by room.
+        by_room: dict[str, list[str]] = {}
+        for user_id, presence in all_presence.items():
+            room = presence.room_name or "Unbekannt"
+            by_room.setdefault(room, []).append(ps.get_display_name(user_id))
+
+        rooms = [{"room": r, "users": sorted(u)} for r, u in sorted(by_room.items())]
+        import uuid
+        artifact = {
+            "id": f"art_presence_{uuid.uuid4().hex[:12]}",
+            "kind": "presence_map",
+            "title": "Wer ist wo",
+            "data": {"rooms": rooms},
+        }
+        total = sum(len(r["users"]) for r in rooms)
+        return {
+            "success": True, "action_taken": False,
+            "message": f"{total} Person(en) in {len(rooms)} Raum/Räumen.",
+            "data": {"artifacts": [artifact]},
+        }
+
+    # Bound on concurrent per-room announces during a broadcast. Each
+    # _announce_core opens its OWN AsyncSession (an AsyncSession is not
+    # concurrency-safe), so this caps simultaneous sessions + WS fan-out well
+    # below the async pool's safe concurrency for a household (~≤6 rooms).
+    _BROADCAST_CONCURRENCY = 4
+
+    async def _announce_in_room(self, params: dict) -> dict:
+        """Speak a text message (TTS) on a room's audio device.
+
+        Privacy gate (FAIL-CLOSED): a message marked ``privacy="personal"`` is
+        spoken aloud ONLY if the room is private (the target is alone). If other
+        people are present it is NOT announced — we return a ``blocked`` status so
+        the agent can relay that back instead of broadcasting confidential content
+        to everyone in the room. ``privacy="public"`` always announces.
+
+        This is a single primitive (synthesize → resolve room device → play). The
+        person→room resolution + ordering is left to the agent (it calls
+        internal.get_user_location first), so nothing about the relay flow is
+        hardcoded here. The actual work lives in ``_announce_core`` (shared with
+        the broadcast fan-out); single-announce passes ``audio_bytes=None`` so the
+        TTS synth stays LAZY — a personal message blocked by the privacy gate
+        never wastes a synth.
+        """
+        text = (params.get("text") or "").strip()
+        room_name = (params.get("room_name") or "").strip()
+        privacy = (params.get("privacy") or "public").strip().lower()
+        force = str(params.get("force", "false")).lower() in ("true", "1", "yes")
+
+        # Intended recipients (a name or list of names). A personal message is
+        # private-enough only if everyone present is one of these.
+        _fu = params.get("for_users")
+        if isinstance(_fu, str):
+            for_users = [n.strip() for n in _fu.split(",") if n.strip()]
+        elif isinstance(_fu, list):
+            for_users = [str(n).strip() for n in _fu if str(n).strip()]
+        else:
+            for_users = []
+
+        if not text:
+            return {"success": False, "message": "Parameter 'text' is required", "action_taken": False}
+        if not room_name:
+            return {"success": False, "message": "Parameter 'room_name' is required", "action_taken": False}
+
+        return await self._announce_core(
+            room_name=room_name, text=text, audio_bytes=None,
+            privacy=privacy, for_users=for_users, force=force,
+        )
+
+    async def _announce_core(
+        self,
+        room_name: str,
+        text: str,
+        audio_bytes: bytes | None,
+        privacy: str,
+        for_users: list[str],
+        force: bool,
+    ) -> dict:
+        """Resolve a room, run the privacy gate, synth (or reuse pre-synth bytes),
+        and play TTS in that ONE room — opening its OWN database session.
+
+        Shared by ``_announce_in_room`` (single; ``audio_bytes=None`` → lazy synth
+        AFTER the gate) and ``_broadcast_announcement`` (public-only fan-out that
+        synthesizes ONCE and passes the same bytes to every room). It opens its own
+        ``AsyncSessionLocal`` because an ``AsyncSession`` is not concurrency-safe,
+        so the parallel broadcast cannot share one. The privacy gate self-skips on
+        ``privacy='public'``; broadcast always passes public.
+        """
+        try:
+            import base64
+
+            from services.database import AsyncSessionLocal
+            from services.piper_service import PiperService
+            from ha_glue.services.audio_output_service import get_audio_output_service
+            from ha_glue.services.device_manager import get_device_manager
+            from ha_glue.services.output_routing_service import OutputRoutingService
+            from ha_glue.services.presence_service import get_presence_service
+            from ha_glue.services.room_service import RoomService
+
+            async with AsyncSessionLocal() as db:
+                room_service = RoomService(db)
+                room = await room_service.get_room_by_name(room_name) \
+                    or await room_service.get_room_by_alias(room_name)
+                if not room:
+                    return {"success": False, "message": f"Room '{room_name}' not found", "action_taken": False}
+
+                # Canonical room identity captured as plain locals so the
+                # post-session fallback never touches a detached ORM instance.
+                resolved_room_id = room.id
+                resolved_room_name = room.name
+
+                # --- Privacy gate (FAIL-CLOSED) ---
+                # A personal message is spoken aloud ONLY with POSITIVE proof the
+                # room is private: we know the recipients (allowed_ids), at least
+                # one person is tracked in the room, and EVERY tracked person is a
+                # recipient. Anything else (no/unresolvable recipients, nobody
+                # tracked, or a non-recipient present) blocks — we never fall back
+                # to a weaker "probably alone" guess. force=true bypasses (the
+                # recipient consented after being told a message is waiting).
+                # INHERENT LIMIT: presence only sees people with a tracked BLE
+                # device, so this can't detect an untracked bystander — it is
+                # best-effort, not a guarantee against every eavesdropper.
+                if privacy != "public" and not force:
+                    presence = get_presence_service()
+                    occupants = presence.get_room_occupants(room.id)
+                    allowed_ids = {
+                        uid for n in for_users
+                        if (uid := presence.find_user_by_name(n)) is not None
+                    }
+                    everyone_present_is_recipient = (
+                        bool(allowed_ids)
+                        and bool(occupants)
+                        and all(o.user_id in allowed_ids for o in occupants)
+                    )
+                    if not everyone_present_is_recipient:
+                        if not allowed_ids:
+                            why = "die Empfaenger sind nicht bekannt (gib sie in for_users an)"
+                        elif not occupants:
+                            why = f"in {room.name} ist niemand (mit getracktem Geraet) erkennbar anwesend"
+                        else:
+                            non_rec = sum(1 for o in occupants if o.user_id not in allowed_ids)
+                            why = f"in {room.name} ist/sind {non_rec} Nicht-Empfaenger-Person(en) anwesend"
+                        return {
+                            "success": False,
+                            "action_taken": False,
+                            "blocked": "not_private",
+                            "message": (
+                                f"Persönliche Nachricht NICHT laut angesagt ({why}). Gib NICHT den "
+                                f"Inhalt preis. Sage NUR neutral an, dass eine Nachricht wartet (OHNE "
+                                f"Inhalt), und frage, ob trotzdem vorgelesen werden soll. Bei "
+                                f"ausdrücklicher Zustimmung des Empfängers rufe announce_in_room erneut "
+                                f"mit force=true auf."
+                            ),
+                            "data": {
+                                "room_name": room.name,
+                                "occupants": len(occupants),
+                                "recipients_present": len(allowed_ids & {o.user_id for o in occupants}),
+                            },
+                        }
+
+                    # BLE gate passed. BLE only sees people with a tracked device —
+                    # so, if a camera is in the room, take a snapshot and count
+                    # people via the vision model to catch an UNTRACKED bystander.
+                    # (Snapshot is transient — never stored.) Fail policy on a
+                    # missing camera / failed snapshot or vision is configurable.
+                    from ha_glue.utils.config import ha_glue_settings as _ha
+                    if _ha.announce_camera_occupancy_check:
+                        from ha_glue.services.satellite_manager import get_satellite_manager
+                        sat_mgr = get_satellite_manager()
+                        cam_sat = sat_mgr.get_camera_satellite_for_room(room.id)
+                        if cam_sat is not None:
+                            img = await sat_mgr.request_snapshot(
+                                cam_sat.satellite_id, timeout=_ha.announce_snapshot_timeout
+                            )
+                            people = None
+                            if img:
+                                try:
+                                    from main import app as _app
+                                    _ollama = getattr(_app.state, "ollama", None)
+                                    if _ollama is not None:
+                                        # Bound the vision inference so a slow model
+                                        # can't hang the announce indefinitely; a
+                                        # timeout falls into the fail policy below.
+                                        people = await asyncio.wait_for(
+                                            _ollama.count_people_in_image(img),
+                                            timeout=_ha.announce_snapshot_timeout,
+                                        )
+                                except Exception:  # noqa: BLE001 (incl. TimeoutError)
+                                    people = None
+                            if people is not None and people > len(occupants):
+                                return {
+                                    "success": False, "action_taken": False,
+                                    "blocked": "not_private",
+                                    "message": (
+                                        f"Persönliche Nachricht NICHT laut angesagt — die Kamera in "
+                                        f"{room.name} sieht {people} Person(en), mehr als die "
+                                        f"{len(occupants)} bekannten Empfänger; es ist also jemand "
+                                        f"Unbekanntes im Raum. Sage NUR neutral an, dass eine Nachricht "
+                                        f"wartet (OHNE Inhalt); bei Zustimmung des Empfängers erneut "
+                                        f"mit force=true."
+                                    ),
+                                    "data": {
+                                        "room_name": room.name,
+                                        "people_seen": people,
+                                        "tracked_recipients": len(occupants),
+                                    },
+                                }
+                            if people is None and _ha.announce_camera_check_fail_closed:
+                                return {
+                                    "success": False, "action_taken": False,
+                                    "blocked": "not_private",
+                                    "message": (
+                                        f"Persönliche Nachricht NICHT laut angesagt — der Kamera-Check in "
+                                        f"{room.name} war nicht möglich (kein Bild/keine Auswertung) und "
+                                        f"die Policy ist fail-closed. Sage neutral an, dass eine Nachricht "
+                                        f"wartet; bei Zustimmung erneut mit force=true."
+                                    ),
+                                    "data": {"room_name": room.name, "camera_check": "failed"},
+                                }
+                            # else: fail-open — the BLE decision stands, announce.
+
+                # Lazy synth: single-announce passes None and synthesizes HERE
+                # (after the gate, so a blocked personal message wastes none);
+                # broadcast passes pre-synthesized bytes and reuses them.
+                tts_audio = audio_bytes if audio_bytes is not None \
+                    else await PiperService().synthesize_to_bytes(text)
+                if not tts_audio:
+                    return {"success": False, "message": "TTS synthesis failed", "action_taken": False}
+
+                session_id = f"announce-{room.id}"
+                decision = await OutputRoutingService(db).get_audio_output_for_room(room.id)
+                if decision.output_device and not decision.fallback_to_input:
+                    ok = await get_audio_output_service().play_audio(
+                        audio_bytes=tts_audio,
+                        output_device=decision.output_device,
+                        session_id=session_id,
+                    )
+                    if ok:
+                        return {
+                            "success": True, "action_taken": True,
+                            "message": f"Nachricht in {room.name} angesagt",
+                            "data": {"room_name": room.name, "text": text, "privacy": privacy},
+                        }
+
+            # Fallback (only reached when the primary routing path did NOT
+            # deliver): send TTS to EVERY speaker in the room directly. Key on the
+            # resolved room id — the raw param string may differ from the
+            # canonical name — and send to ALL speakers, failing only if none
+            # accept (a room with 2+ raw satellite speakers must all play, not
+            # just the first one to answer).
+            device_manager = get_device_manager()
+            audio_b64 = base64.b64encode(tts_audio).decode("utf-8")
+            any_ok = False
+            for device in device_manager.get_devices_in_room_by_id(resolved_room_id):
+                if device.capabilities.has_speaker:
+                    try:
+                        await device.websocket.send_json({
+                            "type": "tts_audio",
+                            "session_id": f"announce-{resolved_room_id}",
+                            "audio": audio_b64,
+                            "is_final": True,
+                        })
+                        any_ok = True
+                    except Exception:  # noqa: BLE001 — one dead link must not skip the rest
+                        continue
+            if any_ok:
+                return {
+                    "success": True, "action_taken": True,
+                    "message": f"Nachricht in {resolved_room_name} angesagt",
+                    "data": {"room_name": resolved_room_name, "text": text, "privacy": privacy},
+                }
+            return {"success": False, "message": f"Kein Lautsprecher in {resolved_room_name} verfügbar", "action_taken": False}
+
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error announcing in room '{room_name}': {e}")
+            return {"success": False, "message": f"Error announcing: {e!s}", "action_taken": False}
+
+    async def _broadcast_announcement(self, params: dict) -> dict:
+        """Speak a PUBLIC announcement (TTS) in every room where someone is
+        currently present — a house-wide fan-out over ``_announce_core``.
+
+        Public-only by design (decision: no N-way GPU vision-storm, no
+        semantically-incoherent house-wide confidential message): a
+        ``privacy='personal'`` request is rejected at this boundary; the targeted
+        relay (``announce_in_room``) still handles confidential content.
+
+        Flow: ``get_all_presence()`` → dedup occupied rooms by ``room_id`` (skip
+        ``room_id=None``) → resolve each room's CANONICAL name from its id (never
+        trust the nullable presence ``room_name``) → synthesize TTS ONCE → a
+        semaphore-bounded ``asyncio.gather`` of ``_announce_core`` per room (each
+        its own session) → swallow per-room errors → honest per-room summary.
+        """
+        text = (params.get("text") or "").strip()
+        privacy = (params.get("privacy") or "public").strip().lower()
+        if not text:
+            return {"success": False, "message": "Parameter 'text' is required", "action_taken": False}
+        if privacy == "personal":
+            return {
+                "success": False, "action_taken": False,
+                "message": (
+                    "Eine Rundansage ist immer öffentlich — für vertrauliche Inhalte "
+                    "nutze announce_in_room (die gezielte Nachricht an eine Person)."
+                ),
+            }
+
+        try:
+            from services.database import AsyncSessionLocal
+            from services.piper_service import PiperService
+            from ha_glue.services.presence_service import get_presence_service
+            from ha_glue.services.room_service import RoomService
+
+            presence = get_presence_service()
+            all_presence = presence.get_all_presence()
+            # Dedup occupied rooms by id; skip a None room_id (user is "home" but
+            # not placed in any room).
+            room_ids = {p.room_id for p in all_presence.values() if p.room_id is not None}
+            if not room_ids:
+                return {
+                    "success": True, "action_taken": False,
+                    "message": "Es ist niemand (mit getracktem Gerät) anwesend.",
+                }
+
+            # Resolve canonical names from ids in ONE session (presence room_name
+            # is nullable; a non-resolving id is dropped). No synth yet.
+            rooms: list[tuple[int, str]] = []
+            async with AsyncSessionLocal() as db:
+                room_service = RoomService(db)
+                for rid in room_ids:
+                    room = await room_service.get_room(rid)
+                    if room is not None:
+                        rooms.append((rid, room.name))
+            if not rooms:
+                return {
+                    "success": True, "action_taken": False,
+                    "message": "Es ist niemand (mit getracktem Gerät) anwesend.",
+                }
+
+            # Synthesize ONCE; abort the whole broadcast on synth failure.
+            tts_audio = await PiperService().synthesize_to_bytes(text)
+            if not tts_audio:
+                return {"success": False, "action_taken": False, "message": "TTS synthesis failed"}
+
+            sem = asyncio.Semaphore(self._BROADCAST_CONCURRENCY)
+
+            async def _one(room_name: str) -> tuple[str, bool]:
+                async with sem:
+                    try:
+                        res = await self._announce_core(
+                            room_name=room_name, text=text, audio_bytes=tts_audio,
+                            privacy="public", for_users=[], force=False,
+                        )
+                        return (room_name, bool(res.get("success")))
+                    except Exception as e:  # noqa: BLE001 — one room must not break the rest
+                        logger.warning(f"broadcast: room '{room_name}' failed: {e}")
+                        return (room_name, False)
+
+            results = await asyncio.gather(*[_one(rn) for _rid, rn in rooms])
+            reached = [rn for rn, ok in results if ok]
+            failed = [rn for rn, ok in results if not ok]
+            total = len(results)
+
+            msg = f"Angesagt in: {', '.join(reached) or '—'} ({len(reached)}/{total})."
+            if failed:
+                msg += f" Nicht erreicht: {', '.join(failed)}."
+            return {
+                "success": bool(reached),
+                "action_taken": bool(reached),
+                "message": msg,
+                "data": {"reached": reached, "failed": failed, "text": text},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error broadcasting announcement: {e}")
+            return {"success": False, "message": f"Error broadcasting: {e!s}", "action_taken": False}
+
+    def _presence_room_user(self, room_id: int) -> int | None:
+        """The single user presence currently places in ``room_id``, else None.
+
+        Used to attribute a media session when there is no authenticated chat
+        user (AUTH disabled / single-user mode) — Media Follow Me keys sessions
+        on user_id and presence_leave_room fires with the presence-resolved
+        user_id, so the playback side must agree. Returns None when the room has
+        zero or ambiguous (>1) occupants, so we never attribute (and later stop)
+        the wrong person's music.
+        """
+        try:
+            from ha_glue.services.presence_service import get_presence_service
+
+            occupants = get_presence_service().get_room_occupants(room_id)
+            if len(occupants) == 1:
+                return occupants[0].user_id
+            return None
+        except Exception:
+            return None
+
     async def _register_media_follow(
         self, params: dict, room_name: str, media_type, **kwargs
     ) -> None:
@@ -297,25 +1003,38 @@ class InternalToolService:
 
         if not _settings.media_follow_enabled:
             return
-        user_id = params.get("user_id")
-        if not user_id:
-            return
         try:
+            rid = await self._get_room_id(room_name)
+            if rid is None:
+                return
+            # Session owner: in practice always the presence-resolved occupant of
+            # the playback room. `params` never carries a user_id today (the
+            # dispatcher passes it as a kwarg, not in params, and the LLM tool
+            # schema has no user_id arg), so the `or` first operand is currently
+            # inert — kept only for a future authenticated-caller path. Without
+            # the presence fallback, AUTH-disabled playback has user_id=None → no
+            # session registered → leaving never stops the music, even though
+            # presence_leave_room fires with that same presence-resolved user.
+            # Caveat: presence is BLE-cadence (~30-60s), so "play then walk away
+            # immediately" may register no session if the scan hasn't yet placed
+            # the user in the room; >1 occupants → None (no follow, by design).
+            user_id = params.get("user_id") or self._presence_room_user(rid)
+            if not user_id:
+                return
+
             from ha_glue.services.media_follow_service import MediaType, get_media_follow_service
 
             mf = get_media_follow_service()
             # Convert string to enum if needed
             if isinstance(media_type, str):
                 media_type = MediaType(media_type)
-            rid = await self._get_room_id(room_name)
-            if rid is not None:
-                mf.register_playback(
-                    user_id=int(user_id),
-                    room_id=rid,
-                    room_name=room_name,
-                    media_type=media_type,
-                    **kwargs,
-                )
+            mf.register_playback(
+                user_id=int(user_id),
+                room_id=rid,
+                room_name=room_name,
+                media_type=media_type,
+                **kwargs,
+            )
         except Exception as e:
             logger.debug(f"Media follow registration failed: {e}")
 
@@ -367,9 +1086,38 @@ class InternalToolService:
             else:
                 return resolve_result
 
-        entity_id = resolve_result["data"]["entity_id"]
-        resolved_room_name = resolve_result["data"]["room_name"]
-        device_name = resolve_result["data"]["device_name"]
+        data = resolve_result["data"]
+
+        # Generic output provider (samsung, sonos, …): route through the registry
+        # adapter with bounded power-on. Gated on the flag; the resolver only
+        # returns these target_types when output_providers_enabled is on.
+        from utils.config import settings as _root_settings
+        if _root_settings.output_providers_enabled:
+            provider = self._get_output_provider(data.get("target_type"))
+            if provider is not None:
+                return await self._play_via_provider(
+                    provider, data, media_url=media_url, title=title,
+                    room_name=room_name, params=params,
+                )
+
+        # DLNA renderers have no HA entity_id and must be driven through the
+        # DLNA MCP path, not media_player.play_media. Without this branch the
+        # entity_id lookup below KeyErrors on every DLNA room (the agent's
+        # default playback tool was unusable for DLNA-only rooms).
+        if data.get("target_type") == "dlna":
+            return await self._play_url_on_dlna(
+                renderer_name=data.get("dlna_renderer_name"),
+                media_url=media_url,
+                title=title,
+                thumb=thumb,
+                room_name=data.get("room_name", room_name),
+                device_name=data.get("device_name"),
+                params=params,
+            )
+
+        entity_id = data["entity_id"]
+        resolved_room_name = data["room_name"]
+        device_name = data["device_name"]
 
         # Step 2: Call HA media_player.play_media
         try:
@@ -503,6 +1251,213 @@ class InternalToolService:
                 "action_taken": False,
             }
 
+    # --- Generic output-provider dispatch (output_providers_enabled) ---------
+
+    def _get_output_provider(self, target_type: str | None):
+        """Look up a registry McpOutputProvider for a target_type (None if absent
+        or the registry can't be built). Built fresh per call from the live
+        MCPManager so a re-registered server is picked up without restart."""
+        if not target_type:
+            return None
+        try:
+            from main import app
+            from ha_glue.services.output_providers import build_mcp_output_providers
+            mcp_manager = getattr(app.state, "mcp_manager", None)
+            if not mcp_manager:
+                return None
+            return build_mcp_output_providers(mcp_manager).get(target_type)
+        except Exception as e:  # never let provider lookup break playback
+            logger.error(f"output provider lookup failed for '{target_type}': {e}")
+            return None
+
+    # Explicitly-not-ready states. Drives the power-on trigger AND the readiness
+    # poll symmetrically. Deliberately does NOT include "unknown": a provider whose
+    # status tool has no state field (e.g. samsung tv_info) reports "unknown" while
+    # fully awake — treating that as not-ready would trap an on TV in a never-wake
+    # loop. So "responded with anything but off/standby" == ready. The harder case
+    # (a standby device that returns a success envelope with a non-off state) is
+    # device-specific and needs real-hardware tuning of the stanza's status mapping
+    # — tracked for validation before the flag is enabled in prod.
+    _NOT_READY_STATES = frozenset({"off", "standby"})
+
+    async def _poll_provider_ready(self, provider, target_id: str) -> bool:
+        """Poll status() until the target reports a ready state, bounded by the
+        provider's boot_timeout. Returns True when ready, False on timeout.
+        Checks BEFORE sleeping (an already-awake device returns immediately);
+        iteration-bounded (no wall-clock dependency) so it is test-friendly."""
+        import asyncio as _asyncio
+
+        interval = 2.0
+        max_polls = max(1, int((provider.boot_timeout or interval) / interval))
+        for i in range(max_polls):
+            try:
+                st = await provider.status(target_id)
+                if st.state not in self._NOT_READY_STATES:
+                    return True
+            except Exception:  # transient during boot — keep polling
+                pass
+            if i < max_polls - 1:
+                await _asyncio.sleep(interval)
+        return False
+
+    async def _play_via_provider(
+        self, provider, data: dict, *, media_url: str, title: str | None,
+        room_name: str, params: dict,
+    ) -> dict:
+        """Play through a generic output provider: power-on (bounded poll) if the
+        device is off and the provider can power, then play. Honest errors — a TV
+        that won't wake returns failure, never a fake success."""
+        from ha_glue.services.output_providers import MediaRef, OutputProviderError
+
+        target_id = data.get("output_target_id") or data.get("target_id") or ""
+        device_name = data.get("device_name") or target_id
+        resolved_room = data.get("room_name", room_name)
+
+        # Power-on before play if supported and the device is off OR unreachable.
+        # A TV in standby typically can't be probed at all (status() raises), so a
+        # failed status is itself the strongest "needs waking" signal — plus an
+        # explicit off/standby state. WoL is idempotent, so over-triggering on an
+        # already-awake device is harmless (the readiness poll returns immediately).
+        if provider.has_capability("power"):
+            try:
+                st = await provider.status(target_id)
+            except OutputProviderError as e:
+                logger.info(f"{provider.key} pre-play status failed ({e}); treating as off → power-on")
+                st = None
+            if st is None or st.state in self._NOT_READY_STATES:
+                try:
+                    await provider.control(target_id, "on")
+                except OutputProviderError as e:
+                    return {
+                        "success": False,
+                        "message": f"Could not power on {device_name}: {e}",
+                        "action_taken": False,
+                    }
+                if not await self._poll_provider_ready(provider, target_id):
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Could not wake {device_name} in {resolved_room} within "
+                            f"{int(provider.boot_timeout)}s — it may be unplugged or "
+                            f"Wake-on-LAN is off."
+                        ),
+                        "action_taken": False,
+                    }
+
+        try:
+            res = await provider.play(
+                target_id, [MediaRef(url=media_url, title=title)], mode="now"
+            )
+        except OutputProviderError as e:
+            return {
+                "success": False,
+                "message": f"Playback failed on {device_name}: {e}",
+                "action_taken": False,
+            }
+        if not res.ok:
+            detail = res.message or res.state or "unknown error"
+            return {
+                "success": False,
+                "message": f"Playback failed on {device_name}: {detail}",
+                "action_taken": False,
+            }
+
+        # NOTE: media-follow is intentionally NOT registered for generic providers
+        # in v1. The follow engine's SINGLE_URL replay strategy re-dispatches via
+        # the HA media_player path, which would mis-route a samsung-originated
+        # stream on a room change. Provider-aware media-follow is a follow-up.
+        return {
+            "success": True,
+            "message": f"Playing on {device_name} in {resolved_room}",
+            "action_taken": True,
+            "data": {
+                "target_type": provider.key,
+                "output_target_id": target_id,
+                "room_name": resolved_room,
+                "device_name": device_name,
+                "media_url": media_url,
+            },
+        }
+
+    async def _play_url_on_dlna(
+        self,
+        *,
+        renderer_name: str | None,
+        media_url: str,
+        title: str | None,
+        thumb: str | None,
+        room_name: str,
+        device_name: str | None,
+        params: dict,
+    ) -> dict:
+        """Play a single already-resolved media URL on a DLNA renderer.
+
+        The DLNA counterpart of the HA `media_player.play_media` path in
+        `_play_in_room`: a room that resolves to a DLNA renderer is played via
+        `mcp.dlna.play_tracks` (a one-item queue), mirroring how
+        `_play_album_on_dlna` sends tracks. Avoids the entity_id assumption that
+        made `_play_in_room` crash on DLNA rooms.
+        """
+        if not renderer_name:
+            return {
+                "success": False,
+                "message": f"No DLNA renderer name for room '{room_name}'",
+                "action_taken": False,
+            }
+        try:
+            import json as _json
+
+            from main import app
+
+            mcp_manager = getattr(app.state, "mcp_manager", None)
+            if not mcp_manager:
+                return {
+                    "success": False,
+                    "message": "MCP manager not available",
+                    "action_taken": False,
+                }
+
+            track = {"url": media_url, "title": title or "", "artist": "", "album": ""}
+            if thumb:
+                # play_tracks renders cover art from `art_url` (same field the
+                # video path uses); forward it so DLNA single-URL playback shows
+                # the thumbnail instead of a blank tile.
+                track["art_url"] = thumb
+            result = await mcp_manager.execute_tool(
+                "mcp.dlna.play_tracks",
+                {"renderer_name": renderer_name, "tracks": _json.dumps([track])},
+            )
+            if not result.get("success"):
+                return {
+                    "success": False,
+                    "message": f"DLNA playback failed: {result.get('message', 'unknown error')}",
+                    "action_taken": False,
+                }
+
+            await self._register_media_follow(
+                params, room_name, "single_url",
+                media_url=media_url, title=title, thumb=thumb,
+            )
+            return {
+                "success": True,
+                "message": f"Playing on {device_name or renderer_name} in {room_name} (DLNA: {renderer_name})",
+                "action_taken": True,
+                "data": {
+                    "renderer_name": renderer_name,
+                    "room_name": room_name,
+                    "device_name": device_name,
+                    "media_url": media_url,
+                    "target_type": "dlna",
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error playing URL on DLNA renderer '{renderer_name}': {e}")
+            return {
+                "success": False,
+                "message": f"Error playing on DLNA: {e!s}",
+                "action_taken": False,
+            }
+
     _MEDIA_ACTION_MAP = {
         "stop": "media_stop",
         "pause": "media_pause",
@@ -518,6 +1473,120 @@ class InternalToolService:
         "next": "mcp.dlna.next_track",
         "previous": "mcp.dlna.previous_track",
     }
+
+    @staticmethod
+    def _resolve_target_volume(params: dict, current_pct: int | None) -> tuple[int | None, dict | None]:
+        """Compute absolute target volume 0-100 from params. Returns (target, error).
+
+        Exactly one of (target, error) is non-None.
+        - Rejects passing BOTH 'volume' and 'volume_step'.
+        - 'volume' (absolute): clamp 0-100.
+        - 'volume_step' (relative, PERCENTAGE POINTS): requires current_pct;
+          if current_pct is None -> clear error (can't read current volume).
+          target = clamp(current_pct + step, 0, 100).
+        """
+        has_step = params.get("volume_step") is not None
+        raw_abs = params.get("volume")
+        has_abs = raw_abs is not None
+
+        def _err(message: str) -> tuple[None, dict]:
+            return None, {
+                "success": False,
+                "message": message,
+                "action_taken": False,
+            }
+
+        if has_step and has_abs:
+            return _err("Pass either 'volume' (absolute 0-100) or 'volume_step' (relative), not both")
+        if not has_step and not has_abs:
+            return _err("Parameter 'volume' or 'volume_step' is required for volume action")
+
+        if has_abs:
+            try:
+                v = int(raw_abs)
+            except (ValueError, TypeError):
+                return _err(f"Invalid volume value: {raw_abs}")
+            return max(0, min(100, v)), None
+
+        # Relative (volume_step, percentage points)
+        try:
+            step = int(params.get("volume_step"))
+        except (ValueError, TypeError):
+            return _err(f"Invalid volume_step value: {params.get('volume_step')}")
+        if current_pct is None:
+            return _err(
+                "Could not read the current volume for this device, so I can't change it "
+                "relatively — please tell me an absolute level (0-100)."
+            )
+        return max(0, min(100, current_pct + step)), None
+
+    @staticmethod
+    def _extract_mcp_json(res: dict) -> dict:
+        """Parse the JSON payload dict out of an execute_tool result.
+
+        execute_tool returns `data` as a LIST of content blocks
+        (`[{"type":"text","text":"<json>"}]`), NOT the deserialized object — so
+        the real payload must be parsed from the text block (falling back to
+        `message`). Tolerates a flat dict `data` too (tests / direct callers).
+        Returns {} when nothing parses.
+        """
+        import json as _json
+
+        data = res.get("data")
+        if isinstance(data, dict):
+            return data
+        raw_text = ""
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    raw_text = item.get("text", "")
+                    break
+        if not raw_text:
+            raw_text = res.get("message", "") or ""
+        try:
+            parsed = _json.loads(raw_text)
+        except (ValueError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _extract_dlna_volume(vol_res: dict) -> int | None:
+        """Pull a 0-100 volume int out of an mcp.dlna.get_volume result.
+
+        The MCP wrapper (MCPManager.execute_tool) may surface the value either
+        flat on the result (`vol_res["volume"]`) or nested inside the `data`
+        content blocks / `message` as JSON (see the project memory note that the
+        wrapper can nest the real payload — same shape `_play_album_on_dlna`
+        parses for Jellyfin track lists). Returns None when the renderer can't
+        report a volume (value missing / None / unparseable).
+        """
+        # 1) Flat value on the result.
+        v = vol_res.get("volume")
+        # 2) Nested JSON payload (data content blocks, else message string).
+        if v is None:
+            import json as _json
+
+            raw_text = ""
+            data = vol_res.get("data", [])
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        raw_text = item.get("text", "")
+                        break
+            if not raw_text:
+                raw_text = vol_res.get("message", "")
+            try:
+                parsed = _json.loads(raw_text)
+            except (ValueError, TypeError):
+                parsed = {}
+            if isinstance(parsed, dict):
+                v = parsed.get("volume")
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return None
 
     async def _media_control(self, params: dict) -> dict:
         """
@@ -535,7 +1604,7 @@ class InternalToolService:
                 "action_taken": False,
             }
 
-        valid_actions = set(self._MEDIA_ACTION_MAP) | {"volume"}
+        valid_actions = set(self._MEDIA_ACTION_MAP) | {"volume", "mute", "unmute", "status", "seek", "play_mode"}
         if action not in valid_actions:
             return {
                 "success": False,
@@ -565,13 +1634,27 @@ class InternalToolService:
 
         target_type = device_data.get("target_type", "homeassistant")
 
-        if target_type == "dlna":
+        # Generic output provider (samsung, sonos, …) routes through the registry
+        # when the flag is on; dlna/HA/renfield keep their legacy handlers. Flag
+        # off => provider is None => byte-identical legacy branching.
+        from utils.config import settings as _root_settings
+        provider = (
+            self._get_output_provider(target_type)
+            if _root_settings.output_providers_enabled else None
+        )
+        if provider is not None:
+            result = await self._media_control_via_provider(
+                action, device_data, resolved_room_name, params, provider
+            )
+        elif target_type == "dlna":
             result = await self._media_control_dlna(action, device_data, resolved_room_name, params)
         else:
             result = await self._media_control_ha(action, device_data, resolved_room_name, params)
 
-        # Clear media follow session on explicit stop
-        if action == "stop" and result.get("success"):
+        # Clear media follow session on explicit USER stop — but NOT when the stop
+        # is Media Follow's own suspend (_stop_playback sets _media_follow_internal),
+        # which would delete the session we're about to resume in the next room.
+        if action == "stop" and result.get("success") and not params.get("_media_follow_internal"):
             from ha_glue.utils.config import ha_glue_settings as _settings
             if _settings.media_follow_enabled:
                 try:
@@ -584,6 +1667,77 @@ class InternalToolService:
                     pass
 
         return result
+
+    async def _media_control_via_provider(
+        self, action: str, device_data: dict, room_name: str, params: dict, provider
+    ) -> dict:
+        """Execute a media-control action through a generic output provider.
+
+        Translates the internal.media_control vocabulary onto the provider's
+        contract: `status` → provider.status(); `volume` → control('volume', value);
+        everything else → control(action). Actions the provider's stanza doesn't
+        map (e.g. next/seek/play_mode on a single-item TV) raise and surface a
+        graceful 'not supported' — never a misroute.
+        """
+        from ha_glue.services.output_providers import OutputProviderError
+
+        target_id = device_data.get("output_target_id") or device_data.get("target_id") or ""
+        device_name = device_data.get("device_name") or target_id
+        try:
+            if action == "status":
+                st = await provider.status(target_id)
+                return {
+                    "success": True,
+                    "message": f"{device_name} in {room_name}: {st.state}",
+                    "action_taken": False,
+                    "data": {
+                        "target_type": provider.key,
+                        "output_target_id": target_id,
+                        "room_name": room_name,
+                        "state": st.state,
+                        "position": st.position,
+                    },
+                }
+            if action == "volume":
+                # The contract carries absolute volume only. Relative (volume_step)
+                # would need a read-modify-write; defer it with a clear message.
+                vol = params.get("volume")
+                if vol is None:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Relative volume isn't supported for {device_name} yet — "
+                            f"give an absolute volume (0-100)."
+                        ),
+                        "action_taken": False,
+                    }
+                res = await provider.control(target_id, "volume", value=int(vol))
+            else:
+                res = await provider.control(target_id, action)
+        except OutputProviderError as e:
+            return {
+                "success": False,
+                "message": f"'{action}' isn't supported on {device_name}: {e}",
+                "action_taken": False,
+            }
+
+        if not getattr(res, "ok", True):
+            return {
+                "success": False,
+                "message": f"{action} failed on {device_name}: {res.message}",
+                "action_taken": False,
+            }
+        return {
+            "success": True,
+            "message": f"{action} on {device_name} in {room_name}",
+            "action_taken": True,
+            "data": {
+                "target_type": provider.key,
+                "output_target_id": target_id,
+                "room_name": room_name,
+                "action": action,
+            },
+        }
 
     async def _media_control_dlna(self, action: str, device_data: dict, room_name: str, params: dict) -> dict:
         """Execute media control action on a DLNA renderer via MCP."""
@@ -605,25 +1759,84 @@ class InternalToolService:
                     "action_taken": False,
                 }
 
-            if action == "volume":
-                volume = params.get("volume")
-                if volume is None:
+            if action == "status":
+                # Read-only: what's playing on this renderer (track/state/queue).
+                status_res = await mcp_manager.execute_tool(
+                    "mcp.dlna.get_status", {"renderer_name": renderer_name}
+                )
+                if not status_res.get("success"):
                     return {
                         "success": False,
-                        "message": "Parameter 'volume' is required for volume action",
+                        "message": f"Could not get status for {room_name}: "
+                                   f"{status_res.get('message', 'unknown error')}",
                         "action_taken": False,
                     }
+                # execute_tool nests the real payload in content blocks — parse it.
+                return {
+                    "success": True,
+                    "message": f"Playback status for {room_name} (DLNA: {renderer_name})",
+                    "action_taken": False,
+                    "data": {
+                        "room_name": room_name,
+                        "renderer_name": renderer_name,
+                        "target_type": "dlna",
+                        "status": self._extract_mcp_json(status_res),
+                    },
+                }
+
+            if action == "seek":
+                pos = params.get("position_seconds")
+                if pos is None:
+                    return {"success": False, "message": "Parameter 'position_seconds' is required for seek", "action_taken": False}
                 try:
-                    volume = int(volume)
+                    pos = int(pos)
                 except (ValueError, TypeError):
-                    return {
-                        "success": False,
-                        "message": f"Invalid volume value: {params.get('volume')}",
-                        "action_taken": False,
-                    }
-                volume = max(0, min(100, volume))
+                    return {"success": False, "message": f"Invalid position_seconds: {params.get('position_seconds')}", "action_taken": False}
+                res = await mcp_manager.execute_tool(
+                    "mcp.dlna.seek", {"renderer_name": renderer_name, "position_seconds": max(0, pos)}
+                )
+                if not res.get("success"):
+                    return {"success": False, "message": f"Seek failed on {room_name}: {res.get('message', 'unknown error')}", "action_taken": False}
+                return {"success": True, "message": f"Seeked to {max(0, pos)}s on {room_name}", "action_taken": True,
+                        "data": {"room_name": room_name, "renderer_name": renderer_name, "action": action, "position_seconds": max(0, pos)}}
+
+            if action == "play_mode":
+                mode = (params.get("mode") or "").strip()
+                if not mode:
+                    return {"success": False, "message": "Parameter 'mode' is required for play_mode (normal/repeat_one/repeat_all/shuffle/random)", "action_taken": False}
+                res = await mcp_manager.execute_tool(
+                    "mcp.dlna.set_play_mode", {"renderer_name": renderer_name, "mode": mode}
+                )
+                if not res.get("success"):
+                    return {"success": False, "message": f"Play mode '{mode}' failed on {room_name}: {res.get('message', 'unknown error')}", "action_taken": False}
+                return {"success": True, "message": f"Play mode set to {mode} on {room_name}", "action_taken": True,
+                        "data": {"room_name": room_name, "renderer_name": renderer_name, "action": action, "mode": mode}}
+
+            applied_volume = None
+            if action == "volume":
+                # Read current volume only for the relative path — a wasted MCP
+                # round-trip on absolute sets is avoided.
+                current_pct = None
+                if params.get("volume_step") is not None and params.get("volume") is None:
+                    vol_res = await mcp_manager.execute_tool(
+                        "mcp.dlna.get_volume", {"renderer_name": renderer_name}
+                    )
+                    if vol_res.get("success"):
+                        current_pct = self._extract_dlna_volume(vol_res)
+                    # If the tool errored or isn't deployed yet, current_pct stays
+                    # None -> _resolve_target_volume returns the D2 clear error.
+
+                target, err = self._resolve_target_volume(params, current_pct)
+                if err:
+                    return err
+                applied_volume = target
                 tool_name = "mcp.dlna.set_volume"
-                tool_params = {"renderer_name": renderer_name, "volume": volume}
+                tool_params = {"renderer_name": renderer_name, "volume": target}
+            elif action in ("mute", "unmute"):
+                # Native RenderingControl SetMute — the renderer restores the
+                # prior volume on unmute, so no level is stored.
+                tool_name = "mcp.dlna.set_mute"
+                tool_params = {"renderer_name": renderer_name, "mute": action == "mute"}
             else:
                 tool_name = self._DLNA_ACTION_MAP.get(action)
                 if not tool_name:
@@ -643,16 +1856,27 @@ class InternalToolService:
                     "action_taken": False,
                 }
 
+            data = {
+                "renderer_name": renderer_name,
+                "room_name": room_name,
+                "action": action,
+                "target_type": "dlna",
+            }
+            if action == "volume":
+                # Echo the resulting level so the agent sees a concrete completed
+                # state and gives final_answer instead of re-issuing the call
+                # (which, for a relative volume_step, would re-apply the delta).
+                data["volume"] = applied_volume
+                message = f"Volume in {room_name} set to {applied_volume}%."
+            elif action in ("mute", "unmute"):
+                message = f"{room_name} {'muted' if action == 'mute' else 'unmuted'}."
+            else:
+                message = f"Media {action} executed on {room_name} (DLNA: {renderer_name})"
             return {
                 "success": True,
-                "message": f"Media {action} executed on {room_name} (DLNA: {renderer_name})",
+                "message": message,
                 "action_taken": True,
-                "data": {
-                    "renderer_name": renderer_name,
-                    "room_name": room_name,
-                    "action": action,
-                    "target_type": "dlna",
-                },
+                "data": data,
             }
 
         except Exception as e:
@@ -678,28 +1902,96 @@ class InternalToolService:
 
             ha_client = HomeAssistantClient()
 
-            if action == "volume":
-                volume = params.get("volume")
-                if volume is None:
-                    return {
-                        "success": False,
-                        "message": "Parameter 'volume' is required for volume action",
-                        "action_taken": False,
-                    }
+            if action == "status":
+                # Read-only: what's playing on this HA media_player.
+                state = await ha_client.get_state(entity_id)
+                attrs = (state or {}).get("attributes", {})
+                return {
+                    "success": True,
+                    "message": f"Playback status for {room_name}",
+                    "action_taken": False,
+                    "data": {
+                        "room_name": room_name,
+                        "entity_id": entity_id,
+                        "target_type": "homeassistant",
+                        "status": {
+                            "state": (state or {}).get("state"),
+                            "title": attrs.get("media_title"),
+                            "artist": attrs.get("media_artist"),
+                            "album": attrs.get("media_album_name"),
+                        },
+                    },
+                }
+
+            if action == "seek":
+                pos = params.get("position_seconds")
+                if pos is None:
+                    return {"success": False, "message": "Parameter 'position_seconds' is required for seek", "action_taken": False}
                 try:
-                    volume = int(volume)
+                    pos = max(0, int(pos))
                 except (ValueError, TypeError):
-                    return {
-                        "success": False,
-                        "message": f"Invalid volume value: {params.get('volume')}",
-                        "action_taken": False,
-                    }
-                volume_level = max(0.0, min(1.0, volume / 100.0))
+                    return {"success": False, "message": f"Invalid position_seconds: {params.get('position_seconds')}", "action_taken": False}
+                await ha_client.call_service(
+                    domain="media_player", service="media_seek", entity_id=entity_id,
+                    service_data={"seek_position": pos},
+                )
+                return {"success": True, "message": f"Seeked to {pos}s on {room_name}", "action_taken": True,
+                        "data": {"room_name": room_name, "entity_id": entity_id, "action": action, "position_seconds": pos}}
+
+            if action == "play_mode":
+                # HA exposes shuffle + repeat as SEPARATE services, not the single
+                # UPnP play-mode enum. Map the common ones; reject the rest clearly.
+                mode = (params.get("mode") or "").strip().lower()
+                if not mode:
+                    return {"success": False, "message": "Parameter 'mode' is required for play_mode (normal/repeat_one/repeat_all/shuffle)", "action_taken": False}
+                if mode in ("shuffle", "random"):
+                    await ha_client.call_service(domain="media_player", service="shuffle_set",
+                                                 entity_id=entity_id, service_data={"shuffle": True})
+                elif mode in ("repeat_one",):
+                    await ha_client.call_service(domain="media_player", service="repeat_set",
+                                                 entity_id=entity_id, service_data={"repeat": "one"})
+                elif mode in ("repeat_all",):
+                    await ha_client.call_service(domain="media_player", service="repeat_set",
+                                                 entity_id=entity_id, service_data={"repeat": "all"})
+                elif mode == "normal":
+                    await ha_client.call_service(domain="media_player", service="shuffle_set",
+                                                 entity_id=entity_id, service_data={"shuffle": False})
+                    await ha_client.call_service(domain="media_player", service="repeat_set",
+                                                 entity_id=entity_id, service_data={"repeat": "off"})
+                else:
+                    return {"success": False, "message": f"Unknown play mode '{mode}' (use normal/repeat_one/repeat_all/shuffle)", "action_taken": False}
+                return {"success": True, "message": f"Play mode set to {mode} on {room_name}", "action_taken": True,
+                        "data": {"room_name": room_name, "entity_id": entity_id, "action": action, "mode": mode}}
+
+            applied_volume = None
+            if action == "volume":
+                # Read current volume only for the relative path — avoids a
+                # wasted HTTP read on absolute sets.
+                current_pct = None
+                if params.get("volume_step") is not None and params.get("volume") is None:
+                    state = await ha_client.get_state(entity_id)  # dict | None (swallows errors)
+                    level = (state or {}).get("attributes", {}).get("volume_level")  # 0.0-1.0 or None
+                    current_pct = round(level * 100) if level is not None else None
+
+                target, err = self._resolve_target_volume(params, current_pct)
+                if err:
+                    return err
+                applied_volume = target
+                volume_level = max(0.0, min(1.0, target / 100.0))
                 await ha_client.call_service(
                     domain="media_player",
                     service="volume_set",
                     entity_id=entity_id,
                     service_data={"volume_level": volume_level},
+                )
+            elif action in ("mute", "unmute"):
+                # Native media_player.volume_mute — the player restores the prior
+                # volume on unmute, so no level is stored.
+                await ha_client.call_service(
+                    domain="media_player",
+                    service="volume_mute",
+                    entity_id=entity_id,
+                    service_data={"is_volume_muted": action == "mute"},
                 )
             else:
                 ha_service = self._MEDIA_ACTION_MAP[action]
@@ -709,15 +2001,25 @@ class InternalToolService:
                     entity_id=entity_id,
                 )
 
+            data = {
+                "entity_id": entity_id,
+                "room_name": room_name,
+                "action": action,
+            }
+            if action == "volume":
+                # Echo the resulting level so the agent sees a concrete completed
+                # state and gives final_answer instead of re-issuing the call.
+                data["volume"] = applied_volume
+                message = f"Volume in {room_name} set to {applied_volume}%."
+            elif action in ("mute", "unmute"):
+                message = f"{room_name} {'muted' if action == 'mute' else 'unmuted'}."
+            else:
+                message = f"Media {action} executed on {room_name}"
             return {
                 "success": True,
-                "message": f"Media {action} executed on {room_name}",
+                "message": message,
                 "action_taken": True,
-                "data": {
-                    "entity_id": entity_id,
-                    "room_name": room_name,
-                    "action": action,
-                },
+                "data": data,
             }
 
         except Exception as e:
@@ -881,6 +2183,79 @@ class InternalToolService:
                 "action_taken": False,
             }
 
+    async def _play_from_server(self, params: dict) -> dict:
+        """Play a DLNA MediaServer library object on a room's DLNA renderer.
+
+        Resolves room → DLNA renderer, then calls mcp.dlna.play_from_server,
+        which resolves the object's playable items server-side and plays them as
+        a gapless queue (no content URLs from the caller). Pairs with
+        mcp.dlna.list_servers + browse_server/search_server.
+        """
+        server_name = (params.get("server_name") or "").strip()
+        object_id = (params.get("object_id") or "").strip()
+        room_name = (params.get("room_name") or "").strip()
+
+        if not server_name:
+            return {"success": False, "message": "Parameter 'server_name' is required", "action_taken": False}
+        if not object_id:
+            return {"success": False, "message": "Parameter 'object_id' is required", "action_taken": False}
+        if not room_name:
+            return {"success": False, "message": "Parameter 'room_name' is required", "action_taken": False}
+
+        resolve_result = await self._resolve_room_player({"room_name": room_name})
+        if not resolve_result.get("success"):
+            # A busy device resolves to success=False with the generic "ask to
+            # interrupt" message — but play_from_server has no force param, so
+            # give a clear, actionable error instead of leaking resolve vocab.
+            if resolve_result.get("data", {}).get("status") == "busy":
+                return {
+                    "success": False,
+                    "message": f"Room '{room_name}' is currently playing — stop it first before playing from a media server.",
+                    "action_taken": False,
+                }
+            return resolve_result
+        data = resolve_result["data"]
+        if data.get("target_type") != "dlna":
+            return {
+                "success": False,
+                "message": f"Room '{room_name}' has no DLNA renderer configured (found {data.get('target_type', 'unknown')})",
+                "action_taken": False,
+            }
+        renderer_name = data.get("dlna_renderer_name", "")
+        resolved_room = data.get("room_name", room_name)
+
+        try:
+            from main import app
+            mcp_manager = getattr(app.state, "mcp_manager", None)
+            if not mcp_manager:
+                return {"success": False, "message": "MCP manager not available", "action_taken": False}
+
+            res = await mcp_manager.execute_tool(
+                "mcp.dlna.play_from_server",
+                {"server_name": server_name, "object_id": object_id, "renderer_name": renderer_name},
+            )
+            if not res.get("success"):
+                return {
+                    "success": False,
+                    "message": f"Play from server failed: {res.get('message', 'unknown error')}",
+                    "action_taken": False,
+                }
+            return {
+                "success": True,
+                "message": f"Playing from {server_name} on {resolved_room}",
+                "action_taken": True,
+                "data": {
+                    "room_name": resolved_room,
+                    "renderer_name": renderer_name,
+                    "server_name": server_name,
+                    "object_id": object_id,
+                    "result": self._extract_mcp_json(res),
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error playing from server '{server_name}' object '{object_id}' in '{room_name}': {e}")
+            return {"success": False, "message": f"Error playing from server: {e!s}", "action_taken": False}
+
     async def _resolve_room_visual_player(self, params: dict) -> dict:
         """
         Resolve room_name → visual DLNA renderer (Smart TV).
@@ -932,15 +2307,16 @@ class InternalToolService:
                     }
 
                 if decision.target_type == "dlna":
+                    renderer_name = decision.target_id  # DLNA target_id == renderer name
                     return {
                         "success": True,
-                        "message": f"Found visual DLNA renderer for {room.name}: {decision.output_device.dlna_renderer_name}",
+                        "message": f"Found visual DLNA renderer for {room.name}: {renderer_name}",
                         "action_taken": True,
                         "data": {
                             "target_type": "dlna",
-                            "dlna_renderer_name": decision.output_device.dlna_renderer_name,
+                            "dlna_renderer_name": renderer_name,
                             "room_name": room.name,
-                            "device_name": decision.output_device.device_name or decision.output_device.dlna_renderer_name,
+                            "device_name": decision.output_device.device_name or renderer_name,
                         },
                     }
 
@@ -1193,6 +2569,183 @@ class InternalToolService:
             "data": {"users": users},
         }
 
+    async def _presence_history(self, params: dict) -> dict:
+        """Query a user's PERSISTED presence history (timeline / last-seen /
+        who-was-in-room) — survives restarts, unlike the live presence tools."""
+        from datetime import UTC, datetime, timedelta
+
+        from ha_glue.utils.config import ha_glue_settings
+
+        if not ha_glue_settings.presence_history_enabled:
+            return {
+                "success": False,
+                "message": "Presence history is disabled",
+                "action_taken": False,
+            }
+
+        from ha_glue.services.presence_analytics import _analytics_tz, _to_local
+        from ha_glue.services.presence_service import get_presence_service
+
+        query_type = (params.get("query_type") or "timeline").strip().lower()
+        user_name = (params.get("user_name") or "").strip()
+        room_name = (params.get("room_name") or "").strip()
+
+        # Parse the ISO8601 window (default: last 24h, naive UTC to match storage).
+        def _parse_iso(value: str | None) -> datetime | None:
+            if not value:
+                return None
+            try:
+                dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(UTC).replace(tzinfo=None)
+            return dt
+
+        now = datetime.now(UTC).replace(tzinfo=None)
+        until = _parse_iso(params.get("until")) or now
+        since = _parse_iso(params.get("since")) or (until - timedelta(hours=24))
+
+        tz = _analytics_tz()
+
+        def _fmt(dt: datetime | None) -> str:
+            if dt is None:
+                return "unknown"
+            return _to_local(dt, tz).strftime("%Y-%m-%d %H:%M")
+
+        presence_service = get_presence_service()
+
+        # Resolve the room filter (ILIKE) when given.
+        room_id = None
+        if room_name:
+            from sqlalchemy import select
+
+            from models.database import Room
+            from services.database import AsyncSessionLocal
+
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(Room).where(Room.name.ilike(f"%{room_name}%"))
+                )
+                room = result.scalars().first()
+            if room is None:
+                return {
+                    "success": False,
+                    "message": f"Room '{room_name}' not found",
+                    "action_taken": False,
+                }
+            room_id = room.id
+
+        from ha_glue.services.presence_analytics import PresenceAnalyticsService
+        from services.database import AsyncSessionLocal
+
+        if query_type == "who_was_in_room":
+            if room_id is None:
+                return {
+                    "success": False,
+                    "message": "Parameter 'room_name' is required for 'who_was_in_room'",
+                    "action_taken": False,
+                }
+            async with AsyncSessionLocal() as db:
+                service = PresenceAnalyticsService(db)
+                events = await service.get_room_occupancy_window(
+                    room_id=room_id, since=since, until=until
+                )
+            names = []
+            for ev in events:
+                name = presence_service.get_display_name(ev["user_id"])
+                ev["user_name"] = name
+                if ev["event_type"] == "enter" and name not in names:
+                    names.append(name)
+            who = ", ".join(names) if names else "nobody"
+            summary = (
+                f"Between {_fmt(since)} and {_fmt(until)}, {room_name} was entered by: {who}."
+                if names
+                else f"No presence events for {room_name} between {_fmt(since)} and {_fmt(until)}."
+            )
+            return {
+                "success": True,
+                "message": f"{len(events)} event(s) in {room_name}",
+                "action_taken": True,
+                "data": {"room_name": room_name, "events": events},
+                "summary": summary,
+            }
+
+        # timeline / last_seen_by_room both need a resolved user.
+        if not user_name:
+            return {
+                "success": False,
+                "message": "Parameter 'user_name' is required",
+                "action_taken": False,
+            }
+        user_id = presence_service.find_user_by_name(user_name)
+        if user_id is None:
+            return {
+                "success": False,
+                "message": f"User '{user_name}' not found",
+                "action_taken": False,
+            }
+        display_name = presence_service.get_display_name(user_id)
+
+        if query_type == "last_seen_by_room":
+            async with AsyncSessionLocal() as db:
+                service = PresenceAnalyticsService(db)
+                rows = await service.get_last_seen_by_room(user_id=user_id)
+            if not rows:
+                return {
+                    "success": True,
+                    "message": f"No presence history for {display_name}",
+                    "action_taken": True,
+                    "data": {"user_name": display_name, "rooms": []},
+                    "summary": f"There is no recorded presence history for {display_name}.",
+                }
+            parts = [f"{r['room_name']} ({_fmt(r['last_seen'])})" for r in rows]
+            summary = f"{display_name} was last seen in: " + "; ".join(parts) + "."
+            return {
+                "success": True,
+                "message": f"{len(rows)} room(s) for {display_name}",
+                "action_taken": True,
+                "data": {"user_name": display_name, "rooms": rows},
+                "summary": summary,
+            }
+
+        # Default: timeline.
+        async with AsyncSessionLocal() as db:
+            service = PresenceAnalyticsService(db)
+            events = await service.get_timeline(
+                user_id=user_id,
+                since=since,
+                until=until,
+                room_id=room_id,
+                limit=100,
+            )
+        if not events:
+            return {
+                "success": True,
+                "message": f"No presence events for {display_name} in that window",
+                "action_taken": True,
+                "data": {"user_name": display_name, "events": events},
+                "summary": (
+                    f"{display_name} has no recorded presence events between "
+                    f"{_fmt(since)} and {_fmt(until)}."
+                ),
+            }
+        lines = [
+            f"{_fmt(ev['created_at'])}: {ev['event_type']} {ev['room_name'] or 'unknown room'}"
+            for ev in events
+        ]
+        summary = (
+            f"{display_name}'s presence between {_fmt(since)} and {_fmt(until)}:\n"
+            + "\n".join(lines)
+        )
+        return {
+            "success": True,
+            "message": f"{len(events)} event(s) for {display_name}",
+            "action_taken": True,
+            "data": {"user_name": display_name, "events": events},
+            "summary": summary,
+        }
+
     # ── Radio tools ──────────────────────────────────────────────────────────
 
     async def _play_radio(self, params: dict) -> dict:
@@ -1262,6 +2815,33 @@ class InternalToolService:
                 parsed = {}
 
             stream_url = parsed.get("stream_url", "")
+
+            # Guard against TuneIn's "not compatible" placeholder. An invalid or
+            # guessed station_id (the classic failure: the LLM skips
+            # mcp.radio.search_stations and copies a schema example or reuses an
+            # id from memory) resolves to
+            # cdn-cms.tunein.com/service/Audio/notcompatible.<locale>.mp3 — a
+            # dead placeholder that "plays" as silence and made the agent loop on
+            # a bad id. Scan the WHOLE resolver response (not just the parsed
+            # stream_url field) so a response-shape change can't slip it past,
+            # and check this BEFORE the empty-url branch so a bad id gets the
+            # actionable "search first" message rather than a generic error.
+            if "notcompatible" in f"{raw_text} {stream_url}".lower():
+                logger.warning(
+                    "Radio station_id '%s' resolved to the TuneIn 'notcompatible' "
+                    "placeholder — invalid or guessed id (search_stations was likely skipped)",
+                    station_id,
+                )
+                return {
+                    "success": False,
+                    "message": (
+                        f"'{station_id}' is not a valid radio station. Call "
+                        "mcp.radio.search_stations(query=...) to find the correct "
+                        "station_id, then play that — never guess or reuse an id."
+                    ),
+                    "action_taken": False,
+                }
+
             if not stream_url:
                 return {
                     "success": False,
@@ -1512,5 +3092,75 @@ class InternalToolService:
             return {
                 "success": False,
                 "message": f"Error removing favorite: {e!s}",
+                "action_taken": False,
+            }
+
+    async def _bluetooth_scan(self, params: dict) -> dict:
+        """Fan a broad Bluetooth discovery scan out to every satellite and return
+        the aggregated device list. Gated on bt_scan_enabled. Slow (15-30s)."""
+        from ha_glue.utils.config import ha_glue_settings
+
+        if not ha_glue_settings.bt_scan_enabled:
+            return {
+                "success": False,
+                "message": "Bluetooth scanning is disabled",
+                "action_taken": False,
+            }
+
+        # Clamp the durations so a runaway value can't pin the BT controllers.
+        def _clamp(value, default: float) -> float:
+            try:
+                return max(1.0, min(20.0, float(value)))
+            except (ValueError, TypeError):
+                return default
+
+        ble_duration = _clamp(params.get("ble_duration"), 10.0)
+        classic_timeout = _clamp(params.get("classic_timeout"), 12.0)
+
+        try:
+            from ha_glue.services.bt_scan_service import BtScanService
+            from ha_glue.services.satellite_manager import get_satellite_manager
+
+            sat_mgr = get_satellite_manager()
+            data = await BtScanService().scan_all_satellites(
+                sat_mgr,
+                ble_duration=ble_duration,
+                classic_timeout=classic_timeout,
+                # Allow the satellite enough time for the sequential BLE+Classic scan.
+                per_sat_timeout=ble_duration + classic_timeout + 15.0,
+            )
+
+            if data["satellites_queried"] == 0:
+                return {
+                    "success": False,
+                    "message": "No satellites are connected to scan from",
+                    "action_taken": False,
+                    "data": data,
+                }
+            if data["satellites_responded"] == 0:
+                return {
+                    "success": False,
+                    "message": (
+                        f"None of the {data['satellites_queried']} satellite(s) responded "
+                        f"to the Bluetooth scan"
+                    ),
+                    "action_taken": False,
+                    "data": data,
+                }
+
+            return {
+                "success": True,
+                "message": (
+                    f"Found {data['total_devices']} Bluetooth device(s) across "
+                    f"{data['satellites_responded']}/{data['satellites_queried']} satellite(s)"
+                ),
+                "action_taken": True,
+                "data": data,
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error running Bluetooth scan: {e}")
+            return {
+                "success": False,
+                "message": f"Error running Bluetooth scan: {e!s}",
                 "action_taken": False,
             }

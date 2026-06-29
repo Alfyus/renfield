@@ -40,9 +40,13 @@ RUN pip install --no-cache-dir --upgrade pip>=25.3 setuptools
 # The constraints file pins torch/torchaudio/torchvision to +cpu wheels from the
 # PyTorch CPU index — prevents transitive deps (docling, easyocr, transformers)
 # from resolving torch to a full CUDA build (saves ~3 GB of nvidia/* wheels).
-COPY requirements.txt constraints.txt ./
-RUN grep -v "github.com" requirements.txt > requirements-pypi.txt \
-    && (grep "github.com" requirements.txt > requirements-github.txt || true)
+# Only constraints.txt is needed for the heavy layers below — they install
+# LITERAL package names, not from requirements.txt. requirements.txt is COPY'd
+# LATER (just before Layer 4) so a dependency bump — especially an MCP-server
+# github pin (the frequent case) — rebuilds only Layers 4-5 (~3 min) and leaves
+# the cached ~1.9 GB torch/ML/audio layers intact. Single canonical
+# requirements.txt is kept; the pypi/github split is generated in-build.
+COPY constraints.txt ./
 
 # Layer 1: torch ecosystem (~700 MB) — biggest single chunk; isolated so the
 # rest of the deps can re-use it from the layer cache on subsequent builds.
@@ -62,6 +66,12 @@ RUN pip install --no-cache-dir \
       --constraint constraints.txt \
       faster-whisper piper-tts librosa soundfile noisereduce
 
+# requirements.txt COPY'd HERE (after the heavy layers) so a deps change rebuilds
+# only Layers 4-5 below, not the torch/ML/audio layers above.
+COPY requirements.txt ./
+RUN grep -v "github.com" requirements.txt > requirements-pypi.txt \
+    && (grep "github.com" requirements.txt > requirements-github.txt || true)
+
 # Layer 4: remaining pypi reqs (~600 MB) — fastapi, sqlalchemy, ollama, mcp, etc.
 RUN pip install --no-cache-dir \
       --extra-index-url https://download.pytorch.org/whl/cpu \
@@ -69,7 +79,14 @@ RUN pip install --no-cache-dir \
       -r requirements-pypi.txt
 
 # Layer 5: github archive deps (small, slow to resolve — kept in its own layer).
-RUN if [ -s requirements-github.txt ]; then pip install --no-cache-dir --force-reinstall --no-deps -r requirements-github.txt; fi
+# GITHUB_DEPS_REV busts ONLY this layer so a satellite MCP package pinned to a
+# moving ref (e.g. `renfield-mcp-dlna @ .../main.tar.gz`) can be re-fetched
+# without invalidating the heavy ML layers above (which 504 on Harbor). Pass
+# the upstream commit SHA as the value to make the build reproducible:
+#   docker build --build-arg GITHUB_DEPS_REV=<sha> …
+ARG GITHUB_DEPS_REV=0
+RUN echo "github deps rev: ${GITHUB_DEPS_REV}" \
+    && if [ -s requirements-github.txt ]; then pip install --no-cache-dir --force-reinstall --no-deps -r requirements-github.txt; fi
 
 # Stage the heaviest packages OUTSIDE /opt/venv so the runtime stage can COPY
 # them individually. A single `COPY --from=builder /opt/venv /opt/venv` would
@@ -99,6 +116,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
     libgomp1 \
     espeak-ng \
+    poppler-utils \
     wget \
     curl \
     ca-certificates \
@@ -161,6 +179,22 @@ COPY . .
 # from ./data/wakeword-models; in the image build context they must sit next to
 # the backend sources (synced from the repo's data/wakeword-models/ at build time).
 COPY wakeword-models /app/wakeword-models
+
+# Satellite source — bundled so the OTA update service can build update packages
+# (SatelliteUpdateService.build_update_package reads /app/satellite, and
+# get_latest_version reads its __version__). Without this the
+# /api/satellites/update-package endpoint 503s and the UI can't push updates.
+# Synced into the backend build context from the repo's src/satellite/ at build
+# time (the build context is src/backend/, like wakeword-models above).
+COPY satellite /app/satellite
+
+# Fail the build LOUDLY if the bundled source is missing or truncated (a partial
+# rsync would otherwise let COPY succeed, then silently degrade: get_latest_version
+# falls back to config and build_update_package would tar a corrupt tree). Assert
+# the package entrypoint exists and carries a parseable __version__.
+RUN test -f /app/satellite/renfield_satellite/__init__.py \
+    && grep -Eq '^__version__\s*=\s*["'"'"'][0-9]+(\.[0-9]+)*["'"'"']' /app/satellite/renfield_satellite/__init__.py \
+    || (echo "ERROR: /app/satellite missing or has no parseable __version__ — was src/satellite/ rsynced into the build context?" && exit 1)
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash appuser \

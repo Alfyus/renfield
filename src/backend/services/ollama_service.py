@@ -254,6 +254,52 @@ WICHTIGE REGELN FÜR ANTWORTEN:
             logger.error(f"Streaming Fehler: {e}")
             yield prompt_manager.get("chat", "error_fallback", lang=lang, default=f"Fehler: {e!s}", error=str(e))
 
+    async def count_people_in_image(self, image_b64: str) -> int | None:
+        """Count visible people in an image via the vision model (non-streaming).
+
+        Used by the announce privacy gate to catch people NOT tracked by BLE.
+        Returns the count, or None if no vision model / the call fails / the
+        answer can't be parsed (callers decide fail-open vs fail-closed).
+        """
+        import re as _re
+
+        vision_model = settings.ollama_vision_model
+        if not vision_model:
+            return None
+        if not await llm_circuit_breaker.allow_request():
+            logger.warning("🔴 LLM circuit breaker OPEN — skipping vision occupancy check")
+            return None
+        try:
+            prompt = (
+                "How many people (humans) are physically present in this image? "
+                "Count only real people, not photos/posters/screens/reflections. "
+                "Answer with ONLY a single integer. /no_think"
+            )
+            messages = [{"role": "user", "content": prompt, "images": [image_b64]}]
+            if settings.ollama_vision_url:
+                from utils.llm_client import _make_client_with_fallback
+                vision_client = _make_client_with_fallback(settings.ollama_vision_url)
+            else:
+                vision_client = self.client
+
+            resp = await vision_client.chat(
+                model=vision_model,
+                messages=messages,
+                stream=False,
+                options={"num_ctx": settings.ollama_num_ctx},
+            )
+            await llm_circuit_breaker.record_success()
+            content = (resp.message.content if resp and resp.message else "") or ""
+            # qwen3-vl can emit a <think>…</think> block (with stray numbers); strip
+            # it, then take the LAST integer — the final answer, not a reasoning digit.
+            content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL | _re.IGNORECASE)
+            nums = _re.findall(r"\d+", content)
+            return int(nums[-1]) if nums else None
+        except Exception as e:  # noqa: BLE001
+            await llm_circuit_breaker.record_failure()
+            logger.warning(f"Vision occupancy count failed: {e}")
+            return None
+
     async def chat_stream_with_image(
         self,
         message: str,
@@ -796,12 +842,21 @@ WICHTIGE REGELN FÜR ANTWORTEN:
         self,
         session_id: str,
         db: AsyncSession,
-        max_messages: int = 20
+        max_messages: int = 20,
+        user_id: int | None = None,
+        enforce_ownership: bool = False,
     ) -> list[dict]:
-        """Lade Konversationskontext aus der Datenbank (delegiert an ConversationService)"""
+        """Lade Konversationskontext aus der Datenbank (delegiert an ConversationService).
+
+        ``user_id`` + ``enforce_ownership`` close the cross-user history-read IDOR on
+        the WS path; see ConversationService.load_context.
+        """
         from services.conversation_service import ConversationService
         service = ConversationService(db)
-        return await service.load_context(session_id, max_messages)
+        return await service.load_context(
+            session_id, max_messages,
+            user_id=user_id, enforce_ownership=enforce_ownership,
+        )
 
     async def save_message(
         self,
@@ -811,11 +866,25 @@ WICHTIGE REGELN FÜR ANTWORTEN:
         db: AsyncSession,
         metadata: dict | None = None,
         user_id: int | None = None,
+        parent_message_id: int | None = None,
+        enforce_ownership: bool = False,
     ) -> "Message":
-        """Speichere eine einzelne Nachricht (delegiert an ConversationService)"""
+        """Speichere eine einzelne Nachricht (delegiert an ConversationService).
+
+        ``parent_message_id`` (chat branching, Phase 1): when given, the message
+        forks as a sibling under that parent; else it chains onto the current
+        active tip. See ConversationService.save_message.
+
+        ``enforce_ownership`` (auth-enabled WS path): raises ``PermissionError``
+        rather than appending into another user's conversation.
+        """
         from services.conversation_service import ConversationService
         service = ConversationService(db)
-        return await service.save_message(session_id, role, content, metadata, user_id=user_id)
+        return await service.save_message(
+            session_id, role, content, metadata,
+            user_id=user_id, parent_message_id=parent_message_id,
+            enforce_ownership=enforce_ownership,
+        )
 
     async def get_conversation_summary(
         self,

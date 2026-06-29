@@ -1,11 +1,18 @@
-import { useRef, useEffect, useMemo, type ReactNode } from 'react';
+import { useRef, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Volume2, Loader, FileText, AlertCircle, CheckCircle, Search, CheckCircle2, XCircle, ChevronRight, Radio } from 'lucide-react';
+import { Volume2, Loader, FileText, AlertCircle, CheckCircle, Search, CheckCircle2, XCircle, ChevronRight, ChevronLeft, Radio, Pencil, RotateCcw, Trash2 } from 'lucide-react';
 import AdaptiveCardRenderer from '../../components/AdaptiveCardRenderer';
 import IntentCorrectionButton from '../../components/IntentCorrectionButton';
 import AttachmentQuickActions from './AttachmentQuickActions';
 import EmailForwardDialog from './EmailForwardDialog';
+import PaperlessConfirmCard from './PaperlessConfirmCard';
+import SourceChips from '../../components/chat/SourceChips';
+import FollowupChips from '../../components/chat/FollowupChips';
+import MediaHandoffIndicator from '../../components/chat/MediaHandoffIndicator';
+import AgentRoleBadge from '../../components/chat/AgentRoleBadge';
+import ArtifactRenderer from '../../components/chat/artifacts/ArtifactRenderer';
+import { useFeatureFlags } from '../../api/resources/brain';
 import { useChatContext } from './context/ChatContext';
 import { CitationChip } from '../../components/wissensbasis/CitationChip';
 import { useTraceQuery, type TraceEntity } from '../../api/resources/wissensbasis';
@@ -137,11 +144,30 @@ export default function ChatMessages() {
   const { t } = useTranslation();
   const {
     messages, loading, historyLoading, speakText, handleFeedbackSubmit,
+    regenerateWithCorrectedIntent,
     actionLoading, actionResult, indexToKb, sendToPaperless, sendToBoth, handleSummarize,
     handleSendViaEmail, emailDialog, confirmSendViaEmail, cancelEmailDialog,
-    sendMessage, sessionId,
+    sendMessage, sessionId, submitPaperlessConfirm,
+    pendingScrollIndex, clearPendingScroll,
+    editAndResubmit, regenerateTurn, switchBranch, deleteBranch, sendDeviceAction,
   } = useChatContext();
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const { data: features } = useFeatureFlags();
+  const roleSurfacingEnabled = features?.role_surfacing_enabled ?? false;
+  const artifactsEnabled = features?.artifacts_typed_enabled ?? false;
+  // Chat branching (Phase 1): edit/regenerate fork affordances. Dark by default.
+  const branchingEnabled = features?.chat_branching_enabled ?? false;
+  // Index of the user message currently being edited inline (null = none).
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState('');
+
+  // Phase 2: fork-from-ANY message — any user turn is editable, any finished
+  // assistant turn is regenerable (the per-message ‹n/m› switcher below lets the
+  // user navigate the resulting sibling branches).
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  // Per-message element refs so a search jump can scroll/focus a specific turn.
+  const messageRefs = useRef<Array<HTMLDivElement | null>>([]);
+  // Briefly highlighted message index (the jump target's ring), cleared on a timer.
+  const [flashIndex, setFlashIndex] = useState<number | null>(null);
 
   // Fetch the wissensbasis reasoning trace for this session so we can
   // wrap entity mentions in the assistant prose with CitationChips.
@@ -154,13 +180,42 @@ export default function ChatMessages() {
     [traceQ.data?.trace?.entities],
   );
 
-  // Auto-scroll to bottom when messages change
+  // Auto-scroll to bottom when messages change. Scroll the CONTAINER directly
+  // rather than calling scrollIntoView() on a sentinel: in Safari, scrollIntoView
+  // walks up and scrolls every scrollable ancestor — including the window — so on
+  // each new message it scrolled the whole page and pushed the chat + input out of
+  // view. Scrolling the container's scrollTop can only move this region, never the
+  // window, so it fixes Safari and behaves identically elsewhere.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = scrollContainerRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   }, [messages]);
+
+  // Jump-to-message (chat-ui item 3): when a search result arms
+  // pendingScrollIndex AND the target message is now loaded, scroll it into
+  // view, focus it (so keyboard focus returns to the thread, not stranded in
+  // the sidebar search field), flash a highlight ring, then clear the pending
+  // index so a later auto-scroll on new messages isn't fought. Out-of-range
+  // indices (history shorter than expected) are cleared without scrolling.
+  useEffect(() => {
+    if (pendingScrollIndex === null) return;
+    if (historyLoading) return; // wait until the switched history has loaded
+    const target = messageRefs.current[pendingScrollIndex];
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target.focus({ preventScroll: true });
+      setFlashIndex(pendingScrollIndex);
+      const tid = window.setTimeout(() => setFlashIndex(null), 2000);
+      clearPendingScroll();
+      return () => window.clearTimeout(tid);
+    }
+    // Index not present (stale/short history) — give up gracefully.
+    clearPendingScroll();
+  }, [pendingScrollIndex, historyLoading, messages, clearPendingScroll]);
 
   return (
     <div
+      ref={scrollContainerRef}
       className="flex-1 overflow-y-auto card space-y-4 mb-4 mx-4 md:mx-0"
       role="log"
       aria-live="polite"
@@ -207,7 +262,13 @@ export default function ChatMessages() {
       {messages.map((message, index) => (
         <div
           key={index}
-          className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+          ref={(el) => { messageRefs.current[index] = el; }}
+          tabIndex={-1}
+          className={`flex outline-none scroll-mt-4 ${message.role === 'user' ? 'justify-end' : 'justify-start'} ${
+            flashIndex === index
+              ? 'rounded-lg ring-2 ring-accent-400 dark:ring-accent-500 ring-offset-2 ring-offset-white dark:ring-offset-gray-800 transition-shadow'
+              : ''
+          }`}
           role="article"
           aria-label={message.role === 'user' ? t('chat.yourMessage') : t('chat.assistantResponse')}
         >
@@ -303,13 +364,174 @@ export default function ChatMessages() {
               </ul>
             )}
 
-            {message.role === 'assistant' ? renderMessageContent(message.content, t('chat.albumArt'), message.entities ?? chipEntities, `msg-${index}`) : <p className="whitespace-pre-wrap">{message.content}</p>}
+            {message.role === 'assistant'
+              ? renderMessageContent(message.content, t('chat.albumArt'), message.entities ?? chipEntities, `msg-${index}`)
+              : editingIndex === index ? (
+                /* Inline edit-and-resubmit editor (chat branching, Phase 1). */
+                <div className="flex flex-col gap-2">
+                  <textarea
+                    className="input w-full text-gray-900 dark:text-gray-100"
+                    rows={Math.min(6, Math.max(2, editDraft.split('\n').length))}
+                    value={editDraft}
+                    autoFocus
+                    aria-label={t('chat.editMessage')}
+                    onChange={(e) => setEditDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        if (editDraft.trim()) {
+                          editAndResubmit(index, editDraft);
+                          setEditingIndex(null);
+                        }
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        setEditingIndex(null);
+                      }
+                    }}
+                  />
+                  <div className="flex gap-2 justify-end">
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs px-3 py-1"
+                      onClick={() => setEditingIndex(null)}
+                    >
+                      {t('common.cancel')}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-primary text-xs px-3 py-1"
+                      disabled={!editDraft.trim()}
+                      onClick={() => {
+                        if (editDraft.trim()) {
+                          editAndResubmit(index, editDraft);
+                          setEditingIndex(null);
+                        }
+                      }}
+                    >
+                      {t('chat.resubmit')}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="whitespace-pre-wrap">{message.content}</p>
+              )}
+
+            {/* Branch switcher (chat branching, Phase 2): ◂ n/m ▸ + delete, on
+                any message that has sibling branches. Keyboard-reachable;
+                role-aware colors so contrast holds on the user bubble too. */}
+            {branchingEnabled && message.branch && message.branch.count > 1
+              && typeof message.id === 'number' && !loading && (() => {
+              const onUserBubble = message.role === 'user';
+              const navClass = onUserBubble
+                ? 'text-white/80 hover:bg-white/20 focus:ring-white/50'
+                : 'text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 focus:ring-accent-400';
+              const br = message.branch;
+              const msgId = message.id;
+              return (
+                <div
+                  className={`mt-2 inline-flex items-center gap-1 text-xs ${onUserBubble ? 'text-white/80' : 'text-gray-500 dark:text-gray-400'}`}
+                  role="group"
+                  aria-label={t('chat.branch.group')}
+                >
+                  <button
+                    type="button"
+                    onClick={() => { const p = br.sibling_ids[br.index - 1]; if (typeof p === 'number') void switchBranch(p); }}
+                    disabled={br.index === 0}
+                    className={`p-1.5 rounded disabled:opacity-30 disabled:cursor-not-allowed focus:outline-none focus:ring-2 ${navClass}`}
+                    aria-label={t('chat.branch.previous')}
+                  >
+                    <ChevronLeft className="w-4 h-4" aria-hidden="true" />
+                  </button>
+                  <span className="tabular-nums px-0.5" aria-live="polite">
+                    {t('chat.branch.position', { current: br.index + 1, total: br.count })}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => { const n = br.sibling_ids[br.index + 1]; if (typeof n === 'number') void switchBranch(n); }}
+                    disabled={br.index === br.count - 1}
+                    className={`p-1.5 rounded disabled:opacity-30 disabled:cursor-not-allowed focus:outline-none focus:ring-2 ${navClass}`}
+                    aria-label={t('chat.branch.next')}
+                  >
+                    <ChevronRight className="w-4 h-4" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const neighbor = br.sibling_ids[br.index - 1] ?? br.sibling_ids[br.index + 1];
+                      if (typeof neighbor === 'number' && window.confirm(t('chat.branch.deleteConfirm'))) {
+                        void deleteBranch(msgId, neighbor);
+                      }
+                    }}
+                    className={`p-1.5 ml-1 rounded focus:outline-none focus:ring-2 ${onUserBubble ? 'text-white/80 hover:bg-white/20 focus:ring-white/50' : 'text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-gray-200 dark:hover:bg-gray-700 focus:ring-red-400'}`}
+                    aria-label={t('chat.branch.delete')}
+                  >
+                    <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              );
+            })()}
+
+            {/* Edit affordance (chat branching): any user message (Phase 2 —
+                fork-from-any), dark behind chat_branching_enabled. Keyboard-
+                reachable (a real focusable button, not hover-only). */}
+            {branchingEnabled && message.role === 'user'
+              && editingIndex !== index && !loading && (
+              <button
+                type="button"
+                onClick={() => { setEditingIndex(index); setEditDraft(message.content); }}
+                className="mt-2 text-xs text-white/80 hover:text-white flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-white/50 rounded"
+                aria-label={t('chat.editMessage')}
+              >
+                <Pencil className="w-3 h-3" aria-hidden="true" />
+                <span>{t('chat.edit')}</span>
+              </button>
+            )}
+
+            {/* Provenance source chips — KB documents a knowledge-backed answer
+                used. Renders nothing when the turn had no sources. */}
+            {message.role === 'assistant' && !message.streaming && (
+              <SourceChips sources={message.sources} />
+            )}
+
+            {/* Follow-up suggestion chips — only under the LAST finished
+                assistant turn (ephemeral; tapping fills the composer). */}
+            {message.role === 'assistant' && !message.streaming && index === messages.length - 1 && (
+              <FollowupChips followups={message.suggestedFollowups} />
+            )}
 
             {/* Adaptive Card (from WebSocket card message) */}
             {message.card && (
               <div className="mt-2">
                 <AdaptiveCardRenderer card={message.card} />
               </div>
+            )}
+
+            {/* Typed artifacts (Lane A: table/list/keyvalue/chart). Inert when
+                the feature flag is off. Each renders in arrival order. `loading`
+                = the artifact is still streaming (partial); `finalized` = the
+                turn finished, so a stuck-partial resolves to the fallback. */}
+            {artifactsEnabled && message.role === 'assistant' && message.artifacts?.map((artifact) => (
+              <ArtifactRenderer
+                key={artifact.id}
+                artifact={artifact}
+                loading={artifact.partial === true && message.streaming === true}
+                finalized={message.streaming !== true}
+                onDeviceAction={sendDeviceAction}
+              />
+            ))}
+
+            {/* Interactive Paperless cold-start confirm card */}
+            {message.paperlessConfirm && (
+              <PaperlessConfirmCard
+                key={message.paperlessConfirm.confirmToken}
+                confirmToken={message.paperlessConfirm.confirmToken}
+                filename={message.paperlessConfirm.filename}
+                summary={message.paperlessConfirm.summary}
+                fields={message.paperlessConfirm.fields}
+                status={message.paperlessConfirm.status}
+                onSubmit={(token, decisions) => submitPaperlessConfirm(token, { decisions })}
+                onAbort={(token) => submitPaperlessConfirm(token, { abort: true })}
+              />
             )}
 
             {/* Attachment chips */}
@@ -368,6 +590,29 @@ export default function ChatMessages() {
               </button>
             )}
 
+            {/* Regenerate affordance (chat branching): any finished assistant
+                turn (Phase 2 — fork-from-any), dark behind chat_branching_enabled.
+                Keyboard-reachable. Re-runs the same user query → new sibling. */}
+            {branchingEnabled && message.role === 'assistant' && !message.streaming
+              && !loading && (
+              <button
+                type="button"
+                onClick={() => regenerateTurn(index)}
+                className="mt-2 ml-3 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white inline-flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-accent-400 rounded"
+                aria-label={t('chat.regenerate')}
+              >
+                <RotateCcw className="w-3 h-3" aria-hidden="true" />
+                <span>{t('chat.regenerate')}</span>
+              </button>
+            )}
+
+            {/* Agent-role badge (item 6) — which role answered; tap to pin next turn. */}
+            {message.role === 'assistant' && !message.streaming && roleSurfacingEnabled && message.agentRole && (
+              <div className="mt-2">
+                <AgentRoleBadge role={message.agentRole} />
+              </div>
+            )}
+
             {/* Intent info + Correction Button */}
             {message.role === 'assistant' && !message.streaming && message.intentInfo && (
               <IntentCorrectionButton
@@ -376,12 +621,19 @@ export default function ChatMessages() {
                 detectedConfidence={message.intentInfo.confidence}
                 feedbackType="intent"
                 onCorrect={handleFeedbackSubmit}
+                onRegenerate={regenerateWithCorrectedIntent}
                 proactive={message.feedbackRequested === true}
               />
             )}
           </div>
         </div>
       ))}
+
+      {/* Room-handoff affordance (item 8): a quiet, transient inline meta line
+          when Media Follow moves the user's playback to the room they entered.
+          Self-gated on the room_handoff_enabled feature flag; renders nothing
+          when off or idle. Sits in the thread flow, not as a floating overlay. */}
+      <MediaHandoffIndicator />
 
       {/* Loading Indicator */}
       {loading && (
@@ -427,9 +679,6 @@ export default function ChatMessages() {
           onCancel={cancelEmailDialog}
         />
       )}
-
-      {/* Scroll anchor */}
-      <div ref={messagesEndRef} />
     </div>
   );
 }

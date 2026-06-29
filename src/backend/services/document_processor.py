@@ -5,6 +5,10 @@ Handles document parsing, chunking, and metadata extraction for RAG.
 Supports: PDF, DOCX, PPTX, XLSX, HTML, MD, TXT, and images.
 """
 import asyncio
+import gc
+import re
+import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -59,7 +63,7 @@ class DocumentProcessor:
                 force_full_page_ocr=True,  # OCR auf jeder Seite, embedded Text ignoriert
                 bitmap_area_threshold=0.0,
             )
-            ocr_pipeline_options.images_scale = 2.0  # Höhere Auflösung für bessere OCR-Qualität
+            ocr_pipeline_options.images_scale = settings.rag_ocr_images_scale  # memory-vs-accuracy; see config
             self._ocr_converter = DocumentConverter(
                 format_options={
                     InputFormat.PDF: PdfFormatOption(pipeline_options=ocr_pipeline_options)
@@ -86,26 +90,85 @@ class DocumentProcessor:
             logger.error(f"Fehler beim Initialisieren von Docling: {e}")
             raise
 
+    _VOWELS = set("aeiouäöüAEIOUÄÖÜ")
+
+    @staticmethod
+    def extract_text_layer(file_path: str) -> str:
+        """Raw PDF text-layer extraction via poppler ``pdftotext -layout``.
+
+        Recovers positioned text-layer tokens (e.g. a right-aligned deadline date
+        rendered in a subsetted no-ToUnicode font) that the Docling/OCR stack drops.
+        Verified as the ONLY extractor that recovers such tokens (pymupdf and Docling
+        both miss the MacRoman/uni=no case — see tasks/T-A0-1-RESULTS). Used to build
+        the field-extraction UNION; NOT used for RAG chunking.
+
+        Returns "" for non-PDFs, when ``pdftotext`` is unavailable, or on any error
+        (the caller then falls back to Docling/OCR output alone — no hard failure).
+        """
+        if not str(file_path).lower().endswith(".pdf"):
+            return ""
+        if shutil.which("pdftotext") is None:
+            logger.warning("pdftotext (poppler-utils) not installed — text-layer union skipped")
+            return ""
+        try:
+            proc = subprocess.run(
+                ["pdftotext", "-layout", file_path, "-"],
+                capture_output=True, timeout=60, check=False,
+            )
+            if proc.returncode != 0:
+                logger.warning(f"pdftotext exit {proc.returncode} for {Path(file_path).name}")
+                return ""
+            text = proc.stdout.decode("utf-8", errors="replace")
+            cap = settings.rag_text_layer_max_chars
+            if len(text) > cap:
+                logger.warning(f"text layer truncated to {cap} chars for {Path(file_path).name}")
+                text = text[:cap]
+            return text
+        except Exception as e:  # subprocess timeout / decode / OS error
+            logger.warning(f"text-layer extraction failed for {Path(file_path).name}: {e}")
+            return ""
+
+    @classmethod
+    def assess_text_layer_quality(cls, text: str, page_count: int = 1) -> tuple[bool, str]:
+        """Decide whether a raw text layer is trustworthy enough to UNION into
+        field_text. Multi-signal (calibrated on the Schicht A golden set, T-A0-1):
+        coverage, space ratio, replacement/control-char ratio, vowel-token ratio.
+
+        Returns ``(usable, reason)``. ``usable=False`` ⇒ drop the text layer and use
+        Docling/OCR output alone (the text layer is empty/scan or garbled).
+        Distinct from ``_is_text_garbled`` (which gates the OCR re-conversion); this
+        gates the field-extraction union and is intentionally a separate decision.
+        """
+        n = len(text)
+        if n == 0:
+            return False, "empty text layer"
+        chars_per_page = n / max(1, page_count)
+        if chars_per_page < settings.rag_text_layer_min_chars_per_page:
+            return False, f"sparse text layer ({chars_per_page:.0f} chars/page) — likely a scan"
+        space_ratio = text.count(" ") / n
+        if space_ratio < settings.rag_text_layer_min_space_ratio:
+            return False, f"low space ratio ({space_ratio:.1%}) — no-space mojibake"
+        repl = text.count("�") + sum(1 for c in text if ord(c) < 9 or 13 < ord(c) < 32)
+        if repl / n > settings.rag_text_layer_max_replacement_ratio:
+            return False, f"high replacement/control ratio ({repl / n:.1%}) — broken encoding"
+        toks = re.findall(r"\S+", text)
+        alpha = [t for t in toks if sum(c.isalpha() for c in t) >= 3]
+        if alpha:
+            vowel_ratio = sum(1 for t in alpha if any(c in cls._VOWELS for c in t)) / len(alpha)
+            if vowel_ratio < settings.rag_text_layer_min_vowel_ratio:
+                return False, f"low vowel-token ratio ({vowel_ratio:.0%}) — garbled glyphs"
+        return True, "usable"
+
     @staticmethod
     def _is_text_garbled(text: str) -> bool:
-        """Erkennt garbled/kaputten embedded Text (Leerzeichen-Verhältnis zu niedrig).
+        """Thin delegate to the shared ``utils.ocr_quality.is_text_garbled``.
 
-        PDFs mit kaputtem Text-Layer enthalten Wörter ohne Leerzeichen
-        (z.B. 'UmschauMarktplatz13Wiesbaden'). Normale Texte haben ~15-25%
-        Leerzeichen. Unter dem konfigurierten Schwellwert (Standard: 3%)
-        wird ein OCR-Re-Lauf empfohlen.
+        Kept as a method so existing call sites / tests are unchanged; the
+        heuristic itself lives in one place now (shared with the Paperless
+        audit's quality score so the two can't drift).
         """
-        if not text or len(text) < 50:
-            return False
-        space_ratio = text.count(' ') / len(text)
-        is_garbled = space_ratio < settings.rag_ocr_space_threshold
-        if is_garbled:
-            logger.warning(
-                f"Garbled embedded text detected (space ratio={space_ratio:.1%} "
-                f"< threshold={settings.rag_ocr_space_threshold:.1%}) — "
-                "re-running with force_full_page_ocr"
-            )
-        return is_garbled
+        from utils.ocr_quality import is_text_garbled
+        return is_text_garbled(text)
 
     async def process_document(
         self,
@@ -147,6 +210,13 @@ class DocumentProcessor:
             # Bestimme ob force_full_page_ocr genutzt werden soll
             use_ocr = force_ocr or settings.rag_force_ocr
 
+            # Track which OCR pathway actually produced the chunks we'll
+            # return. Updated whenever we (re-)convert below. Surfaces in
+            # the result dict as `ocr_engine`, consumed by RAGService and
+            # written to document_processing_history.ocr_engine. Unlocks
+            # the deferred OCR-engine benchmark (group history by engine).
+            ocr_engine = "docling_full_page_ocr" if use_ocr else "docling"
+
             # Dokument in Thread-Pool konvertieren (CPU-intensiv)
             loop = asyncio.get_event_loop()
 
@@ -186,6 +256,7 @@ class DocumentProcessor:
                     if ocr_result is not None:
                         result = ocr_result
                         doc = result.document
+                        ocr_engine = "docling_full_page_ocr"
 
             # Metadaten extrahieren
             metadata = self._extract_metadata(doc, file_path)
@@ -199,32 +270,41 @@ class DocumentProcessor:
             )
             chunks = chunk_result["chunks"]
             dropped = int(chunk_result.get("dropped_low_quality", 0))
-
-            # Per-chunk-rate trigger (sibling of doc-level _is_text_garbled):
-            # if more than rag_chunk_quality_drop_threshold of the emitted
-            # chunks failed the quality gate, the OCR run was probably bad
-            # at the chunk level even if it cleared the doc-level
-            # space-ratio check. Re-convert with force_full_page_ocr.
-            #
-            # Already-forced short-circuit: if this call was ALREADY
-            # invoked with force_ocr=True (or settings.rag_force_ocr) and
-            # the result still trips the per-chunk gate, retrying with
-            # the same setting will give the same result — fail fast with
-            # a distinctive error_message so the maintenance UI can
-            # surface it. Prevents the convergence loop the adversarial
-            # review flagged.
-            #
-            # Note on trigger chaining: when the doc-level _is_text_garbled
-            # path above (lines 173-188) already re-converted the doc, the
-            # NEW chunks may still trip this per-chunk trigger. That re-
-            # converts a second time with the same OCR engine — wasted
-            # GPU but bounded by the already-forced short-circuit (the
-            # second pass below sets force_ocr semantics implicitly via
-            # `_convert_document_ocr`). Worst case: 2 OCR retries on the
-            # same doc before failing. Acceptable cost for the recovery
-            # invariant.
             total_emitted = len(chunks) + dropped
             drop_rate = (dropped / total_emitted) if total_emitted else 0.0
+
+            # Schicht A text-layer extraction, computed ONCE here and reused by BOTH
+            # the re-OCR decision below and the field_text union at the end (a single
+            # poppler pdftotext pass, off the event loop). extract_text_layer returns
+            # "" for non-PDF / no text layer / missing binary, so tl_usable stays
+            # False and behaviour is unchanged for those inputs.
+            text_layer = await loop.run_in_executor(None, self.extract_text_layer, file_path)
+            tl_usable, tl_reason = (False, "absent")
+            if text_layer:
+                tl_usable, tl_reason = self.assess_text_layer_quality(
+                    text_layer, page_count=metadata.get("page_count") or 1
+                )
+
+            # Per-chunk-rate trigger (sibling of doc-level _is_text_garbled): when the
+            # chunker dropped more than rag_chunk_quality_drop_threshold of the emitted
+            # chunks, the conversion that produced them was bad. The RESPONSE depends
+            # on WHY:
+            #   * text layer USABLE → the Docling garbage is a font-decode failure
+            #     (subsetted no-ToUnicode font), NOT a scanned page. force_full_page_ocr
+            #     would re-rasterize and DROP the positioned text-layer tokens (deadline
+            #     dates, Steuernummer) — the exact Schicht A degradation. Chunk from the
+            #     text layer instead and SKIP OCR. Also sidesteps the OOM-prone double
+            #     conversion (two converters + page rasters > 6Gi). Trade-off: a hybrid
+            #     doc that is BOTH font-broken AND has image-only values loses the
+            #     image-only OCR recovery in chunks — rare, since a usable text layer
+            #     means the doc is digital, not scanned.
+            #   * else → genuinely scanned/garbled. Re-convert with force_full_page_ocr,
+            #     FREEING the Standard conversion first so peak memory holds one doc +
+            #     rasters, not two. If the retry ALSO trips → status='failed'.
+            #
+            # Already-forced short-circuit: a call ALREADY invoked with force_ocr=True
+            # that still trips would loop on retry → fail fast with a distinct
+            # error_message so the maintenance UI can tell "tried our best" apart.
             if drop_rate > settings.rag_chunk_quality_drop_threshold:
                 if use_ocr:
                     logger.error(
@@ -238,60 +318,113 @@ class DocumentProcessor:
                         "status": "failed",
                         "error": "ocr_quality_low_after_forced_ocr",
                     }
-                logger.info(
-                    f"Per-chunk quality trigger ({dropped}/{total_emitted} = "
-                    f"{drop_rate:.0%} > {settings.rag_chunk_quality_drop_threshold:.0%}) "
-                    f"— re-konvertiere {path.name} mit force_full_page_ocr"
-                )
-                ocr_result = await loop.run_in_executor(
-                    None, self._convert_document_ocr, file_path
-                )
-                if ocr_result is None:
-                    # The retry converter itself raised — distinct from
-                    # "retry produced still-bad chunks". Surfacing the
-                    # difference matters for triage: this branch means
-                    # the OCR engine choked on the file (corrupt PDF,
-                    # OOM, unsupported variant), not that our quality
-                    # heuristic is too strict.
-                    logger.error(
-                        f"OCR retry conversion FAILED (None result) for "
-                        f"{path.name} — ingesting nothing, marking failed"
+
+                # Both remaining branches discard the Standard conversion. Free it —
+                # plus any auto-detect re-OCR tree still held by ocr_result (lines
+                # ~263-268) — and gc.collect() BEFORE either chunking from the text
+                # layer or launching the force-OCR converter, so peak memory never
+                # holds two Docling document trees (the hybrid-doc OOM fix). collect()
+                # rather than relying on refcount drop because Docling trees are
+                # cycle-heavy (parent<->child node refs) and won't free on rebind.
+                result = None
+                doc = None
+                ocr_result = None
+                gc.collect()
+
+                if tl_usable:
+                    logger.info(
+                        f"Per-chunk quality trigger ({dropped}/{total_emitted} = "
+                        f"{drop_rate:.0%}) on {path.name}, but the embedded text layer "
+                        f"is usable ({tl_reason}) — chunking from the text layer and "
+                        f"skipping force-OCR (avoids dropping positioned tokens)"
                     )
-                    return {
-                        "metadata": metadata,
-                        "chunks": [],
-                        "status": "failed",
-                        "error": "ocr_retry_conversion_failed",
-                    }
-                doc = ocr_result.document
-                chunk_result = await loop.run_in_executor(
-                    None, self._create_chunks, doc
-                )
-                chunks = chunk_result["chunks"]
-                dropped = int(chunk_result.get("dropped_low_quality", 0))
-                total_emitted = len(chunks) + dropped
-                drop_rate = (dropped / total_emitted) if total_emitted else 0.0
-                if drop_rate > settings.rag_chunk_quality_drop_threshold:
-                    logger.error(
-                        f"OCR-quality still bad after retry: {path.name} "
-                        f"(drop_rate={drop_rate:.0%})"
+                    # Apply the SAME per-chunk quality gate _create_chunks uses, so
+                    # this path can't ingest low-quality spans every other path drops,
+                    # and chunks_dropped_low_quality stays an honest audit signal.
+                    # A doc-level-usable text layer is overwhelmingly clean, so this
+                    # rarely drops anything — it's defense-in-depth, not the main act.
+                    from utils.content_quality import is_low_quality_text
+                    raw = self._simple_chunk(text_layer)
+                    chunks = [c for c in raw if not is_low_quality_text(c.get("text", ""))]
+                    dropped = len(raw) - len(chunks)
+                    ocr_engine = "poppler_text_layer"
+                else:
+                    logger.info(
+                        f"Per-chunk quality trigger ({dropped}/{total_emitted} = "
+                        f"{drop_rate:.0%} > {settings.rag_chunk_quality_drop_threshold:.0%}) "
+                        f"— re-konvertiere {path.name} mit force_full_page_ocr"
                     )
-                    return {
-                        "metadata": metadata,
-                        "chunks": chunks,
-                        "status": "failed",
-                        "error": "ocr_quality_low",
-                    }
+                    ocr_result = await loop.run_in_executor(
+                        None, self._convert_document_ocr, file_path
+                    )
+                    if ocr_result is None:
+                        # The retry converter itself raised — distinct from "retry
+                        # produced still-bad chunks". This branch means the OCR engine
+                        # choked on the file (corrupt PDF, OOM, unsupported variant),
+                        # not that our quality heuristic is too strict.
+                        logger.error(
+                            f"OCR retry conversion FAILED (None result) for "
+                            f"{path.name} — ingesting nothing, marking failed"
+                        )
+                        return {
+                            "metadata": metadata,
+                            "chunks": [],
+                            "status": "failed",
+                            "error": "ocr_retry_conversion_failed",
+                        }
+                    doc = ocr_result.document
+                    ocr_engine = "docling_full_page_ocr"
+                    chunk_result = await loop.run_in_executor(
+                        None, self._create_chunks, doc
+                    )
+                    chunks = chunk_result["chunks"]
+                    dropped = int(chunk_result.get("dropped_low_quality", 0))
+                    total_emitted = len(chunks) + dropped
+                    drop_rate = (dropped / total_emitted) if total_emitted else 0.0
+                    if drop_rate > settings.rag_chunk_quality_drop_threshold:
+                        logger.error(
+                            f"OCR-quality still bad after retry: {path.name} "
+                            f"(drop_rate={drop_rate:.0%})"
+                        )
+                        return {
+                            "metadata": metadata,
+                            "chunks": chunks,
+                            "status": "failed",
+                            "error": "ocr_quality_low",
+                        }
 
             logger.info(
                 f"Dokument verarbeitet: {len(chunks)} Chunks erstellt "
                 + (f"({dropped} dropped as low-quality)" if dropped else "")
             )
 
+            # Field-extraction UNION (Schicht A): Docling/OCR output ∪ raw text layer.
+            # Docling recovers OCR-only image values; the raw text layer recovers
+            # positioned tokens Docling drops (right-aligned dates, no-ToUnicode fonts).
+            # Neither alone is complete on hybrid PDFs. RAG chunking is unaffected; this
+            # only populates result["field_text"] for downstream field extractors.
+            # text_layer + tl_usable were computed once above (reused, not re-run).
+            # On the text-layer-chunk path `doc` is None → docling_text is "" and
+            # field_text falls back to the (good) text layer alone.
+            docling_text = ""
+            if doc is not None and hasattr(doc, "export_to_text"):
+                docling_text = await loop.run_in_executor(None, doc.export_to_text)
+            field_text = docling_text
+            if text_layer and tl_usable:
+                field_text = (
+                    f"{docling_text}\n\n===TEXT-LAYER (raw)===\n{text_layer}"
+                    if docling_text else text_layer
+                )
+            elif text_layer and not tl_usable:
+                logger.info(f"Text-layer union skipped for {path.name}: {tl_reason}")
+
             return {
                 "metadata": metadata,
                 "chunks": chunks,
-                "status": "completed"
+                "status": "completed",
+                "ocr_engine": ocr_engine,
+                "chunks_dropped_low_quality": dropped,
+                "field_text": field_text,
             }
 
         except Exception as e:
@@ -502,12 +635,21 @@ class DocumentProcessor:
 
         return chunks
 
-    async def extract_text_only(self, file_path: str, max_chars: int = 50000) -> str | None:
+    async def extract_text_only(
+        self, file_path: str, max_chars: int = 50000, force_ocr: bool = False
+    ) -> str | None:
         """
         Quick text extraction without chunking or embedding.
 
-        For TXT/MD files, reads directly via aiofiles.
-        For other formats, uses Docling conversion + export_to_text().
+        For TXT/MD files, reads directly via aiofiles. For other formats, uses
+        Docling conversion + export_to_text().
+
+        OCR quality recovery — same gates as ``process_document``: honors
+        ``rag_force_ocr`` / the ``force_ocr`` arg, and (for PDFs, when
+        ``rag_ocr_auto_detect`` is on) re-converts with full-page OCR if the
+        embedded text layer is garbled. Callers therefore get the same OCR
+        quality as a fresh KB ingest — they no longer silently keep a
+        mojibake'd text layer.
 
         Returns None on error.
         """
@@ -529,17 +671,33 @@ class DocumentProcessor:
             self._ensure_initialized()
 
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self._convert_document, file_path)
+            use_ocr = force_ocr or settings.rag_force_ocr
+            if use_ocr:
+                result = await loop.run_in_executor(None, self._convert_document_ocr, file_path)
+            else:
+                result = await loop.run_in_executor(None, self._convert_document, file_path)
 
             if result is None:
                 return None
 
             doc = result.document
-            if hasattr(doc, 'export_to_text'):
-                text = doc.export_to_text()
-                return text[:max_chars] if text else None
+            text = doc.export_to_text() if hasattr(doc, 'export_to_text') else ""
 
-            return None
+            # Auto-detect garbled embedded text and re-run with full-page OCR
+            # (PDF only) — the recovery path process_document uses, previously
+            # missing here despite the docstring's claim.
+            if (
+                not use_ocr
+                and settings.rag_ocr_auto_detect
+                and ext == "pdf"
+                and self._is_text_garbled(text)
+            ):
+                logger.info(f"extract_text_only: re-konvertiere mit force_full_page_ocr: {path.name}")
+                ocr_result = await loop.run_in_executor(None, self._convert_document_ocr, file_path)
+                if ocr_result is not None and hasattr(ocr_result.document, 'export_to_text'):
+                    text = ocr_result.document.export_to_text() or text
+
+            return text[:max_chars] if text else None
 
         except Exception as e:
             logger.error(f"extract_text_only Fehler für {file_path}: {e}")

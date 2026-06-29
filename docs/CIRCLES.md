@@ -58,6 +58,10 @@ Die Quell-Tabellen tragen **denormalisiert** eine `circle_tier`- und `atom_id`-S
 
 Wenn der Eigentümer eine Tier-Änderung an einem Atom vornimmt (`PATCH /api/atoms/{id}`), kaskadiert die Änderung auf alle incidenten Relationen (bei `kg_entity`-Atoms) und aktualisiert die denormalisierten `circle_tier`-Spalten in einem Transaktions-Schritt. Konsistenz zwischen `atoms.policy` und Quell-Tabelle ist ein ACID-Commit.
 
+### Merge-Invariante (Structured Memory)
+
+Werden zwei KG-Entitäten zusammengeführt (`merge_entities`, z. B. durch den Reconciler), gilt: **eine Verschmelzung darf die Sichtbarkeit nie erhöhen.** Der überlebende Knoten erhält `circle_tier = MIN(beide)`, und alle inzidenten Relationen rechnen auf `LEAST(subject, object)` neu (gleiche Kaskade wie oben). Deshalb werden **nur same-tier** Paare automatisch gemergt; **Cross-Tier-Paare gehen in die Owner-Review** (`/brain/review`, `kg_merge_proposals`) statt still verschmolzen zu werden. Der Loser bleibt als Tombstone (`is_active=False`, `canonical_id=<winner>`) für den Audit-Trail.
+
 ---
 
 ## Datenmodell
@@ -111,7 +115,11 @@ Jedes Subsystem, das Inhalte dem LLM präsentiert, wendet den Circle-Filter an:
 
 | Route | Zweck |
 |---|---|
-| `GET /api/atoms` | Unified Cross-Source-Search (`/brain` Frontend) |
+| `GET /api/atoms` | Unified Cross-Source-Search (`/brain` Frontend); `document_fact` ist eine fusionierte RRF-Quelle (Schicht-A-Fakten erscheinen mit grünem „Fakt"-Badge) |
+| `GET /api/atoms/documents/{id}/facts` | Alle Schicht-A-Fakten eines Dokuments; 404/403 am Eltern-Dokument circle-gated |
+| `GET /api/atoms/obligations` | Verpflichtungen (Rechnungen + Behörden-Fristen), nächste Frist zuerst; `due_before` + `limit` + `offset` (Offset-Paging für „Mehr laden"); jede Zeile trägt den per-Nutzer `confirmed`-Status |
+| `POST/DELETE /api/atoms/obligations/{id}/confirm` | Frist als erledigt markieren / wieder öffnen (pro Nutzer, circle-gated 404); serverseitige Quittungs-Ledger statt localStorage |
+| `GET /api/config/features` | Frontend-sichtbare Feature-Flags (Allowlist: `schicht_a_extraction_enabled`, `wissen_workspace_enabled`) — die eine bewusste Settings→Browser-Naht |
 | `PATCH /api/atoms/{id}` | Tier ändern; cascade auf incidente Relationen |
 | `GET /api/circles/me` | Eigene Circle-Konfiguration laden |
 | `GET /api/circles/me/members` | Mitgliederlisten pro Tier |
@@ -128,10 +136,15 @@ Jedes Subsystem, das Inhalte dem LLM präsentiert, wendet den Circle-Filter an:
 |---|---|
 | `/brain` | Cross-Source-Suche über eigene Wissensebene |
 | `/brain/review` | Review-Queue: vom System vorgeschlagene Tier-Zuweisungen bestätigen |
+| `/brain/fristen` | Verpflichtungs-Agenda: Fristen-Inbox nach Dringlichkeit gruppiert (Überfällig/Diese Woche/Später), `⚑ rechtlich` bei `legal_gate`, server-gestütztes Bestätigen (Quittungs-Ledger) mit Undo-Toast; gespeist vom Fristen-Notifier (`OBLIGATION_NOTIFIER_ENABLED`) |
 | `/settings/circles` | Circle-Mitglieder pro Stufe verwalten |
 | `/settings/circles/peers` | Federations-Peers (für externe Anfragen über die Circle-Grenze) |
 
-Shared Komponenten: `TierBadge` + `TierPicker` nutzen die `.tier-badge-{0..4}`-Utilities aus `src/frontend/src/index.css` — farbliche Zuordnung *self* (warm) → *public* (kühl), siehe `DESIGN.md`.
+Die Dokument-Karten unter `/knowledge` tragen eine inline **Fakten**-Panel (`FaktenPanel`, lazy-Fetch beim Aufklappen) und verlinken bidirektional mit der Agenda (`?doc={id}#fakten` ↔ `#frist-{id}`).
+
+Shared Komponenten: `TierBadge` + `TierPicker` + `FactProvenance` (✓ deterministisch / ~ Modell-Vorschlag) + `ObligationRow` nutzen die `.tier-badge-{0..4}` / `.fact-group` / `.legal-flag`-Utilities aus `src/frontend/src/index.css` — farbliche Zuordnung *self* (warm) → *public* (kühl), siehe `DESIGN.md`.
+
+**Vereinheitlichter Wissens-Workspace (`wissen_workspace_enabled`, standardmäßig aus).** Ist das Flag an, bündeln sich die obigen Korpus-Seiten plus `/knowledge`, `/memory`, `/knowledge-graph` zu einem `/wissen`-Workspace: persistente Lens-Leiste (Übersicht · Dokumente · Graph · Erinnerungen · Fristen · Prüfen, per-Lens über dieselbe Permission/Feature-Metadaten gated), eine persistente **lens-bezogene Omnisuche** (`?scope=lens|everything`) und ein **universeller Detail-Drawer** (Klick auf ein beliebiges Atom → typ-spezifischer Inhalt + Tier-Edit über zwei ID-Räume: Atom-UUID via `usePatchAtomTier`, `kg_node` via KG-Integer-ID `useUpdateKgEntityTier`). Die alten Routen leiten dann (mit erhaltenem `?search`/`#hash`) nach `/wissen/*` um; aus = unveränderte flache Navigation. Skills (`/brain/skills`) + Föderations-Verlauf (`/brain/audit`) bleiben eigenständig. Details: Abschnitt im Haupt-`CLAUDE.md`.
 
 ---
 

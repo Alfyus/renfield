@@ -2268,3 +2268,151 @@ class TestShouldUseNativeFC:
         client_false = MagicMock(supports_native_tools=False)
         assert agent._should_use_native_fc(client_no_attr) is False
         assert agent._should_use_native_fc(client_false) is False
+
+
+class TestTrajectoryStepRecording:
+    """Regression: run() must record the terminal final_answer step into
+    context.steps so the post-turn bookkeeping classifies the turn from a
+    complete step list.
+
+    The bug: _run_impl appended tool_call/tool_result/error to context.steps
+    but yielded final_answer without recording it, so every turn's
+    context.steps lacked a final_answer. outcome_from_steps then returned
+    ABORT for every turn (dropped from agent_trajectories, which excludes
+    abort) and turn_success was forced False (no skill auto-extraction;
+    injected skills mis-recorded as failures).
+    """
+
+    def _helpers(self):
+        # Reuse the mock builders from TestAgentServiceRun without
+        # re-collecting its tests.
+        return TestAgentServiceRun()
+
+    async def _bookkeeping_steps(self, agent, *, ollama, executor, message,
+                                 monkeypatch):
+        """Drive a real agent turn and return the `steps` list that the
+        post-turn bookkeeping dispatch was handed (== context.steps)."""
+        import services.agent_service as agsvc
+
+        captured: dict = {}
+
+        def _capture(**kwargs):
+            captured["steps"] = kwargs.get("steps")
+
+        monkeypatch.setattr(agsvc, "_post_turn_skill_bookkeeping", _capture)
+        monkeypatch.setattr(agsvc, "_spawn_skill_task", lambda *a, **k: None)
+        # Any one self-learning flag makes run() dispatch the bookkeeping.
+        monkeypatch.setattr(agsvc.settings, "trajectory_capture_enabled", True)
+
+        await collect_steps(agent, message=message, ollama=ollama,
+                            executor=executor)
+        return captured.get("steps")
+
+    @pytest.mark.unit
+    async def test_direct_final_answer_recorded_as_success(self, monkeypatch):
+        from models.database import TRAJECTORY_OUTCOME_SUCCESS
+        from services.trajectory_service import outcome_from_steps
+
+        h = self._helpers()
+        ollama = h._make_ollama_mock([
+            '{"action": "final_answer", "answer": "Hallo!", "reason": "x"}'
+        ])
+        agent = AgentService(h._make_registry(), max_steps=5)
+        steps = await self._bookkeeping_steps(
+            agent, ollama=ollama, executor=h._make_executor_mock(),
+            message="Hallo", monkeypatch=monkeypatch,
+        )
+        assert steps is not None
+        assert any(s.step_type == "final_answer" for s in steps)
+        assert outcome_from_steps(steps) == TRAJECTORY_OUTCOME_SUCCESS
+
+    @pytest.mark.unit
+    async def test_tool_then_answer_recorded_as_success(self, monkeypatch):
+        from models.database import TRAJECTORY_OUTCOME_SUCCESS
+        from services.trajectory_service import outcome_from_steps
+
+        h = self._helpers()
+        ollama = h._make_ollama_mock([
+            '{"action": "mcp.homeassistant.get_state", '
+            '"parameters": {"entity_id": "sensor.t"}, "reason": "c"}',
+            '{"action": "final_answer", "answer": "22C", "reason": "d"}',
+        ])
+        executor = h._make_executor_mock([
+            {"success": True, "message": "22C", "action_taken": True}
+        ])
+        agent = AgentService(h._make_registry(), max_steps=5)
+        steps = await self._bookkeeping_steps(
+            agent, ollama=ollama, executor=executor,
+            message="Wie warm?", monkeypatch=monkeypatch,
+        )
+        assert any(s.step_type == "tool_call" for s in steps)
+        assert any(s.step_type == "final_answer" for s in steps)
+        assert outcome_from_steps(steps) == TRAJECTORY_OUTCOME_SUCCESS
+
+    @pytest.mark.unit
+    async def test_failed_tool_then_answer_recorded_as_tool_fail(self, monkeypatch):
+        from models.database import TRAJECTORY_OUTCOME_TOOL_FAIL
+        from services.trajectory_service import outcome_from_steps
+
+        h = self._helpers()
+        ollama = h._make_ollama_mock([
+            '{"action": "mcp.homeassistant.get_state", '
+            '"parameters": {"entity_id": "sensor.t"}, "reason": "c"}',
+            '{"action": "final_answer", "answer": "Konnte nicht lesen", "reason": "d"}',
+        ])
+        executor = h._make_executor_mock([
+            {"success": False, "message": "tool boom", "action_taken": False}
+        ])
+        agent = AgentService(h._make_registry(), max_steps=5)
+        steps = await self._bookkeeping_steps(
+            agent, ollama=ollama, executor=executor,
+            message="Wie warm?", monkeypatch=monkeypatch,
+        )
+        assert any(s.step_type == "final_answer" for s in steps)
+        # final_answer present, but a tool failed → tool_fail (still captured).
+        assert outcome_from_steps(steps) == TRAJECTORY_OUTCOME_TOOL_FAIL
+
+    @pytest.mark.unit
+    def test_no_final_answer_stays_abort(self):
+        """Inverse guard: the fix records final_answer only when one is
+        emitted — it must never fabricate one. A genuine answer-less turn
+        (cancel/timeout before answering) classifies as ABORT and is
+        therefore dropped from capture, exactly as intended."""
+        from models.database import TRAJECTORY_OUTCOME_ABORT
+        from services.agent_service import AgentStep
+        from services.trajectory_service import outcome_from_steps
+
+        steps = [
+            AgentStep(step_number=1, step_type="tool_call", content="", tool="x"),
+            AgentStep(step_number=2, step_type="tool_result", content="ok",
+                      tool="x", success=True),
+        ]
+        assert outcome_from_steps(steps) == TRAJECTORY_OUTCOME_ABORT
+
+
+# ---------------------------------------------------------------------------
+# Tool pre-selection: structural companion re-inclusion
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_with_required_companions_readds_radio_search():
+    """play_radio's station_id is unknowable without search_stations, so the
+    pre-selection must never end up with play_radio but no search tool."""
+    from services.agent_service import _with_required_companions
+
+    out = _with_required_companions(["internal.resolve_room_player", "internal.play_radio"])
+    assert "mcp.radio.search_stations" in out
+    # order-stable: companion appended, originals kept in order
+    assert out[:2] == ["internal.resolve_room_player", "internal.play_radio"]
+
+
+@pytest.mark.unit
+def test_with_required_companions_is_dedup_safe_and_inert():
+    from services.agent_service import _with_required_companions
+
+    # already present → no duplicate
+    out = _with_required_companions(["internal.play_radio", "mcp.radio.search_stations"])
+    assert out.count("mcp.radio.search_stations") == 1
+    # unrelated tools untouched
+    assert _with_required_companions(["internal.media_control"]) == ["internal.media_control"]
+    assert _with_required_companions([]) == []

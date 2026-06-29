@@ -32,13 +32,15 @@ from pathlib import Path
 
 from loguru import logger
 
+from utils.config import settings
 
-# Cold-start window for the LLM-metadata confirm flow. Design doc § 5:
-# first N uploads per user require explicit confirm; after that the
-# system trusts itself and extraction runs silently. N=10 is
-# conservative — covers "first two weeks of household use" at ~1
-# upload/day without becoming permanent friction.
-_COLD_START_CONFIRM_N = 10
+
+# Cold-start window for the LLM-metadata confirm flow: the first N archives
+# require an explicit confirm; after that the system trusts itself and archives
+# silently. Sourced from settings (default 3) so it's tunable without a code
+# change — `PAPERLESS_COLD_START_CONFIRM_N=0` disables the confirm entirely.
+# (Was a hard-coded 10, which felt like permanent friction in practice.)
+_COLD_START_CONFIRM_N = settings.paperless_cold_start_confirm_n
 
 # Skip-metadata heuristic. The agent can pass ``skip_metadata=True``
 # explicitly when the user said "ohne Metadaten". The tool itself also
@@ -57,6 +59,10 @@ CHAT_UPLOAD_TOOLS: dict = {
             "Forward a file the user has attached to this chat to Paperless-NGX "
             "for OCR and archiving. Reads the file from server storage using the "
             "attachment_id shown in the UPLOADED DOCUMENT section of this prompt. "
+            "If no attachment_id is shown (e.g. the user asks in a follow-up "
+            "message), call this tool WITHOUT attachment_id — the server resolves "
+            "the most recent completed upload in this chat session. Never invent "
+            "an attachment_id. "
             "Do NOT pass file_content_base64 — the tool does that internally from "
             "real file bytes. Preferred over mcp.paperless.upload_document for "
             "user-attached files. "
@@ -69,7 +75,9 @@ CHAT_UPLOAD_TOOLS: dict = {
         "parameters": {
             "attachment_id": (
                 "Integer ID of the attachment shown in the UPLOADED DOCUMENT "
-                "section. Required."
+                "section. OPTIONAL — omit it if no id is shown and the server "
+                "will use the most recent completed upload in this chat session. "
+                "Never guess or fabricate an id."
             ),
             "title": (
                 "Optional Paperless document title. Defaults to the attachment "
@@ -168,26 +176,35 @@ async def forward_attachment_to_paperless(
             auth-disabled), the cold-start check is bypassed and
             extraction always runs with confirm.
     """
-    attachment_id_raw = params.get("attachment_id")
-    if attachment_id_raw is None:
-        return {
-            "success": False,
-            "message": "Parameter 'attachment_id' is required",
-            "action_taken": False,
-        }
-    try:
-        attachment_id = int(attachment_id_raw)
-    except (TypeError, ValueError):
-        return {
-            "success": False,
-            "message": f"'attachment_id' must be an integer, got: {attachment_id_raw!r}",
-            "action_taken": False,
-        }
-
     if mcp_manager is None:
         return {
             "success": False,
             "message": "MCP manager not available — Paperless MCP not wired in",
+            "action_taken": False,
+        }
+
+    # attachment_id is a HINT, not a hard requirement. The agent often forwards
+    # as a follow-up message ("auch an Paperless schicken") that carries no bound
+    # attachment, or guesses an id that isn't in this session. Parse leniently —
+    # an unresolvable id falls through to the session fallback below instead of
+    # failing with a confusing "not found" (or the agent fabricating an id).
+    attachment_id_raw = params.get("attachment_id")
+    attachment_id: int | None = None
+    if attachment_id_raw is not None:
+        try:
+            attachment_id = int(attachment_id_raw)
+        except (TypeError, ValueError):
+            attachment_id = None
+
+    # Nothing to resolve from: no usable id AND no session to fall back on.
+    # Return without touching the DB.
+    if attachment_id is None and session_id is None:
+        return {
+            "success": False,
+            "message": (
+                "Kein hochgeladenes Dokument gefunden. Bitte hänge die Datei an "
+                "und warte, bis der Upload abgeschlossen ist."
+            ),
             "action_taken": False,
         }
 
@@ -198,18 +215,48 @@ async def forward_attachment_to_paperless(
         from services.database import AsyncSessionLocal
 
         async with AsyncSessionLocal() as db:
-            query = select(ChatUpload).where(ChatUpload.id == attachment_id)
-            if session_id is not None:
-                query = query.where(ChatUpload.session_id == session_id)
-            result = await db.execute(query)
-            upload = result.scalar_one_or_none()
+            upload = None
+            if attachment_id is not None:
+                query = select(ChatUpload).where(ChatUpload.id == attachment_id)
+                if session_id is not None:
+                    query = query.where(ChatUpload.session_id == session_id)
+                upload = (await db.execute(query)).scalar_one_or_none()
+
+            # Session fallback: resolve to the most recent completed upload in
+            # THIS chat session when the agent passed no/unresolvable id. Scoped
+            # to session_id, so it can never reach another user's upload.
+            if upload is None and session_id is not None:
+                fb = (
+                    select(ChatUpload)
+                    .where(
+                        ChatUpload.session_id == session_id,
+                        ChatUpload.status == "completed",
+                        ChatUpload.extracted_text.isnot(None),
+                    )
+                    .order_by(ChatUpload.id.desc())
+                    .limit(1)
+                )
+                upload = (await db.execute(fb)).scalar_one_or_none()
+                if upload is not None:
+                    logger.info(
+                        "forward_attachment_to_paperless: no usable attachment_id "
+                        "(%r); session fallback → upload %s (%s)",
+                        attachment_id_raw, upload.id, upload.filename,
+                    )
 
         if not upload:
             return {
                 "success": False,
-                "message": f"Attachment {attachment_id} not found",
+                "message": (
+                    "In diesem Chat ist kein hochgeladenes Dokument vorhanden. "
+                    "Bitte hänge die Datei an und warte, bis der Upload "
+                    "abgeschlossen ist, bevor du sie an Paperless schickst."
+                ),
                 "action_taken": False,
             }
+
+        # Authoritative from here on — the fallback may have resolved the id.
+        attachment_id = upload.id
 
         if not upload.file_path or not Path(upload.file_path).is_file():
             return {
@@ -356,6 +403,14 @@ async def forward_attachment_to_paperless(
                 "confirm_token": confirm_token,
                 "attachment_id": attachment_id,
                 "filename": upload.filename,
+                # Structured payload for the interactive confirm card. The text
+                # preview above stays as the fallback; clients that render the
+                # card use this. `idx` is 1-based over the FULL proposals list so
+                # it maps straight to pending.proposals[idx-1] in the structured
+                # commit path (same convention as _parse_user_choices).
+                "confirm": _build_confirm_payload(
+                    post_fuzzy, extraction_result.metadata.resolutions,
+                ),
             },
         }
     except Exception as e:
@@ -586,26 +641,60 @@ async def _run_extraction(
         return None
 
 
-async def _get_confirms_used(user_id: int | None) -> int:
-    """Read ``users.paperless_confirms_used`` for the cold-start check.
+# Single-user (AUTH-off) cold-start counter. There's no user row to hang
+# ``paperless_confirms_used`` on, so the trust-after-N ramp is tracked in a
+# global SystemSetting key instead — otherwise the confirm would fire forever.
+_SINGLEUSER_CONFIRMS_KEY = "paperless.singleuser_confirms_used"
 
-    Returns 0 when ``user_id`` is None (auth-disabled dev) so extraction
-    always runs with confirm in that mode — the operator can decide to
-    flip the flag via the admin UI once they're comfortable.
+
+async def _get_confirms_used(user_id: int | None) -> int:
+    """Read the cold-start confirm counter. Per-user (``users.
+    paperless_confirms_used``) when known; a global SystemSetting key in
+    single-user / auth-disabled mode so trust-after-N works without a user id.
     """
-    if user_id is None:
-        return 0
     from sqlalchemy import select
 
-    from models.database import User
+    from models.database import SystemSetting, User
     from services.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
+        if user_id is None:
+            row = await db.get(SystemSetting, _SINGLEUSER_CONFIRMS_KEY)
+            if row is None:
+                return 0
+            try:
+                return int(json.loads(row.value))
+            except (ValueError, TypeError):
+                return 0
         result = await db.execute(
             select(User.paperless_confirms_used).where(User.id == user_id)
         )
-        value = result.scalar()
-    return int(value or 0)
+        return int(result.scalar() or 0)
+
+
+async def _bump_confirms_used(db, user_id: int | None) -> None:
+    """Increment the cold-start confirm counter on the given session (no commit).
+    Per-user when known; the global SystemSetting key in single-user mode."""
+    from sqlalchemy import update
+
+    from models.database import SystemSetting, User
+
+    if user_id is not None:
+        await db.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(paperless_confirms_used=User.paperless_confirms_used + 1)
+        )
+        return
+    row = await db.get(SystemSetting, _SINGLEUSER_CONFIRMS_KEY)
+    if row is None:
+        db.add(SystemSetting(key=_SINGLEUSER_CONFIRMS_KEY, value=json.dumps(1)))
+    else:
+        try:
+            cur = int(json.loads(row.value))
+        except (ValueError, TypeError):
+            cur = 0
+        row.value = json.dumps(cur + 1)
 
 
 def _extraction_to_upload_params(post_fuzzy: dict) -> dict:
@@ -721,3 +810,76 @@ def _render_confirm_message(
         "auf ausdrücklichen Wunsch (`neu`)."
     )
     return "\n".join(lines)
+
+
+def _build_confirm_payload(metadata: dict, resolutions: list) -> dict:
+    """Structured confirm data for the interactive confirm card.
+
+    Mirrors `_render_confirm_message` but emits machine-readable per-field
+    options instead of prose, so the frontend can render a clickable picker
+    and submit a structured decision (no free-text parsing).
+
+    `summary` is the already-resolved metadata (shown read-only on the card).
+    `fields` is one entry per resolution that still needs a user decision.
+    Each field's `idx` is **1-based over the full resolutions list** so it
+    maps straight to `pending.proposals[idx-1]` in the structured commit
+    path — the same index convention `_parse_user_choices` uses, so an
+    exact-match field we don't surface still doesn't shift the indices.
+    """
+    summary = {
+        key: metadata.get(key)
+        for key in (
+            "title", "correspondent", "document_type",
+            "tags", "storage_path", "created_date",
+        )
+    }
+
+    fields = []
+    for i, res in enumerate(resolutions or []):
+        field = res.field if hasattr(res, "field") else res.get("field")
+        extracted = (
+            res.extracted_value if hasattr(res, "extracted_value")
+            else res.get("extracted_value")
+        )
+        near = (
+            list(res.near_matches) if hasattr(res, "near_matches")
+            else list(res.get("near_matches") or [])
+        )
+        needs_decision = (
+            res.requires_user_decision if hasattr(res, "requires_user_decision")
+            else (res.get("status") != "exact" or bool(near))
+        )
+        if not needs_decision:
+            continue
+
+        # Options, in display order: each near-match (pick existing), then
+        # "create new" with the extracted value, then "leave empty".
+        options = [
+            {"action": "use", "value": candidate, "label": candidate}
+            for candidate in near
+        ]
+        options.append({
+            "action": "create",
+            "value": extracted,
+            "label": f"Neu anlegen: „{extracted}“",
+        })
+        options.append({"action": "skip", "value": None, "label": "Leer lassen"})
+
+        # Default mirrors `_default_decisions`: take the top near-match if
+        # present (the "(Vorschlag)" the text preview marks), else leave empty.
+        # NEVER default to "create" — new taxonomy entries only on explicit ask.
+        default = (
+            {"action": "use", "value": near[0]} if near
+            else {"action": "skip", "value": None}
+        )
+
+        fields.append({
+            "idx": i + 1,
+            "field": field,
+            "label": _FIELD_LABELS_DE.get(field, field),
+            "extracted_value": extracted,
+            "options": options,
+            "default": default,
+        })
+
+    return {"summary": summary, "fields": fields}

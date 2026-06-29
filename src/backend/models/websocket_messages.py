@@ -189,6 +189,28 @@ class WSChatMessage(BaseModel):
     knowledge_base_id: int | None = Field(None, description="Specific knowledge base to search")
     # Document upload context
     attachment_ids: list[int] | None = Field(None, description="IDs of uploaded documents to include as context")
+    # Command-palette role override: a soft routing hint for the next turn (the
+    # palette's "switch agent role" action). Validated against agent_roles.yaml in
+    # the handler; an unknown/None value is ignored and normal routing applies.
+    role_hint: str | None = Field(None, max_length=64, description="Soft agent-role routing hint")
+    # "Korrigieren & neu beantworten": when the user corrects a mis-classified
+    # intent via the chat feedback control and re-runs the turn, the corrected
+    # intent string (e.g. "mcp.dlna.play_album", "knowledge.ask") rides here. The
+    # handler maps it to an agent role (agent_router.role_for_intent) and uses it
+    # as the role_hint. An explicit role_hint takes precedence; an unmappable
+    # value is ignored and normal routing applies.
+    corrected_intent: str | None = Field(None, max_length=128, description="Corrected intent to force-route a regenerated turn")
+    # Chat branching (edit-and-fork, Phase 1). When set (and CHAT_BRANCHING_ENABLED),
+    # this turn FORKS: the new user message is inserted as a SIBLING under
+    # `fork_from_message_id` rather than appended to the current tip. Two shapes:
+    #   * edit-and-resubmit: client sends new `content` + fork_from = the PARENT of
+    #     the user message being edited (so the new user msg is a sibling of the
+    #     edited one).
+    #   * regenerate: client sends fork_from = the USER message of the turn (same
+    #     content re-run) → a new assistant sibling.
+    # Ignored entirely when the flag is off. The abandoned branch's memories are
+    # deactivated before generation (deactivate-at-fork).
+    fork_from_message_id: int | None = Field(None, description="Fork parent message id (chat branching)")
     # Phase B voice integration (B.4.a). Voice-server emits a 192-dim
     # ECAPA-TDNN speaker embedding on `final_transcript`; the frontend
     # forwards it here so the chat handler can resolve a Speaker DB row

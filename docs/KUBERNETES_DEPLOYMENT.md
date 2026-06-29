@@ -68,7 +68,7 @@ Cluster-wide Traefik changes (entrypoints, TLS, CRDs) are tracked in `../private
 | Service | Image | Notes |
 |---------|-------|-------|
 | Backend | `registry.treehouse.x-idra.de/renfield/backend:latest` | CPU image (~3.5 GB). Includes wake-word models and renfield-mcp-dlna entrypoint |
-| Frontend | `registry.treehouse.x-idra.de/renfield/frontend:latest` | Nginx serving React SPA |
+| Frontend | `registry.treehouse.x-idra.de/renfield/frontend:latest` | Nginx serving React SPA (vite-plugin-pwa PWA). `nginx.conf` serves `sw.js`/`registerSW.js`/`index.html`/manifest `no-cache` and content-hashed bundles `immutable` — required for new deploys to reach the browser; see deploy-production skill → "Frontend PWA cache propagation" |
 | PostgreSQL | `pgvector/pgvector:pg16` | pgvector for embedding search |
 | Redis | `redis:7-alpine` | Message queue + cache (AOF enabled) |
 | Ollama | `ollama/ollama:latest` | LLM inference, requires GPU |
@@ -81,6 +81,8 @@ Harbor is the registry. A `harbor-pull-secret` of type `kubernetes.io/dockerconf
 ### Why torch+cpu via constraints
 
 The backend image had ballooned to 7.5 GB because transitive deps in `docling`, `easyocr`, and `transformers` upgraded torch to a CUDA build, dragging in `nvidia/*` wheels (2.7 GB) and `triton` (641 MB). `src/backend/constraints.txt` pins `torch`/`torchaudio`/`torchvision` to `+cpu` wheels from the PyTorch CPU index so pip's resolver cannot upgrade. Final image: ~3.5 GB, which pushes through Harbor's proxy without the 504 timeouts that the old layer had.
+
+**`transformers` must stay capped `<5`** (`requirements.txt`). Since the torch pin holds at the **2.6.0 +cpu** wheel, an unbounded `transformers` resolves to a 5.x release that references `torch.float8_e8m0fnu` (added only in torch ≥ 2.7). That breaks the Docling import chain at runtime (`AttributeError: module 'torch' has no attribute 'float8_e8m0fnu'` → `Could not import module 'AutoProcessor'` → "Docling nicht installiert"), so **every** document fails processing (`status=failed`). `transformers>=4.47.0,<5` resolves to 4.57.x (with `huggingface_hub` 0.36.x), which `docling-ibm-models` (`>=4.42`) accepts and which keeps `rt_detr_v2` support. Only the **document-worker** runs Docling, so a worker-only image roll fixes this with zero API downtime. Reprocess already-failed docs by moving them from the watch-share `processed/` back to `incomming/` (the folder-ingest D2 matrix re-ingests a `failed` row on re-push).
 
 ## Manifest Structure
 
@@ -189,6 +191,35 @@ A follow-up will introduce cert-manager with Let's Encrypt.
 Satellites and browsers resolve `renfield.local` via multicast DNS. The `mdns-responder` pod runs Avahi on a worker's host network and publishes `renfield.local → 192.168.1.230`; it is a singleton (only one Avahi per name on the LAN).
 
 For clients whose resolvers bypass mDNS (e.g., `getent hosts renfield.local` via DNS-only on some systems), the site's upstream DNS also carries the record.
+
+## Cross-cluster service exposure (LLM / voice)
+
+Some GPU-backed services in the `renfield` namespace are exposed to **other clusters** on the LAN over Traefik `*.test.local` hostnames (VIP `192.168.1.230`), not just to in-cluster pods. Today the external consumer is the **Reva** prod cluster (`192.168.99.0/24`), which uses this cluster as its router/embeddings + voice tier:
+
+| Hostname | Backend Service | Port | External consumer |
+|---|---|---|---|
+| `ollama.test.local` | `ollama` | 11434 | Reva router / embeddings |
+| `voice.test.local` | `voice-server` | 8080 | Reva voice (`VOICE_SERVER_URL`) |
+| `llama-agent.test.local` | `llama-server-agent` | 8080 | (dormant — agent normally scaled to 0) |
+
+> In-cluster Renfield (`backend`) reaches these same services via the ClusterIP Services (`voice-server:8080`, `ollama:11434`) and does **not** use these ingresses.
+
+**Security — IP allowlist.** `ollama`/`llama-server` have no built-in auth, so these ingresses are gated by a Traefik `IPAllowList` middleware (`llm-ingress-allowlist`, namespace `renfield`) restricting the source to the consuming cluster's subnet — otherwise any LAN host could drive unauthenticated, uncapped inference on the GPU (DoS / cost-abuse).
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: { name: llm-ingress-allowlist, namespace: renfield }
+spec:
+  ipAllowList:
+    sourceRange:
+      - 192.168.99.0/24      # Reva prod cluster (append new consumer subnets here)
+```
+Attached per-ingress via `traefik.ingress.kubernetes.io/router.middlewares: renfield-llm-ingress-allowlist@kubernetescrd`.
+
+**Prerequisite:** `traefik-web-service` must run `externalTrafficPolicy: Local`. With MetalLB-L2 + the default `Cluster` policy, kube-proxy SNATs the client to a node IP before Traefik sees it, so `IPAllowList` (which matches the direct TCP remote) would gate node IPs and fail silently. The consuming cluster appears by its **node** LAN IP (Calico `natOutgoing` SNATs the pod IP), so allowlist on the node subnet, not pod IPs.
+
+Manifests live in the cluster repo (`private_k8s/renfield-llm-voice-ingress.yaml`, `private_k8s/traefik.yaml`). Cross-referenced from Reva at `docs/operations/security-hardening.md` §11.
 
 ## Deploy Sequence
 

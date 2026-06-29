@@ -18,7 +18,9 @@ On any failure after backup creation, the backup is restored automatically.
 
 import asyncio
 import hashlib
+import logging
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -28,6 +30,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 import urllib.request
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateStage(str, Enum):
@@ -59,6 +63,11 @@ class UpdateRequest:
     package_url: str
     checksum: str  # Format: "sha256:hexdigest"
     size_bytes: int
+    # Signed release manifest (security H6). manifest = the canonical JSON bytes
+    # the offline release key signed; signature = base64 Ed25519 over them.
+    # Absent on unsigned/legacy releases (verified only when present, or required).
+    manifest: str | None = None
+    signature: str | None = None
 
 
 class UpdateManager:
@@ -73,7 +82,10 @@ class UpdateManager:
         self,
         install_path: Optional[str] = None,
         backup_path: Optional[str] = None,
-        service_name: str = "renfield-satellite"
+        service_name: str = "renfield-satellite",
+        verify_tls: bool = True,
+        release_pubkeys: Optional[list] = None,
+        require_signature: bool = False,
     ):
         """
         Initialize UpdateManager.
@@ -82,7 +94,37 @@ class UpdateManager:
             install_path: Path where satellite is installed
             backup_path: Path for backup during update
             service_name: Name of systemd service to restart
+            verify_tls: Verify the TLS certificate when downloading the update
+                package (review H6). Defaults True — the OTA download is a
+                code-delivery path and must not silently disable verification.
+                Tied to the same config.server.verify_tls as the WS/auth paths;
+                set False only for a self-signed local backend.
+            release_pubkeys: Pinned Ed25519 release public keys (64-hex each) the
+                signed manifest is verified against (security H6). N keys → rotation.
+            require_signature: When True, an update with no valid signed manifest
+                is REJECTED (fail closed). Default False = verify-if-present
+                (legacy/unsigned releases still install on the checksum alone).
         """
+        self.verify_tls = verify_tls
+        self.release_pubkeys = [k for k in (release_pubkeys or []) if k]
+        self.require_signature = require_signature
+        # Last-failure detail for an accurate terminal status (vs. a generic
+        # "check logs") — see start_update / the satellite's send_update_failed.
+        self._last_error: Optional[str] = None
+        self._rolled_back = False
+        # Probe cryptography at startup if signature verification is configured,
+        # so a missing crypto stack is loud NOW rather than only when an OTA is
+        # attempted (the documented IRK silent-no-op trap).
+        if self.require_signature or self.release_pubkeys:
+            try:
+                import cryptography  # noqa: F401
+            except Exception:
+                logger.error(
+                    "OTA signature verification is configured (require_signature=%s, "
+                    "%d pinned key(s)) but `cryptography` is NOT installed — every "
+                    "signed update will be REJECTED. Install cryptography on this satellite.",
+                    self.require_signature, len(self.release_pubkeys),
+                )
         # Default paths
         if install_path:
             self.install_path = Path(install_path)
@@ -90,11 +132,18 @@ class UpdateManager:
             # Try to detect install path
             self.install_path = self._detect_install_path()
 
-        # Backup path within installation directory (user has write access)
+        # Backup path — must be (1) OUTSIDE install_path, so the rollback's own
+        # rmtree(install_path) can't delete it (a backup under install_path/.backup
+        # bricked a satellite in prod — #775), AND (2) writable by the service user.
+        # The earlier "sibling of install_path" choice broke #2: install_path.parent
+        # is typically /opt, which is root-owned, so a non-root satellite (runs as
+        # `evdb`) hit `[Errno 13] Permission denied` at the backup step and every OTA
+        # failed there. Use the running user's home (writable + external), falling
+        # back to the temp dir.
         if backup_path:
             self.backup_path = Path(backup_path)
         else:
-            self.backup_path = self.install_path / ".backup"
+            self.backup_path = self._default_backup_path()
         self.service_name = service_name
 
         # State
@@ -103,6 +152,23 @@ class UpdateManager:
         self._progress = 0
         self._on_progress: Optional[Callable[[UpdateStage, int, str], None]] = None
         self._backup_created = False
+
+    def _default_backup_path(self) -> Path:
+        """A backup dir that is OUTSIDE install_path and writable by this process.
+
+        Prefers the running user's home (writable, external to the typically
+        root-owned /opt where install_path lives); falls back to the temp dir if
+        home is missing or not writable. Never a child of install_path.
+        """
+        name = ".renfield-update-backup-" + self.install_path.name
+        try:
+            import pwd
+            home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+            if home and home != self.install_path and os.access(home, os.W_OK):
+                return home / name
+        except (KeyError, OSError, ImportError):
+            pass
+        return Path(tempfile.gettempdir()) / name
 
     def _detect_install_path(self) -> Path:
         """Detect the satellite installation path"""
@@ -158,7 +224,9 @@ class UpdateManager:
         package_url: str,
         checksum: str,
         size_bytes: int,
-        base_url: str = ""
+        base_url: str = "",
+        manifest: Optional[str] = None,
+        signature: Optional[str] = None,
     ) -> bool:
         """
         Start the update process.
@@ -190,8 +258,13 @@ class UpdateManager:
             target_version=target_version,
             package_url=full_url,
             checksum=checksum,
-            size_bytes=size_bytes
+            size_bytes=size_bytes,
+            manifest=manifest,
+            signature=signature,
         )
+
+        self._last_error = None
+        self._rolled_back = False
 
         try:
             # Store current version for rollback message
@@ -204,16 +277,22 @@ class UpdateManager:
             # 2. Verify checksum (40-45%)
             self._verify_checksum(package_path, request.checksum)
 
-            # 3. Create backup (45-55%)
-            self._create_backup()
-
-            # 4. Extract package (55-70%)
+            # 3. Extract package (55-70%)
             extract_path = self._extract_package(package_path)
 
-            # 5. Install (70-90%)
+            # 4. Verify the signed release manifest (H6): authenticity, not just
+            # integrity. Done BEFORE the backup + install so a rejection aborts
+            # without touching the installed code (no needless rollback). Aborts
+            # on any tamper/mismatch, or when a signature is required but absent.
+            self._verify_signature(extract_path, request)
+
+            # 5. Create backup (only now that the package is authenticated)
+            self._create_backup()
+
+            # 6. Install (70-90%)
             self._install_package(extract_path)
 
-            # 6. Restart service (90-100%)
+            # 7. Restart service (90-100%)
             self._report_progress(UpdateStage.RESTARTING, 90, "Restarting service...")
 
             # Report success before restart (we won't be able to after)
@@ -226,12 +305,15 @@ class UpdateManager:
 
         except UpdateError as e:
             print(f"[Update] Error: {e}")
+            self._last_error = e.message
             self._report_progress(UpdateStage.FAILED, 0, str(e.message))
 
-            # Attempt rollback if backup was created
+            # Attempt rollback if backup was created (a pre-backup failure — e.g.
+            # a rejected signature — leaves the install untouched, no rollback).
             if self._backup_created:
                 try:
                     self._rollback()
+                    self._rolled_back = True
                 except Exception as rollback_error:
                     print(f"[Update] Rollback failed: {rollback_error}")
 
@@ -239,11 +321,13 @@ class UpdateManager:
 
         except Exception as e:
             print(f"[Update] Unexpected error: {e}")
+            self._last_error = str(e)
             self._report_progress(UpdateStage.FAILED, 0, str(e))
 
             if self._backup_created:
                 try:
                     self._rollback()
+                    self._rolled_back = True
                 except Exception as rollback_error:
                     print(f"[Update] Rollback failed: {rollback_error}")
 
@@ -251,6 +335,18 @@ class UpdateManager:
 
         finally:
             self._is_updating = False
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """Detail of the most recent update failure (e.g. a signature rejection),
+        for an accurate terminal status instead of a generic 'check logs'."""
+        return self._last_error
+
+    @property
+    def rolled_back(self) -> bool:
+        """Whether the most recent failure actually rolled back (a pre-install
+        abort such as a rejected signature does not)."""
+        return self._rolled_back
 
     async def _download_package(self, request: UpdateRequest) -> Path:
         """Download the update package"""
@@ -271,12 +367,19 @@ class UpdateManager:
                         f"Downloading... ({count * block_size // 1024}KB / {total_size // 1024}KB)"
                     )
 
-            # Run download in thread pool to avoid blocking
-            # Use unverified SSL context for self-signed certs on local network
+            # Run download in thread pool to avoid blocking.
+            # TLS verification on the code-delivery path (review H6): a verifying
+            # context by default; only disabled when verify_tls is explicitly
+            # False (self-signed local backend), matching the WS/auth policy.
             import ssl
             ssl_ctx = ssl.create_default_context()
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
+            if not self.verify_tls:
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                logger.warning(
+                    "OTA download TLS verification is DISABLED (verify_tls=False) "
+                    "— update authenticity relies on the checksum only."
+                )
 
             def _download():
                 req = urllib.request.Request(request.package_url)
@@ -349,43 +452,105 @@ class UpdateManager:
         except Exception as e:
             raise UpdateError(UpdateStage.VERIFYING, str(e))
 
-    def _create_backup(self):
-        """Create backup of current installation"""
-        self._report_progress(UpdateStage.BACKING_UP, 45, "Creating backup...")
+    def _verify_signature(self, extract_path: Path, request: "UpdateRequest"):
+        """Verify the signed release manifest against the extracted tree (H6).
 
-        def ignore_special_files(directory, files):
-            """Ignore special files that can't be copied (named pipes, sockets, etc.)"""
-            ignored = []
-            for f in files:
-                path = os.path.join(directory, f)
-                # Skip named pipes, sockets, device files
-                if os.path.exists(path):
-                    mode = os.stat(path).st_mode
-                    import stat
-                    if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
-                        ignored.append(f)
-                # Also skip common cache/temp directories
-                if f in ['__pycache__', '.pytest_cache', '.git', 'venv', '.backup']:
-                    ignored.append(f)
-            return ignored
+        Fail-closed when ``require_signature`` is set; otherwise verify only when
+        a signature is present (an unsigned/legacy release still installs on the
+        checksum alone, but a present-but-INVALID signature always aborts).
+        """
+        import json as _json
+
+        has_sig = bool(request.manifest and request.signature)
+
+        if not has_sig:
+            if self.require_signature:
+                raise UpdateError(
+                    UpdateStage.VERIFYING,
+                    "release signature required but the update is unsigned — refusing to install",
+                )
+            logger.warning(
+                "OTA package is UNSIGNED (no release manifest) — installing on the "
+                "checksum alone. Set require_signature once the fleet has release keys."
+            )
+            return
+
+        # A signature is present → it MUST verify (even when not required).
+        from renfield_satellite.update.release_manifest import (
+            verify_extracted,
+            verify_signature,
+        )
+
+        self._report_progress(UpdateStage.VERIFYING, 50, "Verifying release signature...")
+        manifest_bytes = request.manifest.encode("utf-8")
+
+        if not self.release_pubkeys:
+            raise UpdateError(
+                UpdateStage.VERIFYING,
+                "update is signed but no release public keys are pinned on this satellite",
+            )
+        if not verify_signature(manifest_bytes, request.signature, self.release_pubkeys):
+            raise UpdateError(
+                UpdateStage.VERIFYING,
+                "release manifest signature does not verify against any pinned key",
+            )
+
+        try:
+            manifest = _json.loads(manifest_bytes)
+        except Exception as e:
+            raise UpdateError(UpdateStage.VERIFYING, f"malformed release manifest: {e}")
+
+        if manifest.get("version") != request.target_version:
+            raise UpdateError(
+                UpdateStage.VERIFYING,
+                f"manifest version {manifest.get('version')!r} != target {request.target_version!r}",
+            )
+
+        problems = verify_extracted(extract_path, manifest)
+        if problems:
+            raise UpdateError(
+                UpdateStage.VERIFYING,
+                f"package contents do not match the signed manifest: {problems[:3]}",
+            )
+
+        self._report_progress(UpdateStage.VERIFYING, 55, "Release signature verified")
+
+    def _create_backup(self):
+        """Back up only the parts of the install the update will replace.
+
+        _install_package swaps out exactly `renfield_satellite/` and
+        `requirements.txt` — nothing else. So the backup covers only those, NOT
+        the venv / config / models, which the update never touches and which MUST
+        survive a rollback. (The old code backed up the whole install_path but
+        excluded the venv, then the rollback rmtree'd the whole install_path —
+        deleting the venv it had no backup of. Net: a failed update bricked the
+        device.) The backup lives outside install_path (see __init__).
+        """
+        self._report_progress(UpdateStage.BACKING_UP, 45, "Creating backup...")
 
         try:
             # Remove old backup if exists
             if self.backup_path.exists():
                 shutil.rmtree(self.backup_path)
 
-            # Copy current installation to backup (ignoring special files)
-            if self.install_path.exists():
-                shutil.copytree(
-                    self.install_path,
-                    self.backup_path,
-                    ignore=ignore_special_files
-                )
-                self._backup_created = True
-                self._report_progress(UpdateStage.BACKING_UP, 55, "Backup created")
-            else:
+            code_dir = self.install_path / "renfield_satellite"
+            if not code_dir.exists():
                 # No existing installation to back up
                 self._report_progress(UpdateStage.BACKING_UP, 55, "No existing installation, skipping backup")
+                return
+
+            self.backup_path.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                code_dir,
+                self.backup_path / "renfield_satellite",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
+            )
+            req = self.install_path / "requirements.txt"
+            if req.exists():
+                shutil.copy(req, self.backup_path / "requirements.txt")
+
+            self._backup_created = True
+            self._report_progress(UpdateStage.BACKING_UP, 55, "Backup created")
 
         except Exception as e:
             raise UpdateError(UpdateStage.BACKING_UP, str(e))
@@ -443,8 +608,13 @@ class UpdateManager:
             if target_satellite_dir.exists():
                 shutil.rmtree(target_satellite_dir)
 
-            # Copy new files
-            shutil.copytree(satellite_dir, target_satellite_dir)
+            # Copy new files — strip bytecode so only verified .py source is
+            # installed (defense in depth for the H6 .pyc-injection guard;
+            # CPython recompiles fresh from the trusted .py).
+            shutil.copytree(
+                satellite_dir, target_satellite_dir,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
             self._report_progress(UpdateStage.INSTALLING, 80, "Files copied")
 
             # Copy requirements.txt if present
@@ -469,30 +639,66 @@ class UpdateManager:
         except Exception as e:
             raise UpdateError(UpdateStage.INSTALLING, str(e))
 
-    # Known-safe packages that may appear in satellite requirements
+    # Known-safe packages that may appear in satellite requirements.
+    # MUST stay in sync with src/satellite/requirements.txt — a missing entry
+    # makes the OTA installer reject the satellite's OWN dependency and roll the
+    # whole update back (the bug that blocked every OTA: soundcard / pymicro- /
+    # pyopen-wakeword / bleak were missing and RPi.GPIO failed name matching).
+    # Stored as written; compared after PEP 503 canonicalization, so RPi.GPIO,
+    # rpi-gpio and rpi_gpio all match. The regression test parses the real
+    # requirements.txt against this set.
     SAFE_PACKAGES = frozenset({
         "websockets", "aiohttp", "numpy", "onnxruntime",
-        "openwakeword", "webrtcvad", "noisereduce", "spidev",
+        "openwakeword", "pymicro-wakeword", "pyopen-wakeword",
+        "webrtcvad", "noisereduce", "spidev", "soundcard", "bleak",
         "lgpio", "python-mpv", "psutil", "pyyaml", "zeroconf",
-        "sounddevice", "pyaudio", "scipy", "librosa", "rpigpio",
+        "sounddevice", "pyaudio", "scipy", "librosa", "RPi.GPIO",
+        "cryptography",
     })
+
+    @staticmethod
+    def _canonical_pkg(name: str) -> str:
+        """PEP 503 canonical project name: lowercase, collapse runs of -_. to -.
+
+        This is the rule pip/PyPI use to resolve a project, so the validator's
+        equivalence classes line up with what `pip install` actually fetches.
+        Deleting the separators instead (the earlier approach) would let
+        `s.o.u.n.d.c.a.r.d` collapse onto `soundcard` while pip resolves it to a
+        DISTINCT PyPI project an attacker could register — an OTA RCE bypass.
+        """
+        return re.sub(r"[-_.]+", "-", name.split("[")[0].strip().lower())
 
     def _install_requirements(self, req_file: Path):
         """Install requirements with package whitelist validation"""
+        safe = {self._canonical_pkg(p) for p in self.SAFE_PACKAGES}
         # Parse and validate packages
         packages = []
         with open(req_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or line.startswith("-"):
+            for raw in f:
+                # Strip inline comments (PEP 508 `pkg>=1  # note`) and trim.
+                line = raw.split("#", 1)[0].strip()
+                if not line:
                     continue
-                # Extract package name (before any version specifier)
-                pkg_name = line.split("==")[0].split(">=")[0].split("<=")[0].split("~=")[0].split("!=")[0].split("[")[0].strip().lower().replace("-", "").replace("_", "")
-                packages.append((pkg_name, line))
+                # Reject pip option / flag / file-redirection lines OUTRIGHT.
+                # `pip install -r <file>` honours options inside the file, so a
+                # silently-skipped `--index-url https://evil/…` would repoint the
+                # whole install at an attacker index — bypassing the name
+                # allowlist entirely. Fail closed.
+                if line.startswith("-"):
+                    raise UpdateError(
+                        UpdateStage.INSTALLING,
+                        f"Disallowed pip option in requirements: {line!r}",
+                    )
+                # Extract package name (before any version specifier / marker).
+                # `@`/whitespace are intentionally NOT split on, so a direct URL
+                # reference (`pkg @ https://evil/x.whl`) keeps the URL in the
+                # token and fails the allowlist instead of resolving to `pkg`.
+                pkg_name = line
+                for sep in ("==", ">=", "<=", "~=", "!=", ">", "<", ";"):
+                    pkg_name = pkg_name.split(sep)[0]
+                packages.append((self._canonical_pkg(pkg_name), line))
 
-        rejected = [(name, spec) for name, spec in packages
-                     if name.replace("-", "").replace("_", "") not in
-                     {p.replace("-", "").replace("_", "") for p in self.SAFE_PACKAGES}]
+        rejected = [(name, spec) for name, spec in packages if name not in safe]
         if rejected:
             rejected_names = [spec for _, spec in rejected]
             print(f"[Update] Rejected unknown packages: {rejected_names}")
@@ -530,20 +736,29 @@ class UpdateManager:
             # Process might be killed by the restart, so don't raise
 
     def _rollback(self):
-        """Rollback to backup"""
+        """Restore the code + requirements from the external backup.
+
+        Only the items the update replaced are restored; the venv, config and
+        models are left untouched. NEVER rmtree install_path — doing that (with
+        an in-tree backup) is exactly what destroyed the install before.
+        """
         self._report_progress(UpdateStage.ROLLING_BACK, 0, "Rolling back...")
 
         try:
-            if not self.backup_path.exists():
+            backup_code = self.backup_path / "renfield_satellite"
+            if not backup_code.exists():
                 print("[Update] No backup to restore")
                 return
 
-            # Remove failed installation
-            if self.install_path.exists():
-                shutil.rmtree(self.install_path)
+            # Swap the failed code dir back for the backed-up one.
+            target_code = self.install_path / "renfield_satellite"
+            if target_code.exists():
+                shutil.rmtree(target_code)
+            shutil.copytree(backup_code, target_code)
 
-            # Restore from backup
-            shutil.copytree(self.backup_path, self.install_path)
+            backup_req = self.backup_path / "requirements.txt"
+            if backup_req.exists():
+                shutil.copy(backup_req, self.install_path / "requirements.txt")
 
             print("[Update] Rollback complete")
 

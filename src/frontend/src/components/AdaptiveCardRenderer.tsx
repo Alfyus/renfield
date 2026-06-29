@@ -151,6 +151,28 @@ const CITE_ENTITY_RE = /^[A-Za-z0-9_\-/]{1,256}$/;
 const isValidEntity = (v: string) => !!v && !v.includes('..') && CITE_ENTITY_RE.test(v);
 
 /**
+ * URL scheme allowlist for AdaptiveCard Action.OpenUrl / Image (review M3).
+ * React does NOT sanitize URL schemes in href/src, so a `javascript:` (or
+ * `data:`) URL from a card producer (incl. a federated Reva backend) would be a
+ * clickable XSS in the Renfield origin. Only http(s) and protocol-relative/
+ * same-origin relative URLs are allowed; anything else returns null so the
+ * caller renders inert text instead of a live link/image. Mirrors the
+ * fail-closed posture of the citation-chip path.
+ */
+const safeUrl = (v: string | undefined | null): string | null => {
+  if (!v || typeof v !== 'string') return null;
+  const s = v.trim();
+  // Relative / same-origin (no scheme, not protocol-relative "//evil").
+  if (/^\/(?!\/)/.test(s) || /^[.?#]/.test(s)) return s;
+  try {
+    const u = new URL(s, window.location.origin);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? s : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
  * Parse markdown bold/italic and inline citation tags into React elements.
  * No raw HTML injection — every dynamic value flows through React's
  * escape boundary.
@@ -241,10 +263,14 @@ function renderElement(element: AcElement | undefined, index: number | string = 
 
     case 'ColumnSet': {
       const cs = element as AcColumnSet;
-      const clickable = cs.selectAction?.type === 'Action.OpenUrl';
+      // M3: only clickable when the OpenUrl target passes the scheme allowlist.
+      const csHref = cs.selectAction?.type === 'Action.OpenUrl'
+        ? safeUrl(cs.selectAction.url)
+        : null;
+      const clickable = csHref !== null;
       const Wrapper = clickable ? 'a' : 'div';
-      const wrapperProps = clickable && cs.selectAction
-        ? { href: cs.selectAction.url, target: '_blank', rel: 'noopener noreferrer' }
+      const wrapperProps = csHref
+        ? { href: csHref, target: '_blank', rel: 'noopener noreferrer' }
         : {};
 
       return (
@@ -303,10 +329,13 @@ function renderElement(element: AcElement | undefined, index: number | string = 
       const img = element as AcImage;
       const sizeMap: Record<string, string> = { Small: 'h-8', Medium: 'h-16', Large: 'h-24', Auto: '' };
       const imgSize = (img.size && sizeMap[img.size]) || sizeMap.Medium;
+      // M3: drop images whose src isn't an allowed scheme (no data:/javascript:).
+      const imgSrc = safeUrl(img.url);
+      if (!imgSrc) return null;
       return (
         <img
           key={key}
-          src={img.url}
+          src={imgSrc}
           alt={img.altText || ''}
           className={`${imgSize} ${spacing} rounded`}
         />
@@ -319,10 +348,24 @@ function renderElement(element: AcElement | undefined, index: number | string = 
         <div key={key} className={`flex flex-wrap gap-2 ${spacing} ${separator}`}>
           {(as.actions ?? []).map((action, i) => {
             if (action.type === 'Action.OpenUrl') {
+              // M3: only render a live link for an allowed URL scheme; otherwise
+              // show the title as inert text (no javascript:/data: href).
+              const actionHref = safeUrl(action.url);
+              if (!actionHref) {
+                return (
+                  <span
+                    key={`${key}-action-${i}`}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium
+                      bg-gray-300 text-gray-700 rounded dark:bg-gray-600 dark:text-gray-200"
+                  >
+                    {action.title}
+                  </span>
+                );
+              }
               return (
                 <a
                   key={`${key}-action-${i}`}
-                  href={action.url}
+                  href={actionHref}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium

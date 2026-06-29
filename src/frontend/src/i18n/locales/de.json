@@ -27,7 +27,8 @@
     "noResults": "Keine Ergebnisse gefunden",
     "continue": "Weiter",
     "back": "Zurück",
-    "done": "Fertig"
+    "done": "Fertig",
+    "clear": "Leeren"
   },
   "nav": {
     "chat": "Chat",
@@ -47,6 +48,7 @@
     "memory": "Erinnerungen",
     "brain": "Zweites Gehirn",
     "brainReview": "Überprüfung",
+    "fristen": "Fristen",
     "federationAudit": "Föderations-Verlauf",
     "circles": "Kreise",
     "intents": "Intents",
@@ -64,7 +66,8 @@
     "adminSkills": "Fähigkeiten-Inbox",
     "adminToolHealth": "Werkzeug-Gesundheit",
     "adminTrajectories": "Verlaufstrajektorien",
-    "adminCurator": "Kurator"
+    "adminCurator": "Kurator",
+    "wissen": "Wissen"
   },
   "auth": {
     "login": "Anmelden",
@@ -124,7 +127,115 @@
     "yourMessage": "Deine Nachricht",
     "assistantResponse": "Antwort von {{appName}}",
     "readAloud": "Vorlesen",
+    "edit": "Bearbeiten",
+    "editMessage": "Nachricht bearbeiten",
+    "resubmit": "Erneut senden",
+    "regenerate": "Neu generieren",
+    "branch": {
+      "group": "Branch-Navigation",
+      "previous": "Vorheriger Branch",
+      "next": "Nächster Branch",
+      "position": "{{current}}/{{total}}",
+      "delete": "Diesen Branch löschen",
+      "deleteConfirm": "Diesen Branch und alle Antworten darin löschen? Das kann nicht rückgängig gemacht werden."
+    },
     "albumArt": "Albumcover",
+    "mediaHandoff": {
+      "followed": "Wiedergabe folgt nach {{room}}",
+      "followedUnknownRoom": "Wiedergabe folgt dir",
+      "continued": "Fortgesetzt in {{room}}",
+      "continuedUnknownRoom": "Wiedergabe fortgesetzt",
+      "ariaLabel": "Hinweis: Medienwiedergabe ist dir in einen anderen Raum gefolgt"
+    },
+    "sources": {
+      "label": "Quellen",
+      "more": "+{{count}} weitere"
+    },
+    "followups": {
+      "label": "Vorschläge für Folgefragen"
+    },
+    "artifacts": {
+      "generated": "generiert",
+      "loading": "Artefakt wird geladen",
+      "regionLabel": "Generiertes Artefakt: {{title}}",
+      "regionLabelUntitled": "Generiertes Artefakt",
+      "fallbackNote": "konnte nicht als Artefakt dargestellt werden",
+      "emptyTable": "Keine Zeilen",
+      "emptyList": "Keine Einträge",
+      "emptyKeyValue": "Keine Einträge",
+      "emptyChart": "Keine Datenpunkte",
+      "weather": {
+        "feelsLike": "Gefühlt {{temp}}"
+      },
+      "deviceControl": {
+        "empty": "Keine schaltbaren Geräte gefunden",
+        "run": "Szene {{name}} ausführen",
+        "runLabel": "Ausführen",
+        "brightness": "Helligkeit von {{name}}",
+        "tempDown": "Sollwert von {{name}} senken",
+        "tempUp": "Sollwert von {{name}} erhöhen"
+      },
+      "presenceMap": {
+        "empty": "Aktuell ist niemand zuhause erkennbar",
+        "nobody": "leer"
+      },
+      "chartSummary": "{{type}} mit {{count}} Datenreihe(n)",
+      "chartType": {
+        "bar": "Balkendiagramm",
+        "line": "Liniendiagramm"
+      },
+      "seriesFallback": "Reihe {{n}}"
+    },
+    "roleBadge": {
+      "pin": "Beantwortet von {{role}} · für die nächste Frage anheften",
+      "pinned": "{{role}} für die nächste Frage angeheftet"
+    },
+    "roles": {
+      "smart_home": "Smart Home",
+      "media": "Medien",
+      "documents": "Dokumente",
+      "research": "Recherche",
+      "presence": "Anwesenheit",
+      "workflow": "Automatisierung",
+      "general": "Allgemein",
+      "conversation": "Konversation",
+      "knowledge": "Wissen",
+      "routine": "Routine"
+    },
+    "palette": {
+      "title": "Aktionen",
+      "open": "Aktionspalette öffnen",
+      "search": "Aktion suchen…",
+      "noResults": "Keine Aktion gefunden",
+      "roleActive": "Rolle: {{role}}",
+      "clearRole": "Rolle zurücksetzen",
+      "categories": {
+        "navigate": "Navigation",
+        "tool": "Aktion",
+        "setRole": "Rolle"
+      },
+      "actions": {
+        "knowledge": "Dokumente öffnen",
+        "brain": "Wissen öffnen",
+        "fristen": "Fristen öffnen",
+        "memory": "Erinnerungen öffnen",
+        "graph": "Wissensgraph öffnen",
+        "circles": "Circles-Einstellungen",
+        "homeassistant": "Smart Home öffnen",
+        "cameras": "Kameras öffnen",
+        "rooms": "Räume öffnen",
+        "btScan": "Bluetooth-Geräte scannen",
+        "goodNight": "Gute-Nacht-Routine starten",
+        "goodMorning": "Guten-Morgen-Routine starten",
+        "presence": "Wer ist zuhause?",
+        "searchDocs": "In Dokumenten suchen",
+        "roleSmartHome": "Rolle: Smart Home",
+        "roleMedia": "Rolle: Medien",
+        "roleDocuments": "Rolle: Dokumente",
+        "roleResearch": "Rolle: Recherche",
+        "roleGeneral": "Rolle: Allgemein"
+      }
+    },
     "intent": "Intent",
     "startConversation": "Starte ein Gespräch mit {{appName}}",
     "useTextOrMic": "Du kannst Text eingeben oder das Mikrofon nutzen",
@@ -150,10 +261,11 @@
     "attachFile": "Datei anhängen",
     "uploading": "Wird hochgeladen...",
     "uploadSuccess": "Hochgeladen",
-    "uploadFailed": "Upload fehlgeschlagen",
+    "uploadFailed": "Verarbeitung fehlgeschlagen",
     "unsupportedFormat": "Dateiformat nicht unterstützt",
     "fileTooLarge": "Datei zu groß (max. {{size}}MB)",
     "removeAttachment": "Anhang entfernen",
+    "uploadProcessing": "wird verarbeitet …",
     "documentUploaded": "Dokument hochgeladen: {{filename}}",
     "documentAttached": "{{count}} Dokument(e) angehängt",
     "dropFileHere": "Datei ablegen zum Anhängen",
@@ -180,6 +292,22 @@
     "emailFailed": "E-Mail-Versand fehlgeschlagen",
     "documentIndexing": "Wird indexiert...",
     "documentIndexed": "In Wissensdatenbank indexiert",
+    "paperlessConfirm": {
+      "title": "Dokument in Paperless ablegen",
+      "decisionsHeading": "Bitte pro Feld wählen",
+      "confirm": "Ablegen",
+      "abort": "Abbrechen",
+      "submitted": "Auswahl gesendet",
+      "createValueLabel": "Neuer Eintrag",
+      "summaryFields": {
+        "title": "Titel",
+        "correspondent": "Korrespondent",
+        "document_type": "Dokumenttyp",
+        "tags": "Tags",
+        "storage_path": "Speicherpfad",
+        "created_date": "Ausstellungsdatum"
+      }
+    },
     "agentThinking": "Denkt nach...",
     "agentStepsCount": "{{count}} Schritt ausgeführt",
     "agentStepsCount_other": "{{count}} Schritte ausgeführt",
@@ -193,7 +321,23 @@
     },
     "exampleWeather": "Wie wird das Wetter?",
     "exampleLight": "Schalte das Licht im Wohnzimmer ein",
-    "exampleMusic": "Spiel Jazz Musik"
+    "exampleMusic": "Spiel Jazz Musik",
+    "search": {
+      "placeholderGlobal": "Nachrichten durchsuchen…",
+      "placeholderInConversation": "In dieser Unterhaltung suchen…",
+      "clear": "Suche leeren",
+      "searching": "Suche läuft…",
+      "resultsLabel": "Suchergebnisse",
+      "roleUser": "Du",
+      "roleAssistant": "Renfield",
+      "moreResults": "Weitere Treffer vorhanden – Suche verfeinern",
+      "emptyTitle": "Keine Nachrichten zu „{{query}}“ gefunden",
+      "emptyHintGlobal": "Versuch andere Begriffe oder prüfe die Schreibweise.",
+      "emptyHintInConversation": "In dieser Unterhaltung gibt es keinen passenden Treffer.",
+      "noPermissionTitle": "Suche nicht verfügbar",
+      "noPermissionHint": "Bitte melde dich an, um deine Nachrichten zu durchsuchen.",
+      "error": "Die Suche ist fehlgeschlagen. Bitte versuch es erneut."
+    }
   },
   "voice": {
     "startRecording": "Sprachaufnahme starten",
@@ -481,6 +625,20 @@
     "serverError": "Beim Hochladen ist etwas schiefgegangen.",
     "showDetails": "Details anzeigen",
     "hideDetails": "Details verbergen",
+    "facts": {
+      "toggle": "Fakten",
+      "title": "Extrahierte Fakten",
+      "loadError": "Fakten konnten nicht geladen werden.",
+      "extracting": "Fakten werden extrahiert …",
+      "empty": "Keine Fakten gefunden.",
+      "disabled": "Fakten-Extraktion ist deaktiviert.",
+      "disabledHint": "In den Einstellungen aktivierbar.",
+      "group": {
+        "identifier": "Kennzeichen",
+        "universal": "Eckdaten",
+        "obligation": "Fristen"
+      }
+    },
     "failedRetry": "Erneut hochladen",
     "pollingTimeout": "Die Verarbeitung von „{{filename}}\" dauert länger als erwartet. Bitte die Seite neu laden, um den aktuellen Status zu sehen."
   },
@@ -497,6 +655,8 @@
     "noMemories": "Noch keine Erinnerungen vorhanden",
     "count": "{{count}} Erinnerungen",
     "couldNotLoad": "Erinnerungen konnten nicht geladen werden",
+    "subjectLabel": "Über: {{name}}",
+    "aboutThisEntity": "Erinnerungen über diesen Knoten",
     "content": "Inhalt",
     "importance": "Wichtigkeit",
     "accessCount": "Zugriffe",
@@ -786,9 +946,58 @@
       "completed": "Abgeschlossen",
       "failed": "Fehlgeschlagen",
       "rolling_back": "Stelle Backup wieder her..."
+    },
+    "enrollment": {
+      "title": "Satelliten-Enrollment",
+      "description": "Stellt jedem Satelliten einen eindeutigen Enrollment-Schlüssel (PSK) aus, mit dem er sich beim Backend ausweist. Der Schlüssel wird nur EINMAL angezeigt — danach auf dem Satelliten hinterlegen.",
+      "statusEnabled": "Enrollment aktiv",
+      "statusDisabled": "Enrollment inaktiv",
+      "statusEnforcing": "Erzwungen",
+      "statusPermissive": "Übergangsphase",
+      "pendingCount": "{{count}} noch nicht authentifiziert",
+      "satelliteId": "Satelliten-ID",
+      "satelliteIdPlaceholder": "z. B. sat-wohnzimmer",
+      "room": "Raum",
+      "roomPlaceholder": "Raum (optional)",
+      "enroll": "Einschreiben",
+      "enrolling": "Wird eingeschrieben …",
+      "enrollFailed": "Enrollment fehlgeschlagen",
+      "tokenMinted": "Schlüssel für {{id}} erstellt",
+      "tokenRotated": "Schlüssel für {{id}} neu erstellt",
+      "tokenOnceWarning": "Dieser Schlüssel wird nur einmal angezeigt. Jetzt kopieren und auf dem Satelliten hinterlegen (host_vars oder k8s-Secret).",
+      "copy": "Kopieren",
+      "copied": "Kopiert",
+      "lastAuth": "Zuletzt authentifiziert",
+      "never": "nie",
+      "connected": "Verbunden",
+      "offline": "Offline",
+      "revoked": "widerrufen",
+      "revoke": "Widerrufen",
+      "rotate": "Neu ausstellen",
+      "alreadyEnrolled": "Bereits eingeschrieben — nutze „Neu ausstellen\", um ein frisches Token zu erzeugen.",
+      "copyFailed": "Kopieren fehlgeschlagen — Token manuell markieren und kopieren (wird nur einmal angezeigt).",
+      "invalidIdFormat": "Ungültiges Format der Satelliten-ID — nur Buchstaben, Zahlen und . _ - erlaubt."
     }
   },
   "presence": {
+    "irk": {
+      "title": "Telefon-Präsenz (BLE-Kopplung)",
+      "description": "Koppeln Sie ein Telefon einmalig, damit seine wechselnde Bluetooth-Adresse einer festen Identität für die Raumpräsenz zugeordnet wird. Keine App nötig.",
+      "user": "Benutzer",
+      "selectUser": "Benutzer wählen…",
+      "satellite": "Satellit",
+      "selectSatellite": "Satellit wählen…",
+      "label": "Bezeichnung",
+      "labelPlaceholder": "z. B. eduard-iphone",
+      "startPairing": "Kopplung starten",
+      "waiting": "Warte auf Telefon…",
+      "instructions": "Am Telefon: Einstellungen → Bluetooth → „Renfield {{room}}“ antippen.",
+      "theSatellite": "den Satelliten",
+      "captured": "Gekoppelt — Telefon-Präsenz wird jetzt erfasst.",
+      "failed": "Kein Telefon rechtzeitig gekoppelt. Bitte erneut versuchen.",
+      "disabled": "deaktiviert",
+      "revoke": "Entfernen"
+    },
     "title": "Anwesenheit",
     "subtitle": "Wer ist wo — Raumpräsenz via BLE, Sprache und Web",
     "roomOccupancy": "Raumbelegung",
@@ -833,6 +1042,12 @@
     "tabLive": "Live",
     "tabAnalytics": "Analytik",
     "heatmapTitle": "Raum-Aktivitäts-Heatmap",
+    "heatmapDescription": "Wie oft ein Raum zu welcher Tageszeit betreten wurde (lokale Zeit). Dunkler = häufiger.",
+    "heatmapHourAxis": "Uhrzeit (Stunde des Tages)",
+    "heatmapRoomLabel": "Raum",
+    "heatmapLegendLess": "weniger",
+    "heatmapLegendMore": "mehr",
+    "heatmapCellTooltip": "{{room}} um {{hour}}:00 Uhr — {{count}}×",
     "predictionsTitle": "Anwesenheits-Prognosen",
     "dailySummaryTitle": "Tägliche Aktivität",
     "allUsers": "Alle Benutzer",
@@ -886,6 +1101,7 @@
     "selectCorrectIntent": "Richtigen Intent wählen:",
     "selectComplexity": "Richtige Einstufung wählen:",
     "correctionSaved": "Korrektur gespeichert! {{appName}} lernt daraus.",
+    "regenerate": "Neu beantworten",
     "proactiveQuestion": "War das die richtige Zuordnung?",
     "intentConversation": "Allgemeine Konversation",
     "intentKnowledge": "Wissensdatenbank",
@@ -913,7 +1129,8 @@
     "forbidden": "Zugriff verweigert",
     "serverError": "Serverfehler",
     "validationError": "Validierungsfehler",
-    "couldNotProcess": "Entschuldigung, es gab einen Fehler bei der Verarbeitung deiner Anfrage."
+    "couldNotProcess": "Entschuldigung, es gab einen Fehler bei der Verarbeitung deiner Anfrage.",
+    "connectionInterrupted": "Die Verbindung wurde während der Antwort unterbrochen. Bitte versuche es erneut."
   },
   "errorBoundary": {
     "title": "Etwas ist schiefgelaufen",
@@ -1029,6 +1246,7 @@
       "control": "Audit-Steuerung",
       "review": "Prüf-Warteschlange",
       "ocr": "OCR-Probleme",
+      "lowquality": "Niedrige OCR-Qualität",
       "completeness": "Vollständigkeit",
       "duplicates": "Duplikate",
       "correspondents": "Ansprechpartner",
@@ -1075,6 +1293,16 @@
       "reocr": "Neu verarbeiten",
       "noIssues": "Keine OCR-Probleme gefunden"
     },
+    "lowQuality": {
+      "title": "Dokument",
+      "empty": "Keine Dokumente mit niedriger OCR-Qualität gefunden",
+      "failedBadge": "OCR fehlgeschlagen",
+      "droppedBadge": "{{pct}} % verworfen",
+      "ignore": "Ignorieren",
+      "unignore": "Wieder berücksichtigen",
+      "ignored": "ignoriert",
+      "reocr": "Erneut OCR"
+    },
     "completeness": {
       "score": "Vollständigkeit",
       "issues": "Probleme",
@@ -1107,7 +1335,53 @@
     "notConfigured": "Paperless Audit ist nicht konfiguriert. Aktiviere PAPERLESS_AUDIT_ENABLED=true und stelle sicher, dass der Paperless MCP-Server verbunden ist.",
     "error": "Fehler beim Laden der Audit-Daten"
   },
+  "obligations": {
+    "title": "Fristen",
+    "subtitle": "Anstehende Pflichten aus deinen Dokumenten",
+    "loadError": "Fristen konnten nicht geladen werden.",
+    "confirmError": "Bestätigung konnte nicht gespeichert werden.",
+    "exportIcs": "Export (.ics)",
+    "calendarSyncLabel": "Kalender-Sync:",
+    "calendarSyncOff": "Aus",
+    "calendarError": "Kalendereinstellung konnte nicht geladen/gespeichert werden.",
+    "timeRangeLabel": "Zeitraum",
+    "group": {
+      "overdue": "Überfällig",
+      "thisWeek": "Diese Woche",
+      "later": "Später"
+    },
+    "frist": {
+      "today": "heute · {{date}}",
+      "future_one": "in {{count}} Tag · {{date}}",
+      "future_other": "in {{count}} Tagen · {{date}}",
+      "overdue_one": "seit {{count}} Tag · {{date}}",
+      "overdue_other": "seit {{count}} Tagen · {{date}}"
+    },
+    "kind": {
+      "zahlung": "Zahlung",
+      "widerspruch": "Widerspruch",
+      "klagefrist": "Klagefrist",
+      "frist": "Frist"
+    },
+    "legal": "rechtlich",
+    "legalAria": "Rechtliche Frist — erfordert Bestätigung",
+    "bestaetigen": "Bestätigen",
+    "rueckgaengig": "Rückgängig",
+    "wiederOeffnen": "Wieder öffnen",
+    "toastConfirmed": "Bestätigt",
+    "toastConfirmedAria": "Bestätigt — rückgängig in 5 Sekunden",
+    "loadMore": "Mehr laden",
+    "emptyTitle": "Keine offenen Pflichten.",
+    "emptyBody": "Alle Fristen aus deinen Dokumenten sind erledigt oder noch weiter weg.",
+    "openSource": "Dokument öffnen"
+  },
   "circles": {
+    "tierOverridden": "Eigene Sichtbarkeit (weicht vom Dokument ab).",
+    "tierOverriddenShort": "abweichend",
+    "resetTier": "Auf Dokument-Tier zurücksetzen",
+    "filterLabel": "Ergebnisse filtern",
+    "filterAll": "Alle",
+    "filterFactsOnly": "Nur Fakten",
     "tier": {
       "0": "Privat",
       "1": "Vertraut",
@@ -1134,6 +1408,24 @@
     "reviewDaysLabel": "Zeitraum",
     "reviewEmpty": "Keine neuen Atome zur Überprüfung.",
     "reviewTierChanged": "Stufe aktualisiert.",
+    "mergeProposals": {
+      "sectionTitle": "Zusammenführungs-Vorschläge",
+      "whySuggested": "Mögliches Duplikat · {{pct}}% Ähnlichkeit",
+      "reason": {
+        "cross_tier": "unterschiedliche Sichtbarkeit",
+        "gray_zone": "ähnlich, aber unsicher"
+      },
+      "survivorLegend": "Welche Entität soll bleiben?",
+      "keepThis": "{{name}} behalten",
+      "mentions_one": "{{count}} Erwähnung",
+      "mentions_other": "{{count}} Erwähnungen",
+      "willMerge": "wird zu",
+      "visibilityWarning": "Achtung: Sichtbarkeit ändert sich von {{from}} zu {{to}}",
+      "merge": "Zusammenführen",
+      "reject": "Ablehnen",
+      "merged": "Zusammengeführt",
+      "undo": "Rückgängig"
+    },
     "settingsTitle": "Kreise & Mitglieder",
     "settingsSubtitle": "Verwalte deine Kreis-Stufen und wer darin eingeladen ist.",
     "defaultCaptureTier": "Standard-Erfassungsstufe",
@@ -1150,8 +1442,16 @@
       "kb_document": "Dokument",
       "kg_node": "Entität",
       "kg_edge": "Beziehung",
-      "conversation_memory": "Erinnerung"
+      "conversation_memory": "Erinnerung",
+      "document_fact": "Fakt"
     },
+    "source": {
+      "deterministic": "verlässlich",
+      "deterministicTitle": "Deterministisch ermittelt — verlässlich",
+      "advisory": "Modell-Vorschlag",
+      "advisoryTitle": "Vom Sprachmodell vorgeschlagen — bitte prüfen"
+    },
+    "lowConfidence": "(geringes Vertrauen)",
     "couldNotLoad": "Konnte Daten nicht laden.",
     "couldNotSave": "Konnte Änderungen nicht speichern.",
     "score": "Relevanz",
@@ -1433,6 +1733,73 @@
         "staleArchived": "Veraltete archiviert",
         "error": "Fehler"
       }
+    }
+  },
+  "lens": {
+    "uebersicht": "Übersicht",
+    "dokumente": "Dokumente",
+    "graph": "Graph",
+    "erinnerungen": "Erinnerungen",
+    "fristen": "Fristen",
+    "pruefen": "Prüfen",
+    "railLabel": "Wissens-Ansichten",
+    "pickerLabel": "Ansicht wählen",
+    "searchAllPlaceholder": "Alles durchsuchen…",
+    "scopeLabel": "Suchbereich",
+    "scopeThis": "Diese Ansicht",
+    "scopeAll": "Alles",
+    "searchNoResults": "Nichts gefunden für „{{query}}“",
+    "searchWidenHint": "Auf „Alles“ erweitern, um die gesamte Wissensbasis zu durchsuchen.",
+    "overview": {
+      "title": "Auf einen Blick",
+      "figDocs_one": "{{count}} Dokument",
+      "figDocs_other": "{{count}} Dokumente",
+      "figEntities_one": "{{count}} Entität",
+      "figEntities_other": "{{count}} Entitäten",
+      "figRelations_one": "{{count}} Beziehung",
+      "figRelations_other": "{{count}} Beziehungen",
+      "figMemories_one": "{{count}} Erinnerung",
+      "figMemories_other": "{{count}} Erinnerungen",
+      "open": "Öffnen",
+      "fristen": "Nächste Fristen",
+      "fristenSoon_one": "{{count}} in den nächsten 7 Tagen",
+      "fristenSoon_other": "{{count}} in den nächsten 7 Tagen",
+      "overdueAccent_one": "{{count}} überfällig",
+      "overdueAccent_other": "{{count}} überfällig",
+      "noFristen": "Keine Fristen in den nächsten 7 Tagen.",
+      "review": "Zu prüfen",
+      "reviewNone": "Nichts zu prüfen.",
+      "reviewShort_one": "{{count}} zu prüfen",
+      "reviewShort_other": "{{count}} zu prüfen",
+      "docsNone": "Noch keine Dokumente.",
+      "graphNone": "Noch keine Entitäten.",
+      "memoriesNone": "Noch keine Erinnerungen.",
+      "emptyTitle": "Dein zweites Gehirn ist noch leer.",
+      "emptyCta": "Dokument hochladen"
+    },
+    "detail": {
+      "title": "Detail",
+      "tier": "Sichtbarkeit",
+      "openInDocs": "In Dokumenten öffnen",
+      "openInGraph": "Im Graph öffnen"
+    }
+  },
+  "commandCenter": {
+    "title": "Kommandozentrale",
+    "subtitle": "Live-Konstellation des laufenden Systems",
+    "idle": "inaktiv",
+    "srSummary": "{{roles}} Agenten-Rollen, {{tools}} Werkzeuge, {{rooms}} Räume. Aktive Rolle: {{active}}.",
+    "ring": {
+      "roles": "Agenten-Rollen",
+      "tools": "Werkzeuge & Integrationen",
+      "rooms": "Räume & Satelliten",
+      "peers": "Föderations-Instanzen"
+    },
+    "legend": {
+      "healthy": "Gesund",
+      "degraded": "Eingeschränkt",
+      "down": "Ausgefallen",
+      "unknown": "Unbekannt"
     }
   }
 }

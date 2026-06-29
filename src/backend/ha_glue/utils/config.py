@@ -96,6 +96,17 @@ class HaGlueSettings(BaseSettings):
     presence_webhook_url: str = ""                      # URL to POST presence events (empty = disabled)
     presence_webhook_secret: SecretStr | None = None    # Shared secret for webhook auth (X-Webhook-Secret header)
     presence_analytics_retention_days: int = 90         # Days to keep presence events for analytics
+    presence_analytics_timezone: str = "Europe/Berlin"  # Local TZ for heatmap/forecast hour+day bucketing (events stored UTC)
+    presence_history_enabled: bool = True               # Persistent presence-history timeline routes + agent tool (gate; events are always persisted)
+    bt_scan_enabled: bool = False                       # On-demand Bluetooth discovery scan ("scan all bluetooth devices") fanned out to satellites
+
+    # === Announce / message-relay camera occupancy check ===
+    # For a personal announcement, after the BLE gate passes, optionally take a
+    # snapshot from the room's satellite camera and count people via the vision
+    # model — to catch a bystander NOT tracked by BLE. Off => BLE gate only.
+    announce_camera_occupancy_check: bool = True        # Use the camera check when a camera is in the room
+    announce_camera_check_fail_closed: bool = False     # On snapshot/vision failure: True=block, False=fall back to BLE gate
+    announce_snapshot_timeout: float = 8.0              # Seconds to wait for the satellite snapshot
 
     # === Media Follow Me (playback follows user between rooms) ===
     media_follow_enabled: bool = False                         # Master switch (requires presence_enabled)
@@ -115,8 +126,18 @@ class HaGlueSettings(BaseSettings):
     jellyfin_user_id: str | None = None
 
     # === Satellite OTA Updates ===
-    satellite_latest_version: str = "1.0.0"  # Latest available satellite version
+    # FALLBACK only. The authoritative latest version is read at runtime from the
+    # bundled satellite source (__version__ in renfield_satellite/__init__.py) by
+    # SatelliteUpdateService.get_latest_version — so the advertised version can't
+    # drift from the package actually served. This value (or the
+    # SATELLITE_LATEST_VERSION env) is used only when the source isn't bundled.
+    satellite_latest_version: str = "1.4.0"  # Fallback latest satellite version
     satellite_package_cache_ttl: int = Field(default=300, ge=10, le=86400)
+    # Security H6: require a valid offline-signed release manifest before pushing
+    # an OTA update. Default off (verify-if-present) until the release-signing
+    # pipeline + per-satellite pinned public keys are in place; flip to fail-closed
+    # once the fleet has the release pubkeys.
+    satellite_ota_require_signature: bool = False
 
     # === Rooms ===
     rooms_auto_create_from_satellite: bool = True  # Auto-create rooms when satellites register

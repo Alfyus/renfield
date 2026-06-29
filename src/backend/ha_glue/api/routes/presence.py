@@ -5,6 +5,8 @@ Endpoints for room occupancy, user presence, BLE device management,
 and presence analytics (heatmap, predictions).
 """
 
+from datetime import UTC, datetime, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -283,6 +285,177 @@ async def delete_device(
         raise HTTPException(status_code=404, detail="Device not found")
 
 
+# --- Per-person BLE IRK store (resolve rotating RPAs → stable identity) ---
+
+class BLEIrkCreate(BaseModel):
+    user_id: int
+    label: str = Field(..., min_length=1, max_length=100,
+                       description="Globally-unique stable identity (e.g. 'eduard-iphone')")
+    irk: str = Field(..., pattern=r"^[0-9A-Fa-f]{32}$",
+                     description="16-byte IRK as 32 hex chars, MSO-first")
+
+
+class BLEIrkResponse(BaseModel):
+    id: int
+    user_id: int
+    label: str
+    is_enabled: bool
+    created_at: str | None = None
+
+
+@router.get("/irks", response_model=list[BLEIrkResponse])
+async def list_irks(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """List registered BLE IRKs (metadata only — the key itself is never returned)."""
+    from models.database import UserBleIrk
+    rows = (await db.execute(select(UserBleIrk))).scalars().all()
+    return [
+        BLEIrkResponse(
+            id=r.id, user_id=r.user_id, label=r.label, is_enabled=r.is_enabled,
+            created_at=r.created_at.isoformat() if r.created_at else None,
+        )
+        for r in rows
+    ]
+
+
+@router.post("/irks", response_model=BLEIrkResponse, status_code=201)
+async def create_irk(
+    body: BLEIrkCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Register a per-person IRK (stored encrypted, pushed to satellites)."""
+    from models.database import User as DBUser, UserBleIrk
+    from services.secret_encryption import encrypt_secret
+
+    if not (await db.execute(select(DBUser).where(DBUser.id == body.user_id))).scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="User not found")
+    if (await db.execute(select(UserBleIrk).where(UserBleIrk.label == body.label))).scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Label already exists")
+
+    row = UserBleIrk(
+        user_id=body.user_id,
+        label=body.label,
+        irk_encrypted=encrypt_secret(body.irk.lower()),
+        is_enabled=True,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)   # reloads MAC + IRK caches
+    await presence.push_macs_to_satellites()
+
+    return BLEIrkResponse(
+        id=row.id, user_id=row.user_id, label=row.label, is_enabled=row.is_enabled,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
+class BLEIrkCaptureRequest(BaseModel):
+    satellite_id: str
+    user_id: int
+    label: str = Field(..., min_length=1, max_length=100)
+    window_seconds: int = Field(default=60, ge=10, le=180)
+
+
+@router.post("/irks/capture", response_model=BLEIrkResponse, status_code=201)
+async def capture_irk(
+    body: BLEIrkCaptureRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Drive the UI pairing flow: open a one-time pairing window on a satellite,
+    capture the phone's IRK when it bonds, and store it (encrypted) for `user_id`.
+    The caller shows the user the 'pair to Renfield <room>' prompt meanwhile."""
+    from models.database import User as DBUser, UserBleIrk
+    from services.secret_encryption import encrypt_secret
+    from ha_glue.services.satellite_manager import get_satellite_manager
+
+    if not (await db.execute(select(DBUser).where(DBUser.id == body.user_id))).scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="User not found")
+    if (await db.execute(select(UserBleIrk).where(UserBleIrk.label == body.label))).scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Label already exists")
+
+    manager = get_satellite_manager()
+    res = await manager.request_irk_capture(body.satellite_id, body.label, body.window_seconds)
+    if res.get("error"):
+        raise HTTPException(status_code=502, detail=f"Capture failed: {res['error']}")
+    irk = (res.get("irk") or "").lower()
+    if len(irk) != 32 or any(c not in "0123456789abcdef" for c in irk):
+        raise HTTPException(status_code=408, detail="No phone paired during the capture window")
+
+    row = UserBleIrk(
+        user_id=body.user_id, label=body.label,
+        irk_encrypted=encrypt_secret(irk), is_enabled=True,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)
+    await presence.push_macs_to_satellites()
+
+    return BLEIrkResponse(
+        id=row.id, user_id=row.user_id, label=row.label, is_enabled=row.is_enabled,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
+class BLEIrkUpdate(BaseModel):
+    is_enabled: bool
+
+
+@router.patch("/irks/{irk_id}", response_model=BLEIrkResponse)
+async def update_irk(
+    irk_id: int,
+    body: BLEIrkUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Enable/disable an IRK without deleting it (disabling stops resolution +
+    re-pushes the reduced set to satellites)."""
+    from models.database import UserBleIrk
+    row = (await db.execute(select(UserBleIrk).where(UserBleIrk.id == irk_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="IRK not found")
+    row.is_enabled = body.is_enabled
+    await db.commit()
+    await db.refresh(row)
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)
+    await presence.push_macs_to_satellites()
+
+    return BLEIrkResponse(
+        id=row.id, user_id=row.user_id, label=row.label, is_enabled=row.is_enabled,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
+@router.delete("/irks/{irk_id}", status_code=204)
+async def delete_irk(
+    irk_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.ADMIN)),
+):
+    """Revoke a BLE IRK (deletes it + re-pushes the reduced set to satellites)."""
+    from models.database import UserBleIrk
+    row = (await db.execute(select(UserBleIrk).where(UserBleIrk.id == irk_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="IRK not found")
+    await db.delete(row)
+    await db.commit()
+
+    presence = get_presence_service()
+    await presence.load_device_registry(db)
+    await presence.push_macs_to_satellites()
+
+
 # --- Analytics ---
 
 class HeatmapCell(BaseModel):
@@ -304,6 +477,18 @@ class DailySummary(BaseModel):
     date: str
     enter_count: int
     leave_count: int
+
+
+class PresenceEventResponse(BaseModel):
+    id: int
+    user_id: int
+    room_id: int
+    room_name: str | None = None
+    event_type: str
+    source: str | None = None
+    confidence: float | None = None
+    satellite_id: str | None = None
+    created_at: datetime
 
 
 @router.get("/analytics/heatmap", response_model=list[HeatmapCell])
@@ -342,3 +527,114 @@ async def get_daily_summary(
 
     service = PresenceAnalyticsService(db)
     return await service.get_daily_summary(days=days)
+
+
+# --- Persistent presence history (timeline / last-seen / room-window) ---
+
+
+def _resolve_history_target(user_id: int | None, current_user: "User | None") -> int:
+    """Resolve whose presence history to read, guarding against IDOR.
+
+    Self-lookups and single-user mode (``current_user`` None, AUTH off) are
+    unrestricted. Reading ANOTHER user's location history requires ROOMS_MANAGE
+    — otherwise any ROOMS_READ user could enumerate where anyone in the
+    household has been.
+    """
+    target = user_id if user_id is not None else (current_user.id if current_user else None)
+    if target is None:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    if (
+        current_user is not None
+        and target != current_user.id
+        and not current_user.has_permission(Permission.ROOMS_MANAGE.value)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Reading another user's presence history requires ROOMS_MANAGE",
+        )
+    return target
+
+
+@router.get("/analytics/timeline", response_model=list[PresenceEventResponse])
+async def get_presence_timeline(
+    user_id: int | None = Query(default=None),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    room_id: int | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(require_permission(Permission.ROOMS_READ)),
+):
+    """Chronological presence-event timeline for a user.
+
+    Defaults to the authenticated user when ``user_id`` is omitted. In
+    single-user mode (AUTH_ENABLED=false) ``current_user`` is None.
+    """
+    if not ha_glue_settings.presence_history_enabled:
+        raise HTTPException(status_code=404, detail="Presence history is disabled")
+
+    target_user_id = _resolve_history_target(user_id, current_user)
+
+    from ha_glue.services.presence_analytics import PresenceAnalyticsService
+
+    service = PresenceAnalyticsService(db)
+    return await service.get_timeline(
+        user_id=target_user_id,
+        since=since,
+        until=until,
+        room_id=room_id,
+        limit=limit,
+        offset=offset,
+    )
+
+
+class LastSeenByRoomEntry(BaseModel):
+    room_id: int
+    room_name: str | None = None
+    last_seen: datetime
+
+
+@router.get("/analytics/last-seen-by-room", response_model=list[LastSeenByRoomEntry])
+async def get_last_seen_by_room(
+    user_id: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(require_permission(Permission.ROOMS_READ)),
+):
+    """Per-room most-recent 'enter' time for a user."""
+    if not ha_glue_settings.presence_history_enabled:
+        raise HTTPException(status_code=404, detail="Presence history is disabled")
+
+    target_user_id = _resolve_history_target(user_id, current_user)
+
+    from ha_glue.services.presence_analytics import PresenceAnalyticsService
+
+    service = PresenceAnalyticsService(db)
+    return await service.get_last_seen_by_room(user_id=target_user_id)
+
+
+@router.get("/analytics/room-window", response_model=list[PresenceEventResponse])
+async def get_room_window(
+    room_id: int = Query(...),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(require_permission(Permission.ROOMS_MANAGE)),
+):
+    """All users' enter/leave events for a room within a window (admin).
+
+    ``since``/``until`` default to the last 24 hours when omitted.
+    """
+    if not ha_glue_settings.presence_history_enabled:
+        raise HTTPException(status_code=404, detail="Presence history is disabled")
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    if until is None:
+        until = now
+    if since is None:
+        since = until - timedelta(hours=24)
+
+    from ha_glue.services.presence_analytics import PresenceAnalyticsService
+
+    service = PresenceAnalyticsService(db)
+    return await service.get_room_occupancy_window(room_id=room_id, since=since, until=until)

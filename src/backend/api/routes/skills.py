@@ -421,9 +421,11 @@ async def approve_skill(
     corpus. Idempotent — approving an already-approved skill is a no-op
     (returns the row unchanged).
     """
+    # AUTH_ENABLED=false (single-user mode) yields admin=None — guard the deref.
+    admin_id = admin.id if admin else None
     skill = await _load_for_admin(db, skill_id)
     if skill.status == SKILL_STATUS_APPROVED:
-        return _to_response(skill, is_owner=(skill.user_id == admin.id))
+        return _to_response(skill, is_owner=(skill.user_id == admin_id))
 
     if skill.status not in (SKILL_STATUS_DRAFT, SKILL_STATUS_REJECTED):
         raise HTTPException(
@@ -439,10 +441,10 @@ async def approve_skill(
     await db.commit()
     SkillService.invalidate_has_skills_cache()
     logger.info(
-        f"🧠 Skill #{skill.id} approved by admin={admin.id} "
+        f"🧠 Skill #{skill.id} approved by admin={admin_id} "
         f"({skill.title!r})"
     )
-    return _to_response(skill, is_owner=(skill.user_id == admin.id))
+    return _to_response(skill, is_owner=(skill.user_id == admin_id))
 
 
 @router.post("/{skill_id}/reject", response_model=SkillResponse)
@@ -455,9 +457,11 @@ async def reject_skill(
 ):
     """Admin: flip a draft skill to rejected (excluded from retrieval,
     kept for audit). Idempotent."""
+    # AUTH_ENABLED=false (single-user mode) yields admin=None — guard the deref.
+    admin_id = admin.id if admin else None
     skill = await _load_for_admin(db, skill_id)
     if skill.status == SKILL_STATUS_REJECTED:
-        return _to_response(skill, is_owner=(skill.user_id == admin.id))
+        return _to_response(skill, is_owner=(skill.user_id == admin_id))
 
     if skill.status != SKILL_STATUS_DRAFT:
         raise HTTPException(
@@ -469,10 +473,10 @@ async def reject_skill(
     await db.commit()
     SkillService.invalidate_has_skills_cache()
     logger.info(
-        f"🧠 Skill #{skill.id} rejected by admin={admin.id} "
+        f"🧠 Skill #{skill.id} rejected by admin={admin_id} "
         f"({skill.title!r})"
     )
-    return _to_response(skill, is_owner=(skill.user_id == admin.id))
+    return _to_response(skill, is_owner=(skill.user_id == admin_id))
 
 
 # ----------------------------------------------------------------- pin
@@ -614,13 +618,17 @@ async def run_curator(
     need per-user inspection, filter the response from GET
     /curator/runs by ``triggered_by_user_id``.
     """
+    # AUTH_ENABLED=false (single-user mode) yields admin=None — guard every
+    # deref or the route 500s (see reference: routes single-user-mode user None).
+    admin_id = admin.id if admin else None
+    admin_username = admin.username if admin else None
     svc = SkillCuratorService(db)
     logger.info(
-        f"🧹 Curator manual run requested: admin_id={admin.id} "
-        f"admin_username={admin.username!r} target_user_id={body.user_id!r}"
+        f"🧹 Curator manual run requested: admin_id={admin_id} "
+        f"admin_username={admin_username!r} target_user_id={body.user_id!r}"
     )
     run_row = await svc.run_curator(
-        triggered_by_user_id=admin.id,
+        triggered_by_user_id=admin_id,
         run_type=CURATOR_RUN_TYPE_MANUAL,
     )
     return _curator_run_to_response(run_row)

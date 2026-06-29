@@ -15,6 +15,8 @@ data:
   OLLAMA_FALLBACK_URL: ""
   # DLNA MCP runs on hostNetwork (any worker); the `dlna-mcp` Service routes to it.
   DLNA_MCP_URL: "http://dlna-mcp:9091/mcp"
+  # Samsung TV MCP — same hostNetwork pattern; the `samsung-mcp` Service routes to it.
+  SAMSUNG_MCP_URL: "http://samsung-mcp:9092/mcp"
 
   # External integrations
   HOME_ASSISTANT_URL: "http://192.168.1.80:8123"
@@ -95,6 +97,12 @@ data:
   RAG_CHUNK_OVERLAP: "50"
   RAG_TOP_K: "5"
   RAG_SIMILARITY_THRESHOLD: "0.4"
+  # Reranker disabled: the default model (mxbai-rerank-base-v1) isn't in the
+  # Ollama registry (never pullable) and _rerank is a bi-encoder cosine pass,
+  # not a true cross-encoder — it has always 404'd and fallen back to the RRF
+  # order. RRF + lexical fusion is the real ranking. A proper cross-encoder
+  # reranker is a separate TODO. (Disabled 2026-05-31.)
+  RAG_RERANK_ENABLED: "false"
 
   # Feature flags
   DEFAULT_LANGUAGE: "de"
@@ -109,6 +117,9 @@ data:
   N8N_MCP_ENABLED: "true"
   EMAIL_MCP_ENABLED: "true"
   DLNA_MCP_ENABLED: "true"
+  # Samsung TV ships dark: flip to "true" AFTER the samsung-mcp image is built and
+  # the one-time TV pairing is done (see deploy-production skill). URL is wired above.
+  SAMSUNG_MCP_ENABLED: "false"
   WEATHER_ENABLED: "true"
   SEARCH_ENABLED: "true"
   NEWS_ENABLED: "true"
@@ -120,8 +131,14 @@ data:
   AGENT_STEP_TIMEOUT: "60"
   AGENT_TOTAL_TIMEOUT: "300"
 
-  # Presentation
+  # Presentation — URL handed to DLNA renderers / HA media_player to fetch
+  # backend-served TTS audio: http://renfield.local/api/voice/tts-cache/...
+  # http (not https) because Samsung TVs can't do the self-signed cert; the
+  # `backend-tts-cache-http` IngressRoute serves this path plain (no redirect).
+  # Renderers resolve renfield.local via DNS (Linn/Samsung) or /etc/hosts
+  # (HiFiBerry, see provision-hifiberry.yml). See docs/MESSAGE_RELAY.md.
   ADVERTISE_HOST: "renfield.local"
+  ADVERTISE_SCHEME: "http"
   ADVERTISE_PORT: "80"
 
   # Satellites

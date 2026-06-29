@@ -24,10 +24,12 @@ from api.routes import (
     chat,
     chat_upload,
     circles,
+    email_ingest,
     federation_audit,
     federation_pairing,
     federation_query,
     feedback,
+    folder_ingest,
     intents,
     knowledge,
     memory,
@@ -41,9 +43,11 @@ from api.routes import (
     trajectories,
     users,
 )
+from api.routes import config as config_routes
 from api.routes import knowledge_graph as kg_routes
 from api.routes import mcp as mcp_routes
 from api.routes import settings as settings_routes
+from api.routes import wissensbasis as wissensbasis_routes
 from api.websocket import chat_router, kg_live_router
 # NOTE: device_router, satellite_router, and the HA-specific REST routers
 # (camera, homeassistant, paperless_audit, presence, rooms, satellites)
@@ -134,6 +138,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "frame-ancestors 'none';"
             )
 
+        # API responses must never be HTTP-cached. If a transient HTML/SPA
+        # fallback is ever served for an /api path (e.g. during a backend
+        # rollout), caching it would replay a non-JSON body to the SPA.
+        # Only default when the route hasn't set its own policy (e.g. the TTS
+        # cache route sets no-cache for DLNA renderers — don't clobber it).
+        if path.startswith("/api/") and "cache-control" not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
+
         return response
 
 
@@ -172,8 +184,11 @@ if settings.features["voice"]:
 # presence, paperless_audit) moved to ha_glue.api.routes and are
 # mounted via the register_routes hook in ha_glue/bootstrap.py.
 app.include_router(settings_routes.router, prefix="/api/settings", tags=["Settings"])
+app.include_router(config_routes.router, prefix="/api/config", tags=["Config"])
 app.include_router(speakers.router, prefix="/api/speakers", tags=["Speakers"])
 app.include_router(knowledge.router, prefix="/api/knowledge", tags=["Knowledge"])
+app.include_router(folder_ingest.router, prefix="/api/folder-ingest", tags=["Folder Ingest"])
+app.include_router(email_ingest.router, prefix="/api/email-ingest", tags=["Email Ingest"])
 app.include_router(memory.router, prefix="/api/memory", tags=["Memory"])
 app.include_router(preferences.router, prefix="/api/preferences", tags=["Preferences"])
 app.include_router(mcp_routes.router, prefix="/api/mcp", tags=["MCP"])
@@ -184,6 +199,7 @@ app.include_router(trajectories.router, prefix="/api/trajectories", tags=["Traje
 app.include_router(tool_health.router, prefix="/api/tool-health", tags=["Tool Health"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(kg_routes.router, prefix="/api/knowledge-graph", tags=["Knowledge Graph"])
+app.include_router(wissensbasis_routes.router, prefix="/api/wissensbasis", tags=["Wissensbasis - Graph"])
 app.include_router(atoms.router, prefix="/api/atoms", tags=["Circles - Atoms"])
 app.include_router(circles.router, prefix="/api/circles", tags=["Circles - Membership"])
 app.include_router(federation_pairing.router, prefix="/api/federation", tags=["Federation - Pairing"])
@@ -404,6 +420,13 @@ async def create_ws_token(
             "message": "WebSocket authentication is disabled",
             "expires_in": None
         }
+
+    # Security review H1: this endpoint historically minted a device token to
+    # ANY caller (it declared `current_user` but never checked it). When WS auth
+    # is on, require an authenticated user — satellites authenticate with their
+    # enrollment PSK on the register frame, not via this faucet.
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
     token_store = get_token_store()
     token = token_store.create_token(

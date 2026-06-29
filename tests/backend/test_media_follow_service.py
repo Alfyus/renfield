@@ -136,6 +136,32 @@ class TestOnUserLeaveRoom:
         assert session.suspended_at is not None
 
     @pytest.mark.asyncio
+    async def test_suspend_does_not_clear_session(self, playing_session):
+        """on_user_leave_room's internal stop must NOT clear the session — it
+        must survive as SUSPENDED so the next room can resume it. Regression for
+        the live-test 2026-06-14: _stop_playback -> _media_control(action=stop)
+        was clearing the very session being suspended, so the music never
+        followed. The stop must carry the _media_follow_internal marker."""
+        captured = {}
+
+        async def fake_media_control(params):
+            captured.update(params)
+            return {"success": True}
+
+        with patch(
+            "ha_glue.services.internal_tools.InternalToolService._media_control",
+            side_effect=fake_media_control,
+        ), patch.object(playing_session, "_is_user_opted_in", return_value=True):
+            await playing_session.on_user_leave_room(
+                user_id=1, room_id=10, room_name="Arbeitszimmer"
+            )
+
+        s = playing_session.get_session(1)
+        assert s is not None, "session was cleared during suspend — nothing to follow"
+        assert s.state == SessionState.SUSPENDED
+        assert captured.get("_media_follow_internal") is True
+
+    @pytest.mark.asyncio
     async def test_leave_stops_playback(self, playing_session):
         mock_stop = AsyncMock()
         with patch.object(playing_session, "_is_user_opted_in", return_value=True), \
@@ -199,13 +225,47 @@ class TestOnUserEnterRoom:
         mock_resume.assert_called_once_with(session, 20, "Wohnzimmer")
 
     @pytest.mark.asyncio
-    async def test_enter_no_suspended_session_no_action(self, playing_session):
-        """Playing session (not suspended) should not trigger resume."""
+    async def test_enter_different_room_while_playing_follows(self, playing_session):
+        """Playing in room A, enter room B with NO prior leave (the presence
+        stale-timeout ordering: the 'left A' event lags up to 120s behind the
+        real move, so the enter arrives while the session is still PLAYING).
+        Must treat it as a move — stop A and resume in B. Regression for the
+        2026-06-14 live-test bug where the lagging leave left the music stuck
+        SUSPENDED and it never followed."""
+        session = playing_session.get_session(1)  # PLAYING in room 10
+        mock_stop = AsyncMock()
         mock_resume = AsyncMock()
-        with patch.object(playing_session, "_resume_playback", mock_resume):
+        with patch.object(playing_session, "_stop_playback", mock_stop), \
+             patch.object(playing_session, "_resume_playback", mock_resume), \
+             patch("ha_glue.services.media_follow_service.ha_glue_settings") as s:
+            s.media_follow_resume_delay = 0
+            s.media_follow_suspend_timeout = 600.0
             await playing_session.on_user_enter_room(
                 user_id=1, room_id=20, room_name="Wohnzimmer"
             )
+        mock_stop.assert_called_once()  # old room stopped
+        mock_resume.assert_called_once_with(session, 20, "Wohnzimmer")
+
+    @pytest.mark.asyncio
+    async def test_enter_same_room_while_playing_no_action(self, playing_session):
+        """Entering the SAME room the session is already playing in is a no-op."""
+        mock_stop = AsyncMock()
+        mock_resume = AsyncMock()
+        with patch.object(playing_session, "_stop_playback", mock_stop), \
+             patch.object(playing_session, "_resume_playback", mock_resume):
+            await playing_session.on_user_enter_room(
+                user_id=1, room_id=10, room_name="Arbeitszimmer"
+            )
+        mock_stop.assert_not_called()
+        mock_resume.assert_not_called()
+        assert playing_session.get_session(1).state == SessionState.PLAYING
+
+    @pytest.mark.asyncio
+    async def test_enter_no_session_no_action(self, service):
+        """Entering a room with no media session does nothing."""
+        mock_resume = AsyncMock()
+        with patch.object(service, "_resume_playback", mock_resume):
+            await service.on_user_enter_room(user_id=99, room_id=20, room_name="X")
         mock_resume.assert_not_called()
 
     @pytest.mark.asyncio
@@ -520,3 +580,114 @@ class TestResumeVideoPlayback:
         assert session.state == SessionState.PLAYING
         assert session.room_id == 20
         assert session.room_name == "Schlafzimmer"
+
+
+# =============================================================================
+# Room-handoff affordance (chat-UI item 8) — the `media_handoff` device-WS frame
+# =============================================================================
+
+
+@pytest.mark.unit
+class TestMediaHandoffNotify:
+    """`_notify_user` emits the typed `media_handoff` frame on a successful
+    follow, gated behind ROOM_HANDOFF_ENABLED so the chat affordance ships dark.
+    The legacy `info` toast is unconditional and unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_handoff_frame_emitted_when_enabled(self, service):
+        dm = MagicMock()
+        dm.broadcast_to_room = AsyncMock()
+        with patch(
+            "ha_glue.services.device_manager.get_device_manager", return_value=dm
+        ), patch("ha_glue.services.media_follow_service.settings") as s:
+            s.room_handoff_enabled = True
+            await service._notify_user(1, "Küche", "Thriller")
+
+        # Two broadcasts to the destination room: the legacy info toast + the
+        # typed media_handoff frame (same room audience — no privacy widening).
+        rooms = [c.args[0] for c in dm.broadcast_to_room.call_args_list]
+        assert rooms == ["Küche", "Küche"]
+        frames = [c.args[1] for c in dm.broadcast_to_room.call_args_list]
+        assert frames[0]["type"] == "info"
+        handoff = frames[1]
+        assert handoff["type"] == "media_handoff"
+        assert handoff["kind"] == "media_followed"
+        assert handoff["room"] == "Küche"          # the room the user entered
+        assert handoff["title"] == "Thriller"
+
+    @pytest.mark.asyncio
+    async def test_handoff_frame_suppressed_when_disabled(self, service):
+        dm = MagicMock()
+        dm.broadcast_to_room = AsyncMock()
+        with patch(
+            "ha_glue.services.device_manager.get_device_manager", return_value=dm
+        ), patch("ha_glue.services.media_follow_service.settings") as s:
+            s.room_handoff_enabled = False
+            await service._notify_user(1, "Küche", "Thriller")
+
+        # Only the legacy info toast — NO media_handoff frame (flag dark).
+        frames = [c.args[1] for c in dm.broadcast_to_room.call_args_list]
+        assert [f["type"] for f in frames] == ["info"]
+
+    @pytest.mark.asyncio
+    async def test_resume_emits_handoff_carrying_the_new_room(self, service):
+        """End-to-end through _resume_playback: a successful follow into a new
+        room emits the handoff frame carrying THAT room's name."""
+        service.register_playback(
+            user_id=1,
+            room_id=10,
+            room_name="Arbeitszimmer",
+            media_type=MediaType.RADIO,
+            station_id="s12345",
+            station_name="BBC Radio 1",
+        )
+        session = service.get_session(1)
+        session.state = SessionState.SUSPENDED
+        session.suspended_at = time.time()
+
+        dm = MagicMock()
+        dm.broadcast_to_room = AsyncMock()
+        mock_result = {"success": True, "message": "Playing"}
+        with patch("ha_glue.services.media_follow_service.settings") as s, \
+             patch("ha_glue.services.device_manager.get_device_manager", return_value=dm), \
+             patch("ha_glue.services.internal_tools.InternalToolService._play_radio",
+                   new_callable=AsyncMock, return_value=mock_result):
+            s.media_follow_resume_delay = 0
+            s.room_handoff_enabled = True
+            await service._resume_playback(session, 20, "Wohnzimmer")
+
+        handoff = [
+            c.args[1] for c in dm.broadcast_to_room.call_args_list
+            if c.args[1].get("type") == "media_handoff"
+        ]
+        assert len(handoff) == 1
+        assert handoff[0]["room"] == "Wohnzimmer"   # the NEW room
+
+    @pytest.mark.asyncio
+    async def test_no_handoff_when_resume_fails(self, service):
+        """A failed resume must NOT claim a handoff (no frame at all) — the
+        unreachable/stale design state."""
+        service.register_playback(
+            user_id=1,
+            room_id=10,
+            room_name="Arbeitszimmer",
+            media_type=MediaType.RADIO,
+            station_id="s12345",
+            station_name="BBC Radio 1",
+        )
+        session = service.get_session(1)
+        session.state = SessionState.SUSPENDED
+        session.suspended_at = time.time()
+
+        dm = MagicMock()
+        dm.broadcast_to_room = AsyncMock()
+        with patch("ha_glue.services.media_follow_service.settings") as s, \
+             patch("ha_glue.services.device_manager.get_device_manager", return_value=dm), \
+             patch("ha_glue.services.internal_tools.InternalToolService._play_radio",
+                   new_callable=AsyncMock, return_value={"success": False, "message": "boom"}):
+            s.media_follow_resume_delay = 0
+            s.room_handoff_enabled = True
+            await service._resume_playback(session, 20, "Wohnzimmer")
+
+        # _notify_user is only called inside the success branch → no broadcasts.
+        dm.broadcast_to_room.assert_not_called()

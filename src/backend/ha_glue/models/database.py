@@ -292,8 +292,16 @@ class RoomOutputDevice(Base):
     Defines which devices should be used for TTS audio output in a room,
     with priority ordering and interruption settings.
 
-    Exactly one of renfield_device_id, ha_entity_id, or dlna_renderer_name
-    must be set.
+    The output target is the generic ``(output_provider, output_target_id)``
+    pair — ``output_provider`` IS the ``target_type`` value space
+    (``renfield`` | ``homeassistant`` | ``dlna`` | ``samsung`` | ``sonos`` | …)
+    and ``output_target_id`` is the provider-scoped id (device_id / HA entity id
+    / DLNA renderer name / TV host / …). See docs/design/output-providers.md.
+
+    The three legacy brand-identity columns (``renfield_device_id`` /
+    ``ha_entity_id`` / ``dlna_renderer_name``) were dropped in migration
+    ``pc20260617b_drop_outlegacy`` after the additive pair soaked in prod; all
+    reads now go through this pair.
     """
 
     __tablename__ = "room_output_devices"
@@ -301,11 +309,10 @@ class RoomOutputDevice(Base):
     id = Column(Integer, primary_key=True, index=True)
     room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False, index=True)
 
-    renfield_device_id = Column(
-        String(100), ForeignKey("room_devices.device_id"), nullable=True
-    )
-    ha_entity_id = Column(String(255), nullable=True)
-    dlna_renderer_name = Column(String(255), nullable=True)
+    # Generic output-provider pair (docs/design/output-providers.md). The sole
+    # target-identity columns since the legacy brand columns were dropped.
+    output_provider = Column(String(50), nullable=True)
+    output_target_id = Column(String(255), nullable=True)
 
     output_type = Column(String(20), nullable=False, default=OUTPUT_TYPE_AUDIO)
 
@@ -323,33 +330,28 @@ class RoomOutputDevice(Base):
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     room = relationship("Room", back_populates="output_devices")
-    renfield_device = relationship("RoomDevice", foreign_keys=[renfield_device_id])
 
     @property
     def is_renfield_device(self) -> bool:
-        return self.renfield_device_id is not None
+        return self.output_provider == "renfield"
 
     @property
     def is_ha_device(self) -> bool:
-        return self.ha_entity_id is not None
+        return self.output_provider == "homeassistant"
 
     @property
     def is_dlna_device(self) -> bool:
-        return self.dlna_renderer_name is not None
+        return self.output_provider == "dlna"
 
     @property
     def target_id(self) -> str:
-        return self.renfield_device_id or self.ha_entity_id or self.dlna_renderer_name or ""
+        return self.output_target_id or ""
 
     @property
     def target_type(self) -> str:
-        if self.renfield_device_id:
-            return "renfield"
-        if self.ha_entity_id:
-            return "homeassistant"
-        if self.dlna_renderer_name:
-            return "dlna"
-        return "renfield"
+        # output_provider IS the target_type value space. Default to renfield
+        # for a malformed/empty row (mirrors the pre-cleanup behavior).
+        return self.output_provider or "renfield"
 
 
 # Legacy alias for backward compatibility (kept next to RoomDevice so the
@@ -379,6 +381,95 @@ class UserBleDevice(Base):
     user = relationship("User", backref="ble_devices")
 
 
+class UserBleIrk(Base):
+    """Per-person BLE Identity Resolving Key for presence.
+
+    Modern phones (iPhone/Android) advertise with rotating Resolvable Private
+    Addresses, so a static MAC whitelist can't track them. The IRK — obtained
+    out-of-band once (iPhone: Mac/iCloud keychain or a one-time bond to a
+    satellite; Android: bonded-device info) — lets a satellite resolve the
+    rotating address back to this stable `label`. See
+    docs/design/ble-presence-improvement.md.
+
+    The IRK is a device-tracking secret: stored ENCRYPTED at rest
+    (services/secret_encryption) and pushed to satellites over the WS link only.
+    """
+
+    __tablename__ = "user_ble_irks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # Globally-unique stable identity the satellite reports on a resolved match;
+    # the backend maps it back to this user for presence attribution.
+    label = Column(String(100), unique=True, nullable=False, index=True)
+    # Fernet token of the 32-hex-char IRK — never stored or logged in plaintext.
+    irk_encrypted = Column(String(255), nullable=False)
+    is_enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = relationship("User", backref="ble_irks")
+
+
+class Satellite(Base):
+    """Per-satellite enrollment credential (PSK) for the /ws/satellite path.
+
+    Closes the assertion-based-trust hole (security review H1): a satellite
+    today *claims* a ``satellite_id`` in its register frame with no proof, so
+    any LAN device can register as ``sat-wohnzimmer``, evict the incumbent, and
+    harvest the IRK push. Each enrolled satellite holds a random 256-bit token,
+    stored here ONLY as a bcrypt hash; the satellite presents the plaintext in
+    the register frame's ``token`` field and the backend verifies it
+    constant-time. See docs/private/security/satellite-trust-design.md.
+
+    The plaintext token is shown exactly once (at enrollment) and is never
+    stored or returned afterwards — same posture as the folder/email ingest
+    push tokens.
+    """
+
+    __tablename__ = "satellites"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # The asserted identity the satellite registers under; the token is bound
+    # to this id, so a register frame whose satellite_id ≠ the token's id fails.
+    satellite_id = Column(String(100), unique=True, nullable=False, index=True)
+    # bcrypt hash of the enrollment PSK — never the plaintext.
+    token_hash = Column(String(255), nullable=False)
+    # Cosmetic; the runtime room still comes from the register frame.
+    room = Column(String(100), nullable=True)
+    # Audit: which admin enrolled it (NULL for Ansible/bin-script seeding).
+    enrolled_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    enrolled_at = Column(DateTime, default=_utcnow)
+    # Set on every successful PSK verification — drives the auto-flip readiness
+    # check (the fleet only enforces once EVERY enrolled row has connected once).
+    last_authenticated_at = Column(DateTime, nullable=True)
+    # Revocation: a revoked or disabled row never authenticates.
+    revoked_at = Column(DateTime, nullable=True)
+    is_enabled = Column(Boolean, default=True, nullable=False)
+
+    enrolled_by = relationship("User")
+
+
+class SatelliteFleetState(Base):
+    """Singleton row holding the enrollment-enforcement latch.
+
+    Auto-flip (security review decision ③) transitions the fleet from PERMISSIVE
+    to ENFORCING once every enrolled satellite has authenticated at least once.
+    The transition is LATCHED here (``enrollment_enforced_at`` set once, never
+    cleared automatically) so a later UI-enrolled-but-not-yet-connected
+    satellite — whose row has a NULL ``last_authenticated_at`` — cannot silently
+    re-open the fleet to unauthenticated registration. Break-glass: clear the
+    latch (or flip ``satellite_enrollment_enabled=False``).
+    """
+
+    __tablename__ = "satellite_fleet_state"
+
+    # Always id=1 — enforced by the service (single fleet per backend).
+    id = Column(Integer, primary_key=True)
+    enrollment_enforced_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class PresenceEvent(Base):
     """Persisted presence event for analytics (heatmap, predictions)."""
 
@@ -390,10 +481,12 @@ class PresenceEvent(Base):
     event_type = Column(String(20), nullable=False)  # "enter" | "leave"
     source = Column(String(20), default="ble")        # "ble" | "voice" | "web"
     confidence = Column(Float, nullable=True)
+    satellite_id = Column(String(100), nullable=True)  # satellite producing the enter detection (NULL on leave/voice/web)
     created_at = Column(DateTime, default=_utcnow, index=True)
 
     __table_args__ = (
         Index("ix_presence_events_analytics", "user_id", "room_id", "created_at"),
+        Index("ix_presence_events_history", "user_id", "created_at"),
     )
 
 

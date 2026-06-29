@@ -145,6 +145,51 @@ def _parse_mcp_raw_data(data: list) -> any:
         return None
 
 
+def _extract_agent_sources(tool_results: list) -> list[dict]:
+    """Collect provenance sources from this turn's knowledge_search tool results.
+
+    Returns a deduped (by document_id) list of {document_id, filename, title, tier}
+    for the chat "source chips" UI. The sources are already circle-filtered at
+    retrieval time (rag.search pins to the asker's user_id), so surfacing them is
+    pure display — no second permission path. Empty list when the turn used no
+    knowledge_search (the UI renders nothing for an empty list).
+    """
+    sources: list[dict] = []
+    seen: set = set()
+    for tool_name, data in tool_results:
+        if tool_name != "internal.knowledge_search" or not isinstance(data, dict):
+            continue
+        # `data` is the tool's INNER result dict (AgentStep.data = result["data"],
+        # set in agent_service), so `sources` lives at the top level here — NOT
+        # nested under another "data" key.
+        for src in data.get("sources") or []:
+            doc_id = src.get("document_id") if isinstance(src, dict) else None
+            if doc_id is None or doc_id in seen:
+                continue
+            seen.add(doc_id)
+            sources.append(src)
+    return sources
+
+
+def _collect_tool_artifacts(tool_results: list) -> list:
+    """Gen-UI: gather typed artifacts a tool emitted in its result ``data``.
+
+    The render/weather widget tools return ``data={"artifacts": [...]}``; the
+    agent loop already collects every tool result's data into
+    ``agent_tool_results``. This flattens the artifacts out so the chat handler
+    can hand them to ``_emit_turn_artifacts`` (which re-validates + emits +
+    persists, same path as the sub-intent producers). Empty when no tool emitted
+    an artifact — a no-op for ordinary turns.
+    """
+    artifacts: list = []
+    for _tool, data in tool_results:
+        if isinstance(data, dict):
+            arts = data.get("artifacts")
+            if isinstance(arts, list):
+                artifacts.extend(arts)
+    return artifacts
+
+
 def _build_agent_action_result(tool_results: list) -> dict:
     """Build a synthetic action_result from agent tool results for conversation history.
 
@@ -263,12 +308,44 @@ async def _route_chat_tts_output(
     return False
 
 
+async def _followup_chips_background(
+    websocket,
+    user_message: str,
+    assistant_response: str,
+    lang: str,
+    model: str,
+    count: int,
+    timeout: float,
+) -> None:
+    """Background task: generate follow-up suggestion chips AFTER `done`, then
+    push them as a separate `followups` frame.
+
+    Off the turn's critical path on purpose — a synchronous pre-`done` call would
+    delay the spinner-off / TTS-resume / wakeword re-arm that the frontend gates
+    on `done` (harmful especially for voice turns, which can't use the chips).
+    Best-effort + bounded: no chips on any failure/timeout, never raises.
+    """
+    try:
+        from services.followup_service import generate_followups
+        chips = await asyncio.wait_for(
+            generate_followups(
+                user_message, assistant_response, lang=lang, model=model, count=count
+            ),
+            timeout=timeout,
+        )
+        if chips:
+            await websocket.send_json({"type": "followups", "suggested_followups": chips})
+    except Exception as e:  # noqa: BLE001 — best-effort; chips are optional
+        logger.debug(f"follow-up chips skipped: {e}")
+
+
 async def _extract_memories_background(
     user_message: str,
     assistant_response: str,
     user_id: int | None,
     session_id: str | None,
     lang: str,
+    captured_kg_subjects: set[str] | None = None,
 ) -> None:
     """Background task: extract and save memories from a conversation exchange.
 
@@ -276,6 +353,12 @@ async def _extract_memories_background(
     failures of the LLM extractor or guard short-circuits are visible in
     production logs. Without this, missing memories look identical to a
     bug-skipped trigger.
+
+    ``captured_kg_subjects`` (Phase 3-subsume per-fact fix): when the chat
+    handler runs the `post_message`/KG extraction FIRST in the same ordered
+    background coroutine, the subject names the KG actually captured a relation
+    for this turn are threaded here so the subsume gate is per-fact, not a
+    subject-level proxy. None = uncoordinated → service falls back to the proxy.
     """
     logger.info(
         f"📝 Memory extraction starting (session={session_id}, user_id={user_id}, "
@@ -291,13 +374,91 @@ async def _extract_memories_background(
                 user_id=user_id,
                 session_id=session_id,
                 lang=lang,
+                captured_kg_subjects=captured_kg_subjects,
             )
             logger.info(
                 f"📝 Memory extraction done: extracted={len(memories)} "
                 f"(session={session_id})"
             )
+            # Chat branching (Phase 2) race guard: a fork/switch may have landed
+            # WHILE this background extraction ran, so re-derive is_active from the
+            # conversation's CURRENT active leaf. Idempotent — whichever of
+            # extraction/fork commits last re-fixes truth, so a memory written for
+            # an abandoned turn can't linger active. Flag-gated → zero cost when
+            # branching is off (the prod default).
+            if session_id and settings.chat_branching_enabled:
+                try:
+                    from sqlalchemy import select
+
+                    from models.database import Conversation as _Conv
+                    from services.conversation_service import (
+                        ConversationService as _CS,
+                    )
+                    _conv = (
+                        await db.execute(
+                            select(_Conv).where(_Conv.session_id == session_id)
+                        )
+                    ).scalar_one_or_none()
+                    if _conv is not None:
+                        _changed = await _CS(db).recompute_memory_activation(_conv)
+                        if _changed:
+                            await db.commit()
+                except Exception as _ge:  # noqa: BLE001
+                    logger.warning(
+                        f"⚠️ Post-extraction branch recompute failed: {_ge}"
+                    )
     except Exception as e:
         logger.warning(f"Memory extraction failed: {e}", exc_info=True)
+
+
+async def _extract_structured_background(
+    user_message: str,
+    assistant_response: str,
+    user_id: int | None,
+    session_id: str | None,
+    lang: str,
+) -> None:
+    """Ordered background coroutine for the Phase 3-subsume coordination.
+
+    Runs the `post_message` hooks FIRST (KG extraction + plugins like the twin),
+    capturing the subject NAMES of the relations the KG actually saved this turn
+    into a shared set, then runs memory extraction with that set so the subsume
+    gate is per (subject, turn): a state/attribute fact about a subject for whom
+    no relation was captured this turn is kept flat. (NOT truly per-fact — the
+    set holds subject names, not (subject, object) pairs, so a same-turn same-
+    subject state fact alongside an entity-object fact is still subsumed; see
+    ConversationMemoryService._should_subsume_fact.) KG extraction runs exactly
+    ONCE (in the hook); the set is the only cross-task signal — no double-extract.
+
+    Stays entirely in the background (this coroutine is spawned AFTER the `done`
+    frame), so re-sequencing KG-before-memory never delays the user response /
+    TTS / wakeword. Used ONLY when subsume coordination is active; otherwise the
+    two tasks stay independent + concurrent (legacy behavior, byte-identical).
+    """
+    from utils.hooks import run_hooks
+
+    captured_kg_subjects: set[str] = set()
+    # 1) post_message hooks first — KG populates the set. The hook reads it under
+    #    the kwarg name `captured_subjects` (see kg_post_message_hook). Plugins
+    #    (twin) ignore the extra kwarg (**kwargs). run_hooks never raises.
+    await run_hooks(
+        "post_message",
+        user_msg=user_message,
+        assistant_msg=assistant_response,
+        user_id=user_id,
+        session_id=session_id,
+        lang=lang,
+        captured_subjects=captured_kg_subjects,
+    )
+    # 2) memory extraction with the per-turn captured set as the subsume signal.
+    await _extract_memories_background(
+        user_message=user_message,
+        assistant_response=assistant_response,
+        user_id=user_id,
+        session_id=session_id,
+        lang=lang,
+        captured_kg_subjects=captured_kg_subjects,
+    )
 
 
 def _format_file_size(size_bytes: int | None) -> str:
@@ -309,6 +470,58 @@ def _format_file_size(size_bytes: int | None) -> str:
     if size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+# --- Paperless cold-start confirm handoff (deterministic bridge) -----------
+# forward_attachment_to_paperless leaves a paperless_pending_confirms row and
+# shows the user a preview; the user's NEXT message is their response. The
+# router/agent has no notion of a pending confirm, so without this bridge the
+# reply ("ja" / "1:neu, 2:x") is treated as a fresh request and the upload never
+# commits. We resolve the pending row per session and, when the message looks
+# like a confirm reply, route it straight to internal.paperless_commit_upload;
+# non-matches fall through to the agent (LLM fallback).
+_CONFIRM_REPLY_RE = re.compile(
+    r"^\s*(ja|nein|yes|no|ok|okay|abbrechen|cancel|neu|new|x)\b", re.IGNORECASE
+)
+_CONFIRM_FIELD_RE = re.compile(r"\b\d+\s*:\s*\S+")  # per-field choice, e.g. "1:neu", "2: x"
+_PENDING_CONFIRM_MAX_AGE_MIN = 60  # ignore abandoned confirms older than this
+
+
+def _looks_like_confirm_reply(text: str) -> bool:
+    """Does this message look like a reply to a Paperless confirm preview
+    (ja/nein, or per-field choices like '1:neu, 2:x')? Only consulted when a
+    pending confirm already exists for the session."""
+    t = (text or "").strip()
+    return bool(_CONFIRM_REPLY_RE.match(t) or _CONFIRM_FIELD_RE.search(t))
+
+
+async def _pending_paperless_confirm(session_id: str) -> str | None:
+    """confirm_token of the most recent *fresh* pending Paperless confirm for
+    this session, else None. The row exists only while a confirm awaits the
+    user (forward creates it; commit/abort deletes it; edit-rounds keep it). A
+    freshness window guards against an abandoned row hijacking a later message."""
+    try:
+        from datetime import datetime, timedelta
+
+        from sqlalchemy import select
+
+        from models.database import PaperlessPendingConfirm
+
+        cutoff = datetime.utcnow() - timedelta(minutes=_PENDING_CONFIRM_MAX_AGE_MIN)
+        async with AsyncSessionLocal() as db:
+            row = (await db.execute(
+                select(PaperlessPendingConfirm)
+                .where(
+                    PaperlessPendingConfirm.session_id == session_id,
+                    PaperlessPendingConfirm.created_at >= cutoff,
+                )
+                .order_by(PaperlessPendingConfirm.created_at.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+            return str(row.confirm_token) if row else None
+    except Exception as e:  # noqa: BLE001 — bridge is best-effort, never block chat
+        logger.warning(f"⚠️ Pending-confirm lookup failed: {e}")
+        return None
 
 
 async def _fetch_document_context(attachment_ids: list[int], lang: str) -> str:
@@ -381,6 +594,20 @@ async def _fetch_document_context(attachment_ids: list[int], lang: str) -> str:
         return ""
 
 
+def _format_memory_line(m: dict) -> str:
+    """Render one retrieved memory as a context line, surfacing its subject.
+
+    The subject tag is the D9 fix for the cross-person conflation: each fact
+    carries WHO it is about (``- [FACT · Alice] ...``) so the LLM never merges
+    facts about different people. Falls back to the bare category when the
+    memory has no subject (speaker-self / general facts).
+    """
+    cat_label = (m.get("category") or "").upper()
+    subject = m.get("subject_name")
+    tag = f"{cat_label} · {subject}" if subject else cat_label
+    return f"- [{tag}] {m.get('content', '')}"
+
+
 async def _retrieve_memory_context(content: str, user_id: int | None, lang: str) -> str:
     """Retrieve relevant memories and format as prompt section."""
     from utils.hooks import run_hooks
@@ -407,10 +634,7 @@ async def _retrieve_memory_context(content: str, user_id: int | None, lang: str)
                         combined.append(m)
 
                 if combined:
-                    lines = []
-                    for m in combined:
-                        cat_label = m["category"].upper()
-                        lines.append(f"- [{cat_label}] {m['content']}")
+                    lines = [_format_memory_line(m) for m in combined]
                     memories_str = "\n".join(lines)
 
                     sections.append(prompt_manager.get(
@@ -625,6 +849,189 @@ async def websocket_endpoint(
             # value automatically (Python 3.7+ context propagation).
             voice_originated.set(False)
 
+            # Lightweight session-register frame (client sends it on WS open /
+            # when it has a session_id). Registers the connection NOW so
+            # background pushes — e.g. the async chat-upload `upload_processed`
+            # event — can reach this session BEFORE the user's first text
+            # message. Without this, register_ws_connection only fires on the
+            # first chat message, so an upload-then-wait flow leaves the session
+            # unregistered and notify_session silently no-ops (chip stuck in
+            # "processing"). WSChatMessage is Literal["text"], so handle the
+            # register frame before that validation.
+            if isinstance(data, dict) and data.get("type") == "register":
+                reg_sid = data.get("session_id")
+                if reg_sid:
+                    register_ws_connection(reg_sid, websocket)
+                    session_state.db_session_id = reg_sid
+                continue
+
+            # Structured Paperless-confirm decision from the interactive confirm
+            # card. The card submits {type:"paperless_confirm", confirm_token,
+            # decisions:[{idx,action,value}], abort?} instead of free text, so we
+            # route straight to internal.paperless_commit_upload with the
+            # structured decisions — bypassing the free-text parser entirely.
+            # Handled before WSChatMessage validation (which is Literal["text"]).
+            if isinstance(data, dict) and data.get("type") == "paperless_confirm":
+                confirm_token = data.get("confirm_token")
+                # Prefer the server-tracked session (set on the `register` frame
+                # / first message) over the client-supplied one — the pending
+                # lookup is session-scoped, so trusting client input here would
+                # let a leaked confirm_token cross session boundaries.
+                confirm_sid = session_state.db_session_id or data.get("session_id")
+                # `user_id` is a loop-body local (first bound after WSChatMessage
+                # validation below), so derive the connection identity locally —
+                # referencing the later local here raises UnboundLocalError when a
+                # confirm frame is the first frame on a (re)connected socket.
+                confirm_user_id = (
+                    auth_result.get("user_id") if isinstance(auth_result, dict) else None
+                )
+                if not confirm_token:
+                    await send_ws_error(
+                        websocket, WSErrorCode.INVALID_MESSAGE,
+                        "paperless_confirm requires 'confirm_token'",
+                    )
+                    continue
+                try:
+                    from services.action_executor import ActionExecutor
+                    _mcp = getattr(app.state, "mcp_manager", None)
+                    _executor = ActionExecutor(mcp_manager=_mcp, session_id=confirm_sid)
+                    _params = {"confirm_token": confirm_token}
+                    if data.get("abort"):
+                        _params["abort"] = True
+                    else:
+                        _params["decisions"] = data.get("decisions") or []
+                    action_result = await _executor.execute(
+                        {
+                            "intent": "internal.paperless_commit_upload",
+                            "parameters": _params,
+                            "confidence": 1.0,
+                        },
+                        user_id=confirm_user_id,
+                    )
+                    await websocket.send_json({
+                        "type": "action",
+                        "intent": {"intent": "internal.paperless_commit_upload"},
+                        "result": action_result,
+                    })
+                    _confirm_msg = action_result.get("message", "") or ""
+                    if _confirm_msg:
+                        await websocket.send_json({"type": "stream", "content": _confirm_msg})
+                    await websocket.send_json({"type": "done"})
+                    logger.info(
+                        f"📎 Paperless confirm card → commit token "
+                        f"{str(confirm_token)[:8]} (session {confirm_sid})"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"⚠️ Paperless confirm card handoff failed: {e}")
+                    await send_ws_error(
+                        websocket, WSErrorCode.INTERNAL_ERROR,
+                        "Bestätigung konnte nicht verarbeitet werden.",
+                    )
+                continue
+
+            # Interactive device-control widget click (Gen-UI). The widget sends
+            # {type:"device_action", entity_id, action}; we gate on the HA_CONTROL
+            # permission (fail-closed), then route to internal.device_action which
+            # re-validates domain/action/entity before calling HA. The widget can
+            # grant NO control the user doesn't already have via the agent (same
+            # HA_CONTROL gate). Handled before WSChatMessage validation.
+            # NOTE (by design): this direct, authenticated click does NOT fire the
+            # `verify_tool_call` hook (which only runs on the agent's `mcp.*`
+            # path). A plugin voice-2FA gate on agent-issued HA calls therefore
+            # does not intercept widget clicks — that gate is for LLM/voice-
+            # originated actions, not a deliberate tap; HA_CONTROL is the gate here.
+            if isinstance(data, dict) and data.get("type") == "device_action":
+                da_user_id = auth_result.get("user_id") if isinstance(auth_result, dict) else None
+                entity_id = data.get("entity_id")
+                action = data.get("action")
+                da_value = data.get("value")  # optional numeric (brightness / temperature)
+                if (not isinstance(entity_id, str) or not entity_id or len(entity_id) > 255
+                        or not isinstance(action, str) or not action
+                        # bool is an int subclass — exclude it so `value: true`
+                        # can't slip through as a numeric (mirrors _require_str /
+                        # _finite_number in artifact_service).
+                        or (da_value is not None and (isinstance(da_value, bool)
+                                                      or not isinstance(da_value, (int, float))))):
+                    await send_ws_error(
+                        websocket, WSErrorCode.INVALID_MESSAGE,
+                        "device_action requires 'entity_id' (≤255 chars), 'action', optional numeric 'value'",
+                    )
+                    continue
+                # AUTH-enabled mode: a frame with NO resolved human user is a
+                # device/satellite token (user_id=None) — NOT a person with a
+                # permission list. Deny: only TRUE single-user mode (auth
+                # disabled) may actuate without HA_CONTROL. (A da_perms=None below
+                # is otherwise reachable by such a token and would skip the gate.)
+                if settings.auth_enabled and da_user_id is None:
+                    await websocket.send_json({
+                        "type": "device_action_result",
+                        "entity_id": entity_id,
+                        "success": False,
+                        "message": "Keine Berechtigung zum Steuern von Geräten.",
+                    })
+                    continue
+                # HA_CONTROL gate. da_perms is None ONLY in auth-disabled
+                # single-user mode now (parity with the agent's unrestricted
+                # actuation there); when a permission list exists, HA_CONTROL is
+                # required — fail-closed.
+                try:
+                    from models.permissions import Permission, has_permission
+                    da_perms = None
+                    if da_user_id is not None:
+                        from sqlalchemy import select as _select
+                        from sqlalchemy.orm import selectinload as _sel
+                        from models.database import User as _User
+                        async with AsyncSessionLocal() as _db:
+                            _u = (await _db.execute(
+                                _select(_User).options(_sel(_User.role)).where(_User.id == int(da_user_id))
+                            )).scalar_one_or_none()
+                            if _u:
+                                da_perms = _u.get_permissions()
+                    if da_perms is not None and not has_permission(da_perms, Permission.HA_CONTROL):
+                        await websocket.send_json({
+                            "type": "device_action_result",
+                            "entity_id": entity_id,
+                            "success": False,
+                            "message": "Keine Berechtigung zum Steuern von Geräten.",
+                        })
+                        continue
+
+                    from services.action_executor import ActionExecutor
+                    _mcp = getattr(app.state, "mcp_manager", None)
+                    _params: dict = {"entity_id": entity_id, "action": action}
+                    if da_value is not None:
+                        _params["value"] = da_value
+                    _res = await ActionExecutor(mcp_manager=_mcp).execute(
+                        {
+                            "intent": "internal.device_action",
+                            "parameters": _params,
+                            "confidence": 1.0,
+                        },
+                        user_id=da_user_id,
+                    )
+                    _rdata = _res.get("data") or {}
+                    _frame: dict = {
+                        "type": "device_action_result",
+                        "entity_id": entity_id,
+                        "success": bool(_res.get("success")),
+                        "state": _rdata.get("state"),
+                        "message": _res.get("message", ""),
+                    }
+                    # Echo the resolved continuous value so the slider/stepper reconciles.
+                    if "brightness" in _rdata:
+                        _frame["brightness"] = _rdata["brightness"]
+                    if "targetTemp" in _rdata:
+                        _frame["targetTemp"] = _rdata["targetTemp"]
+                    await websocket.send_json(_frame)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"⚠️ device_action failed: {e}")
+                    await websocket.send_json({
+                        "type": "device_action_result",
+                        "entity_id": entity_id, "success": False,
+                        "message": "Aktion fehlgeschlagen.",
+                    })
+                continue
+
             # Validate message
             try:
                 msg = WSChatMessage(**data)
@@ -636,6 +1043,14 @@ async def websocket_endpoint(
                 attachment_ids = msg.attachment_ids or []
                 msg_speaker_embedding = msg.speaker_embedding
                 msg_request_id = msg.request_id
+                # Chat branching (Phase 1): a fork is only honored when the flag
+                # is on; otherwise the inbound id is ignored and the turn appends
+                # normally (CTE-always-on keeps the tree walkable regardless).
+                fork_from_message_id = (
+                    msg.fork_from_message_id
+                    if settings.chat_branching_enabled
+                    else None
+                )
             except ValidationError as e:
                 await send_ws_error(websocket, WSErrorCode.INVALID_MESSAGE, str(e))
                 continue
@@ -706,9 +1121,22 @@ async def websocket_endpoint(
                     session_state.db_session_id = msg_session_id
                     register_ws_connection(msg_session_id, websocket)
                     try:
+                        # Cross-user IDOR guard: scope the history load to the
+                        # authenticated (JWT) caller when auth is enabled. The
+                        # established `user_id` is computed further down (and may be
+                        # voice-promoted), but the security identity for the
+                        # ownership boundary is the JWT one, available here.
+                        _auth_user_id = (
+                            auth_result.get("user_id")
+                            if isinstance(auth_result, dict)
+                            else None
+                        )
                         async with AsyncSessionLocal() as db_session:
                             db_history = await ollama.load_conversation_context(
-                                msg_session_id, db_session, max_messages=settings.agent_conv_context_messages
+                                msg_session_id, db_session,
+                                max_messages=settings.agent_conv_context_messages,
+                                user_id=_auth_user_id,
+                                enforce_ownership=settings.auth_enabled,
                             )
                             if db_history:
                                 session_state.conversation_history = db_history
@@ -833,7 +1261,40 @@ async def websocket_endpoint(
             intent = None
             action_result = None
             agent_steps_count = 0
+            # Provenance sources (knowledge_search) for the chat source-chips UI.
+            # Shared init so the persist/done block can reference it on every path
+            # (the legacy non-agent path never touches agent_tool_results).
+            agent_tool_results: list = []
+            # Validated chat artifacts (Lane A typed table/list/keyvalue/chart)
+            # produced by the hook / sub-intent / orchestration card path this
+            # turn. Emitted as `artifact` WS frames and persisted into
+            # message_metadata["artifacts"] (array, keyed by id). Gated on
+            # settings.artifacts_typed_enabled. See services/artifact_service.py.
+            turn_artifacts: list[dict] = []
+
+            async def _emit_turn_artifacts(raw_artifacts: object) -> None:
+                """Validate (caps/kind), emit `artifact` frames, accumulate for persist.
+
+                Called from each producer path (sub-intent / orchestration /
+                build_assistant_card hook). No-op when the Lane A flag is off so
+                the feature ships dark. Validation drops rejects (logged); the
+                client zod validator owns shape (a shape it can't render → its
+                escaped-text fallback). Each accepted artifact is emitted on its
+                own frame and queued into ``turn_artifacts`` for persistence.
+                """
+                if not settings.artifacts_typed_enabled:
+                    return
+                from services.artifact_service import (
+                    build_artifact_frame,
+                    validate_artifacts,
+                )
+                for art in validate_artifacts(raw_artifacts):
+                    turn_artifacts.append(art)
+                    await websocket.send_json(build_artifact_frame(art))
+
             media_shortcut_handled = False
+            paperless_confirm_handled = False
+            pending_confirm_token = None
 
             if settings.agent_enabled:
                 transport = _detect_media_transport(content)
@@ -873,16 +1334,71 @@ async def websocket_endpoint(
                         session_state.last_media_room = room
                         media_shortcut_handled = True
 
+            # === Paperless confirm handoff (pre-memory, pre-router) ===
+            # A fresh pending Paperless confirm + a confirm-like reply → commit
+            # deterministically. The router/agent can't be relied on to
+            # rediscover the 2-step protocol (it doesn't know a confirm is
+            # pending). Non-confirm-like messages fall through to the agent,
+            # which then sees the [PENDING_PAPERLESS_CONFIRM] directive below.
+            if not media_shortcut_handled and message_type == "text" and content and msg_session_id:
+                pending_confirm_token = await _pending_paperless_confirm(msg_session_id)
+                if pending_confirm_token and _looks_like_confirm_reply(content):
+                    try:
+                        from services.action_executor import ActionExecutor
+                        _mcp = getattr(app.state, "mcp_manager", None)
+                        _executor = ActionExecutor(mcp_manager=_mcp, session_id=msg_session_id)
+                        intent = {
+                            "intent": "internal.paperless_commit_upload",
+                            "parameters": {"confirm_token": pending_confirm_token},
+                            "confidence": 1.0,
+                        }
+                        action_result = await _executor.execute(
+                            {
+                                "intent": "internal.paperless_commit_upload",
+                                "parameters": {
+                                    "confirm_token": pending_confirm_token,
+                                    "user_response_text": content,
+                                },
+                                "confidence": 1.0,
+                            },
+                            user_id=user_id,
+                        )
+                        full_response = action_result.get("message", "") or ""
+                        await websocket.send_json(
+                            {"type": "action", "intent": intent, "result": action_result}
+                        )
+                        if full_response:
+                            await websocket.send_json({"type": "stream", "content": full_response})
+                        paperless_confirm_handled = True
+                        logger.info(
+                            f"📎 Paperless confirm handoff → commit token "
+                            f"{pending_confirm_token[:8]} (session {msg_session_id})"
+                        )
+                    except Exception as e:  # noqa: BLE001 — fall through to agent
+                        logger.warning(f"⚠️ Paperless confirm handoff failed: {e}")
+
             # Retrieve memory + document context (skipped for transport shortcuts)
             memory_context = ""
             document_context = ""
-            if not media_shortcut_handled:
+            if not media_shortcut_handled and not paperless_confirm_handled:
                 memory_context = await _retrieve_memory_context(
                     content, user_id=user_id, lang=ollama.default_lang
                 )
                 if attachment_ids:
                     document_context = await _fetch_document_context(
                         attachment_ids, lang=ollama.default_lang
+                    )
+                # LLM fallback: a pending confirm exists but the reply didn't look
+                # like ja/nein/field-choices. Tell the agent so it can still route
+                # to internal.paperless_commit_upload instead of guessing.
+                if pending_confirm_token and not paperless_confirm_handled:
+                    document_context += (
+                        "\n\n[PENDING_PAPERLESS_CONFIRM] Es liegt eine offene "
+                        "Paperless-Bestätigung vor (confirm_token="
+                        f"{pending_confirm_token}). Die aktuelle Nutzernachricht ist "
+                        "wahrscheinlich die Antwort darauf — rufe "
+                        "internal.paperless_commit_upload mit diesem confirm_token und "
+                        "user_response_text=<Nachricht> auf; erfinde keine andere Aktion."
                     )
 
             # Build personality context for agent prompts
@@ -893,10 +1409,22 @@ async def websocket_endpoint(
                     user_personality_style, user_personality_prompt, ollama.default_lang
                 )
 
+            # Build time-of-day context for agent prompts (day/evening/night).
+            # build_time_context wraps everything in try/except and returns ""
+            # on any error, so this can never break the agent path.
+            from services.daypart_service import build_time_context
+            time_context = build_time_context(lang=ollama.default_lang)
+
             # Get router from app state (initialized at startup if agent_enabled)
             agent_router = getattr(app.state, 'agent_router', None)
 
-            if not media_shortcut_handled and settings.agent_enabled and agent_router:
+            # Resolved agent role for this turn — surfaced to the client (role badge)
+            # + persisted. Only assigned on the router path below; init None so the
+            # shortcut paths (which skip classification) don't NameError when the
+            # shared persistence/done blocks reference it.
+            role = None
+
+            if not media_shortcut_handled and not paperless_confirm_handled and settings.agent_enabled and agent_router:
                 # === Unified Router Path ===
                 # Every message goes through router → specialized agent
                 from services.action_executor import ActionExecutor
@@ -933,12 +1461,27 @@ async def websocket_endpoint(
                 except Exception as _e:
                     logger.debug(f"Entity resolution skipped: {_e}")
 
+                # Effective role hint: an explicit palette role_hint wins; else a
+                # "Korrigieren & neu beantworten" regenerate maps its corrected
+                # intent to the owning role (None = fall through to normal routing).
+                _role_hint = getattr(msg, "role_hint", None)
+                if not _role_hint:
+                    _corrected = getattr(msg, "corrected_intent", None)
+                    if _corrected:
+                        _role_hint = agent_router.role_for_intent(_corrected)
+                        # !r so an injected newline in the client string can't forge log lines.
+                        if _role_hint:
+                            logger.info(f"Regenerate: corrected intent {_corrected!r} → role '{_role_hint}'")
+                        else:
+                            logger.debug(f"Regenerate: corrected intent {_corrected!r} mapped to no role; normal routing")
+
                 # Context-aware classification (entity → continuity → semantic → LLM)
                 role = await agent_router.classify_with_context(
                     content, _resolved, ollama,
                     conversation_history=session_state.conversation_history if session_state.conversation_history else None,
                     context_vars=_ctx_vars,
                     lang=ollama.default_lang,
+                    role_hint=_role_hint,
                 )
                 logger.info(f"🎯 Router: '{content[:60]}...' → {role.name}")
 
@@ -954,8 +1497,12 @@ async def websocket_endpoint(
                         pass  # Non-critical
 
                 # Fire post_routing hook (async, fire-and-forget) for trace persistence
+                # NOTE: do NOT `import asyncio` here. asyncio is imported at module
+                # scope (top of file); a function-local import inside this branch
+                # makes `asyncio` a LOCAL for the whole websocket_endpoint, so any
+                # asyncio.* use on a path that skips this branch raises
+                # UnboundLocalError (prod WebSocket crash, chat_handler:~1980).
                 from utils.hooks import run_hooks
-                import asyncio
                 _pr_task = asyncio.create_task(run_hooks(
                     "post_routing",
                     message=content,
@@ -1079,6 +1626,9 @@ async def websocket_endpoint(
                                     # card's contents.
                                     card_msg["replace_text"] = replace_text
                                 await websocket.send_json(card_msg)
+                            # Typed artifacts (Lane A) — a sub-intent handler may
+                            # return an `artifacts` list alongside/instead of a card.
+                            await _emit_turn_artifacts(si_result.get("artifacts"))
                             logger.info(
                                 f"Sub-intent '{role.name}/{role.sub_intent}' "
                                 f"handled by plugin (answer_chars={len(full_response)}, "
@@ -1179,6 +1729,11 @@ async def websocket_endpoint(
                         deferred_final_answer: str | None = None
                         deferred_card: dict | None = None
                         deferred_replace_text: str | None = None
+                        deferred_paperless_confirm: dict | None = None
+                        # Typed artifacts (Lane A) carried on the `card` step's
+                        # data — deferred like the card so they land after the
+                        # synthesis text bubble they attach to.
+                        deferred_artifacts: object = None
 
                         async def _typing_callback() -> None:
                             await websocket.send_json({"type": "typing"})
@@ -1195,6 +1750,7 @@ async def websocket_endpoint(
                             memory_context=memory_context,
                             document_context=document_context,
                             personality_context=personality_context,
+                            time_context=time_context,
                             user_permissions=user_permissions,
                             user_id=user_id,
                             context_vars_text=_context_vars_text,
@@ -1211,6 +1767,14 @@ async def websocket_endpoint(
                                 # 1-line lede via ``replace_text`` to
                                 # collapse the streamed synthesis bubble.
                                 deferred_replace_text = (step.data or {}).get("replace_text")
+                                # …and typed artifacts alongside the card.
+                                deferred_artifacts = (step.data or {}).get("artifacts")
+                            elif step.step_type == "paperless_confirm":
+                                # Same deferral as `card` — the interactive
+                                # confirm card attaches to the latest assistant
+                                # bubble, so hold it until the synthesis text
+                                # is on the wire.
+                                deferred_paperless_confirm = step.data
                             else:
                                 await websocket.send_json(step_to_ws_message(step))
                             if step.step_type == "tool_result" and step.success and step.data:
@@ -1288,6 +1852,21 @@ async def websocket_endpoint(
                                 card_msg["replace_text"] = deferred_replace_text
                             await websocket.send_json(card_msg)
 
+                        await _emit_turn_artifacts(deferred_artifacts)
+                        # Gen-UI: also emit widgets a sub-agent rendered via a
+                        # render/weather tool during orchestration.
+                        await _emit_turn_artifacts(_collect_tool_artifacts(agent_tool_results))
+
+                        if deferred_paperless_confirm:
+                            from services.agent_service import AgentStep
+                            await websocket.send_json(step_to_ws_message(
+                                AgentStep(
+                                    step_number=0,
+                                    step_type="paperless_confirm",
+                                    data=deferred_paperless_confirm,
+                                )
+                            ))
+
                         if agent_tool_results:
                             action_result = _build_agent_action_result(agent_tool_results)
                         if not intent:
@@ -1339,6 +1918,19 @@ async def websocket_endpoint(
                         server_filter=role.mcp_servers,
                         internal_filter=role.internal_tools,
                     )
+                    # Per-request tool filtering seam (mirrors pre_sub_agent for
+                    # the orchestrator path). Lets a plugin restrict the tool set
+                    # using the classified role + sub_intent before the agent
+                    # loop — e.g. deterministic sub-intent → tool-set filtering.
+                    # run_hooks swallows handler errors, so a faulty filter just
+                    # leaves the registry unfiltered.
+                    from utils.hooks import run_hooks
+                    await run_hooks(
+                        "filter_agent_tools",
+                        registry=tool_registry,
+                        role=role,
+                        message=content,
+                    )
                     agent = AgentService(tool_registry, role=role)
                     executor = ActionExecutor(mcp_manager=mcp_manager, session_id=msg_session_id)
 
@@ -1385,6 +1977,7 @@ async def websocket_endpoint(
                         memory_context=memory_context,
                         document_context=document_context,
                         personality_context=personality_context,
+                        time_context=time_context,
                         user_permissions=user_permissions,
                         user_id=user_id,
                         context_vars_text=_context_vars_text,
@@ -1413,13 +2006,17 @@ async def websocket_endpoint(
                     if agent_tool_results:
                         action_result = _build_agent_action_result(agent_tool_results)
 
+                    # Gen-UI: emit any typed widgets the agent rendered via the
+                    # render_table / render_list / weather_widget tools.
+                    await _emit_turn_artifacts(_collect_tool_artifacts(agent_tool_results))
+
                     logger.info(f"🤖 Agent [{role.name}] abgeschlossen: {agent_steps_count} Steps")
 
                     # Set intent info so frontend can show correction button
                     if not intent:
                         intent = {"intent": f"agent.{role.name}", "confidence": 1.0, "parameters": {}}
 
-            elif not media_shortcut_handled:
+            elif not media_shortcut_handled and not paperless_confirm_handled:
                 # === Legacy Ranked Intent Path (agent_enabled=false or no router) ===
                 logger.info("🔍 Extrahiere Ranked Intents...")
                 ranked_intents = await ollama.extract_ranked_intents(
@@ -1551,9 +2148,27 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
             assistant_metadata = {
                 "intent": intent.get("intent") if intent else None,
                 "action_success": action_result.get("success") if action_result else None,
+                # Resolved agent role — persisted so the role badge rehydrates on
+                # history reload (unlike the live-only intentInfo). None on shortcut paths.
+                "agent_role": role.name if role else None,
             }
             if action_summary:
                 assistant_metadata["action_summary"] = action_summary
+            # Provenance: which documents this answer drew on (circle-filtered at
+            # retrieval). Persisted so chips rehydrate on history load; also sent
+            # on the `done` frame below for the live turn. Empty → key omitted.
+            agent_sources = _extract_agent_sources(agent_tool_results)
+            if agent_sources:
+                assistant_metadata["sources"] = agent_sources
+
+            # Typed artifacts (Lane A) produced this turn by the sub-intent /
+            # orchestration card path. Persisted as message_metadata["artifacts"]
+            # (array keyed by id) so they rehydrate on history reload, mirroring
+            # `sources`. Empty → key omitted. (Hook-path artifacts emit after this
+            # block and are live-only — see the build_assistant_card site.)
+            if turn_artifacts:
+                from services.artifact_service import merge_artifacts_into_metadata
+                merge_artifacts_into_metadata(assistant_metadata, turn_artifacts)
 
             session_state.add_to_history("user", content)
             if full_response:
@@ -1562,28 +2177,136 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                 )
 
             # Persist messages to DB if session_id is provided
+            saved_user_message_id: int | None = None
+            saved_assistant_message_id: int | None = None
             if msg_session_id and full_response:
                 try:
                     async with AsyncSessionLocal() as db_session:
+                        # Chat branching (Phase 1): resolve the fork shape from the
+                        # role of `fork_from_message_id` (only set when the flag is
+                        # on). A fork_from pointing at a USER message = REGENERATE
+                        # (re-run the same turn → new assistant sibling under that
+                        # user message, NO new user message). A fork_from pointing
+                        # at an assistant message OR the conversation root (NULL
+                        # parent of the edited user msg) = EDIT-AND-RESUBMIT (new
+                        # user message as a sibling under fork_from, then the
+                        # assistant chains under it). Before generating we already
+                        # have full_response; deactivate the abandoned branch's
+                        # memories here so they stop being injected.
+                        from sqlalchemy import select
+
+                        from models.database import Conversation, Message
+                        from services.conversation_service import ConversationService
+
+                        regenerate_mode = False
+                        assistant_parent_id: int | None = None
+                        if fork_from_message_id is not None:
+                            # SECURITY (IDOR): scope the fork-target lookup to the
+                            # CALLER'S conversation. The client controls
+                            # fork_from_message_id, so an unscoped lookup would let
+                            # it name ANY message id in the DB — disclosing another
+                            # user's message role and, worse, seeding a fork whose
+                            # parent points into a foreign conversation. Joining on
+                            # the session id (mirrors the _abandoned query below)
+                            # makes a foreign/nonexistent target resolve to None →
+                            # treated as "no fork": ignore the id and fall back to a
+                            # normal appended turn.
+                            _fork_msg = (
+                                await db_session.execute(
+                                    select(Message.role)
+                                    .join(
+                                        Conversation,
+                                        Message.conversation_id == Conversation.id,
+                                    )
+                                    .where(
+                                        Message.id == fork_from_message_id,
+                                        Conversation.session_id == msg_session_id,
+                                    )
+                                )
+                            ).scalar_one_or_none()
+                            if _fork_msg is None:
+                                # Foreign/nonexistent target → not a valid fork.
+                                # Drop the id so the save path below appends a
+                                # normal turn (regenerate_mode stays False).
+                                logger.warning(
+                                    "🌿 Fork target %s not in session %s — "
+                                    "ignoring fork_from_message_id (normal turn)",
+                                    fork_from_message_id, msg_session_id,
+                                )
+                                fork_from_message_id = None
+                            else:
+                                # Phase 2: the abandoned branch's memories are no
+                                # longer deactivated one-way here. A single
+                                # SYMMETRIC recompute runs AFTER the new turn is
+                                # saved (so it keys on the new active leaf) — it
+                                # deactivates the abandoned subtree AND reactivates
+                                # whatever is back on-path, in one idempotent pass.
+                                # See the recompute_memory_activation call below.
+                                regenerate_mode = _fork_msg == "user"
+
                         # Save user message
                         user_metadata = {}
                         if room_context:
                             user_metadata["room_context"] = room_context
                         if attachment_ids:
                             user_metadata["attachment_ids"] = attachment_ids
-                        await ollama.save_message(
-                            msg_session_id, "user", content, db_session,
-                            metadata=user_metadata if user_metadata else None,
-                            user_id=user_id,
-                        )
+                        if regenerate_mode:
+                            # Re-run of an existing turn: reuse the existing user
+                            # message as the assistant's parent; do NOT duplicate it.
+                            saved_user_message_id = fork_from_message_id
+                            assistant_parent_id = fork_from_message_id
+                        else:
+                            _user_msg = await ollama.save_message(
+                                msg_session_id, "user", content, db_session,
+                                metadata=user_metadata if user_metadata else None,
+                                user_id=user_id,
+                                parent_message_id=fork_from_message_id,
+                                enforce_ownership=settings.auth_enabled,
+                            )
+                            saved_user_message_id = _user_msg.id
+                            # Assistant chains onto the just-saved user message
+                            # (save_message advanced the leaf there already; passing
+                            # None keeps it appending to that tip).
+                            assistant_parent_id = None
                         # Save assistant response (clean content for UI display)
                         # action_summary stored in metadata for LLM context reconstruction
-                        await ollama.save_message(
+                        _asst_msg = await ollama.save_message(
                             msg_session_id, "assistant", full_response, db_session,
                             metadata=assistant_metadata,
                             user_id=user_id,
+                            parent_message_id=assistant_parent_id,
+                            enforce_ownership=settings.auth_enabled,
                         )
+                        saved_assistant_message_id = _asst_msg.id
                         logger.debug(f"💾 Messages saved to DB: session_id={msg_session_id}, user_id={user_id}")
+
+                        # Chat branching (Phase 2): on a fork, recompute memory
+                        # activation from the NEW active leaf (root→this turn).
+                        # Symmetric + idempotent — deactivates the abandoned
+                        # sibling subtree and reactivates anything now back
+                        # on-path, replacing Phase-1's pre-save one-way deactivate
+                        # and closing its race. No-op on a normal append (active
+                        # path == all messages). save_message already committed the
+                        # new leaf, so reload the conversation to read it.
+                        if fork_from_message_id is not None:
+                            try:
+                                _conv = (
+                                    await db_session.execute(
+                                        select(Conversation).where(
+                                            Conversation.session_id == msg_session_id
+                                        )
+                                    )
+                                ).scalar_one_or_none()
+                                if _conv is not None:
+                                    _changed = await ConversationService(
+                                        db_session
+                                    ).recompute_memory_activation(_conv)
+                                    if _changed:
+                                        await db_session.commit()
+                            except Exception as _re:  # noqa: BLE001
+                                logger.warning(
+                                    f"⚠️ Fork memory recompute failed: {_re}"
+                                )
 
                         # Trigger summary generation if conversation is long enough
                         if settings.conversation_summary_threshold > 0:
@@ -1646,6 +2369,15 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                         if _card_payload.get("replace_text"):
                             _ws_card["replace_text"] = _card_payload["replace_text"]
                         await websocket.send_json(_ws_card)
+                    # Typed artifacts (Lane A) on the same hook payload. NOTE:
+                    # this hook fires AFTER the assistant message was persisted
+                    # above, so a hook-produced artifact renders live this turn
+                    # but does NOT rehydrate on history reload (same property as
+                    # the card itself, which this path also never persists). The
+                    # persisted artifacts are the sub-intent / orchestration ones
+                    # captured into turn_artifacts before the metadata block.
+                    if isinstance(_card_payload, dict):
+                        await _emit_turn_artifacts(_card_payload.get("artifacts"))
                 except Exception as e:
                     # Never block `done` on a card-build/send failure.
                     logger.warning(
@@ -1658,14 +2390,30 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                 "type": "done",
                 "tts_handled": tts_handled_by_server
             }
+            # Chat branching (Phase 1): the persisted message ids for THIS turn so
+            # the frontend can attach them to the rendered turn (needed to fork
+            # from the latest user/assistant message). Always emitted when known —
+            # harmless when the flag is off (the frontend simply doesn't act on
+            # them).
+            if saved_user_message_id is not None:
+                done_msg["user_message_id"] = saved_user_message_id
+            if saved_assistant_message_id is not None:
+                done_msg["assistant_message_id"] = saved_assistant_message_id
             if agent_used:
                 done_msg["agent_steps"] = agent_steps_count
+            if agent_sources:
+                done_msg["sources"] = agent_sources
             # Include intent info for frontend feedback UI
             if intent:
                 done_msg["intent"] = {
                     "intent": intent.get("intent"),
                     "confidence": intent.get("confidence", 0),
                 }
+            # Resolved agent role for the chat role badge (item 6). Frontend gates
+            # display on role_surfacing_enabled; always emitted so the flag flip
+            # needs no backend redeploy.
+            if role:
+                done_msg["role"] = role.name
             await websocket.send_json(done_msg)
 
             # Proactive feedback: ask user when action failed or returned empty
@@ -1697,21 +2445,68 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                 and full_response
                 and _action_success is not False
             )
+            # Phase 3-subsume per-fact fix: when subsume is active we COORDINATE
+            # the KG (`post_message`) and memory extractors so the subsume gate is
+            # per-fact. The ordered coroutine runs KG first (populating the
+            # captured-subject set) then memory extraction with that set, and OWNS
+            # the post_message hook dispatch (so KG runs exactly once — the
+            # separate post_message spawn below is skipped). Off (default) =>
+            # the two tasks stay independent + concurrent (legacy, byte-identical).
+            _subsume_coordinate = bool(
+                getattr(settings, "memory_subsume_to_kg", False)
+            )
             if _mem_should_run:
                 logger.debug(
-                    f"📝 Scheduling memory extraction (session={msg_session_id})"
+                    f"📝 Scheduling memory extraction (session={msg_session_id}, "
+                    f"subsume_coordinate={_subsume_coordinate})"
                 )
-                task = asyncio.create_task(
-                    _extract_memories_background(
-                        user_message=content,
-                        assistant_response=full_response,
-                        user_id=user_id,
-                        session_id=msg_session_id,
-                        lang=ollama.default_lang,
+                if _subsume_coordinate:
+                    task = asyncio.create_task(
+                        _extract_structured_background(
+                            user_message=content,
+                            assistant_response=full_response,
+                            user_id=user_id,
+                            session_id=msg_session_id,
+                            lang=ollama.default_lang,
+                        )
                     )
-                )
+                else:
+                    task = asyncio.create_task(
+                        _extract_memories_background(
+                            user_message=content,
+                            assistant_response=full_response,
+                            user_id=user_id,
+                            session_id=msg_session_id,
+                            lang=ollama.default_lang,
+                        )
+                    )
                 _background_tasks.add(task)
                 task.add_done_callback(_background_tasks.discard)
+
+            # Background: follow-up suggestion chips (opt-in/dark). Dispatched
+            # AFTER `done` so it never delays the turn (see _followup_chips_background).
+            # Skipped on error turns, trivially short answers, and spoken (TTS)
+            # turns — chips are a visual/tap affordance, useless + wasteful there.
+            if (
+                settings.followup_chips_enabled
+                and full_response
+                and len(full_response.strip()) >= 16
+                and not tts_handled_by_server
+                and (action_result is None or action_result.get("success") is not False)
+            ):
+                fu_task = asyncio.create_task(
+                    _followup_chips_background(
+                        websocket,
+                        content,
+                        full_response,
+                        lang=ollama.default_lang,
+                        model=settings.followup_chips_model or settings.ollama_intent_model,
+                        count=settings.followup_chips_count,
+                        timeout=settings.followup_chips_timeout_seconds,
+                    )
+                )
+                _background_tasks.add(fu_task)
+                fu_task.add_done_callback(_background_tasks.discard)
             else:
                 # WARN-level so the absence of extraction is auditable.
                 # The conversation/knowledge route can silently bypass this
@@ -1726,27 +2521,34 @@ WICHTIG: Nutze die ECHTEN Daten aus dem Ergebnis! Gib NUR die Antwort, KEIN JSON
                     f"action_success={_action_success}"
                 )
 
-            # Hook: post_message (fire-and-forget for plugins like renfield-twin)
-            from utils.hooks import run_hooks
-            _pm_task = asyncio.create_task(run_hooks(
-                "post_message",
-                user_msg=content,
-                assistant_msg=full_response,
-                user_id=user_id,
-                session_id=msg_session_id,
-            ))
-            _background_tasks.add(_pm_task)
-            _pm_task.add_done_callback(_background_tasks.discard)
+            # Hook: post_message (fire-and-forget for plugins like renfield-twin).
+            # Skipped ONLY when the subsume-coordination coroutine above already
+            # owns the post_message dispatch (it ran iff subsume is active AND
+            # memory extraction was scheduled this turn) — guarantees KG runs
+            # exactly once. If memory extraction was skipped (failed action /
+            # empty response), the coordinated coroutine never ran, so we still
+            # fire post_message here so KG + plugins are not starved.
+            if not (_subsume_coordinate and _mem_should_run):
+                from utils.hooks import run_hooks
+                _pm_task = asyncio.create_task(run_hooks(
+                    "post_message",
+                    user_msg=content,
+                    assistant_msg=full_response,
+                    user_id=user_id,
+                    session_id=msg_session_id,
+                ))
+                _background_tasks.add(_pm_task)
+                _pm_task.add_done_callback(_background_tasks.discard)
 
             logger.info(f"✅ WebSocket Response gesendet (tts_handled={tts_handled_by_server})")
 
     except WebSocketDisconnect:
         if session_state.db_session_id:
-            unregister_ws_connection(session_state.db_session_id)
+            unregister_ws_connection(session_state.db_session_id, websocket)
         logger.info("👋 WebSocket Verbindung getrennt")
     except Exception as e:
         if session_state.db_session_id:
-            unregister_ws_connection(session_state.db_session_id)
+            unregister_ws_connection(session_state.db_session_id, websocket)
         logger.error(f"❌ WebSocket Fehler: {e}")
         import traceback
         logger.error(traceback.format_exc())

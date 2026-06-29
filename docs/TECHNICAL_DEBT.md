@@ -2,7 +2,7 @@
 
 Dieses Dokument enthält eine umfassende Analyse der technischen Schulden im gesamten Renfield-System.
 
-**Letzte Aktualisierung:** 2026-05-26 (Frontend-Sweep: TypeScript-Migration als abgeschlossen markiert, alle Major-Dep-Updates als erledigt, Komponentengrößen mit aktuellen Zahlen)
+**Letzte Aktualisierung:** 2026-06-04 (Backend #14 behoben: `run_at_boot` für die täglichen Scheduler, #678)
 
 ---
 
@@ -10,11 +10,11 @@ Dieses Dokument enthält eine umfassende Analyse der technischen Schulden im ges
 
 | Bereich | Kritisch | Mittel | Niedrig | Gesamt | Behoben |
 |---------|----------|--------|---------|--------|---------|
-| Backend | 0 | 3 | 4 | 9 | 10 |
+| Backend | 0 | 3 | 4 | 9 | 11 |
 | Frontend | 0 | 0 | 2 | 4 | 7 |
 | Satellite | 0 | 3 | 2 | 5 | 5 |
 | Infrastruktur | 0 | 3 | 2 | 6 | 6 |
-| **Gesamt** | **0** | **9** | **10** | **24** | **28** |
+| **Gesamt** | **0** | **9** | **10** | **24** | **29** |
 
 ---
 
@@ -188,6 +188,27 @@ services/
 Optional: Eine kurze Notiz im neuen `CONTRIBUTING.md`-Abschnitt zu Alembic-Best-Practices, parallel zum bestehenden `memory/feedback_alembic_chain_check.md`.
 
 **Aufwand:** ~30 min für die Konvention; bestehende `pc20260527` nicht nachträglich umschreiben (irrelevant für die aktuelle Tabellengröße).
+
+---
+
+#### ~~14. Periodische Scheduler verlieren tägliche Ticks bei Pod-Neustart~~ ✅ Behoben
+
+**Status:** ✅ Behoben (2026-06-04, #678) — opt-in `run_at_boot` in `_spawn_periodic_task`: ein Tick direkt nach Spawn, vor dem ersten `sleep(interval)`. Aktiviert für die vier täglichen Scheduler (Skill Curator, Trajectory Cleanup, Skill Shadow-Log Cleanup, Speaker-Vocab-Rebuild). Kurz-Intervall-Scheduler behalten den Default (ihr erster Tick fällt ohnehin in eine normale Pod-Lebensdauer). Boot-Run-Fehler werden geloggt und geschluckt (fällt in die Intervall-Schleife durch); `CancelledError` während des Boot-Ticks propagiert sauber (Shutdown). Unit-Tests in `tests/backend/test_lifecycle_scheduler.py`. Die persistierte `last_run_at`-Catch-up-Variante bleibt für ein etwaiges Multi-Replica-Deployment offen, ist aber für den aktuellen Single-Replica-Betrieb nicht nötig.
+
+**Ursprünglicher Befund (2026-06-04):**
+
+**Problem:** `_spawn_periodic_task` (`api/lifecycle.py`) implementiert seine Schleife als `sleep(interval)` → `work()` (sleep-then-run). Der erste Tick erfolgt also erst `interval` Sekunden _nach_ dem Pod-Boot, und der Timer startet bei jedem Neustart bei null. Für die täglichen Scheduler (`interval=86400s`) heißt das: startet der Backend-Pod häufiger als alle 24 h neu (Rollout, OOM, k8s-Reschedule), feuert der Tick **nie**. Betroffen v. a. **Skill Curator** und **Trajectory Cleanup** (beide 86400s), sekundär Skill-Shadow-Log-Cleanup und Speaker-Vocab-Rebuild.
+
+**Evidenz:** In Produktion ist `skill_curator_runs` leer trotz `SKILL_CURATOR_ENABLED=true`; das Log zeigt bei jedem Boot „Skill Curator gestartet", aber keinen einzigen abgeschlossenen Lauf — der Pod wird vor Ablauf der 24 h neu gestartet. Die `procedural_skills`-Dedup/Archivierung läuft damit faktisch nie, ebenso wenig die 30-Tage-Trajectory-Retention (Purge).
+
+**Empfehlung:**
+- Run-at-boot-Tick (einmal `work()` vor der Schleife, optional mit kleinem Jitter gegen Boot-Storms bei mehreren Replicas), **oder**
+- persistierter `last_run_at` (z. B. aus `skill_curator_runs` selbst oder einer kleinen `scheduler_state`-Tabelle) + „catch-up wenn überfällig"-Logik beim Boot.
+- Run-at-boot ist die kleinere Änderung; die persistierte Variante ist robuster gegen häufige Neustarts und Multi-Replica-Deployments.
+
+**Aufwand:** ~1–2 h für run-at-boot inkl. Tests; ~halber Tag für die persistierte Catch-up-Variante.
+
+**Tracking:** [#678](https://github.com/ebongard/renfield/issues/678); betrifft alle `_spawn_periodic_task`-Aufrufer mit Intervall ≳ erwarteter Pod-Lebensdauer.
 
 ---
 

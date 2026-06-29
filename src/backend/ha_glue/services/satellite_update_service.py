@@ -6,11 +6,20 @@ Manages update initiation and tracks update progress.
 """
 
 import hashlib
+import re
 import tarfile
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+# Match `__version__ = "1.4.0"` (single or double quotes), tolerating an inline
+# comment / trailing whitespace. Anchored at line start so __version_info__ or a
+# commented-out line can't match.
+_VERSION_RE = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']')
+# A valid version is dotted digits — reject anything else so a malformed source
+# can't poison version comparison (int() parse) or the tarball filename.
+_VERSION_VALUE_RE = re.compile(r"^\d+(\.\d+)*$")
 
 from loguru import logger
 
@@ -41,8 +50,41 @@ class SatelliteUpdateService:
         logger.info("📦 SatelliteUpdateService initialized")
 
     def get_latest_version(self) -> str:
-        """Get the latest available satellite version from config"""
-        return ha_glue_settings.satellite_latest_version
+        """Latest available satellite version.
+
+        Read from the bundled satellite source (``__version__`` in
+        ``renfield_satellite/__init__.py``) so the advertised version is ALWAYS
+        exactly the package the OTA endpoint would actually serve. This kills the
+        drift class of bug where the source shipped a new version but the
+        ``satellite_latest_version`` env was never bumped (the UI then offered a
+        stale version, or — once it pointed below the deployed code — offered
+        nothing). Falls back to the configured value when the source isn't
+        bundled (local dev / a stripped image).
+        """
+        return self._read_source_version() or ha_glue_settings.satellite_latest_version
+
+    def _read_source_version(self) -> str | None:
+        """Parse ``__version__`` from the bundled satellite source, or None.
+
+        A plain line scan rather than an import — the satellite package pulls in
+        hardware deps (pyaudio, gpiozero, …) the backend image doesn't have.
+        """
+        init_file = self.satellite_source_path / "renfield_satellite" / "__init__.py"
+        try:
+            for line in init_file.read_text().splitlines():
+                m = _VERSION_RE.match(line)
+                if m:
+                    value = m.group(1).strip()
+                    # Reject a malformed value rather than let it disable OTA
+                    # (non-numeric breaks is_update_available's int() compare) or
+                    # flow unsanitized into the package filename.
+                    return value if _VERSION_VALUE_RE.match(value) else None
+        except (OSError, ValueError):
+            # OSError: missing/unreadable. ValueError (incl. UnicodeDecodeError):
+            # a corrupt/non-UTF8 file. Either way fall back to the config value
+            # rather than crash version resolution.
+            return None
+        return None
 
     def is_update_available(self, current_version: str) -> bool:
         """
@@ -131,11 +173,19 @@ class SatelliteUpdateService:
 
             logger.info(f"📦 Building update package: {tarball_path}")
 
+            def _no_pycache(tarinfo):
+                # Exclude compiled bytecode (regenerated; not in the signed
+                # manifest) so a stale/injected .pyc can't ride along (H6).
+                name = tarinfo.name
+                if "__pycache__" in name.split("/") or name.endswith(".pyc"):
+                    return None
+                return tarinfo
+
             with tarfile.open(tarball_path, "w:gz") as tar:
                 # Add the renfield_satellite directory
                 satellite_dir = source_path / "renfield_satellite"
                 if satellite_dir.exists():
-                    tar.add(satellite_dir, arcname="renfield_satellite")
+                    tar.add(satellite_dir, arcname="renfield_satellite", filter=_no_pycache)
 
                 # Add requirements.txt if it exists
                 requirements = source_path / "requirements.txt"
@@ -156,12 +206,19 @@ class SatelliteUpdateService:
             checksum = self._calculate_checksum(tarball_path)
             size = tarball_path.stat().st_size
 
+            # Load the offline-signed release manifest if shipped in the image
+            # (security H6). The backend only FORWARDS these bytes; it cannot
+            # mint a signature. None when the release was not signed.
+            manifest, signature = self._load_release_signature()
+
             # Update cache
             self._package_cache = {
                 "path": str(tarball_path),
                 "checksum": checksum,
                 "size": size,
-                "version": version
+                "version": version,
+                "manifest": manifest,
+                "signature": signature,
             }
             self._package_cache_time = now
 
@@ -179,6 +236,40 @@ class SatelliteUpdateService:
             for chunk in iter(lambda: f.read(8192), b""):
                 sha256.update(chunk)
         return f"sha256:{sha256.hexdigest()}"
+
+    def _load_release_signature(self) -> tuple[str | None, str | None]:
+        """Read the offline-signed release manifest + signature shipped in the
+        image (security H6), or (None, None) if the release was not signed.
+
+        The backend only forwards these bytes — it never signs (the private key
+        lives offline). Filenames mirror renfield_satellite.update.release_manifest.
+        """
+        manifest_path = self.satellite_source_path / "RELEASE_MANIFEST.json"
+        sig_path = self.satellite_source_path / "RELEASE_MANIFEST.json.sig"
+        m_exists, s_exists = manifest_path.exists(), sig_path.exists()
+
+        # Genuinely unsigned release (neither file shipped) — the legitimate
+        # dark/legacy path.
+        if not m_exists and not s_exists:
+            return None, None
+
+        # A half-signed release (one file present, the other missing) is a
+        # packaging error, NOT "unsigned" — fail loud rather than silently drop
+        # signing for the whole fleet.
+        if m_exists != s_exists:
+            raise RuntimeError(
+                f"Incomplete release signing: manifest={m_exists} signature={s_exists} "
+                f"— refusing to serve an OTA package with a half-present signature."
+            )
+
+        # Both present: a read error here is a real fault. Do NOT swallow it into
+        # "unsigned" (that would silently disarm signature verification fleet-wide
+        # and get cached). Let it propagate so build_update_package fails loudly.
+        # Forward the manifest VERBATIM (the satellite verifies the signature over
+        # these exact bytes — do not re-serialize).
+        manifest = manifest_path.read_text(encoding="utf-8")
+        signature = sig_path.read_text(encoding="utf-8").strip()
+        return manifest, signature
 
     def get_package_info(self) -> dict[str, Any] | None:
         """
@@ -235,6 +326,17 @@ class SatelliteUpdateService:
                 "message": "Failed to build update package"
             }
 
+        # Security H6: when signed OTA is required, refuse to push an update that
+        # has no signed release manifest (or whose manifest version doesn't match
+        # the built package) — fail closed rather than ship unverifiable code.
+        signed_ok = bool(package_info.get("manifest") and package_info.get("signature"))
+        if ha_glue_settings.satellite_ota_require_signature and not signed_ok:
+            return {
+                "success": False,
+                "message": "Signed OTA required but this release has no signed manifest — "
+                           "run bin/sign_satellite_release.py and rebuild the image.",
+            }
+
         # Update status
         manager.set_update_status(
             satellite_id,
@@ -250,7 +352,10 @@ class SatelliteUpdateService:
                 "target_version": package_info["version"],
                 "package_url": "/api/satellites/update-package",
                 "checksum": package_info["checksum"],
-                "size_bytes": package_info["size"]
+                "size_bytes": package_info["size"],
+                # Signed release manifest (H6) — None on unsigned releases.
+                "manifest": package_info.get("manifest"),
+                "signature": package_info.get("signature"),
             })
 
             logger.info(f"📤 Update request sent to satellite {satellite_id}")

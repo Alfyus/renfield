@@ -8,6 +8,22 @@
  */
 
 /**
+ * Mic constraints for EVERY voice-capture path (recording, barge-in listener,
+ * speaker enrollment). Without these the raw `{audio:true}` stream runs with
+ * browser auto-gain ON, which cranks the gain on a quiet room and pushes the
+ * ambient noise floor up to speech level (measured RMS median 53 in a real
+ * room) — so the VAD never sees silence and the streamed noise is transcribed
+ * as garbage. `noiseSuppression` removes stationary background noise;
+ * `autoGainControl:false` keeps the floor down so the VAD stays meaningful.
+ * Centralized so recording, verification, and enrollment share identical
+ * acoustic preprocessing (the ECAPA speaker embedding is sensitive to a
+ * train/test mismatch between enroll and verify).
+ */
+export const VOICE_MIC_CONSTRAINTS: MediaStreamConstraints = {
+  audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+};
+
+/**
  * RMS of the analyser's current frequency-domain frame, on the 0..255
  * byte scale.
  *

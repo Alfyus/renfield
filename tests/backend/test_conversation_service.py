@@ -446,3 +446,81 @@ class TestConversationModel:
         assert test_message.conversation_id == test_conversation.id
         assert test_message.role == "user"
         assert test_message.content == "Schalte das Licht ein"
+
+
+# ============================================================================
+# Cross-user IDOR guard (security review H2) — WS-path ownership enforcement
+# ============================================================================
+
+@pytest.mark.backend
+@pytest.mark.database
+class TestConversationOwnershipGuard:
+    """A conversation owned by user A must not be read or written by user B
+    when ``enforce_ownership=True`` (auth-enabled WS path)."""
+
+    async def test_load_context_blocks_cross_user(self, db_session: AsyncSession):
+        service = ConversationService(db_session)
+        # User 1 owns the conversation
+        await service.save_message("idor-load", "user", "private question", user_id=1)
+        await service.save_message("idor-load", "assistant", "private answer", user_id=1)
+
+        # User 2 must see nothing
+        ctx = await service.load_context(
+            "idor-load", user_id=2, enforce_ownership=True
+        )
+        assert ctx == []
+
+    async def test_load_context_allows_owner(self, db_session: AsyncSession):
+        service = ConversationService(db_session)
+        await service.save_message("idor-load-ok", "user", "mine", user_id=7)
+        ctx = await service.load_context(
+            "idor-load-ok", user_id=7, enforce_ownership=True
+        )
+        assert [m["content"] for m in ctx] == ["mine"]
+
+    async def test_load_context_default_is_unenforced(self, db_session: AsyncSession):
+        """Legacy callers (enforce_ownership defaults False) stay byte-identical."""
+        service = ConversationService(db_session)
+        await service.save_message("idor-load-legacy", "user", "mine", user_id=1)
+        # Different/None caller, no enforcement → still returns history
+        ctx = await service.load_context("idor-load-legacy", user_id=2)
+        assert [m["content"] for m in ctx] == ["mine"]
+
+    async def test_save_message_blocks_cross_user_write(self, db_session: AsyncSession):
+        service = ConversationService(db_session)
+        await service.save_message("idor-write", "user", "owner msg", user_id=1)
+
+        with pytest.raises(PermissionError):
+            await service.save_message(
+                "idor-write", "user", "attacker msg",
+                user_id=2, enforce_ownership=True,
+            )
+
+        # Victim's thread is untouched (only the owner's message persists)
+        ctx = await service.load_context("idor-write")
+        assert [m["content"] for m in ctx] == ["owner msg"]
+
+    async def test_save_message_allows_owner_write(self, db_session: AsyncSession):
+        service = ConversationService(db_session)
+        await service.save_message("idor-write-ok", "user", "one", user_id=3)
+        await service.save_message(
+            "idor-write-ok", "assistant", "two", user_id=3, enforce_ownership=True
+        )
+        ctx = await service.load_context("idor-write-ok")
+        assert [m["content"] for m in ctx] == ["one", "two"]
+
+    async def test_save_message_adopts_ownerless_under_enforcement(self, db_session: AsyncSession):
+        """An ownerless conversation (single-user/household) is still adoptable
+        even with enforcement on — the guard only fires on a DIFFERENT owner."""
+        service = ConversationService(db_session)
+        # Create an ownerless conversation first (user_id=None)
+        await service.save_message("idor-adopt", "user", "hi")
+        # Now a real user writes with enforcement — should adopt, not raise
+        msg = await service.save_message(
+            "idor-adopt", "assistant", "claimed", user_id=5, enforce_ownership=True
+        )
+        assert msg.id is not None
+        result = await db_session.execute(
+            select(Conversation).where(Conversation.session_id == "idor-adopt")
+        )
+        assert result.scalar_one().user_id == 5

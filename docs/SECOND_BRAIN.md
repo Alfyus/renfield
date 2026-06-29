@@ -63,7 +63,9 @@ Wenn ein Nutzer fragt *„Was weiß ich über Am Stirkenbend 20?"*, will er kein
 
 Der API-Endpunkt `/api/atoms` und die `/brain`-Frontend-Seite exponieren genau diesen Weg.
 
-**Mehrsprachigkeit im Lexical-Pfad:** Sowohl `conversation_memories.search_vector` (Migration `pc20260528`) als auch `document_chunks.search_vector` (Migration `pc20260529`) sind `GENERATED STORED`-Spalten, deren Ausdruck `to_tsvector`-Aufrufe über alle in `services/fts_languages.FTS_LANGUAGES` aufgeführten Configs (DE / EN / FR / IT / ES / NL) unioniert. Die Query-Seite unioniert `websearch_to_tsquery` über dieselbe Menge. So matcht ein französisches Memory oder Dokument eine deutsche Anfrage und umgekehrt — wichtig für mehrsprachige Haushalte. Beide Spalten pflegen sich serverseitig — App-Code schreibt nicht mehr in `search_vector` (Postgres würde mit `cannot insert a non-DEFAULT value into column "search_vector"` antworten).
+**Mehrsprachigkeit im Lexical-Pfad:** `conversation_memories.search_vector` (Migration `pc20260528`), `document_chunks.search_vector` (Migration `pc20260529`) und `document_facts.search_vector` (Migration `pc20260602`) sind `GENERATED STORED`-Spalten, deren Ausdruck `to_tsvector`-Aufrufe über alle in `services/fts_languages.FTS_LANGUAGES` aufgeführten Configs (DE / EN / FR / IT / ES / NL) unioniert. Die Query-Seite unioniert `websearch_to_tsquery` über dieselbe Menge. So matcht ein französisches Memory oder Dokument eine deutsche Anfrage und umgekehrt — wichtig für mehrsprachige Haushalte. Alle drei Spalten pflegen sich serverseitig — App-Code schreibt nicht mehr in `search_vector` (Postgres würde mit `cannot insert a non-DEFAULT value into column "search_vector"` antworten).
+
+**Schicht-A-Fakten als Retrieval-Quelle:** Aus Dokumenten extrahierte strukturierte Fakten (`document_facts`) waren bis dato *write-only*: nichts las sie. Die Extraktion ist **offen/generisch** — ein deterministischer Pass sichert Identifikatoren (Steuernummer, IBAN), ein LLM-Pass liefert Verpflichtungen plus eine freie `facts[]`-Liste, sodass jeder Dokumenttyp seine eigenen Eckdaten (Rechnungsdatum, Vertragskonto, Leistungszeitraum, Guthaben, Beträge, Aussteller …) statt einer festen Feldauswahl trägt; gespeichert wird in zwei Kübeln (`identifier` / `universal`) plus die typisierten `obligation`-Fakten. `services/document_fact_retrieval.py` macht sie abfragbar und fusioniert `document_fact` als weitere Quelle in dieselbe RRF (grünes „Fakt"-Badge unter `/brain`). Keyword-FTS über `search_vector` plus ein Identifier-`ILIKE`-Zweig auf `normalized_value` (Postgres tokenisiert `114/5876/5293` unzuverlässig — der ILIKE-Zweig ist die verlässliche Exakt-Identifier-Suche, nur bei identifier-förmigen Query-Tokens aktiv). Fakten erben die Circle-Tier-Policy ihres Eltern-Dokuments. Zwei weitere Lesepfade tragen die UI: `facts_for_document(doc_id)` (alle Fakten eines Dokuments) speist die inline **Fakten**-Panel auf jeder `/knowledge`-Dokumentkarte, und `obligations(due_before, offset)` speist die Verpflichtungs-Agenda unter `/brain/fristen` (Rechnungen + Behörden-Fristen, nach Dringlichkeit gruppiert, nächste Frist zuerst) — das eigentlich tragende Versprechen gegen die „stiller-Archiv"-Narbe. Beide Flächen rendern Herkunft (`✓` deterministisch / `~` Modell-Vorschlag) und Tier; rechtliche Fristen (`legal_gate`) sind als `⚑ rechtlich` markiert. Das Bestätigen einer Frist ist serverseitig im Quittungs-Ledger (`obligation_acknowledgements`) verankert (`POST/DELETE /api/atoms/obligations/{id}/confirm`, pro Nutzer) — geräteübergreifend und zugleich das Signal, das den **Fristen-Notifier** stoppt. Der Notifier (`OBLIGATION_NOTIFIER_ENABLED`, täglicher besitzer-adressierter Scan über `obligation_date`, restart-fest via Ledger) macht aus den Fristen *ankommende* Erinnerungen — die andere Hälfte des Versprechens gegen die „stiller-Archiv"-Narbe; rechtliche Fristen werden gemeldet, aber human-gated über `/brain/review`.
 
 Die spezialisierten Retrieval-Pfade bleiben daneben erhalten:
 
@@ -108,6 +110,8 @@ Alle drei nutzen dieselbe `circle_sql.build_filter`-Klausel, sodass Circle-Reich
 
 **KG-Extraktion** läuft sowohl bei Dokument-Ingest (als Hook) als auch bei Chat-Memory-Ingest. Derselbe LLM-Prompt, unterschiedliche Quell-Kontexte. Entity-Deduplizierung per Cosine-Similarity (Embedding-basiert) verhindert das Anlegen von `Eduard van den Bongard` und `Eduard` als zwei Entitäten.
 
+**Ingest-Audit (`document_processing_history`).** Jeder Lauf durch `RAGService.process_existing_document` schreibt eine Zeile in eine reine Audit-Tabelle: `started_at`, `finished_at`, `status` (`processing`/`completed`/`failed`), `force_ocr`, `ocr_engine` (`docling`/`docling_full_page_ocr`), `chunks_produced`, `chunks_dropped_low_quality`, `trigger` (`initial_ingest`/`user_reindex`/`script_purge`/`startup_sweep`), `error_message`. Geschrieben durch den Single-Writer `DocumentProcessingHistoryService.track()` Async-Context-Manager — die Ingest-Funktion belegt die Metriken auf einem Handle, der Manager schließt die Zeile beim Verlassen. Verwendet vom Cleanup-Skript `bin/purge_low_quality_chunks.py` (Re-OCR von Altbestand mit OCR-Garbage): `has_force_ocr_succeeded(doc_id)` filtert über einen Partial-Index Dokumente, die bereits per `force_ocr=True` neu eingelesen wurden — macht das Skript über mehrere Läufe idempotent.
+
 ---
 
 ## Tier-Defaults und Tier-Review
@@ -115,6 +119,12 @@ Alle drei nutzen dieselbe `circle_sql.build_filter`-Klausel, sodass Circle-Reich
 Neue Atome erhalten einen **Default-Tier** — aktuell `2` (household) bei Dokument-Uploads, `1` (trusted) bei KG-Entities aus Chat-Memories. Die Defaults sind bewusst eher einschränkend: was nicht ausdrücklich geteilt wurde, bleibt nah am Eigentümer.
 
 `/brain/review` listet Atome, die der Eigentümer neu klassifizieren sollte — neue Uploads, Entities mit Tier-Konflikten zwischen Relationen, Memories die ein Gate knapp passiert haben. Der Eigentümer kann dort batch-weise Tiers setzen; die Tier-Cascade propagiert auf incidente Relationen.
+
+## Strukturiertes Memory — Kanonisierung & Subjekt
+
+Damit das Gedächtnis nicht nur „flacher Text" ist, traegt jeder konversationelle Fakt ein **Subjekt** (`subject_name` / `subject_entity_id`): über WEN er handelt. Das Retrieval reicht das Subjekt mit und taggt den injizierten Kontext (`- [FACT · <Name>] …`), sodass Fakten über verschiedene Personen strukturell nicht mehr vermischt werden.
+
+Auf der KG-Seite werden Entitäten **kanonisiert**: Schreibvarianten sammeln sich als `surface_forms` auf der kanonischen Zeile, eine Entität kann mehrere Rollen tragen (`entity_types`, z. B. Person + Musiker), und Relationen halten die Provenienz (`stated_by_user_id` — wer hat es gesagt). Ein periodischer **Reconciler** führt nachträglich entstandene Dubletten zusammen: same-tier mit hoher Ähnlichkeit automatisch, Cross-Tier/Grauzone als **Merge-Vorschlag** zur Owner-Review (`/brain/review`). Eine Verschmelzung erhöht nie die Sichtbarkeit (Tier = MIN) — Details in [`CIRCLES.md`](CIRCLES.md#merge-invariante-structured-memory).
 
 ---
 
@@ -129,6 +139,18 @@ Zwei paarweise verbundene Renfield-Instanzen können Queries über die Circle-Gr
 Atome gehören immer **genau einem** `owner_user_id`. Es gibt keine geteilten Atome ohne expliziten Grant — das Modell kennt keinen „shared folder" mit Eigentum-am-Ordner. Das hält die Verantwortlichkeit scharf: wer ein Atom löscht, löscht *sein* Atom; was Mitglieder niedrigerer Tiers davon sehen, war nie *ihres*.
 
 Konsequenz: bei User-Löschung werden alle Atome des Nutzers kaskadierend gelöscht. `AtomExplicitGrant`-Einträge zu anderen Nutzern ebenso. Dort wo KG-Relations auf gelöschte Entitäten zeigen, werden sie mit-abgeräumt.
+
+---
+
+## Ein Ort für alles — der Wissens-Workspace
+
+Die vier Informationsarten haben historisch je eine eigene Seite (`/knowledge`, `/brain`, `/memory`, `/knowledge-graph`, plus die Fristen-Agenda und die Review-Queue). Hinter dem Flag `wissen_workspace_enabled` (standardmäßig aus) verschmelzen sie zu **einem** `/wissen`-Workspace — denn es ist *ein* Korpus, betrachtet durch verschiedene Linsen:
+
+- **Lens-Leiste** statt sechs Navigationspunkte: Übersicht · Dokumente · Graph · Erinnerungen · Fristen · Prüfen. Jede Linse ist die bestehende Seite, eingebettet (Doppel-Header/Breite entfallen via `LensFrame` + Kontext); Sichtbarkeit pro Linse über dieselben Permission-/Feature-Gates.
+- **Lens-bezogene Omnisuche** als Dreh- und Angelpunkt: `scope=lens` lässt die aktive Linse ihre *eigene* Inline-Suche fahren (Dokument-Chunk-Suche, Entity-Tabellenfilter), `scope=everything` legt ein Cross-Source-RRF-Overlay über die `/api/atoms`-Fusion (genau der Weg aus dem Retrieval-Abschnitt oben).
+- **Universeller Detail-Drawer**: Klick auf ein beliebiges Ergebnis öffnet typ-spezifischen Inhalt (Dokument→Fakten, Fakt→ObligationRow+Herkunft, Memory→Text, Entity→Name/Typ, Kante→Triple) samt Tier-Edit. Damit Graph-Entities einzeln adressierbar sind, liefert das Retrieval nun **pro-Entity-`kg_node`-/pro-Relation-`kg_edge`-Atome** (statt eines aggregierten Blocks); der String-Kontext für den Agenten bleibt unverändert.
+
+Alte URLs leiten (mit `?search`/`#hash`) in die Linsen um; ist das Flag aus, bleibt die flache Navigation unverändert. Code-Detail: Abschnitt „Unified Wissen workspace" in `CLAUDE.md`.
 
 ---
 

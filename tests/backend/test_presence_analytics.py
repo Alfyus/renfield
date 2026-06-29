@@ -55,6 +55,18 @@ async def _insert_event(db, user_id, room_id, event_type="enter", source="ble",
     return ev
 
 
+@pytest.fixture(autouse=True)
+def _utc_analytics_tz(monkeypatch):
+    """Pin analytics bucketing to UTC so the grouping/prediction tests assert
+    absolute hours without a timezone shift. TZ-specific behaviour is covered
+    by TestTimezoneBucketing, which overrides this within the test body."""
+    monkeypatch.setattr(
+        "ha_glue.services.presence_analytics.ha_glue_settings.presence_analytics_timezone",
+        "UTC",
+        raising=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hook handler tests
 # ---------------------------------------------------------------------------
@@ -222,6 +234,54 @@ class TestPredictions:
         result = await service.get_predictions(user_id=1, days=365)
         # With 1 distinct day over 52 weeks, probability ≈ 0.02 → filtered out
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Timezone bucketing tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+class TestTimezoneBucketing:
+    async def test_heatmap_buckets_in_local_time(self, db_session, monkeypatch):
+        """Hours are bucketed in the configured local timezone, not UTC.
+
+        Regression: events are stored as naive UTC; a German user saw the
+        heatmap hours offset by the UTC offset.
+        """
+        # Etc/GMT-5 is a fixed UTC+5 zone (no DST) → deterministic assertion.
+        monkeypatch.setattr(
+            "ha_glue.services.presence_analytics.ha_glue_settings.presence_analytics_timezone",
+            "Etc/GMT-5",
+        )
+        await _seed_user_and_room(db_session, user_id=1, room_id=10, room_name="Kitchen")
+        # 22:00 UTC → 03:00 local (UTC+5)
+        ts = (datetime.now(UTC).replace(tzinfo=None) - timedelta(days=1)).replace(
+            hour=22, minute=0, second=0, microsecond=0,
+        )
+        await _insert_event(db_session, 1, 10, "enter", created_at=ts)
+
+        service = PresenceAnalyticsService(db_session)
+        result = await service.get_heatmap(days=30)
+        assert len(result) == 1
+        assert result[0]["hour"] == 3  # local 03:00, NOT the stored UTC 22:00
+
+    async def test_invalid_timezone_falls_back_to_utc(self, db_session, monkeypatch):
+        """An unparseable timezone name degrades to UTC instead of crashing."""
+        monkeypatch.setattr(
+            "ha_glue.services.presence_analytics.ha_glue_settings.presence_analytics_timezone",
+            "Not/AZone",
+        )
+        await _seed_user_and_room(db_session, user_id=1, room_id=10, room_name="Kitchen")
+        ts = (datetime.now(UTC).replace(tzinfo=None) - timedelta(days=1)).replace(
+            hour=9, minute=0, second=0, microsecond=0,
+        )
+        await _insert_event(db_session, 1, 10, "enter", created_at=ts)
+
+        service = PresenceAnalyticsService(db_session)
+        result = await service.get_heatmap(days=30)
+        assert len(result) == 1
+        assert result[0]["hour"] == 9  # UTC fallback → unchanged
 
 
 # ---------------------------------------------------------------------------

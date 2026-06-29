@@ -3,8 +3,8 @@ Datenbank Models
 """
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, BigInteger, Boolean, Column, DateTime, FetchedValue, Float, ForeignKey, Index, Integer, SmallInteger, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy import JSON, BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, FetchedValue, Float, ForeignKey, Index, Integer, Numeric, SmallInteger, String, Text, UniqueConstraint, text as sa_text
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
@@ -43,8 +43,42 @@ class Conversation(Base):
     context_vars = Column(JSON, nullable=True)   # Pinned structured state (entities, focus)
     summary = Column(Text, nullable=True)         # LLM-generated summary of older messages
 
+    # Chat branching (edit-and-fork, Phase 1). The tip of the ACTIVE branch —
+    # the active conversation path is the recursive walk of Message.parent_message_id
+    # UPWARD from this leaf (see ConversationService.active_path_message_ids). Always
+    # maintained on every save_message (CTE-always-on, independent of the
+    # CHAT_BRANCHING_ENABLED flag — the flag only gates the fork affordances/UI).
+    # NULL = empty conversation. Plain Integer FK (constraint added post-create in the
+    # migration to avoid the circular conversations<->messages create-order issue).
+    # ON DELETE SET NULL: deleting a conversation cascade-deletes its messages
+    # (Conversation.messages cascade="all, delete-orphan"), which would otherwise
+    # leave this column dangling at the now-deleted leaf → FK violation / 500 on
+    # Postgres (DELETE /api/chat/session/{id} + the cleanup loop). SET NULL clears
+    # it as the messages go, so the conversation row deletes cleanly.
+    # use_alter=True breaks the conversations<->messages FK cycle for
+    # metadata.create_all (the sqlite test harness has no ALTER ADD CONSTRAINT,
+    # so it omits this FK there — fine; prod's schema comes from the migration,
+    # which adds it with ON DELETE SET NULL). Without this, create_all can't
+    # sequence the cyclic constraints and even a NULL-leaf conversation INSERT
+    # fails under PRAGMA foreign_keys=ON.
+    active_leaf_message_id = Column(
+        Integer,
+        ForeignKey(
+            "messages.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_conversations_active_leaf_message_id",
+        ),
+        nullable=True,
+    )
+
     # Beziehungen
-    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
+    messages = relationship(
+        "Message",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        foreign_keys="Message.conversation_id",
+    )
     user = relationship("User", back_populates="conversations", foreign_keys=[user_id])
     speaker = relationship("Speaker", foreign_keys=[speaker_id])
 
@@ -59,8 +93,45 @@ class Message(Base):
     timestamp = Column(DateTime, default=_utcnow)
     message_metadata = Column(JSON, nullable=True)  # Umbenannt von 'metadata'
 
+    # Chat branching (edit-and-fork, Phase 1). Self-FK to the message that
+    # immediately PRECEDES this one on its branch (NULL = the conversation root).
+    # The active branch is reconstructed by walking this pointer upward from
+    # Conversation.active_leaf_message_id (recursive CTE). A FORK inserts a NEW
+    # message sharing the same parent as the one it replaces (a sibling), so the
+    # original turn is preserved (Phase 2's switcher can resurrect it). Always
+    # maintained on every save (CTE-always-on); the CHAT_BRANCHING_ENABLED flag
+    # only gates the fork affordances/UI, not this column or the active-path query.
+    # ON DELETE CASCADE: deleting a parent prunes its whole subtree.
+    parent_message_id = Column(
+        Integer,
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
+    # Full-text search vector for chat message search (roadmap item 3). Post-
+    # pc20260617 this is a Postgres GENERATED STORED column that unions
+    # to_tsvector across all FTS_LANGUAGES (DE/EN/FR/IT/ES/NL) over `content`.
+    # READ-ONLY from the app: Postgres rejects any INSERT/UPDATE that supplies a
+    # value. The FetchedValue() marker keeps the column out of ORM
+    # INSERTs/UPDATEs (same pattern as DocumentChunk / ConversationMemory /
+    # DocumentFact) so the message write sites in conversation_service /
+    # api/routes/chat.py work unchanged against the GENERATED schema. Sqlite
+    # test runs get a plain nullable column; the GENERATED DDL lives only in the
+    # migration. Search is scoped by conversation OWNERSHIP (messages are not
+    # atoms), NOT through circle_sql — see ConversationService.search_messages.
+    search_vector = Column(TSVECTOR, FetchedValue(), nullable=True)
+
     # Beziehungen
-    conversation = relationship("Conversation", back_populates="messages")
+    # Explicit foreign_keys: two FK paths now exist between conversations and
+    # messages (Message.conversation_id → conversations.id AND
+    # Conversation.active_leaf_message_id → messages.id), so pin the join column
+    # for this relationship to avoid AmbiguousForeignKeysError at mapper config.
+    conversation = relationship(
+        "Conversation",
+        back_populates="messages",
+        foreign_keys=[conversation_id],
+    )
 
 class Task(Base):
     """Aufgaben"""
@@ -241,9 +312,35 @@ class Document(Base):
 
     # Metadata (extrahiert aus Dokument)
     title = Column(String(512), nullable=True)
+    # Human-meaningful title synthesized from Schicht A facts (issuer + type +
+    # date), generated by the LLM at extraction time. Used as the display name in
+    # the UI when present; falls back to title → filename. See
+    # services/schicht_a_extractor.generate_document_title.
+    generated_title = Column(String(512), nullable=True)
     author = Column(String(255), nullable=True)
     page_count = Column(Integer, nullable=True)
     chunk_count = Column(Integer, default=0)
+
+    # Folder-ingest Paperless leg (D2/D10). Tracks whether this document has
+    # been filed into Paperless by the folder-ingest bridge, so a re-pushed
+    # already-completed document runs ONLY the still-missing Paperless step
+    # instead of re-ingesting. NULL = never attempted (normal uploads, and
+    # existing rows pre-migration); see PAPERLESS_STATE_* constants below.
+    # "done" (filed / duplicate-marker terminal / skipped) is the only value
+    # that counts as paperless-done for the dedup matrix.
+    paperless_state = Column(String(20), nullable=True)
+    # The resulting Paperless document id once filed (from await_consume_result).
+    # NULL = never filed, or filed before pc20260613 (recoverable via the
+    # filename+date match in bin/backfill_paperless_metadata.py).
+    paperless_document_id = Column(Integer, nullable=True)
+
+    # Operator flag (set from the Paperless Audit page's "low-quality OCR" tab):
+    # when True, this document is deliberately ignored by the low-quality-chunk
+    # cleanup (bin/purge_low_quality_chunks.py) and can be filtered out of the
+    # audit UI. Additive; migration pc20260618_doc_quality_ignored.
+    quality_ignored = Column(
+        Boolean, nullable=False, server_default=sa_text("false"), default=False
+    )
 
     # Timestamps
     created_at = Column(DateTime, default=_utcnow)
@@ -288,8 +385,16 @@ class DocumentChunk(Base):
         nullable=True
     )
 
-    # Parent-Child Chunking (parent_chunk_id references larger parent chunk)
-    parent_chunk_id = Column(Integer, ForeignKey("document_chunks.id"), nullable=True, index=True)
+    # Parent-Child Chunking (parent_chunk_id references larger parent chunk).
+    # ON DELETE CASCADE added in pc20260530_dph: defends raw-SQL deletes on
+    # parent chunks. ORM-mediated deletes already cascade Python-side via
+    # the `chunks` cascade='all,delete-orphan' on Document.
+    parent_chunk_id = Column(
+        Integer,
+        ForeignKey("document_chunks.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Chunk Metadata
     chunk_index = Column(Integer)           # Position im Dokument (0-basiert)
@@ -516,6 +621,44 @@ class PaperlessUploadTracking(Base):
     swept_at = Column(DateTime, nullable=True, index=True)
 
 
+class EmailIngestLog(Base):
+    """Per-attachment provenance + idempotency ledger for email auto-ingest.
+
+    The renfield-mcp-email-ingest watcher pushes each allowlisted attachment to
+    POST /api/email-ingest/document; the bridge records one row per
+    (mailbox_id, message_id, attachment_sha256) here. Two jobs:
+
+    - **Provenance/audit:** which email (mailbox + Message-ID + sender/subject)
+      a given Document came from — not stored on Document itself.
+    - **Idempotency:** the UNIQUE (mailbox_id, message_id, attachment_sha256)
+      lets a re-pushed email short-circuit to `duplicate` even before the
+      content-hash dedup (and keyed by mailbox so two spheres never collide).
+
+    ``document_id`` is the resulting Document (NULL when the push was rejected
+    before a row was created, e.g. failed/oversize); ``status`` mirrors the
+    4-state IngestStatus the bridge returned.
+    """
+    __tablename__ = "email_ingest_log"
+    __table_args__ = (
+        UniqueConstraint(
+            "mailbox_id", "message_id", "attachment_sha256",
+            name="uq_email_ingest_mailbox_msg_attachment",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    mailbox_id = Column(String(120), nullable=False, index=True)
+    message_id = Column(String(998), nullable=False)  # RFC 5322 line-length cap
+    attachment_sha256 = Column(String(64), nullable=False)
+    document_id = Column(
+        Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    sender = Column(String(320), nullable=True)  # RFC 5321 max addr length
+    subject = Column(Text, nullable=True)
+    status = Column(String(20), nullable=True)  # IngestStatus value at record time
+    created_at = Column(DateTime, default=_utcnow)
+
+
 # Document Processing Status Constants
 DOC_STATUS_PENDING = "pending"
 DOC_STATUS_PROCESSING = "processing"
@@ -523,6 +666,15 @@ DOC_STATUS_COMPLETED = "completed"
 DOC_STATUS_FAILED = "failed"
 
 DOC_STATUSES = [DOC_STATUS_PENDING, DOC_STATUS_PROCESSING, DOC_STATUS_COMPLETED, DOC_STATUS_FAILED]
+
+# Folder-ingest Paperless leg state (Document.paperless_state). NULL = the
+# Paperless step was never attempted for this row. "pending"/"failed" are
+# retryable (not paperless-done); only "done" terminates the leg — it covers a
+# successful file, a Paperless duplicate-marker reject (D10, the doc is already
+# there), and the to_paperless-disabled skip.
+PAPERLESS_STATE_PENDING = "pending"
+PAPERLESS_STATE_DONE = "done"
+PAPERLESS_STATE_FAILED = "failed"
 
 
 # Chunk Type Constants
@@ -938,6 +1090,19 @@ class ConversationMemory(Base):
     # named-circles per Finding 1.2C).
     atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=True, index=True)
     circle_tier = Column(Integer, nullable=False, default=0)
+
+    # --- Structured Memory (Phase 0/D9): subject attribution ---
+    # WHO the fact is ABOUT (a named person -> their entity), distinct from
+    # user_id (the OWNER) and from the speaker. Closes the
+    # flat-memory conflation bug: retrieval can subject-filter instead of
+    # relying on embedding neighborhood. subject_entity_id links to the
+    # canonical KG entity when one resolves; subject_name carries the raw
+    # name even when no entity exists yet (e.g. a not-yet-seen person).
+    subject_entity_id = Column(
+        Integer, ForeignKey("kg_entities.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    subject_name = Column(String(255), nullable=True, index=True)
 
     # Full-text search vector (Postgres GENERATED STORED column from
     # pc20260528). READ-ONLY from the app side — Postgres maintains it
@@ -1401,12 +1566,47 @@ class KGEntity(Base):
     atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=True, index=True)
     circle_tier = Column(Integer, nullable=False, default=0)
 
+    # --- Structured Memory (Phase 0): canonicalization + multi-type ---
+    # NULL canonical_id == this row IS canonical/live; non-NULL == tombstone
+    # pointing at the surviving entity (mirrors procedural_skills.merged_into_id).
+    # merge_entities sets the pointer + is_active=False and reparents
+    # kg_relations FKs to the winner. Reads filter `canonical_id IS NULL`.
+    canonical_id = Column(
+        Integer, ForeignKey("kg_entities.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    # Absorbed alternate spellings / aliases, accumulated on the canonical row.
+    # JSON on sqlite (test shim), JSONB on Postgres (GIN-indexed in migration).
+    surface_forms = Column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False, default=list, server_default=sa_text("'[]'"),
+    )
+    # Multi-type superset, e.g. ["person","musician"]. The scalar entity_type
+    # stays the PRIMARY type for back-compat display/filter; entity_types is the
+    # full set. Backfilled to [entity_type] in the Phase-0 migration.
+    entity_types = Column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False, default=list, server_default=sa_text("'[]'"),
+    )
+    # Optional external grounding (e.g. Wikidata QID). Column only — no runtime
+    # linker (offline-first); reserved for a later phase.
+    external_id = Column(String(64), nullable=True, index=True)
+
     __table_args__ = (
         Index('ix_kg_entities_user_active', 'user_id', 'is_active'),
         Index('idx_kg_entities_owner_tier', 'user_id', 'circle_tier'),
+        # GIN index on surface_forms is created in the Phase-0 migration
+        # (postgresql_using='gin' + jsonb_path_ops) — not here, mirroring the
+        # vector-index convention (indexes that need a PG opclass live in
+        # migrations, not create_all, so the sqlite test shim stays clean).
     )
 
     user = relationship("User", foreign_keys=[user_id])
+    # Self-reference to the surviving (canonical) entity when this row is a
+    # merge tombstone. remote_side keeps it a many-to-one toward the winner.
+    canonical = relationship(
+        "KGEntity", foreign_keys=[canonical_id], remote_side="KGEntity.id",
+    )
     subject_relations = relationship(
         "KGRelation", foreign_keys="KGRelation.subject_id",
         back_populates="subject", cascade="all, delete-orphan"
@@ -1439,6 +1639,13 @@ class KGRelation(Base):
     atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=True, index=True)
     circle_tier = Column(Integer, nullable=False, default=0)
 
+    # --- Structured Memory (Phase 0): provenance ---
+    # Who ASSERTED this fact (the authenticated speaker at extraction time),
+    # distinct from user_id (the graph OWNER). Enables "who told me X about Y".
+    stated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    # The specific message the assertion was extracted from (when available).
+    source_message_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
+
     __table_args__ = (
         Index('idx_kg_relations_subj_tier', 'subject_id', 'circle_tier'),
         Index('idx_kg_relations_obj_tier', 'object_id', 'circle_tier'),
@@ -1447,6 +1654,55 @@ class KGRelation(Base):
     subject = relationship("KGEntity", foreign_keys=[subject_id], back_populates="subject_relations")
     object = relationship("KGEntity", foreign_keys=[object_id], back_populates="object_relations")
     user = relationship("User", foreign_keys=[user_id])
+
+
+# KG merge-proposal review queue (Structured Memory Phase 1, T5)
+KG_MERGE_PROPOSAL_PENDING = "pending"
+KG_MERGE_PROPOSAL_APPROVED = "approved"
+KG_MERGE_PROPOSAL_REJECTED = "rejected"
+# A concurrent approve already merged one side before this one applied (#3):
+# the merge was a no-op, so the proposal is closed as superseded rather than
+# flipped to a misleading "approved" (owner sees nothing changed).
+KG_MERGE_PROPOSAL_SUPERSEDED = "superseded"
+# Why a proposal exists instead of an auto-merge:
+KG_MERGE_REASON_CROSS_TIER = "cross_tier"  # endpoints at different tiers — needs owner sign-off (D3)
+KG_MERGE_REASON_GRAY_ZONE = "gray_zone"    # similar but below the auto-merge threshold (D10)
+
+
+class KgMergeProposal(Base):
+    """A reconciler-proposed entity merge awaiting owner review (D3).
+
+    The background reconciler auto-merges only same-tier, high-confidence
+    duplicates. Cross-tier pairs (which could change who can see the merged
+    node) and gray-zone pairs (similar but below the auto threshold) are NOT
+    merged silently — they land here for the owner to approve/reject on
+    /brain/review. Approval routes through KnowledgeGraphService.merge_entities
+    (loser -> winner), which keeps the merge invariants (tier=MIN, never raise
+    visibility).
+    """
+    __tablename__ = "kg_merge_proposals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    loser_entity_id = Column(Integer, ForeignKey("kg_entities.id", ondelete="CASCADE"), nullable=False)
+    winner_entity_id = Column(Integer, ForeignKey("kg_entities.id", ondelete="CASCADE"), nullable=False)
+    similarity = Column(Float, nullable=False, default=0.0)
+    loser_tier = Column(Integer, nullable=False, default=0)
+    winner_tier = Column(Integer, nullable=False, default=0)
+    reason = Column(String(30), nullable=False, default=KG_MERGE_REASON_CROSS_TIER)
+    status = Column(String(20), nullable=False, default=KG_MERGE_PROPOSAL_PENDING, index=True)
+    created_at = Column(DateTime, default=_utcnow)
+    resolved_at = Column(DateTime, nullable=True)
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    __table_args__ = (
+        Index("ix_kg_merge_proposals_user_status", "user_id", "status"),
+        # one pending proposal per ordered pair (partial unique) is created in
+        # the migration (PG WHERE-predicate index — not expressible portably here).
+    )
+
+    loser = relationship("KGEntity", foreign_keys=[loser_entity_id])
+    winner = relationship("KGEntity", foreign_keys=[winner_entity_id])
 
 
 class MemoryHistory(Base):
@@ -1524,12 +1780,22 @@ SETTING_WAKEWORD_KEYWORD = "wakeword.keyword"
 SETTING_WAKEWORD_THRESHOLD = "wakeword.threshold"
 SETTING_WAKEWORD_COOLDOWN_MS = "wakeword.cooldown_ms"
 SETTING_NOTIFICATION_WEBHOOK_TOKEN = "notification.webhook_token"
+# Revocable Bearer token the renfield-mcp-filesystem server presents on the
+# folder-ingest push (POST /api/folder-ingest/document). Minted by the admin
+# token route (T14), verified constant-time on every push.
+SETTING_FOLDER_INGEST_TOKEN = "folder_ingest.token"
+# Revocable Bearer token the renfield-mcp-email-ingest server presents on the
+# email-ingest push (POST /api/email-ingest/document). Separate from the
+# folder-ingest token so the two watchers are independently revocable.
+SETTING_EMAIL_INGEST_TOKEN = "email_ingest.token"
 
 SYSTEM_SETTING_KEYS = [
     SETTING_WAKEWORD_KEYWORD,
     SETTING_WAKEWORD_THRESHOLD,
     SETTING_WAKEWORD_COOLDOWN_MS,
     SETTING_NOTIFICATION_WEBHOOK_TOKEN,
+    SETTING_FOLDER_INGEST_TOKEN,
+    SETTING_EMAIL_INGEST_TOKEN,
 ]
 
 
@@ -1579,6 +1845,26 @@ ATOM_TYPE_KG_NODE = "kg_node"
 ATOM_TYPE_KG_EDGE = "kg_edge"
 ATOM_TYPE_CONVERSATION_MEMORY = "conversation_memory"
 ATOM_TYPE_PROCEDURAL_SKILL = "procedural_skill"
+ATOM_TYPE_DOCUMENT_FACT = "document_fact"
+
+# DocumentFact.category discriminators (Schicht A). 'identifier' = a deterministic
+# regex hit (Steuernummer, IBAN, Rechnungsnummer); 'obligation' = an LLM-extracted
+# actionable (zahlung/kuendigung/widerspruch/...) carrying a date/amount + legal_gate;
+# 'universal' = a query-layer fact (issuer, total). Free text; no CHECK constraint.
+DOC_FACT_CATEGORY_IDENTIFIER = "identifier"
+DOC_FACT_CATEGORY_OBLIGATION = "obligation"
+DOC_FACT_CATEGORY_UNIVERSAL = "universal"
+# DocumentFact.source — provenance/trust: deterministic regex vs LLM inference.
+DOC_FACT_SOURCE_DETERMINISTIC = "deterministic"
+DOC_FACT_SOURCE_LLM = "llm"
+
+# ObligationAcknowledgement.milestone — the lead-time bucket the notifier fired,
+# OR the reserved sentinel "confirmed" written by the agenda's Bestätigen action.
+# A "confirmed" ack for (fact, owner) suppresses all further notifier milestones
+# for that obligation (the user has handled it). Free text; values are produced
+# only by services/obligation_deadline_notifier.current_milestone + the confirm
+# route, never by the LLM, so no CHECK constraint.
+OBLIGATION_MILESTONE_CONFIRMED = "confirmed"
 
 # ProceduralSkill.source discriminators are declared up-file (in front of
 # the ORM class body that references them as Column defaults). Asserting
@@ -1714,6 +2000,191 @@ class AtomExplicitGrant(Base):
     atom = relationship("Atom", back_populates="explicit_grants")
     grantee = relationship("User", foreign_keys=[granted_to_user_id])
     granter = relationship("User", foreign_keys=[granted_by])
+
+
+class DocumentFact(Base):
+    """One structured fact extracted from a Document's ``field_text`` (Schicht A).
+
+    Polymorphic atom source (``atom_type='document_fact'``): every row is wrapped
+    by an :class:`Atom` so the fact inherits the parent Document's ``circle_tier``
+    and participates in cross-source retrieval. Writers go through
+    ``SchichtAExtractor`` → ``AtomService.create_with_source`` /
+    ``finalize_source_id`` (never a direct INSERT — same rule as other atom sources).
+
+    One table holds three shapes, discriminated by ``category``:
+      * ``identifier`` — a deterministic regex hit. ``value`` is the verbatim span,
+        ``normalized_value`` the whitespace-collapsed form (poppler ``-layout``
+        letter-spaces wide-tracked lines, so the Steuernummer arrives as
+        ``11 4 / 5 8 7 6 / 5 2 9 3``; exact lookups MUST use ``normalized_value``).
+      * ``obligation`` — an LLM-extracted actionable; carries ``obligation_date``
+        (ISO, AS PRINTED — never computed), optional ``amount_*``, ``legal_gate``
+        (statutory/widerspruch kinds → always human-confirmed), ``payment_method``.
+      * ``universal`` — a query-layer fact (issuer, total).
+
+    ``excerpt`` is the verbatim source span (trust anchor) for every category.
+    ``source`` records provenance: ``deterministic`` (regex) vs ``llm`` (inference).
+    """
+    __tablename__ = "document_facts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    category = Column(String(16), nullable=False)   # identifier | obligation | universal
+    kind = Column(String(32), nullable=False)       # steuernummer | zahlung | issuer | ...
+    value = Column(Text, nullable=False)            # verbatim extracted value/summary
+    normalized_value = Column(Text, nullable=True)  # whitespace-collapsed (identifiers)
+    excerpt = Column(Text, nullable=True)           # verbatim source span (trust anchor)
+    obligation_date = Column(Date, nullable=True)   # Frist/Faelligkeit AS PRINTED
+    amount_value = Column(Numeric(14, 2), nullable=True)
+    amount_currency = Column(String(8), nullable=True)
+    legal_gate = Column(Boolean, nullable=False, default=False)
+    payment_method = Column(String(16), nullable=True)  # manual | lastschrift | ...
+    confidence = Column(Float, nullable=True)
+    source = Column(String(16), nullable=False, default=DOC_FACT_SOURCE_DETERMINISTIC)
+    atom_id = Column(String(36), ForeignKey("atoms.atom_id", ondelete="CASCADE"), nullable=False, index=True)
+    circle_tier = Column(Integer, nullable=False, default=0)
+    # When True, this fact's circle_tier was set independently (e.g. a public
+    # issuer on an otherwise-private document) and the parent-document tier
+    # cascade (AtomService.update_tier) MUST NOT overwrite it — sticky in both
+    # directions for the life of this fact row, until explicitly reset to the
+    # document tier (reset_fact_tier). Re-ingest / re-OCR recreates the fact set
+    # from scratch, but the Schicht A ingest hook CARRIES OVERRIDES FORWARD: it
+    # snapshots the prior overridden facts by content identity
+    # (schicht_a_extractor._fact_identity_key = category + kind + normalized/
+    # value signature) and re-applies tier_overridden + the override tier to a
+    # matching re-extracted fact. A fact whose content drifted enough not to
+    # match reverts to the document tier (fail-safe: never more visible than the
+    # parent doc by default).
+    tier_overridden = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+    # Full-text search vector. Post-<id>_document_facts_fts this is a Postgres
+    # GENERATED STORED column that unions to_tsvector across all FTS_LANGUAGES
+    # over `value || normalized_value || excerpt || kind` — the lookup surface
+    # for DocumentFactRetrieval.search(). READ-ONLY from the app: Postgres
+    # rejects any INSERT/UPDATE that supplies a value. The FetchedValue()
+    # marker keeps the column out of ORM INSERTs/UPDATEs (same pattern as
+    # DocumentChunk / ConversationMemory). Sqlite test runs get a plain
+    # nullable column; the GENERATED DDL lives only in the migration.
+    search_vector = Column(TSVECTOR, FetchedValue(), nullable=True)
+
+    __table_args__ = (
+        Index("idx_document_facts_doc_category", "document_id", "category"),
+        Index("idx_document_facts_doc_tier", "document_id", "circle_tier"),
+    )
+
+    document = relationship("Document", foreign_keys=[document_id])
+
+
+class ObligationAcknowledgement(Base):
+    """Notified-ledger + Bestätigt state for Schicht A obligation deadlines.
+
+    One table, two row shapes discriminated by ``milestone``:
+
+      * **notifier ledger** — ``milestone`` ∈ {``14d``,``7d``,``3d``,``1d``,
+        ``due``,``overdue``}, ``user_id`` = the obligation's OWNER. Written by
+        ``services/obligation_deadline_notifier`` after it enqueues a reminder so
+        the daily scan never re-fires the same lead-time bucket (idempotent across
+        pod restarts — the missed-deadline safety property).
+      * **user confirmation** — ``milestone`` = ``"confirmed"`` (the
+        ``OBLIGATION_MILESTONE_CONFIRMED`` sentinel), ``user_id`` = whoever
+        clicked Bestätigen in the agenda. This is the server home for the
+        agenda's former localStorage state. Per-user: a circle peer can confirm
+        their OWN view without affecting anyone else's. The notifier only honors
+        the OWNER's own confirmed ack (it scans by owner + loads that owner's
+        acks) — a peer's confirm hides the row for the peer but does NOT stop the
+        owner's reminders, which is the intended owner-targeted behavior.
+
+    Keyed on the stable ``DocumentFact.id`` int PK. ``ON DELETE CASCADE`` from
+    both parents so a purged fact / deleted user takes its acks with it.
+    """
+    __tablename__ = "obligation_acknowledgements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_fact_id = Column(Integer, ForeignKey("document_facts.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    milestone = Column(String(16), nullable=False)  # 14d|7d|3d|1d|due|overdue|confirmed
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        # One row per (fact, user, milestone) — the notifier's INSERT-or-skip
+        # dedup and the confirm route's idempotency both rely on this.
+        UniqueConstraint("document_fact_id", "user_id", "milestone", name="uq_obligation_ack_fact_user_milestone"),
+        # Hot path: "which of these facts has user U confirmed / been notified about".
+        Index("idx_obligation_ack_user_fact", "user_id", "document_fact_id"),
+    )
+
+
+class ObligationDigestLog(Base):
+    """Per-(user, ISO-week) sent-marker for the weekly obligation digest.
+
+    The weekly digest is the safety FLOOR under the per-milestone notifier: one
+    owner-targeted summary of every OPEN obligation (no lower date bound), so a
+    late-extracted / very-overdue deadline the notifier's grace window missed
+    still surfaces. This table dedups it: one row per ``(user_id, period_key)``
+    (period_key = ISO ``YYYY-Www``) so a pod restart mid-week never re-sends.
+
+    A dedicated table rather than reusing the ``notifications`` row — those carry
+    a ~24h TTL and are reaped by the cleanup scheduler, which would let a
+    mid-week restart re-send. The digest marker must outlive the notification.
+    """
+    __tablename__ = "obligation_digest_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    period_key = Column(String(16), nullable=False)  # ISO year-week, e.g. "2026-W23"
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "period_key", name="uq_obligation_digest_user_period"),
+    )
+
+
+class ObligationCalendarPref(Base):
+    """Per-user opt-in: which calendar to mirror this user's obligations into.
+
+    The obligation→calendar reconciler only runs for users who have a row here
+    (no pref = no sync). ``calendar_name`` is a calendar key from the Calendar
+    MCP's ``list_calendars`` (validated writable for the user at set time).
+    """
+    __tablename__ = "obligation_calendar_pref"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    calendar_name = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class ObligationCalendarEvent(Base):
+    """Sync ledger mapping an obligation fact → its calendar event.
+
+    The reconciler (``services/obligation_calendar_sync``) keeps the user's
+    chosen calendar in step with their open obligations: create on first sight,
+    update when the date/summary changes, delete when the obligation is handled
+    (confirmed), drops out of the window, or its fact is purged. We must keep the
+    ``event_id`` to delete/update later, so the FK to ``document_facts`` is
+    ``ON DELETE SET NULL`` (NOT cascade): a purged fact leaves an orphan row
+    (``document_fact_id`` NULL) that the next reconcile pass deletes from the
+    calendar and removes. ``synced_obligation_date`` + ``synced_summary`` are the
+    last-pushed values, compared each pass to decide create-vs-update-vs-noop.
+    """
+    __tablename__ = "obligation_calendar_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_fact_id = Column(Integer, ForeignKey("document_facts.id", ondelete="SET NULL"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    calendar = Column(String(64), nullable=False)
+    event_id = Column(String(256), nullable=False)
+    synced_obligation_date = Column(Date, nullable=True)
+    synced_summary = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        # One event per (fact, user). NULLs are distinct in Postgres, so orphan
+        # rows (fact purged → SET NULL) coexist until the reconciler cleans them.
+        UniqueConstraint("document_fact_id", "user_id", name="uq_obligation_calevent_fact_user"),
+        # (user_id already indexed via the column's index=True — no extra index.)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1968,6 +2439,101 @@ class FederationQueryLog(Base):
     peer = relationship("PeerUser", foreign_keys=[peer_user_id])
 
 
+class DocumentProcessingHistory(Base):
+    """
+    Audit row for every ingestion attempt against a Document.
+
+    State machine:
+        (none) ──open()──> processing ──close_success()──> completed
+                                       └─close_failure()──> failed
+
+    Zombie rows: a process crash between ``open()`` and ``close_*()`` leaves
+    ``status='processing'`` indefinitely. Cleaned up by the (deferred) startup
+    sweep PR. Until that ships, ``has_force_ocr_succeeded(doc_id)`` filters
+    on ``status='completed'`` and correctly ignores zombies.
+
+    Writes are managed by ``services/document_processing_history.py`` via the
+    ``track()`` async context manager. Do NOT write rows directly from
+    application code — use the service.
+
+    See ``alembic/versions/pc20260530_document_processing_history.py`` for the
+    schema rationale, CHECK constraints, partial-unique constraint that makes
+    the migration backfill idempotent, and the partial index that accelerates
+    the script's hot query.
+    """
+    __tablename__ = "document_processing_history"
+
+    id = Column(BigInteger, primary_key=True)
+    document_id = Column(
+        Integer,
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    started_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    # status: pending|processing|completed|failed (enforced by CHECK constraint).
+    # Keep VARCHAR for project precedent (Document.status is also VARCHAR), but
+    # always write via the ProcessingStatus enum in the service.
+    status = Column(String(20), nullable=False)
+
+    # Always populated. Legacy backfill rows = false (initial_ingest by
+    # definition does not pass a force flag).
+    force_ocr = Column(Boolean, nullable=False)
+
+    # Nullable: legacy backfill rows + any caller that doesn't know.
+    # Values set by document_processor: 'docling' (standard convert) |
+    # 'docling_full_page_ocr' (forced full-page OCR) | 'poppler_text_layer'
+    # (chunked from the poppler text layer on a font-decode failure) |
+    # legacy 'easyocr'. Free text (no CHECK) — purely audit/display, no
+    # consumer branches on the value.
+    ocr_engine = Column(String(50), nullable=True)
+
+    chunks_produced = Column(Integer, nullable=True)
+    chunks_dropped_low_quality = Column(Integer, nullable=True)
+
+    # trigger: initial_ingest|user_reindex|script_purge|startup_sweep
+    # (enforced by CHECK constraint). Write via ProcessingTrigger enum.
+    trigger = Column(String(30), nullable=False)
+
+    error_message = Column(Text, nullable=True)
+
+    # Future-extensible bag for fields we don't know we need yet (e.g.,
+    # per-engine timing, OCR confidence percentiles). JSONB on Postgres.
+    extra = Column(JSON, nullable=False, default=dict)
+
+    document = relationship("Document", foreign_keys=[document_id])
+
+    # Constraints + indexes — declared here (not only in the alembic migration)
+    # so that the test fixture's ``Base.metadata.create_all`` builds a schema
+    # that matches the live alembic-managed DB. Without this, CHECK constraint
+    # tests and the partial-unique idempotence guarantee would silently pass
+    # on the test harness but fire only against the real DB.
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','processing','completed','failed')",
+            name="chk_dph_status",
+        ),
+        CheckConstraint(
+            "trigger IN ('initial_ingest','user_reindex','script_purge','startup_sweep')",
+            name="chk_dph_trigger",
+        ),
+        Index(
+            "idx_dph_document_force_ocr_status",
+            "document_id", "force_ocr", "status",
+            postgresql_where=sa_text("force_ocr = true AND status = 'completed'"),
+        ),
+        Index(
+            "uq_dph_initial_ingest_per_doc",
+            "document_id",
+            unique=True,
+            postgresql_where=sa_text("trigger = 'initial_ingest'"),
+        ),
+    )
+
+
 # ==========================================================================
 # Backwards-compat re-exports from ha_glue.models.database
 # ==========================================================================
@@ -2027,7 +2593,10 @@ _HA_GLUE_REEXPORT_NAMES = frozenset({
     "RoomDevice",
     "RoomOutputDevice",
     "RoomSatellite",
+    "Satellite",
+    "SatelliteFleetState",
     "UserBleDevice",
+    "UserBleIrk",
 })
 
 

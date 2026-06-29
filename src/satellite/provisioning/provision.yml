@@ -30,6 +30,20 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
+    - name: restart bluetooth
+      ansible.builtin.systemd:
+        name: bluetooth
+        state: restarted
+
+    - name: reexec systemd
+      ansible.builtin.systemd:
+        daemon_reexec: true
+
+    - name: restart journald
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted
+
   tasks:
     # =========================================================================
     # SYSTEM — System preparation
@@ -63,6 +77,94 @@
         - "{{ satellite_config_dir }}"
         - "{{ satellite_models_dir }}"
         - "{{ satellite_code_dir }}"
+
+    # =========================================================================
+    # WATCHDOG — two complementary layers:
+    #   1. SoC hardware watchdog (RuntimeWatchdogSec): auto-reboots on a kernel /
+    #      PID-1 hang. Raspberry Pi OS already ships this at 1 min via
+    #      /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf; we tighten
+    #      it with a 50- drop-in (higher precedence) so it actually takes effect.
+    #   2. Network watchdog (renfield-net-watchdog.timer): reboots if the Pi can't
+    #      reach its default gateway for N minutes — the wedged-Wi-Fi/IP failure
+    #      the HW watchdog can't catch (kernel stays healthy and keeps petting it).
+    # =========================================================================
+
+    - name: Ensure systemd manager drop-in dir exists
+      tags: [watchdog, system]
+      ansible.builtin.file:
+        path: /etc/systemd/system.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # Drop a 50- override above the OS 40-rpi-enable-watchdog.conf default.
+    - name: Tighten SoC hardware watchdog (RuntimeWatchdogSec drop-in)
+      tags: [watchdog, system]
+      ansible.builtin.copy:
+        dest: /etc/systemd/system.conf.d/50-renfield-watchdog.conf
+        content: |
+          # Managed by Ansible — overrides 40-rpi-enable-watchdog.conf.
+          [Manager]
+          RuntimeWatchdogSec={{ satellite_hw_watchdog_sec }}s
+        owner: root
+        group: root
+        mode: "0644"
+      when: satellite_hw_watchdog_sec | int > 0
+      notify: reexec systemd
+
+    # A previous revision wrote RuntimeWatchdogSec into the main system.conf
+    # (inert — the OS drop-in outranks it). Remove it; idempotent on a clean
+    # system (no match → no change → no reexec).
+    - name: Remove inert RuntimeWatchdogSec from system.conf (now set via drop-in)
+      tags: [watchdog, system]
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system.conf
+        regexp: '^RuntimeWatchdogSec='
+        state: absent
+      notify: reexec systemd
+
+    - name: Ensure satellite bin dir exists (not all HAT profiles create it)
+      tags: [watchdog, system]
+      ansible.builtin.file:
+        path: "{{ satellite_base_dir }}/bin"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+      when: net_watchdog_enabled | default(true)
+
+    - name: Deploy network watchdog script
+      tags: [watchdog, system]
+      ansible.builtin.template:
+        src: renfield-net-watchdog.sh.j2
+        dest: "{{ satellite_base_dir }}/bin/renfield-net-watchdog.sh"
+        owner: root
+        group: root
+        mode: "0755"
+      when: net_watchdog_enabled | default(true)
+
+    - name: Deploy network watchdog systemd units
+      tags: [watchdog, system]
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - renfield-net-watchdog.service
+        - renfield-net-watchdog.timer
+      when: net_watchdog_enabled | default(true)
+      notify: reload systemd
+
+    - name: Enable + start the network watchdog timer
+      tags: [watchdog, system]
+      ansible.builtin.systemd:
+        name: renfield-net-watchdog.timer
+        enabled: "{{ net_watchdog_enabled | default(true) }}"
+        state: "{{ 'started' if (net_watchdog_enabled | default(true)) else 'stopped' }}"
+        daemon_reload: true
 
     # =========================================================================
     # BOOT — Boot configuration (config.txt)
@@ -278,6 +380,43 @@
       ansible.builtin.debug:
         var: asound_cards.stdout_lines
 
+    # --- WM8960 ALC: hardware AGC in front of the wake-word model ---
+    # openWakeWord scores on raw input amplitude (its predict() does no loudness
+    # normalization), so without upstream gain-leveling, quiet/normal speech
+    # under-scores and only a raised voice fires. The WM8960 codec ships with
+    # ALC Function=Off; enabling its ALC dynamically lifts quiet/far-field speech
+    # toward a target level. Tagged `audio` so it can be (re)applied on an
+    # existing satellite in isolation — without redeploying satellite.yaml or
+    # rebooting: `ansible-playbook ... --tags audio --limit <host>`.
+    - name: Configure WM8960 ALC hardware AGC for wake-word reliability
+      tags: [driver, config, audio]
+      when: wm8960_alc_enabled | default(false)
+      block:
+        - name: Apply WM8960 ALC + noise-gate mixer controls
+          ansible.builtin.command:
+            argv:
+              - amixer
+              - -c
+              - "{{ wm8960_alsa_card }}"
+              - sset
+              - "{{ item.ctl }}"
+              - "{{ item.val }}"
+          loop:
+            - { ctl: "ALC Function",         val: "{{ wm8960_alc_function }}" }
+            - { ctl: "ALC Max Gain",         val: "{{ wm8960_alc_max_gain | string }}" }
+            - { ctl: "ALC Min Gain",         val: "{{ wm8960_alc_min_gain | string }}" }
+            - { ctl: "ALC Target",           val: "{{ wm8960_alc_target | string }}" }
+            - { ctl: "Noise Gate Threshold", val: "{{ wm8960_noise_gate_threshold | string }}" }
+            - { ctl: "Noise Gate",           val: "{{ 'on' if wm8960_noise_gate_enabled else 'off' }}" }
+          loop_control:
+            label: "{{ item.ctl }} = {{ item.val }}"
+          changed_when: true
+
+        - name: Persist ALSA mixer state (restored on boot by alsa-restore.service)
+          ansible.builtin.command:
+            argv: [alsactl, store]
+          changed_when: true
+
     # =========================================================================
     # PYTHON — Python virtual environment
     # =========================================================================
@@ -302,6 +441,21 @@
       become_user: "{{ ansible_user }}"
       ansible.builtin.pip:
         name: "{{ satellite_python_packages }}"
+        virtualenv: "{{ satellite_venv }}"
+
+    # Also tagged `app`: cryptography is a HARD runtime dep of ble/rpa.py (IRK
+    # RPA resolution) but rpa.py silently no-ops without it — resolve_rpa()
+    # returns False for every address, so phone presence dies invisibly. It was
+    # added to satellite_python_packages after sats were first provisioned, and
+    # the safety code-only deploy (`--tags app`) skips `[python]`, so it never
+    # landed and IRK resolution was dead on every bare-metal satellite (2026-06).
+    # Same drift the envirophat task below guards against. Restart-free (no
+    # handler notify); the running process picks it up on its next restart.
+    - name: Ensure cryptography in venv (IRK RPA resolution — also on app deploys)
+      tags: [python, app]
+      become_user: "{{ ansible_user }}"
+      ansible.builtin.pip:
+        name: cryptography
         virtualenv: "{{ satellite_venv }}"
 
     - name: Install openwakeword (--no-deps for Python 3.13+ compat)
@@ -422,21 +576,78 @@
         group: root
         mode: "0644"
 
-    - name: Disable WiFi power save (Pi Zero 2 W firmware bug)
-      tags: [config]
+    # WiFi power save causes periodic ~30-50s WebSocket disconnects on the
+    # Pi Zero 2 W brcmfmac: power-save latency makes the satellite miss the
+    # backend's keepalive ping, so the server drops the connection → endless
+    # reconnect loop (measured 98 reconnects / 30 min on Arbeitszimmer until
+    # disabled — looked like "reboots" via the backend's connection-uptime but
+    # the board never restarted). The previous modprobe options did NOT disable
+    # power save (`roamoff` = roaming; `8192cu` = a different Realtek chip) and
+    # /etc/rc.local is not reliably run on Bookworm. NetworkManager also
+    # re-enables power save on every reconnect, so a dispatcher that runs on
+    # each wlan0 `up` is the only robust fix.
+    - name: Install NetworkManager dispatcher to disable WiFi power save
+      tags: [config, wifi]
       ansible.builtin.copy:
-        content: "options brcmfmac roamoff=1\noptions 8192cu rtw_power_mgnt=0 rtw_enusbss=0\n"
-        dest: /etc/modprobe.d/wifi-powersave.conf
-        mode: "0644"
-
-    - name: Add WiFi power save disable to rc.local
-      tags: [config]
-      ansible.builtin.lineinfile:
-        path: /etc/rc.local
-        line: "iw dev wlan0 set power_save off || true"
-        insertbefore: "^exit 0"
-        create: true
+        dest: /etc/NetworkManager/dispatcher.d/50-renfield-wifi-powersave
         mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible — disable WiFi power save whenever wlan0 comes up
+          # (prevents periodic WebSocket disconnects on Pi Zero 2 W brcmfmac).
+          [ "$1" = "wlan0" ] && [ "$2" = "up" ] && /usr/sbin/iw dev wlan0 set power_save off
+          exit 0
+
+    - name: Disable WiFi power save on the active NM connection (persists in profile)
+      tags: [config, wifi]
+      ansible.builtin.shell: |
+        set -o pipefail
+        con=$(nmcli -t -f DEVICE,NAME connection show --active | sed -n 's/^wlan0://p' | head -1)
+        if [ -n "$con" ]; then
+          nmcli connection modify "$con" 802-11-wireless.powersave 2
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+      failed_when: false
+
+    - name: Disable WiFi power save immediately (no reboot/reconnect needed)
+      tags: [config, wifi]
+      ansible.builtin.command: iw dev wlan0 set power_save off
+      changed_when: true
+      failed_when: false
+
+    # Persistent journald: the satellites have no RTC and shipped with a volatile
+    # journal, so the cause of any crash/reboot was wiped on restart and was
+    # undiagnosable. Persist the journal (size-capped to bound SD-card wear) so a
+    # post-mortem is possible. Mirrors the fix applied to the Esszimmer satellite.
+    - name: Ensure journald.conf.d drop-in directory exists
+      tags: [config, journald]
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: Enable persistent journald
+      tags: [config, journald]
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/10-renfield-persistent.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible — persist the journal across reboots for diagnosis.
+          [Journal]
+          Storage=persistent
+          SystemMaxUse=200M
+          SystemMaxFileSize=50M
+      notify: restart journald
+
+    - name: Ensure persistent journal directory exists
+      tags: [config, journald]
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: directory
+        mode: "2755"
+      notify: restart journald
 
     # =========================================================================
     # MODELS — Wake word and VAD models
@@ -499,6 +710,46 @@
         - melspectrogram.onnx
         - embedding_model.onnx
         - alexa_v0.1.onnx
+
+    # =========================================================================
+    # BLUETOOTH — ensure the adapter is unblocked + up for presence scanning
+    # =========================================================================
+    # The Pi can boot with BT rfkill SOFT-BLOCKED (hci0 DOWN), which silently
+    # kills BLE + Classic-BT presence scanning. A boot oneshot unblocks + ups it.
+
+    - name: Deploy Bluetooth-enable oneshot unit
+      tags: [bluetooth, config]
+      ansible.builtin.template:
+        src: renfield-bt.service.j2
+        dest: /etc/systemd/system/renfield-bt.service
+        mode: "0644"
+      notify: reload systemd
+
+    - name: Flush handlers (reload systemd for BT unit)
+      tags: [bluetooth, config]
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable + start Bluetooth-enable oneshot (unblocks BT now + on boot)
+      tags: [bluetooth, config]
+      ansible.builtin.systemd:
+        name: renfield-bt
+        enabled: true
+        state: started
+
+    # Enable BlueZ experimental features — required for the AdvertisementMonitor
+    # API (continuous, kernel-offloaded, threshold-based per-device RSSI used by
+    # the continuous BLE presence scanner). Without this, BlueZ rejects the
+    # passive/monitor APIs. Survives re-image; restarts bluetoothd on change.
+    - name: Enable BlueZ Experimental (AdvertisementMonitor API)
+      tags: [bluetooth, config]
+      ansible.builtin.ini_file:
+        path: /etc/bluetooth/main.conf
+        section: General
+        option: Experimental
+        value: "true"
+        no_extra_spaces: true
+        mode: "0644"
+      notify: restart bluetooth
 
     # =========================================================================
     # SERVICE — Systemd service

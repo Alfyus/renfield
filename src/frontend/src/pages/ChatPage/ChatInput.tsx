@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { ChangeEvent, DragEvent, KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Send, Mic, MicOff, BookOpen, ChevronDown, Paperclip, X, FileText, Loader } from 'lucide-react';
+import { Send, Mic, MicOff, BookOpen, ChevronDown, Paperclip, X, FileText, Loader, AlertCircle, Command } from 'lucide-react';
 import apiClient from '../../utils/axios';
 import AudioVisualizer from './AudioVisualizer';
 import { useChatContext } from './context/ChatContext';
+import { useFeatureFlags } from '../../api/resources/brain';
+import { roleLabel } from '../../components/chat/AgentRoleBadge';
 
 interface KnowledgeBase {
   id: string;
@@ -18,9 +20,17 @@ export default function ChatInput() {
     audioLevel, silenceTimeRemaining, partialText,
     useRag, toggleRag, selectedKnowledgeBase, setSelectedKnowledgeBase,
     attachments, uploading, uploadDocument, removeAttachment, uploadStates,
+    openPalette, pendingRoleHint, clearRoleHint,
   } = useChatContext();
+  const { data: features } = useFeatureFlags();
+  const paletteEnabled = features?.command_palette_enabled ?? false;
+  // The pinned-role indicator is shared by the palette and the role badge (item 6),
+  // so show it whenever either feature is on — otherwise pinning from the role
+  // badge would set a hint with no visible confirmation.
+  const roleSurfacingEnabled = features?.role_surfacing_enabled ?? false;
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [showRagSettings, setShowRagSettings] = useState(false);
@@ -59,10 +69,35 @@ export default function ChatInput() {
     }
   }, [useRag, knowledgeBases.length]);
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+  // Auto-grow the composer with its content: reset to one line, then expand to
+  // fit up to ~6 lines (then it scrolls). Re-runs whenever the value changes,
+  // so clearing after send shrinks it back to a single line.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    const maxHeight = 168; // ~6 lines
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+  }, [input]);
+
+  // Gate send while any attachment is still extracting (status "processing").
+  // Sending now would silently drop it from attachment_ids — the assistant
+  // would answer as if no file were attached. A failed attachment doesn't block
+  // (it can't be sent anyway); the user removes it or sends without it.
+  const attachmentsProcessing = attachments.some((a) => a.status === 'processing');
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      if (attachmentsProcessing) return;
       sendMessage?.(input, false);
+      return;
+    }
+    // `/` on an empty composer opens the command palette (desktop trigger).
+    // In a non-empty field it types normally.
+    if (paletteEnabled && e.key === '/' && input === '') {
+      e.preventDefault();
+      openPalette?.();
     }
   };
 
@@ -191,22 +226,40 @@ export default function ChatInput() {
       {/* Pending Attachments */}
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-2 mb-3 pb-3 border-b border-gray-200 dark:border-gray-700">
-          {attachments.map(att => (
-            <div
-              key={att.id}
-              className="flex items-center space-x-1 px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded text-sm text-gray-700 dark:text-gray-300"
-            >
-              <FileText className="w-3.5 h-3.5 flex-shrink-0" aria-hidden="true" />
-              <span className="truncate max-w-[120px]">{att.filename}</span>
-              <button
-                onClick={() => removeAttachment(att.id)}
-                className="ml-1 text-gray-400 hover:text-red-500 dark:hover:text-red-400"
-                aria-label={t('chat.removeAttachment')}
+          {attachments.map(att => {
+            const isProcessing = att.status === 'processing';
+            const isFailed = att.status === 'failed';
+            return (
+              <div
+                key={att.id}
+                title={isFailed ? (att.extractError || t('chat.uploadFailed')) : isProcessing ? t('chat.uploadProcessing') : undefined}
+                className={`flex items-center space-x-1 px-2 py-1 rounded text-sm ${
+                  isFailed
+                    ? 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300'
+                    : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300'
+                }`}
               >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          ))}
+                {isProcessing ? (
+                  <Loader className="w-3.5 h-3.5 flex-shrink-0 animate-spin" aria-hidden="true" />
+                ) : isFailed ? (
+                  <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" aria-hidden="true" />
+                ) : (
+                  <FileText className="w-3.5 h-3.5 flex-shrink-0" aria-hidden="true" />
+                )}
+                <span className="truncate max-w-[120px]">{att.filename}</span>
+                {isProcessing && (
+                  <span className="text-xs text-gray-400 dark:text-gray-500">{t('chat.uploadProcessing')}</span>
+                )}
+                <button
+                  onClick={() => removeAttachment(att.id)}
+                  className="ml-1 text-gray-400 hover:text-red-500 dark:hover:text-red-400"
+                  aria-label={t('chat.removeAttachment')}
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -230,17 +283,36 @@ export default function ChatInput() {
         </div>
       )}
 
+      {/* Role override for the next turn (dismissible) — set by the palette OR the
+          assistant role badge (item 6). */}
+      {(paletteEnabled || roleSurfacingEnabled) && pendingRoleHint && (
+        <div className="mb-2 flex items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs bg-primary-100 text-primary-800 dark:bg-primary-900/40 dark:text-primary-100">
+            {t('chat.palette.roleActive', { role: roleLabel(t, pendingRoleHint) })}
+            <button
+              type="button"
+              onClick={() => clearRoleHint?.()}
+              aria-label={t('chat.palette.clearRole')}
+              className="hover:opacity-70 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 rounded"
+            >
+              <X className="w-3 h-3" aria-hidden="true" />
+            </button>
+          </span>
+        </div>
+      )}
+
       {/* Input Area */}
-      <div className="flex items-center space-x-2">
+      <div className="flex items-end space-x-2">
         <label htmlFor="chat-input" className="sr-only">{t('chat.placeholder')}</label>
-        <input
+        <textarea
           id="chat-input"
-          type="text"
+          ref={textareaRef}
+          rows={1}
           value={input}
           onChange={(e) => setInput?.(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={t('chat.placeholder')}
-          className="input flex-1"
+          className="input flex-1 resize-none overflow-y-auto leading-6"
           disabled={loading || recording}
           aria-describedby={loading ? 'chat-loading-hint' : undefined}
         />
@@ -255,6 +327,19 @@ export default function ChatInput() {
           onChange={handleFileChange}
           multiple
         />
+
+        {/* Command palette touch trigger (the `/`-key is the desktop trigger). */}
+        {paletteEnabled && (
+          <button
+            type="button"
+            onClick={() => openPalette?.()}
+            disabled={loading || recording}
+            className="p-3 rounded-lg transition-colors bg-gray-200 hover:bg-gray-300 text-gray-600 dark:bg-gray-700 dark:hover:bg-gray-600 dark:text-gray-300 disabled:opacity-50 active:scale-95"
+            aria-label={t('chat.palette.open')}
+          >
+            <Command className="w-5 h-5" aria-hidden="true" />
+          </button>
+        )}
 
         <button
           onClick={() => fileInputRef.current?.click()}
@@ -284,9 +369,10 @@ export default function ChatInput() {
 
         <button
           onClick={() => sendMessage?.(input, false)}
-          disabled={loading || !input.trim()}
+          disabled={loading || !input.trim() || attachmentsProcessing}
           className="btn btn-primary"
           aria-label={t('chat.sendMessage')}
+          title={attachmentsProcessing ? t('chat.uploadProcessing') : undefined}
         >
           <Send className="w-5 h-5" aria-hidden="true" />
         </button>

@@ -20,6 +20,41 @@ server_url: "wss://renfield.local/ws/satellite"
 server_auto_discover: true
 server_auth_enabled: false
 server_verify_tls: false
+# Per-satellite enrollment PSK (security review H1). MUST be set per host in the
+# gitignored host_vars/satellite-<name>.yml (never here — group_vars is in git).
+# Mint it with `bin/enroll_satellite.py <satellite_id>` (or the admin UI), paste
+# the printed token here, re-provision with --tags config. Empty = not enrolled
+# (the backend treats an absent token as legacy until enrollment is enforced).
+satellite_enrollment_token: ""
+
+# OTA release signing (security review H6). PUBLIC keys are safe in git — add the
+# hex public key(s) printed by `bin/sign_satellite_release.py --gen-key`. Multiple
+# entries = key rotation (the satellite accepts any). require_signature stays
+# false until the release-signing pipeline is live, then flip to fail-closed.
+satellite_release_pubkeys: []
+satellite_ota_require_signature: false
+# Connection robustness (Pi Zero 2 W 2.4GHz WiFi is marginal — detect dead links
+# fast and self-heal instead of wedging). See docs/SATELLITE_CONNECTIVITY.md.
+server_ping_interval: 15          # WS keepalive cadence (s)
+server_ping_timeout: 8            # drop the link if no pong within (s)
+server_register_timeout: 15       # cap the post-connect register handshake (s)
+server_max_disconnected_seconds: 300  # exit→systemd restart if unreconnectable this long (0=off)
+
+# Hardware watchdog: systemd pets /dev/watchdog every cycle; if PID 1 / the kernel
+# hangs, the SoC watchdog hard-resets the board. Keep <= the SoC max (BCM2835 ~15s,
+# sunxi ~16s) or the timer won't arm. 0 disables. Set via a 50- drop-in that
+# overrides the Raspberry Pi OS default (40-rpi-enable-watchdog.conf = 1 min).
+satellite_hw_watchdog_sec: 14
+
+# Network watchdog: reboots the Pi if its default gateway is unreachable for
+# net_watchdog_fail_threshold consecutive ~1-min checks — recovers a wedged
+# Wi-Fi/IP stack that the HW watchdog can't (kernel stays healthy). Empty target
+# = auto-derive the gateway. A 10-min post-boot grace prevents reboot loops.
+net_watchdog_enabled: true
+net_watchdog_target: ""
+net_watchdog_fail_threshold: 5
+net_watchdog_max_reboots: 3        # stop rebooting after this many — a gateway down
+                                   # for hours won't be fixed by it; a good ping refills
 
 # Wake word
 wakeword_model: "hey_renfield"
@@ -31,8 +66,30 @@ vad_silence_duration_ms: 1200
 vad_max_recording_seconds: 20
 vad_silero_threshold: 0.5
 
+# WM8960 codec ALC (Automatic Level Control) — hardware AGC applied INSIDE the
+# codec, before audio ever reaches the wake-word model. openWakeWord's predict()
+# does NO loudness normalization (raw int16 → melspectrogram), so its score is a
+# direct function of input amplitude: quiet/normal-volume speech under-scores and
+# only a raised voice crosses threshold. ALC dynamically lifts quiet/far-field
+# speech toward a target level — the same gain-staging wyoming-satellite does in
+# software (WebRTC AGC) and HA Voice PE does with gain_factor. The codec ships
+# with ALC Function=Off, which is the root cause of "must raise voice".
+# WM8960-based hats only (whisplay, 2mic, 2mic-v2). Disabled by default; enable
+# per-host. Validated on Arbeitszimmer/whisplay 2026-06-24 (normal-voice scores
+# 59-77% with ALC vs 11-45% without). Persisted via `alsactl store` →
+# /var/lib/alsa/asound.state, restored on boot by alsa-restore.service.
+wm8960_alc_enabled: false
+wm8960_alsa_card: "wm8960soundcard"   # `amixer -c` target (whisplay; 2mic = seeed2micvoicec)
+wm8960_alc_function: "Stereo"          # Off | Right | Left | Stereo
+wm8960_alc_target: 6                   # 0-15, higher = louder normalized target level
+wm8960_alc_max_gain: 7                 # 0-7, caps PGA so ALC can't run away into noise
+wm8960_alc_min_gain: 0                 # 0-7
+wm8960_noise_gate_enabled: true        # stops ALC pumping/pulling up idle hiss between utterances
+wm8960_noise_gate_threshold: 5         # 0-31 (1.5dB steps), a few steps above the room's idle floor
+
 # LED
 led_brightness: 20
+led_night_brightness: 5
 led_type: "apa102"
 
 # Display
@@ -66,6 +123,10 @@ satellite_system_packages:
 
 # Python packages (installed in venv)
 satellite_python_packages:
+  # setuptools<81 ships pkg_resources, which webrtcvad imports. Python 3.13
+  # venvs don't bundle setuptools and the latest (>=81) dropped pkg_resources,
+  # so without this a fresh venv crashes on `import webrtcvad`.
+  - "setuptools<81"
   - onnxruntime
   - pyaudio
   - numpy
@@ -83,6 +144,7 @@ satellite_python_packages:
   - aiohttp
   - requests
   - bleak
+  - cryptography   # IRK-based RPA resolution (ble/rpa.py) — resolve rotating phone addresses
   - Pillow
 
 # XVF3800 LED control
@@ -96,6 +158,12 @@ ble_enabled: true
 ble_scan_interval: 30
 ble_scan_duration: 5
 ble_rssi_threshold: -80
+# Continuous BLE scanning (one long-running BleakScanner + smoothed EWMA RSSI)
+# instead of periodic discover() bursts. Off by default (Pi Zero 2 W keeps the
+# simple periodic path); opt in per-host (e.g. BT 5.x / mains-powered nodes).
+ble_continuous: false
+ble_smoothing_alpha: 0.4
+ble_freshness_seconds: 20.0
 
 # openwakeword installed separately with --no-deps for Python 3.13+ compat
 openwakeword_package: "openwakeword"

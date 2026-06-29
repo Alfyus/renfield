@@ -45,13 +45,15 @@ export interface NewDevicePayload {
 
 async function fetchRooms(): Promise<PresenceRoom[]> {
   const response = await apiClient.get<PresenceRoom[]>('/api/presence/rooms');
-  return response.data ?? [];
+  // Guard against a non-array body (e.g. a stale cached HTML/SPA fallback) so
+  // consumers never crash on `.flatMap`/`.map`.
+  return Array.isArray(response.data) ? response.data : [];
 }
 
 async function fetchDevices(): Promise<BleDevice[]> {
   try {
     const response = await apiClient.get<BleDevice[]>('/api/presence/devices');
-    return response.data ?? [];
+    return Array.isArray(response.data) ? response.data : [];
   } catch {
     // May fail if non-admin
     return [];
@@ -77,7 +79,7 @@ async function fetchHeatmap({ days, userId }: AnalyticsArgs): Promise<unknown[]>
   const params: Record<string, unknown> = { days };
   if (userId) params.user_id = userId;
   const response = await apiClient.get<unknown[]>('/api/presence/analytics/heatmap', { params });
-  return response.data ?? [];
+  return Array.isArray(response.data) ? response.data : [];
 }
 
 async function fetchPredictions({ days, userId }: AnalyticsArgs): Promise<unknown[]> {
@@ -85,7 +87,7 @@ async function fetchPredictions({ days, userId }: AnalyticsArgs): Promise<unknow
   const response = await apiClient.get<unknown[]>('/api/presence/analytics/predictions', {
     params: { user_id: userId, days },
   });
-  return response.data ?? [];
+  return Array.isArray(response.data) ? response.data : [];
 }
 
 async function fetchPresenceStatus(): Promise<{ enabled: boolean }> {
@@ -209,6 +211,81 @@ export function useDeletePresenceDevice() {
       mutationFn: deleteDeviceRequest,
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: [...keys.presence.all, 'devices'] });
+      },
+    },
+    'common.error',
+  );
+}
+
+// --- Per-person BLE IRK store (resolve rotating phone addresses) ---
+
+export interface BleIrk {
+  id: number;
+  user_id: number;
+  label: string;
+  is_enabled: boolean;
+  created_at?: string | null;
+}
+
+export interface IrkCapturePayload {
+  satellite_id: string;
+  user_id: number;
+  label: string;
+  window_seconds?: number;
+}
+
+async function fetchIrks(): Promise<BleIrk[]> {
+  try {
+    const response = await apiClient.get<BleIrk[]>('/api/presence/irks');
+    return Array.isArray(response.data) ? response.data : [];
+  } catch {
+    return [];
+  }
+}
+
+async function captureIrkRequest(input: IrkCapturePayload): Promise<BleIrk> {
+  // Long-poll: the backend holds the request open for the pairing window.
+  const response = await apiClient.post<BleIrk>('/api/presence/irks/capture', input, {
+    timeout: ((input.window_seconds ?? 60) + 30) * 1000,
+  });
+  return response.data;
+}
+
+async function deleteIrkRequest(id: number): Promise<void> {
+  await apiClient.delete(`/api/presence/irks/${id}`);
+}
+
+export function usePresenceIrksQuery() {
+  return useApiQuery(
+    {
+      queryKey: [...keys.presence.all, 'irks'] as const,
+      queryFn: fetchIrks,
+      staleTime: STALE.DEFAULT,
+    },
+    'common.error',
+  );
+}
+
+export function useCaptureIrk() {
+  const queryClient = useQueryClient();
+  return useApiMutation(
+    {
+      mutationFn: captureIrkRequest,
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: [...keys.presence.all, 'irks'] });
+      },
+    },
+    'common.error',
+  );
+}
+
+export function useDeletePresenceIrk() {
+  const queryClient = useQueryClient();
+  return useApiMutation(
+    {
+      mutationFn: deleteIrkRequest,
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: [...keys.presence.all, 'irks'] });
       },
     },
     'common.error',

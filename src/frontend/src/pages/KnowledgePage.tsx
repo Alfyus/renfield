@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { ChangeEvent } from 'react';
+import { useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import type { AxiosError } from 'axios';
@@ -27,6 +28,7 @@ import Alert from '../components/Alert';
 import type { AlertVariant } from '../components/Alert';
 import Badge from '../components/Badge';
 import StatusBadge from '../components/knowledge/StatusBadge';
+import FaktenPanel from '../components/knowledge/FaktenPanel';
 import DuplicateDialog from '../components/knowledge/DuplicateDialog';
 import type { ExistingDocument } from '../components/knowledge/DuplicateDialog';
 import { useDocumentPolling } from '../hooks/useDocumentPolling';
@@ -48,6 +50,7 @@ import {
   type DocumentRow,
 } from '../api/resources/knowledge';
 import { keys } from '../api/keys';
+import { useLensContext } from '../context/LensContext';
 
 interface DuplicateErrorPayload {
   existing_document?: ExistingDocument;
@@ -60,6 +63,9 @@ export default function KnowledgePage() {
   const { t } = useTranslation();
   const { confirm, ConfirmDialogComponent } = useConfirmDialog();
   const queryClient = useQueryClient();
+  // Embedded as the Documents lens: the workspace omnisearch (?q=) is the single
+  // search input (D9). We hide our own input and run the chunk search off ?q=.
+  const { embedded } = useLensContext();
 
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{ text: string; variant: AlertVariant } | null>(null);
@@ -81,6 +87,9 @@ export default function KnowledgePage() {
 
   // Per-row expansion state for showing raw `error_message` on failed docs.
   const [expandedErrors, setExpandedErrors] = useState<Record<number, boolean>>({});
+  // Per-row expansion state for the Fakten panel (controlled so the agenda
+  // deep-link can auto-expand it — D3/T6).
+  const [expandedFacts, setExpandedFacts] = useState<Record<number, boolean>>({});
   const [newKbDescription, setNewKbDescription] = useState('');
 
   // Move / Bulk selection state
@@ -109,6 +118,9 @@ export default function KnowledgePage() {
 
   const refreshAfterUpload = async () => {
     await queryClient.invalidateQueries({ queryKey: keys.knowledge.all });
+    // D5: a doc resolving (e.g. after reindex) may have changed its facts —
+    // refetch any open Fakten panel. Prefix-match invalidates all facts queries.
+    await queryClient.invalidateQueries({ queryKey: ['brain', 'facts'] });
   };
 
   // Polling for in-flight uploads (#388). Populated from 202 responses
@@ -234,19 +246,92 @@ export default function KnowledgePage() {
     if (!confirmed) return;
     try {
       await deleteDocMutation.mutateAsync(id);
+      // D5: drop the deleted doc's cached facts.
+      await queryClient.invalidateQueries({ queryKey: keys.brain.facts(id) });
     } catch {
       alert(t('knowledge.deleteFailed'));
     }
   };
 
-  // Reindex document
+  // Reindex document — async (#async-reindex): the endpoint enqueues a
+  // user_reindex task and returns 202 with the doc in `pending`. Track it for
+  // polling so the row updates pending → processing → completed; onResolved
+  // reloads the list + invalidates facts so an open Fakten panel refreshes.
   const handleReindexDocument = async (id: number) => {
     try {
-      await reindexDocMutation.mutateAsync(id);
+      const doc = await reindexDocMutation.mutateAsync(id);
+      trackDocument(doc as KbDocument);
+      // Drop any stale facts immediately; onResolved refetches when done (D5).
+      await queryClient.invalidateQueries({ queryKey: keys.brain.facts(id) });
     } catch {
       alert(t('knowledge.reindexFailed'));
     }
   };
+
+  // Inbound deep link from the obligations agenda: /knowledge?doc={id}#fakten
+  // (D3/T6). Reset filters so the target row is in the list regardless of the
+  // active KB/status filter, then — once the (refetched) list actually
+  // contains it — scroll to it and auto-expand its Fakten panel. Async-race
+  // safe: we gate the scroll/expand on the query having resolved with the row
+  // present, and fire exactly once via the ref so it can't loop.
+  const [searchParams] = useSearchParams();
+  const deepLinkDoc = searchParams.get('doc');
+  const deepLinkHandled = useRef(false);
+
+  // D9 (embedded): drive the chunk search from the workspace omnisearch `?q=`,
+  // debounced. At scope=everything the cross-corpus overlay owns the query, so
+  // we clear our inline results and stay out of the way.
+  const omniQ = searchParams.get('q') ?? '';
+  const omniScope = searchParams.get('scope');
+  // Embedded with a non-empty query and not in cross-corpus mode → the
+  // Documents lens owns the query and renders inline results.
+  const embeddedActiveQuery = embedded && omniScope !== 'everything' && omniQ.trim().length > 0;
+  const { mutateAsync: runChunkSearch } = searchMutation;
+  useEffect(() => {
+    if (!embedded) return;
+    const query = omniQ.trim();
+    setSearchQuery(query);
+    if (omniScope === 'everything' || !query) {
+      setSearchResults([]);
+      return;
+    }
+    let cancelled = false; // ignore an out-of-order resolution after a newer query
+    const id = setTimeout(() => {
+      runChunkSearch({ query, knowledgeBaseId: selectedKnowledgeBase })
+        .then((r) => { if (!cancelled) setSearchResults(r); })
+        .catch(() => { /* surfaced via searchMutation.errorMessage */ });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(id); };
+  }, [embedded, omniQ, omniScope, selectedKnowledgeBase, runChunkSearch]);
+
+  useEffect(() => {
+    // New target id → allow handling again (e.g. agenda → doc A, back, → doc B).
+    deepLinkHandled.current = false;
+  }, [deepLinkDoc]);
+
+  useEffect(() => {
+    if (!deepLinkDoc || deepLinkHandled.current) return;
+    const id = Number(deepLinkDoc);
+    if (!Number.isInteger(id)) return;
+    // Widen the view so a filtered-out target still resolves (D3).
+    if (selectedKnowledgeBase !== null) setSelectedKnowledgeBase(null);
+    if (statusFilter !== 'all') setStatusFilter('all');
+    // Wait for the (possibly refetched) list before touching the DOM.
+    if (documentsQuery.isLoading || documentsQuery.isFetching) return;
+    if (!documents.some((d) => d.id === id)) return; // not reachable — fail quietly
+    deepLinkHandled.current = true;
+    setExpandedFacts((prev) => ({ ...prev, [id]: true }));
+    requestAnimationFrame(() => {
+      document.getElementById(`doc-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }, [
+    deepLinkDoc,
+    documents,
+    documentsQuery.isLoading,
+    documentsQuery.isFetching,
+    selectedKnowledgeBase,
+    statusFilter,
+  ]);
 
   // Search
   const handleSearch = async () => {
@@ -534,8 +619,20 @@ export default function KnowledgePage() {
         )}
       </div>
 
-      {/* Search Section */}
+      {/* Search Section. Embedded as the Wissen Documents lens, the workspace
+          omnisearch is the single input (D9) — hide our own box and only show
+          the inline results it produces; standalone keeps the full search UI. */}
+      {(!embedded || embeddedActiveQuery || searchResults.length > 0) && (
       <div className="card">
+        {/* Embedded: the omnisearch drives this — show a loading/empty status
+            so a query without (yet) results isn't a silent void. */}
+        {embedded && embeddedActiveQuery && searchResults.length === 0 && (
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            {searching ? t('common.loading') : t('knowledge.noResults', { defaultValue: t('common.noResults', { defaultValue: 'Keine Ergebnisse' }) })}
+          </p>
+        )}
+        {!embedded && (
+          <>
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
           <Search className="w-5 h-5 text-primary-400" />
           {t('knowledge.searchInDocuments')}
@@ -562,6 +659,8 @@ export default function KnowledgePage() {
             {t('common.search')}
           </button>
         </div>
+          </>
+        )}
 
         {/* Search Results */}
         {searchResults.length > 0 && (
@@ -601,6 +700,7 @@ export default function KnowledgePage() {
           </div>
         )}
       </div>
+      )}
 
       {/* Status Filters */}
       <div className="flex space-x-2 overflow-x-auto">
@@ -705,7 +805,7 @@ export default function KnowledgePage() {
                   <div className="mt-1">{getFileIcon(doc.file_type)}</div>
                   <div className="flex-1 min-w-0">
                     <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-1 truncate">
-                      {doc.title || doc.filename}
+                      {doc.display_name || doc.title || doc.filename}
                     </h3>
                     <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-500 dark:text-gray-400">
                       <span>{t('common.type')}: {doc.file_type?.toUpperCase()}</span>
@@ -743,6 +843,14 @@ export default function KnowledgePage() {
                         )}
                       </div>
                     )}
+                    <FaktenPanel
+                      documentId={doc.id}
+                      status={doc.status}
+                      open={Boolean(expandedFacts[doc.id])}
+                      onToggle={() =>
+                        setExpandedFacts((prev) => ({ ...prev, [doc.id]: !prev[doc.id] }))
+                      }
+                    />
                   </div>
                   <div className="flex items-center gap-2">
                     <StatusBadge doc={doc} filename={doc.filename} />

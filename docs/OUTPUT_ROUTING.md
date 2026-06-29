@@ -11,23 +11,40 @@ Renfield unterstützt intelligentes Routing von TTS-Ausgaben an das beste verfü
 - **Automatischer Fallback** auf Eingabegerät bei Nichtverfügbarkeit
 - **Unterstützt Renfield-Geräte** (Satellites, Web Panels), **Home Assistant Media Player** und **DLNA Renderer**
 - **DLNA Renderer Discovery** via SSDP-Multicast (automatische Erkennung im Netzwerk)
+- **Generische Output-Provider** (`OUTPUT_PROVIDERS_ENABLED`, opt-in) — neue Marken (Samsung TV, künftig Sonos/LG) werden room-fähig per Config-Stanza, nicht per Code
+
+## Generische Output-Provider (`OUTPUT_PROVIDERS_ENABLED`)
+
+Opt-in-Schicht (Standard aus → Verhalten byte-identisch zum Legacy-Routing). Quelle der Wahrheit: [`docs/design/output-providers.md`](design/output-providers.md).
+
+Statt der drei hartkodierten Quellen (renfield / homeassistant / dlna) macht ein **Provider-Registry** ein neues Ausgabegerät zu *Config + kleinem MCP-Contract*:
+
+- **Stanza in `mcp_servers.yaml`** (`output_provider:`) bildet die normalisierten Contract-Methoden (`discover`/`play`/`control`/`status`) auf die *echten* Tools des MCP-Servers ab — die Übersetzung lebt **vollständig im Renfield-Backend** (`ha_glue/services/output_providers.py`), nie in den (fremden) MCP-Servern.
+- **`(output_provider, output_target_id)`** ersetzt die drei Marken-Spalten auf `room_output_devices` (additiv eingeführt, Dual-Read; die alten Spalten fallen in einem späteren PR weg).
+- **Aggregierte Discovery**: `GET /{room}/available-outputs` liefert bei aktivem Flag eine kapazitäts-getaggte Union (`output_targets`) über alle Provider — parallel ermittelt, mit Per-Provider-Timeout (`OUTPUT_PROVIDER_DISCOVER_TIMEOUT`); ein nicht erreichbarer Provider erscheint **degradiert (nicht weggelassen)**.
+- **Generischer Dispatch**: `internal.play_in_room` / `internal.media_control` routen room-aufgelöste Provider-Ziele über das Registry inkl. **Power-on** (Status off/unerreichbar → `control('on')` → Bereitschafts-Poll bis `boot_timeout` → play; weckt nicht → ehrlicher Fehler). dlna bleibt auf dem bewährten Gapless-Pfad.
+- **Frontend**: `RoomOutputSettings` wird datengetrieben — ein einziger Picker über alle Provider mit Capability-Badges; ein neues Gerät erfordert **keine** UI-Änderung.
+
+Erste Marke: **Samsung TV** (`renfield-mcp-samsung`) — wird damit room-auswählbar, room-abspielbar und room-steuerbar.
 
 ## Voraussetzungen
 
 ### ADVERTISE_HOST Konfiguration
 
-Damit HA Media Player und DLNA Renderer die TTS-Audio-Dateien vom Renfield-Backend abrufen können, muss `ADVERTISE_HOST` in der `.env` Datei gesetzt werden:
+Damit HA Media Player und DLNA Renderer die TTS-Audio-Dateien vom Renfield-Backend abrufen können, müssen `ADVERTISE_HOST`/`ADVERTISE_SCHEME`/`ADVERTISE_PORT` gesetzt sein. Das Backend baut daraus die URL `…/api/voice/tts-cache/{id}.wav`, die der Renderer selbst abruft.
 
 ```bash
-# .env
-ADVERTISE_HOST=192.168.1.159  # IP-Adresse des Renfield-Servers
-ADVERTISE_PORT=80             # Port 80 = Nginx (empfohlen für Produktion)
+# .env (k8s-Prod-Werte)
+ADVERTISE_HOST=renfield.local  # per DNS (Linn/Samsung) bzw. /etc/hosts (HiFiBerry) auflösbar
+ADVERTISE_SCHEME=http          # NICHT https — Samsung-TVs akzeptieren self-signed nicht; http geht überall
+ADVERTISE_PORT=80
 ```
 
 **Wichtig:**
-- **IP-Adresse verwenden**, nicht mDNS (`.local`) — DLNA-Renderer können mDNS oft nicht auflösen
-- **Port 80** verwenden — Port 8000 ist nur auf `127.0.0.1` gebunden und von extern nicht erreichbar
-- Nginx muss `/api/voice/tts-cache/` über **plain HTTP** weiterleiten (ohne HTTPS-Redirect), da DLNA-Renderer kein HTTPS/self-signed Certs unterstützen
+- **`http`, nicht `https`** — DLNA-Renderer (v.a. Samsung-TVs) akzeptieren das self-signed Zertifikat nicht; plain http funktioniert auf allen Renderern.
+- Der Pfad `/api/voice/tts-cache/` muss **plain HTTP ohne HTTPS-Redirect** bedient werden — in k8s über die `backend-tts-cache-http` Traefik-IngressRoute (eigener `web`-Entrypoint-Route, `priority: 100`), nicht Nginx.
+- DLNA-Renderer schicken ein **HEAD vor dem GET** und verlangen `audio/x-wav` + eine `.wav`-Resource — die Route bedient das (sonst Samsung-UPnP-716). Details: `docs/MESSAGE_RELAY.md` → „TTS-Audio-Auslieferung an Renderer".
+- Geräte-Setup: Linn/Samsung brauchen keins; HiFiBerry braucht den `/etc/hosts`-Eintrag aus `provision-hifiberry.yml` (über http **keine CA** nötig).
 
 ## Konfiguration über das Frontend
 
@@ -44,13 +61,18 @@ ADVERTISE_PORT=80             # Port 80 = Nginx (empfohlen für Produktion)
 
 ### Prioritätsreihenfolge
 
-Geräte werden in der konfigurierten Reihenfolge geprüft. Verwende die Pfeil-Buttons um die Priorität zu ändern. Das erste verfügbare Gerät wird verwendet.
+Geräte werden in der konfigurierten Reihenfolge geprüft. Verwende die Pfeil-Buttons um die Priorität zu ändern — **Position 1 = primäres Gerät**. Das erste verfügbare Gerät wird verwendet.
+
+**Qualitäts-Tiebreak:** Haben mehrere Geräte dieselbe Priorität (z. B. keines wurde geordnet — alle auf dem Default-Wert), entscheidet die **Audio-Qualität der Geräteklasse**: externer AV-Renderer (DLNA / Samsung / Sonos) > HA-`media_player` (Smart Speaker) > Renfield-Tablet/Satellit (interner Lautsprecher). So landet die Antwort in einem ungeordneten Raum automatisch auf dem hochwertigsten Gerät (z. B. der HiFiBerry statt dem Tablet). Die manuell gesetzte Priorität gewinnt immer zuerst; Qualität bricht nur Gleichstände (danach `id` für Determinismus).
 
 ## Routing-Algorithmus
 
 ```
-1. Hole alle konfigurierten Output-Geräte für Raum, sortiert nach Priorität
-2. Für jedes Gerät (in Prioritätsreihenfolge):
+1. Hole alle konfigurierten Output-Geräte für Raum, sortiert nach
+   (Priorität ASC, Audio-Qualität DESC, id ASC)
+   — Priorität = manuelle Primär-Reihenfolge; Qualität bricht Gleichstände
+     (externer Renderer > HA-Speaker > Renfield-Tablet)
+2. Für jedes Gerät (in dieser Reihenfolge):
    a. Prüfe Verfügbarkeit via HA API / DeviceManager
    b. Wenn verfügbar (idle/paused) → verwenden
    c. Wenn beschäftigt UND allow_interruption=True → verwenden
@@ -60,6 +82,8 @@ Geräte werden in der konfigurierten Reihenfolge geprüft. Verwende die Pfeil-Bu
    → Fallback auf Eingabegerät (wenn es Speaker hat)
 4. Wenn nichts verfügbar → Keine Audio-Ausgabe
 ```
+
+**Stationär vs. mobil:** Der Raumkontext wird per **IP des registrierten Raumgeräts** aufgelöst (`resolve_room_context_by_ip`). Ein nicht registriertes, mobiles Gerät (Handy/Laptop) trifft keinen Raum → kein Routing → die Antwort spielt im **Browser**. „Stationär" ≡ „als Raumgerät registriert". Chat-TTS wird serverseitig an `homeassistant`- **und** `dlna`-Ziele zugestellt (der Renderer bekommt die volle Antwort als einen Clip); `renfield`-Ziele = das Eingabegerät selbst → der Browser spielt.
 
 ### Verfügbarkeitsstatus
 
@@ -125,9 +149,8 @@ GET /api/voice/tts-cache/{audio_id}
 CREATE TABLE room_output_devices (
     id SERIAL PRIMARY KEY,
     room_id INTEGER NOT NULL REFERENCES rooms(id),
-    renfield_device_id VARCHAR(100) REFERENCES room_devices(device_id),
-    ha_entity_id VARCHAR(255),
-    dlna_renderer_name VARCHAR(255),
+    output_provider VARCHAR(50),    -- "renfield" | "homeassistant" | "dlna" | "samsung" | "sonos" | …
+    output_target_id VARCHAR(255),  -- provider-scoped id (device_id / HA entity / renderer name / TV host …)
     output_type VARCHAR(20) NOT NULL DEFAULT 'audio',
     priority INTEGER NOT NULL DEFAULT 1,
     allow_interruption BOOLEAN DEFAULT FALSE,
@@ -139,15 +162,25 @@ CREATE TABLE room_output_devices (
 );
 ```
 
-**Hinweis:** Genau eines von `renfield_device_id`, `ha_entity_id` oder `dlna_renderer_name` muss gesetzt sein.
+**Hinweis:** Die Ausgabeziel-Identität ist das generische Paar
+`(output_provider, output_target_id)` — `output_provider` IST der `target_type`-
+Wertebereich. Die drei früheren markenspezifischen Spalten (`renfield_device_id`
+/ `ha_entity_id` / `dlna_renderer_name`) wurden nach der Prod-Soak in Migration
+`pc20260617b_drop_outlegacy` entfernt (siehe `docs/design/output-providers.md`).
+Die REST-API akzeptiert die alten Feldnamen weiterhin als reine
+Eingabe-Adapter und gibt sie aus dem Paar berechnet zurück
+(Abwärtskompatibilität).
 
 ### Gerätetypen
 
-| Typ | Identifikator | Discovery | Verfügbarkeitsprüfung |
+`output_provider` benennt den Typ, `output_target_id` den providerspezifischen Identifikator.
+
+| Typ | `output_provider` | Discovery | Verfügbarkeitsprüfung |
 |-----|---------------|-----------|----------------------|
-| Renfield | `renfield_device_id` | DeviceManager (WebSocket) | Echtzeit (online/offline) |
-| Home Assistant | `ha_entity_id` | HA API (`media_player.*`) | HA State API (idle/playing/off) |
-| DLNA | `dlna_renderer_name` | SSDP-Multicast via MCP | Immer `AVAILABLE` (kein Probing) |
+| Renfield | `renfield` | DeviceManager (WebSocket) | Echtzeit (online/offline) |
+| Home Assistant | `homeassistant` | HA API (`media_player.*`) | HA State API (idle/playing/off) |
+| DLNA | `dlna` | SSDP-Multicast via MCP | Immer `AVAILABLE` (kein Probing) |
+| Generisch (samsung/sonos/…) | Provider-Key aus `mcp_servers.yaml` | Provider-`discover()` | Provider-`status()` |
 
 ## DLNA Renderer
 
@@ -257,20 +290,22 @@ User spricht zum Tablet: "Wie ist das Wetter?"
 
 ### TTS wird nicht auf HA Media Player / DLNA Renderer abgespielt
 
-1. **ADVERTISE_HOST prüfen:**
+1. **ADVERTISE_* prüfen:**
    ```bash
-   docker exec renfield-backend env | grep ADVERTISE
+   kubectl -n renfield exec deploy/backend -c backend -- env | grep ADVERTISE
    ```
-   Muss auf erreichbare IP gesetzt sein (nicht `.local` für DLNA!).
+   Prod: `ADVERTISE_HOST=renfield.local`, `ADVERTISE_SCHEME=http`, `ADVERTISE_PORT=80`.
 
 2. **Kann der Renderer die URL erreichen?**
    ```bash
-   # Von einem anderen Gerät im LAN testen:
-   curl http://<ADVERTISE_HOST>/api/voice/tts-cache/test
-   # Erwartung: 404 (Not Found) = Endpoint erreichbar
-   # 301 = HTTPS-Redirect (Nginx-Konfig prüfen)
-   # Connection refused = Port/IP falsch
+   # Von einem anderen Gerät im LAN testen (HEAD, wie ein DLNA-Renderer):
+   curl -I http://renfield.local/api/voice/tts-cache/test
+   # Erwartung: 404 (Not Found) = Endpoint erreichbar (HEAD wird bedient)
+   # 405 = HEAD nicht unterstützt (alte Version → Samsung-716)
+   # 301 = HTTPS-Redirect → die backend-tts-cache-http IngressRoute fehlt/greift nicht
+   # Connection refused = Route/Host falsch
    ```
+   Auf dem Renderer-Gerät selbst muss `renfield.local` auflösen (Linn/Samsung: Router-DNS; HiFiBerry: `/etc/hosts`).
 
 3. **Media Player Status prüfen:**
    ```bash

@@ -4,10 +4,13 @@ Configuration management for Renfield Satellite
 Loads configuration from YAML file and environment variables.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 # Type alias for list default factory
@@ -31,9 +34,23 @@ class ServerConfig:
     discovery_timeout: float = 10.0  # Seconds to wait for discovery
     reconnect_interval: int = 5  # seconds
     heartbeat_interval: int = 30  # seconds
+    # Connection robustness (tuned for the Pi Zero 2 W's marginal 2.4GHz WiFi):
+    # faster dead-link detection + bounded handshake so a blip self-heals instead
+    # of wedging. See docs note in websocket_client.py.
+    ping_interval: int = 15  # WS keepalive ping cadence (was hardcoded 20)
+    ping_timeout: int = 8    # close the link if no pong within this (was 10)
+    register_timeout: float = 15.0  # cap the post-connect register handshake
+    # If the satellite cannot reconnect for this long, exit so systemd restarts a
+    # fresh process (clears any wedged in-process state). 0 disables.
+    max_disconnected_seconds: int = 300
     # Authentication (required when server has WS_AUTH_ENABLED=true)
     auth_enabled: bool = False  # Whether to fetch and use auth token
     auth_token: Optional[str] = None  # Pre-configured token (optional)
+    # Per-satellite enrollment PSK (security review H1). Provisioned out-of-band
+    # (Ansible host_vars / k8s secret), presented in the register frame and
+    # verified server-side against the `satellites` table. Independent of
+    # auth_enabled (the WS-JWT path); empty = not enrolled (legacy behavior).
+    enrollment_token: Optional[str] = None
     # TLS verification (set False only for self-signed certificates)
     verify_tls: bool = True
 
@@ -80,6 +97,16 @@ class WakeWordConfig:
     models_path: str = "/opt/renfield-satellite/models"
     refractory_seconds: float = 2.0  # Cooldown before re-triggering
     stop_words: List[str] = field(default_factory=list)  # Words to cancel interaction
+    # VAD-gating: only run (expensive) wake-word inference when the VAD reports
+    # speech, freeing CPU headroom so audio frames are not dropped under load.
+    # OFF by default: with a high vad_silero_threshold this can SUPPRESS quiet
+    # speech (the VAD never opens the gate), so it must be paired with a low VAD
+    # threshold and validated per-room before enabling. The real cure for
+    # amplitude-sensitive scoring is input-level AGC (e.g. the WM8960 ALC), not
+    # this optimization. Opt-in via `wakeword.vad_gated: true`.
+    vad_gated: bool = False
+    vad_gate_preroll_chunks: int = 4   # chunks of context fed at speech onset (~320ms)
+    vad_gate_tail_chunks: int = 15     # chunks to keep running after last speech (~1.2s)
 
 
 @dataclass
@@ -99,7 +126,12 @@ class VADConfig:
 class LEDConfig:
     """LED control settings"""
     type: str = "apa102"  # "apa102", "gpio_rgb", "xvf3800", or "none"
-    brightness: int = 20  # 0-255
+    brightness: int = 20  # 0-31 (APA102/XVF3800 scale)
+    # Documentation/default only — the LIVE night brightness is pushed by the
+    # backend over the WebSocket (`led_config` / register_ack led_brightness).
+    # This is the local fallback default the backend's led_night_brightness
+    # mirrors; the satellite does not apply it on its own.
+    night_brightness: int = 5
     spi_bus: int = 0
     spi_device: int = 0
     num_leds: int = 3
@@ -144,6 +176,20 @@ class BLEConfig:
     scan_duration: float = 5.0    # seconds per scan
     rssi_threshold: int = -80     # ignore weaker signals
     known_devices: List[str] = field(default_factory=list)  # MAC whitelist, pushed from backend
+    classic_rssi: bool = True     # read real Classic-BT RSSI (hcitool cc/rssi); off => synthetic -50
+    classic_rssi_interval: float = 300.0  # seconds between real RSSI reads per device (throttle connect churn)
+    # Continuous scanning (BT 5.x / mains-powered nodes): keep a single BleakScanner
+    # running with a detection callback instead of periodic discover() bursts, and
+    # report a smoothed (EWMA) per-device RSSI. Lower latency + steadier RSSI for
+    # room arbitration. Falls back to the discover() loop when False.
+    continuous: bool = False
+    smoothing_alpha: float = 0.4      # EWMA weight for each new RSSI sample (0..1)
+    freshness_seconds: float = 20.0   # drop a device from presence if unseen this long
+    # Identity Resolving Keys for resolving rotating RPAs (iPhones/Android) to a
+    # stable identity — name -> 32-char hex IRK (16 bytes, MSO-first). Obtained
+    # out-of-band (iPhone: Mac/iCloud keychain; Android: bonded-device info),
+    # pushed from the backend. See docs/design/ble-presence-improvement.md.
+    irks: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -151,6 +197,17 @@ class EnviroConfig:
     """Enviro pHAT sensor settings"""
     enabled: bool = False
     read_interval: int = 30  # seconds between sensor reads
+
+
+@dataclass
+class UpdateConfig:
+    """OTA update authenticity settings (security H6)."""
+    # Pinned Ed25519 release public keys (64-hex each); the signed release
+    # manifest is verified against these. Multiple = key rotation. Safe in git.
+    release_pubkeys: List[str] = field(default_factory=list)
+    # When True, reject an OTA update that has no valid signed manifest
+    # (fail closed). Default False = verify-if-present.
+    require_signature: bool = False
 
 
 @dataclass
@@ -167,6 +224,7 @@ class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     ble: BLEConfig = field(default_factory=BLEConfig)
     enviro: EnviroConfig = field(default_factory=EnviroConfig)
+    update: UpdateConfig = field(default_factory=UpdateConfig)
 
 
 def load_config(config_path: Optional[str] = None) -> Config:
@@ -220,10 +278,29 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.server.discovery_timeout = srv.get("discovery_timeout", config.server.discovery_timeout)
         config.server.reconnect_interval = srv.get("reconnect_interval", config.server.reconnect_interval)
         config.server.heartbeat_interval = srv.get("heartbeat_interval", config.server.heartbeat_interval)
+        config.server.ping_interval = srv.get("ping_interval", config.server.ping_interval)
+        config.server.ping_timeout = srv.get("ping_timeout", config.server.ping_timeout)
+        config.server.register_timeout = srv.get("register_timeout", config.server.register_timeout)
+        config.server.max_disconnected_seconds = srv.get("max_disconnected_seconds", config.server.max_disconnected_seconds)
         config.server.auth_enabled = srv.get("auth_enabled", config.server.auth_enabled)
         config.server.verify_tls = srv.get("verify_tls", config.server.verify_tls)
         if "auth_token" in srv:
             config.server.auth_token = srv["auth_token"]
+        if "enrollment_token" in srv:
+            # Treat a blank template value ("") as "not enrolled" so the
+            # register frame omits the token rather than sending an empty one.
+            config.server.enrollment_token = srv["enrollment_token"] or None
+            if not config.server.enrollment_token:
+                # The key is present but resolved blank — likely a provisioning
+                # miss (un-rendered host_var / empty secret). Warn loudly: this
+                # satellite registers UNENROLLED and will be rejected once the
+                # fleet enforces. (Silent degrade hid the cryptography no-op bug.)
+                logger.warning(
+                    "server.enrollment_token is present but BLANK — registering "
+                    "UNENROLLED. Provision satellite_enrollment_token (host_vars) "
+                    "or RENFIELD_ENROLLMENT_TOKEN, or the satellite will be "
+                    "rejected once enrollment enforcement is on."
+                )
 
     if "audio" in config_data:
         aud = config_data["audio"]
@@ -249,6 +326,9 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.wakeword.threshold = ww.get("threshold", config.wakeword.threshold)
         config.wakeword.models_path = ww.get("models_path", config.wakeword.models_path)
         config.wakeword.refractory_seconds = ww.get("refractory_seconds", config.wakeword.refractory_seconds)
+        config.wakeword.vad_gated = ww.get("vad_gated", config.wakeword.vad_gated)
+        config.wakeword.vad_gate_preroll_chunks = ww.get("vad_gate_preroll_chunks", config.wakeword.vad_gate_preroll_chunks)
+        config.wakeword.vad_gate_tail_chunks = ww.get("vad_gate_tail_chunks", config.wakeword.vad_gate_tail_chunks)
         if "stop_words" in ww:
             config.wakeword.stop_words = ww["stop_words"]
 
@@ -267,6 +347,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         led = config_data["led"]
         config.led.type = led.get("type", config.led.type)
         config.led.brightness = led.get("brightness", config.led.brightness)
+        config.led.night_brightness = led.get("night_brightness", config.led.night_brightness)
         config.led.num_leds = led.get("num_leds", config.led.num_leds)
         config.led.spi_bus = led.get("spi_bus", config.led.spi_bus)
         config.led.spi_device = led.get("spi_device", config.led.spi_device)
@@ -299,6 +380,13 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.ble.scan_interval = ble.get("scan_interval", config.ble.scan_interval)
         config.ble.scan_duration = ble.get("scan_duration", config.ble.scan_duration)
         config.ble.rssi_threshold = ble.get("rssi_threshold", config.ble.rssi_threshold)
+        config.ble.classic_rssi = ble.get("classic_rssi", config.ble.classic_rssi)
+        config.ble.classic_rssi_interval = ble.get("classic_rssi_interval", config.ble.classic_rssi_interval)
+        config.ble.continuous = ble.get("continuous", config.ble.continuous)
+        config.ble.smoothing_alpha = ble.get("smoothing_alpha", config.ble.smoothing_alpha)
+        config.ble.freshness_seconds = ble.get("freshness_seconds", config.ble.freshness_seconds)
+        if "irks" in ble and isinstance(ble["irks"], dict):
+            config.ble.irks = ble["irks"]
         if "known_devices" in ble:
             config.ble.known_devices = ble["known_devices"]
 
@@ -306,6 +394,17 @@ def load_config(config_path: Optional[str] = None) -> Config:
         env = config_data["enviro"]
         config.enviro.enabled = env.get("enabled", config.enviro.enabled)
         config.enviro.read_interval = env.get("read_interval", config.enviro.read_interval)
+
+    if "update" in config_data:
+        upd = config_data["update"]
+        pubkeys = upd.get("release_pubkeys", config.update.release_pubkeys)
+        # Tolerate a single string or a list; drop blanks.
+        if isinstance(pubkeys, str):
+            pubkeys = [pubkeys]
+        config.update.release_pubkeys = [str(k).strip() for k in (pubkeys or []) if str(k).strip()]
+        config.update.require_signature = bool(
+            upd.get("require_signature", config.update.require_signature)
+        )
 
     # Environment variable overrides
     if os.environ.get("RENFIELD_SATELLITE_ID"):
@@ -325,6 +424,25 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.server.auth_enabled = os.environ["RENFIELD_AUTH_ENABLED"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_AUTH_TOKEN"):
         config.server.auth_token = os.environ["RENFIELD_AUTH_TOKEN"]
+    if os.environ.get("RENFIELD_RELEASE_PUBKEYS"):
+        config.update.release_pubkeys = [
+            k.strip() for k in os.environ["RENFIELD_RELEASE_PUBKEYS"].split(",") if k.strip()
+        ]
+    if os.environ.get("RENFIELD_OTA_REQUIRE_SIGNATURE"):
+        config.update.require_signature = os.environ["RENFIELD_OTA_REQUIRE_SIGNATURE"].lower() in ("true", "1", "yes")
+    if "RENFIELD_ENROLLMENT_TOKEN" in os.environ:
+        # Presence check (not truthiness) so an env-set-but-BLANK token (e.g. a
+        # k8s Secret with an empty value) gets the same loud warning as the YAML
+        # path. In the k8s topology the ConfigMap omits enrollment_token, so the
+        # env var is the ONLY place this warning can fire. (Secret absent
+        # entirely + optional:true stays silent — that is the dark-boot path.)
+        config.server.enrollment_token = os.environ["RENFIELD_ENROLLMENT_TOKEN"] or None
+        if not config.server.enrollment_token:
+            logger.warning(
+                "RENFIELD_ENROLLMENT_TOKEN is set but BLANK — registering "
+                "UNENROLLED. Provision the k8s Secret / env var with a valid PSK, "
+                "or the satellite will be rejected once enrollment enforces."
+            )
     if os.environ.get("RENFIELD_VERIFY_TLS"):
         config.server.verify_tls = os.environ["RENFIELD_VERIFY_TLS"].lower() in ("true", "1", "yes")
     if os.environ.get("RENFIELD_BLE_ENABLED"):

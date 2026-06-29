@@ -78,6 +78,9 @@ class UserResponse(BaseModel):
     created_at: datetime
     last_login: datetime | None
     speaker_id: int | None
+    # Security (review M5): surface the forced-rotation flag so /auth/me and the
+    # login response are actionable (the frontend can force a password change).
+    must_change_password: bool = False
 
     class Config:
         from_attributes = True
@@ -364,8 +367,11 @@ async def change_password(
             detail=error
         )
 
-    # Update password
+    # Update password and clear the forced-rotation flag (review M5): the flag
+    # was set (e.g. for an auto-generated admin password) but never cleared, so
+    # the control was inert. Clearing it here makes the rotation gate functional.
     user.password_hash = get_password_hash(request.new_password)
+    user.must_change_password = False
     await db.commit()
 
     logger.info(f"Password changed for user: {user.username}")
